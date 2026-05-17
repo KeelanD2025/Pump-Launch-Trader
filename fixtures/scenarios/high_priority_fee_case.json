@@ -1,0 +1,13 @@
+{
+  "name": "high_priority_fee_case",
+  "kind": "high_priority_fee_case",
+  "description": "Fee-war launch where observed priority fees are extreme.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0",
+    "min_bundle_score": "0"
+  }
+}

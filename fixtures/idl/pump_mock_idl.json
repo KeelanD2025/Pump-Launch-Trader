@@ -1,0 +1,89 @@
+{
+  "name": "pump",
+  "version": "0.1.0",
+  "metadata": {
+    "address": "Pump111111111111111111111111111111111111111",
+    "description": "Mock Pump IDL fixture used for phase 1-3 tests."
+  },
+  "instructions": [
+    {
+      "name": "create",
+      "accounts": [
+        { "name": "creator" },
+        { "name": "mint" },
+        { "name": "bonding_curve" }
+      ],
+      "args": [
+        { "name": "name", "type": "string" },
+        { "name": "symbol", "type": "string" },
+        { "name": "uri", "type": "string" },
+        { "name": "quote_mint", "type": "publicKey" }
+      ]
+    },
+    {
+      "name": "create_v2",
+      "accounts": [
+        { "name": "creator" },
+        { "name": "mint" },
+        { "name": "bonding_curve" }
+      ],
+      "args": [
+        { "name": "name", "type": "string" },
+        { "name": "symbol", "type": "string" },
+        { "name": "uri", "type": "string" },
+        { "name": "quote_mint", "type": "publicKey" },
+        { "name": "creator_fee_bps", "type": "u16" }
+      ]
+    },
+    {
+      "name": "buy",
+      "accounts": [
+        { "name": "buyer" },
+        { "name": "mint" }
+      ],
+      "args": [
+        { "name": "quote_in", "type": "u64" },
+        { "name": "min_token_out", "type": "u64" }
+      ]
+    },
+    {
+      "name": "sell",
+      "accounts": [
+        { "name": "seller" },
+        { "name": "mint" }
+      ],
+      "args": [
+        { "name": "token_in", "type": "u64" },
+        { "name": "min_quote_out", "type": "u64" }
+      ]
+    },
+    {
+      "name": "buy_exact_quote_in_v2",
+      "accounts": [
+        { "name": "buyer" },
+        { "name": "mint" }
+      ],
+      "args": [
+        { "name": "quote_in", "type": "u64" },
+        { "name": "max_slippage_bps", "type": "u16" }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "BondingCurve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "virtual_quote_reserves", "type": "u64" },
+          { "name": "virtual_token_reserves", "type": "u64" },
+          { "name": "real_quote_reserves", "type": "u64" },
+          { "name": "real_token_reserves", "type": "u64" },
+          { "name": "quote_mint", "type": "publicKey" },
+          { "name": "complete", "type": "bool" }
+        ]
+      }
+    }
+  ],
+  "types": []
+}

@@ -1,0 +1,13 @@
+{
+  "name": "strong_holder_growth_winner",
+  "kind": "strong_holder_growth_winner",
+  "description": "Wide cohort participation and steady holder expansion.",
+  "expected": {
+    "expect_enter_paper": true,
+    "expect_no_enter_paper": false,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0",
+    "min_bundle_score": "0"
+  }
+}

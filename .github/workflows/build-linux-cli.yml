@@ -1,0 +1,358 @@
+name: Build Linux CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_to_vps:
+        description: Deploy the built CLI binary to the VPS
+        required: false
+        default: false
+        type: boolean
+      restart_timer:
+        description: Restart the edge timer after a successful deploy
+        required: false
+        default: false
+        type: boolean
+      run_smoke:
+        description: Run a short edge-only smoke cycle after deploy
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  DIST_DIR: dist
+  TARGET_TRIPLE: x86_64-unknown-linux-gnu
+
+jobs:
+  build-linux-cli:
+    name: Build Linux x86_64 CLI
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Run test suite
+        run: cargo test -q
+
+      - name: Build release CLI
+        run: cargo build --release -p cli
+
+      - name: Validate config
+        run: target/release/cli validate-config --config config/default.toml --config-override config/local.example.toml
+
+      - name: Validate stream-only
+        run: target/release/cli validate-stream-only --config config/default.toml --config-override config/local.example.toml
+
+      - name: Validate edge mode
+        run: target/release/cli validate-edge-mode --config config/default.toml --config-override config/local.example.toml
+
+      - name: Scan for secrets
+        run: target/release/cli scan-secrets --config config/default.toml
+
+      - name: Package build artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${DIST_DIR}"
+          cp target/release/cli "${DIST_DIR}/cli"
+          sha256sum "${DIST_DIR}/cli" | awk '{print $1}' > "${DIST_DIR}/cli.sha256"
+
+          PACKAGE_VERSION="$(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; data=json.load(sys.stdin); print(next(pkg["version"] for pkg in data["packages"] if pkg["name"] == "cli"))'
+          )"
+          BINARY_SHA256="$(cat "${DIST_DIR}/cli.sha256")"
+          RUSTC_VERSION="$(rustc --version)"
+          RUSTC_VERBOSE="$(rustc --version --verbose)"
+          BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          export PACKAGE_VERSION
+          export BINARY_SHA256
+          export RUSTC_VERSION
+          export RUSTC_VERBOSE
+          export BUILD_TIMESTAMP
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = {
+              "git_sha": os.environ["GITHUB_SHA"],
+              "build_timestamp": os.environ["BUILD_TIMESTAMP"],
+              "rustc_version": os.environ["RUSTC_VERSION"],
+              "rustc_verbose": os.environ["RUSTC_VERBOSE"],
+              "target_triple": os.environ["TARGET_TRIPLE"],
+              "binary_sha256": os.environ["BINARY_SHA256"],
+              "package_version": os.environ["PACKAGE_VERSION"],
+          }
+          Path(os.environ["DIST_DIR"], "build_info.json").write_text(
+              json.dumps(info, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload Linux CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-${{ env.TARGET_TRIPLE }}
+          path: |
+            dist/cli
+            dist/cli.sha256
+            dist/build_info.json
+          if-no-files-found: error
+
+  deploy-to-vps:
+    name: Deploy prebuilt CLI to VPS
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' }}
+    needs: build-linux-cli
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux-${{ env.TARGET_TRIPLE }}
+          path: dist
+
+      - name: Verify artifact checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_SHA="$(tr -d '[:space:]' < dist/cli.sha256)"
+          ACTUAL_SHA="$(sha256sum dist/cli | awk '{print $1}')"
+          test "${EXPECTED_SHA}" = "${ACTUAL_SHA}"
+
+      - name: Load VPS SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Add VPS host key
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -p "${PORT}" -H "${VPS_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Stage CLI artifact on VPS
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          scp -P "${PORT}" dist/cli "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new"
+          scp -P "${PORT}" dist/cli.sha256 "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new.sha256"
+          scp -P "${PORT}" dist/build_info.json "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/build_info.json.new"
+
+      - name: Install and validate prebuilt CLI on VPS
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          RESTART_TIMER: ${{ github.event.inputs.restart_timer }}
+          RUN_SMOKE: ${{ github.event.inputs.run_smoke }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          RESTART_AFTER_DEPLOY="${RESTART_TIMER}"
+          if [[ "${RUN_SMOKE}" == "true" ]]; then
+            RESTART_AFTER_DEPLOY="false"
+          fi
+
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" RESTART_AFTER_DEPLOY="${RESTART_AFTER_DEPLOY}" 'bash -se' <<'EOF'
+          set -euo pipefail
+
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          NEW_BIN="${APP_DIR}/target/release/cli.new"
+          NEW_SHA="${APP_DIR}/target/release/cli.new.sha256"
+          NEW_BUILD_INFO="${APP_DIR}/target/release/build_info.json.new"
+          BUILD_INFO_TARGET="${APP_DIR}/target/release/build_info.json"
+          VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          BACKUP="${BIN}.prev.${TIMESTAMP}"
+          DEPLOYMENT_SUMMARY="${APP_DIR}/target/release/deploy_summary.${TIMESTAMP}.json"
+
+          rollback() {
+            if [[ -f "${BACKUP}" ]]; then
+              cp "${BACKUP}" "${BIN}"
+              chmod +x "${BIN}"
+            fi
+          }
+
+          on_error() {
+            rollback
+            exit 1
+          }
+
+          trap on_error ERR
+
+          sudo systemctl stop pump-launch-quant-edge-once.timer || true
+          sudo systemctl stop pump-launch-quant-edge-once.service || true
+
+          if [[ -f "${BIN}" ]]; then
+            cp "${BIN}" "${BACKUP}"
+          fi
+
+          EXPECTED_SHA="$(tr -d '[:space:]' < "${NEW_SHA}")"
+          ACTUAL_SHA="$(sha256sum "${NEW_BIN}" | awk '{print $1}')"
+          test "${EXPECTED_SHA}" = "${ACTUAL_SHA}"
+
+          mv "${NEW_BIN}" "${BIN}"
+          chmod +x "${BIN}"
+
+          "${BIN}" validate-config "${VALIDATE_CONFIG[@]}"
+          "${BIN}" validate-stream-only "${VALIDATE_CONFIG[@]}"
+          "${BIN}" validate-edge-mode "${VALIDATE_CONFIG[@]}"
+          "${BIN}" scan-secrets "${VALIDATE_CONFIG[@]}" --env-file "${ENV_FILE}"
+
+          mv "${NEW_BUILD_INFO}" "${BUILD_INFO_TARGET}"
+          mv "${NEW_SHA}" "${BIN}.sha256"
+
+          trap - ERR
+
+          if [[ "${RESTART_AFTER_DEPLOY}" == "true" ]]; then
+            sudo systemctl start pump-launch-quant-edge-once.timer
+          fi
+
+          export APP_DIR BIN BACKUP BUILD_INFO_TARGET DEPLOYMENT_SUMMARY RESTART_AFTER_DEPLOY
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summary = {
+              "app_dir": os.environ["APP_DIR"],
+              "binary_path": os.environ["BIN"],
+              "backup_path": os.environ["BACKUP"],
+              "build_info_path": os.environ["BUILD_INFO_TARGET"],
+              "restart_timer_requested": os.environ["RESTART_AFTER_DEPLOY"] == "true",
+              "validations_passed": True,
+              "smoke_run_executed": False,
+          }
+          Path(os.environ["DEPLOYMENT_SUMMARY"]).write_text(
+              json.dumps(summary, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, indent=2))
+          PY
+          EOF
+
+      - name: Run optional smoke cycle on VPS
+        if: ${{ github.event.inputs.run_smoke == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+
+          STATUS_BEFORE="$("${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}")"
+          PREVIOUS_RUN_ID="$(printf '%s' "${STATUS_BEFORE}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("last_completed_run_id") or "")')"
+
+          "${BIN}" run-autopilot "${VALIDATE_CONFIG[@]}" --mode edge-collector --once --duration-seconds 120
+
+          STATUS_AFTER="$("${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}")"
+          LATEST_RUN_ID="$(printf '%s' "${STATUS_AFTER}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("last_completed_run_id") or "")')"
+
+          if [[ -n "${LATEST_RUN_ID}" && "${LATEST_RUN_ID}" != "${PREVIOUS_RUN_ID}" ]]; then
+            "${BIN}" verify-run-segments "${VALIDATE_CONFIG[@]}" --run-id "${LATEST_RUN_ID}"
+            "${BIN}" verify-r2-upload "${VALIDATE_CONFIG[@]}" --run-id "${LATEST_RUN_ID}" --check-manifest-consistency
+          fi
+
+          "${BIN}" inspect-dataset-index "${VALIDATE_CONFIG[@]}"
+
+          export PREVIOUS_RUN_ID LATEST_RUN_ID
+
+          python3 - <<'PY'
+          import json
+          import os
+          print(json.dumps({
+              "smoke_run_attempted": True,
+              "previous_last_completed_run_id": os.environ["PREVIOUS_RUN_ID"],
+              "latest_last_completed_run_id": os.environ["LATEST_RUN_ID"],
+              "new_run_detected": bool(os.environ["LATEST_RUN_ID"]) and os.environ["LATEST_RUN_ID"] != os.environ["PREVIOUS_RUN_ID"],
+          }, indent=2))
+          PY
+          EOF
+
+      - name: Restart edge timer after smoke
+        if: ${{ github.event.inputs.restart_timer == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" 'sudo systemctl start pump-launch-quant-edge-once.timer'
+
+      - name: Write deploy summary
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          {
+            echo "## VPS deploy summary"
+            echo
+            echo "- artifact: cli-linux-${TARGET_TRIPLE}"
+            echo "- deploy_to_vps: true"
+            echo "- restart_timer_requested: ${{ github.event.inputs.restart_timer }}"
+            echo "- run_smoke_requested: ${{ github.event.inputs.run_smoke }}"
+            echo "- vps_user: ${VPS_USER}"
+            echo "- vps_host: ${VPS_HOST}"
+            echo "- vps_app_dir: ${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          } >> "${GITHUB_STEP_SUMMARY}"

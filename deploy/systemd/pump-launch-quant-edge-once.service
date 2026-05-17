@@ -1,0 +1,13 @@
+[Unit]
+Description=Pump Launch Quant Edge Collector (One Shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pump-launch-quant
+EnvironmentFile=/home/ubuntu/pump-launch-quant.env
+ExecStart=/home/ubuntu/pump-launch-quant/target/release/cli run-autopilot --config /home/ubuntu/pump-launch-quant/config/default.toml --config-override /home/ubuntu/pump-launch-quant/config/local.toml --mode edge-collector --once --duration-seconds 300
+Nice=5
+

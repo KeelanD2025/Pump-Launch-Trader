@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule Pump Launch Quant Edge Collector (One Shot)
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=60
+Persistent=true
+RandomizedDelaySec=5
+Unit=pump-launch-quant-edge-once.service
+
+[Install]
+WantedBy=timers.target
+

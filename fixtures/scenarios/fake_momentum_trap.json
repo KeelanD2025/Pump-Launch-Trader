@@ -1,0 +1,13 @@
+{
+  "name": "fake_momentum_trap",
+  "kind": "fake_momentum_trap",
+  "description": "Price rises on narrow flow while strong holders distribute.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0.20",
+    "min_bundle_score": "0"
+  }
+}

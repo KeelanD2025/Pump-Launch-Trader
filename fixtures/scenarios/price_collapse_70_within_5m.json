@@ -1,0 +1,13 @@
+{
+  "name": "price_collapse_70_within_5m",
+  "kind": "price_collapse_70_within_5m",
+  "description": "Collapse through launch floor inside five minutes.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": true,
+    "min_rug_score": "0.20",
+    "min_bundle_score": "0"
+  }
+}

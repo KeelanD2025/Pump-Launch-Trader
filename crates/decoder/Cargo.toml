@@ -1,0 +1,10 @@
+[package]
+name = "decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+idl = { path = "../idl" }
+thiserror.workspace = true

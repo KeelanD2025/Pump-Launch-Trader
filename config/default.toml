@@ -1,0 +1,762 @@
+[environment]
+cluster = "mainnet-beta"
+run_id = "paper-default"
+strategy_version = "phase-13-runtime"
+schema_version = 1
+
+[runtime]
+mode = "paper_from_store"
+queue_capacity_canonical = 2048
+queue_capacity_tentative = 1024
+queue_capacity_decisions = 512
+shutdown_drain_timeout_ms = 2000
+health_report_interval_ms = 1000
+
+[edge_collector]
+enabled = false
+stream_only_required = true
+paper_decisions_enabled = false
+feature_engine_enabled = false
+risk_engine_enabled = false
+decision_engine_enabled = false
+paper_executor_enabled = false
+research_reports_enabled = false
+large_exports_enabled = false
+local_analysis_enabled = false
+r2_upload_required = true
+r2_verify_required = true
+minimal_status_reports = true
+max_local_runtime_mb = 256
+flush_interval_seconds = 15
+segment_max_size_mb = 4
+segment_max_age_seconds = 30
+keep_local_segments_after_verify = false
+keep_only_last_open_segment = true
+allow_rpc_enrichment = false
+allow_metadata_fetch = false
+allow_social_fetch = false
+allow_wallet_history_rpc = false
+allow_bundle_enrichment_rpc = false
+
+[edge_collector.storage]
+segment_dir = "data/edge_segments"
+max_open_segments = 4
+max_local_segment_mb = 64
+delete_verified_segments_immediately = true
+require_r2_verified_before_delete = true
+forbid_large_local_exports = true
+forbid_feature_snapshot_files = true
+forbid_research_reports = true
+
+[research_worker]
+enabled = false
+input = "r2"
+r2_dataset_index_required = true
+download_segments = true
+stream_segments_from_r2 = true
+compute_features = true
+compute_risk = true
+compute_decisions = true
+run_backtests = true
+generate_reports = true
+generate_exports = true
+update_calibration = true
+local_output_dir = "research_output"
+
+[enrichment]
+enabled = true
+mode = "research_only"
+run_after_replay = true
+run_on_vps = false
+require_stream_source_first = true
+cache_enabled = true
+cache_dir = "research_output/enrichment_cache"
+ledger_path = "research_output/enrichment_ledger.jsonl"
+max_daily_rpc_calls = 5000
+max_daily_rpc_credits = 5000
+max_daily_http_metadata_fetches = 2000
+max_wallets_per_run = 500
+max_tokens_per_run = 1000
+max_signatures_per_wallet = 25
+max_metadata_bytes = 262144
+request_timeout_ms = 5000
+max_retries = 2
+respect_robots = false
+block_private_ips = true
+deny_localhost = true
+deny_link_local = true
+deny_private_ranges = true
+
+[enrichment.rpc]
+allow_funding_graph_rpc = true
+allow_bundle_evidence_rpc = true
+allow_wallet_age_rpc = true
+allow_metadata_account_rpc = true
+allow_token_largest_accounts_rpc = false
+allow_get_program_accounts = false
+allow_backfill_large_history = false
+allow_transaction_history_scans = false
+
+[enrichment.metadata]
+allow_uri_fetch = true
+allow_social_detection = true
+fetch_only_token_metadata_uri = true
+do_not_fetch_images = true
+do_not_execute_javascript = true
+max_redirects = 2
+allowed_schemes = ["https", "ipfs"]
+extract_social_links_only = true
+
+[ingest.geyser]
+enabled = true
+required = true
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "YELLOWSTONE_AUTH_TOKEN"
+auth_metadata_key = "x-token"
+auth_metadata_value_env = ""
+auth_required = false
+connect_timeout_ms = 10000
+request_timeout_ms = 30000
+keepalive_interval_ms = 10000
+commitment = "processed"
+reconnect_backoff_ms = [250, 500, 1000, 2000, 5000]
+max_reconnect_backoff_ms = 30000
+max_reconnect_attempts = 10
+subscribe_transactions = true
+subscribe_accounts = true
+subscribe_slots = true
+subscribe_blocks = false
+subscribe_blocks_meta = true
+geyser_only_allowed = true
+ping_interval_ms = 15000
+max_decoded_message_size = 67108864
+max_inflight_messages = 8192
+slot_gap_tolerance = 1
+program_filters = ["Pump111111111111111111111111111111111111111"]
+account_filters = []
+
+[ingest.shred]
+enabled = true
+required = false
+udp_bind = "127.0.0.1:19001"
+decoder = "fixture"
+allow_geyser_only_fallback = true
+max_packet_size = 1500
+dedup_window = 8192
+tentative_ttl_ms = 4000
+
+[ingest.deshred]
+enabled = false
+required = false
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "GEYSER_AUTH_TOKEN"
+auth_metadata_key = "x-token"
+auth_required = false
+subscribe_transactions = true
+program_filters_from_pump_ids = true
+connect_timeout_ms = 10000
+request_timeout_ms = 30000
+keepalive_interval_ms = 10000
+reconnect_backoff_ms = 1000
+max_reconnect_backoff_ms = 30000
+max_reconnect_attempts = 10
+fail_if_unsupported = false
+max_decoded_message_size = 67108864
+
+[geyser]
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "YELLOWSTONE_AUTH_TOKEN"
+auth_required = false
+connect_timeout_ms = 10000
+commitment = "processed"
+reconnect_backoff_ms = [250, 500, 1000, 2000, 5000]
+max_reconnect_backoff_ms = 30000
+subscribe_transactions = true
+subscribe_accounts = true
+subscribe_slots = true
+subscribe_blocks = false
+geyser_only_allowed = true
+max_inflight_messages = 8192
+slot_gap_tolerance = 1
+program_filters = [
+  "Pump111111111111111111111111111111111111111",
+]
+account_filters = []
+
+[shred]
+bind_addr = "127.0.0.1:19001"
+max_packet_size = 1500
+dedup_window = 8192
+tentative_ttl_ms = 4000
+
+[pump]
+program_ids = ["Pump111111111111111111111111111111111111111"]
+pump_swap_program_ids = []
+idl_paths = ["../fixtures/idl/pump_mock_idl.json"]
+
+[storage]
+root = "data"
+event_log_dir = "data/events"
+snapshot_dir = "data/snapshots"
+report_dir = "reports"
+run_metadata_log_path = "runs.jsonl"
+decision_log_path = "decisions.jsonl"
+fill_log_path = "fills.jsonl"
+runtime_audit_log_path = "runtime_audit.jsonl"
+
+[storage.segments]
+enabled = true
+max_segment_size_mb = 32
+max_segment_age_seconds = 300
+compress_closed_segments = true
+compression = "zstd"
+upload_closed_segments = true
+verify_before_local_delete = true
+delete_verified_segments = true
+keep_last_n_segments_local = 2
+segment_manifest_path = "data/manifests/segments"
+
+[storage.segments.upload]
+max_concurrent_segment_uploads = 2
+max_pending_segments = 20
+max_pending_segments_warning = 20
+max_pending_segments_pause = 40
+max_pending_segments_stop = 60
+pause_collection_if_pending_segments_exceed = 60
+pause_new_token_tracking_on_backlog = true
+pause_feature_snapshot_writes_on_backlog = false
+force_close_and_upload_on_backlog = true
+retry_failed_uploads = true
+max_upload_retries = 3
+retry_backoff_seconds = 30
+alert_on_upload_backlog = true
+
+[storage.segments.finalization]
+drain_pending_segments_on_finalize = true
+max_finalize_segment_upload_wait_seconds = 300
+max_finalize_upload_retries = 3
+allow_partial_manifest = true
+mark_partial_if_pending_segments = true
+fail_finalization_if_manifest_missing = true
+
+[storage.local]
+report_lite_after_upload = true
+compress_reports_before_upload = true
+delete_uncompressed_exports_after_upload = true
+keep_local_markdown_summaries = true
+keep_local_json_summaries = true
+
+[storage.low_disk_mode]
+enabled = false
+target_local_runtime_mb = 500
+warning_free_mb = 2048
+critical_free_mb = 1536
+emergency_free_mb = 768
+max_local_verified_segments = 1
+max_local_unverified_closed_segments = 20
+max_local_export_mb = 64
+forbid_monolithic_feature_export = true
+forbid_monolithic_large_exports = true
+lite_reports_after_upload = true
+remote_first_analysis = true
+remote_first_exports = true
+delete_verified_segments_immediately = true
+delete_verified_exports_immediately = true
+keep_open_segments_only = true
+keep_small_summaries_local = true
+keep_rpc_ledger_local = true
+keep_calibration_local = true
+keep_manifest_local = true
+
+[exports]
+chunked_enabled = true
+max_uncompressed_export_mb = 128
+feature_export_chunk_rows = 50000
+compress_exports = true
+compression = "zstd"
+upload_export_chunks_to_r2 = true
+verify_export_chunks = true
+delete_local_verified_export_chunks = true
+prevent_monolithic_large_exports = true
+
+[metrics]
+bind_addr = "127.0.0.1:9108"
+enabled = true
+enable_prometheus = true
+enable_healthz = true
+enable_readyz = true
+json_tracing = false
+service_name = "pump-launch-quant"
+
+[reports]
+auto_generate = true
+include_strategy_summary = true
+include_edge_calibration = true
+include_data_gaps = true
+include_top_tokens = true
+
+[reports.low_disk]
+enabled = false
+max_local_report_mb = 10
+remote_full_reports = true
+compress_full_reports = true
+delete_local_full_reports_after_verified_upload = true
+
+[analysis.remote]
+enabled = true
+max_restore_mb = 256
+delete_temp_after_segment = true
+stream_segments_one_at_a_time = true
+allow_full_restore = false
+
+[early_intent]
+enabled = true
+sources = ["fixture", "mock", "deshred", "raw_shred"]
+prefer_deshred_when_available = true
+allow_raw_shred_fixture_in_dev = true
+allow_production_raw_shred = false
+require_early_intent_for_live_shred_exit = true
+max_tentative_event_age_ms = 750
+deduplicate_sources = true
+dedup_amount_tolerance_pct = "5.0"
+dedup_slot_tolerance = 0
+
+[early_intent.mock]
+enabled = true
+allow_in_live_data_paper = true
+allow_in_guarded_live = false
+
+[early_intent.source_precedence]
+deshred = 100
+raw_shred = 90
+fixture = 10
+mock = 10
+replay = 5
+
+[provider]
+name = ""
+record_compatibility = true
+endpoint_host_hash_only = true
+
+[autopilot]
+enabled = false
+mode = "paper_collection"
+stream_only_required = true
+live_trading_allowed = false
+dry_run = true
+allow_mock_when_endpoint_missing = false
+allow_geyser_only_when_deshred_unsupported = true
+require_geyser = true
+require_deshred = false
+max_parallel_runs = 1
+state_path = "data/autopilot/autopilot_state.json"
+lock_path = "data/autopilot/autopilot.lock"
+status_path = "data/autopilot/status.json"
+report_dir = "data/reports/autopilot"
+heartbeat_interval_seconds = 30
+cycle_sleep_seconds = 60
+max_cycle_runtime_seconds = 7200
+graceful_shutdown_timeout_seconds = 30
+
+[autopilot.schedule]
+startup_smoke = true
+continuous = true
+collection_preset = "medium"
+collection_duration_seconds = 1800
+checkpoint_interval_seconds = 300
+run_research_cycle_after_collection = true
+run_backtest_when_ready = true
+export_after_collection = true
+export_after_research_cycle = true
+
+[autopilot.provider]
+run_precheck_each_cycle = true
+run_geyser_smoke_each_cycle = false
+run_deshred_smoke_each_cycle = false
+run_stream_smoke_on_startup = true
+smoke_duration_seconds = 30
+provider_error_retry_seconds = 300
+missing_endpoint_retry_seconds = 600
+auth_error_retry_seconds = 1800
+
+[autopilot.retention]
+enabled = true
+max_total_storage_gb = 50
+max_run_age_days = 14
+keep_last_n_runs = 100
+keep_last_n_backtests = 50
+keep_failed_runs = true
+keep_provider_smoke_reports = true
+compress_old_reports = false
+delete_old_exports = false
+
+[autopilot.alerts]
+enabled = true
+write_local_alerts = true
+alerts_path = "data/autopilot/alerts.jsonl"
+webhook_enabled = false
+webhook_url_env = ""
+alert_on_provider_failure = true
+alert_on_data_gap = true
+alert_on_rpc_denial = true
+alert_on_nonzero_rpc_usage = true
+alert_on_queue_overflow = true
+alert_on_backtest_ready = true
+alert_on_autopilot_crash = true
+
+[autopilot.safety]
+stop_on_nonzero_rpc_usage = true
+stop_on_stream_only_failure = true
+stop_on_live_enabled = true
+stop_on_signer_config_present = false
+stop_on_global_data_gap = false
+stop_on_repeated_provider_failures = false
+max_provider_failures_before_pause = 10
+max_queue_overflows_before_pause = 3
+
+[autopilot.disk]
+min_free_mb_before_cycle = 1024
+min_free_mb_during_cycle = 512
+check_interval_seconds = 30
+warning_free_mb = 2048
+pre_cycle_min_free_mb = 1536
+critical_free_mb = 1024
+emergency_free_mb = 512
+pause_if_below_min_free = true
+run_prune_before_cycle = true
+run_prune_after_verified_upload = true
+allow_prune_verified_exports = true
+allow_prune_verified_reports = false
+allow_prune_verified_raw_events = false
+keep_minimal_manifest = true
+keep_rpc_ledger = true
+keep_calibration = true
+close_segments_on_warning = true
+stop_collection_on_critical = true
+pause_before_os_error = true
+prune_verified_segments_on_warning = true
+prune_verified_runs_on_startup = true
+block_new_cycle_below_warning = false
+block_new_cycle_below_pre_cycle_min = true
+allow_cycle_below_warning_if_r2_healthy = true
+require_no_unuploaded_runs_below_warning = true
+aggressive_low_disk_mode_below_warning = true
+
+[autopilot.post_cycle_cleanup]
+enabled = true
+target_free_mb_after_cycle = 2048
+run_clean_build_artifacts = true
+prune_verified_exports = true
+prune_verified_segments = true
+prune_verified_reports = false
+stop_if_unable_to_reach_pre_cycle_min = true
+allow_next_cycle_if_above_pre_cycle_min = true
+
+[autopilot.backtest_thresholds]
+min_duration_seconds = 3600
+min_tokens_discovered = 100
+min_complete_lifecycles = 20
+min_feature_snapshots = 1000
+min_decisions = 10
+require_stream_only = true
+require_zero_rpc = true
+max_global_data_gaps = 0
+min_holder_confidence = "0.5"
+
+[r2]
+enabled = false
+upload_enabled = false
+delete_enabled = false
+dry_run = true
+account_id_env = "CF_ACCOUNT_ID"
+endpoint_env = "R2_ENDPOINT"
+access_key_id_env = "R2_ACCESS_KEY_ID"
+secret_access_key_env = "R2_SECRET_ACCESS_KEY"
+managed_prefix = "pump-launch-quant"
+region = "auto"
+force_path_style = true
+max_concurrent_uploads = 4
+multipart_threshold_mb = 64
+part_size_mb = 16
+upload_timeout_seconds = 600
+verify_after_upload = true
+verify_checksum = true
+compress_before_upload = true
+compression = "zstd"
+encryption_mode = "none"
+fail_collection_if_upload_fails = false
+prune_local_only_after_verified_upload = true
+
+[r2.buckets]
+datasets_bucket_env = "R2_DATASET_BUCKET"
+reports_bucket_env = "R2_REPORTS_BUCKET"
+calibration_bucket_env = "R2_CALIBRATION_BUCKET"
+provider_compat_bucket_env = "R2_PROVIDER_COMPAT_BUCKET"
+create_if_missing = false
+allow_bucket_delete = false
+allow_bucket_empty = false
+allow_object_delete = false
+destructive_requires_flag = true
+
+[r2.paths]
+runs_prefix = "runs"
+reports_prefix = "reports"
+exports_prefix = "exports"
+calibration_prefix = "calibration"
+provider_compat_prefix = "provider_compatibility"
+rpc_ledger_prefix = "rpc_ledger"
+manifests_prefix = "manifests"
+
+[r2.retention]
+enabled = true
+keep_local_after_upload_hours = 24
+keep_last_n_local_runs = 10
+delete_local_exports_after_upload = true
+delete_local_reports_after_upload = false
+delete_local_raw_events_after_upload = false
+max_local_storage_gb = 50
+
+[r2.autopilot]
+upload_after_collection = true
+upload_after_research_cycle = true
+upload_after_exports = true
+upload_provider_smoke_reports = true
+upload_rpc_ledger = true
+upload_calibration = true
+upload_artifact_manifest = true
+pause_autopilot_on_upload_failure = false
+
+[stream_only]
+enabled = true
+fail_on_hot_path_rpc = true
+fail_on_unbudgeted_rpc = true
+allow_tracking_rpc = false
+allow_holder_rpc = false
+allow_top_holder_rpc = false
+allow_metadata_rpc = false
+allow_backfill_rpc = false
+allow_reconciliation_rpc = false
+allow_confirmation_rpc = false
+allow_execution_rpc = false
+allow_blockhash_rpc = false
+allow_send_rpc = false
+allow_emergency_rpc = false
+rpc_daily_credit_budget = 0
+rpc_monthly_credit_budget = 0
+
+[rpc]
+hot_path_enabled = false
+daily_credit_budget = 0
+monthly_credit_budget = 0
+
+[confirmation]
+source = "geyser_stream"
+allow_rpc_status_fallback = false
+
+[metadata]
+fetch_uri = false
+hot_path_fetch_enabled = false
+offline_import_path = ""
+
+[shred_exit]
+enabled = true
+paper_enabled = true
+live_enabled = false
+min_decode_confidence_warn = "0.55"
+min_decode_confidence_arm = "0.70"
+min_decode_confidence_paper_exit = "0.82"
+min_decode_confidence_live_exit = "0.95"
+warn_impact_pct = "8.0"
+arm_impact_pct = "15.0"
+paper_exit_impact_pct = "25.0"
+live_exit_impact_pct = "35.0"
+min_expected_saved_loss_quote = "0.02"
+min_emergency_exit_net_benefit_quote = "0.01"
+min_latency_edge_ratio = "1.10"
+allow_arm_when_net_benefit_negative = true
+allow_emergency_when_net_benefit_negative = false
+absorption_downgrade_enabled = true
+absorption_downgrade_threshold = "0.75"
+dev_sell_exit_threshold_pct = "5.0"
+top_holder_exit_threshold_pct = "10.0"
+bundle_cluster_exit_threshold_pct = "12.0"
+same_slot_multi_sell_escalation = true
+max_tentative_event_age_ms = 750
+tentative_reconciliation_ttl_ms = 5000
+false_positive_penalty_enabled = true
+tighten_stop_on_arm = true
+prebuild_live_exit_on_arm = false
+allow_paper_exit_on_tentative = true
+allow_live_exit_on_tentative = false
+required_confirmation_level_for_live_exit = "geyser_processed_tx_seen"
+prefer_account_effect_confirmation = true
+
+[shred_exit.calibration]
+enabled = true
+paper_only = true
+path = "data/calibration/shred_exit_calibration.json"
+min_samples_before_adapt = 50
+max_threshold_adjustment_per_hour = "0.05"
+false_positive_rate_limit = "0.10"
+missed_sell_rate_limit = "0.05"
+persist_calibration = true
+max_live_threshold_adjustment = "0.0"
+
+[execution]
+enabled = false
+live_enabled = false
+paper_enabled = true
+use_rpc_send = false
+use_stream_blockhash_cache = true
+max_daily_loss_quote = "500.0"
+max_open_positions = 3
+max_position_size_quote = "1.50"
+max_trades_per_minute = 12
+max_fee_quote = "0.25"
+max_slippage_bps = 300
+
+[paper]
+enabled = true
+initial_balance_quote = "10000.0"
+max_positions = 3
+max_position_size_quote = "1.50"
+max_daily_loss_quote = "500.0"
+close_on_shutdown = false
+scenario_end_liquidation = true
+
+[live]
+enabled = false
+dry_run = true
+require_explicit_enable = true
+explicit_send_confirmation = false
+allow_shred_emergency_exit = false
+max_fee_per_transaction_quote = "0.25"
+max_priority_fee_lamports = 500000
+max_tip_lamports = 250000
+max_slippage_bps = 300
+
+[edge]
+min_expected_net_edge_quote = "0.02"
+min_expected_net_edge_pct = "0.01"
+min_edge_confidence = "0.35"
+fee_safety_margin_multiplier = "1.20"
+latency_safety_margin_multiplier = "1.20"
+allow_watch_without_trade = true
+
+[ttl]
+discovered_secs = 900
+active_light_secs = 1800
+active_deep_secs = 7200
+discarded_summary_secs = 259200
+research_sample_secs = 604800
+
+[strategy]
+min_fee_adjusted_edge_bps = 80
+min_data_quality_score = "0.75"
+max_bundle_risk = "0.55"
+max_rug_risk = "0.45"
+max_fake_momentum_risk = "0.50"
+min_holder_growth = "0.20"
+min_trade_eligibility_score = "0.30"
+min_holder_stickiness_score = "0.20"
+min_momentum_authenticity_score = "0.15"
+max_profit_overhang_score = "0.90"
+
+[strategy.launch_momentum]
+take_profit_pct = "0.18"
+trailing_stop_pct = "0.08"
+stop_loss_pct = "0.09"
+max_hold_ms = 20000
+
+[strategy.holder_growth]
+take_profit_pct = "0.28"
+trailing_stop_pct = "0.12"
+stop_loss_pct = "0.12"
+max_hold_ms = 90000
+
+[strategy.absorption_bounce]
+take_profit_pct = "0.14"
+trailing_stop_pct = "0.07"
+stop_loss_pct = "0.08"
+max_hold_ms = 35000
+
+[strategy.smart_rotation]
+take_profit_pct = "0.20"
+trailing_stop_pct = "0.10"
+stop_loss_pct = "0.10"
+max_hold_ms = 60000
+
+[strategy.organic_slow_grind]
+take_profit_pct = "0.24"
+trailing_stop_pct = "0.10"
+stop_loss_pct = "0.11"
+max_hold_ms = 120000
+
+[strategy.exit_on_shred]
+launch_momentum = true
+holder_growth = true
+absorption_bounce = true
+smart_rotation = true
+organic_slow_grind = true
+
+[risk]
+max_rug_score = "0.45"
+max_bundle_score = "0.55"
+max_fake_momentum_score = "0.50"
+max_profit_overhang_score = "0.90"
+min_data_quality_score = "0.75"
+
+[decision]
+min_trade_eligibility_score = "0.30"
+min_fee_adjusted_edge_bps = 80
+min_holder_stickiness_score = "0.20"
+min_momentum_authenticity_score = "0.15"
+
+[features]
+enable_advanced_cost_basis = true
+enable_cohort_ranking = true
+enable_funding_graph = true
+enable_transaction_fingerprint = true
+enable_absorption = true
+enable_fake_momentum = true
+
+[features.pressure]
+enabled = true
+min_snapshot_interval_ms_normal = 1000
+min_snapshot_interval_ms_disk_warning = 5000
+min_snapshot_interval_ms_upload_backlog = 10000
+always_snapshot_on_trade = true
+always_snapshot_on_decision = true
+always_snapshot_on_enter_exit = true
+skip_low_value_watch_snapshots_under_pressure = true
+
+[rpc_budget]
+daily_credit_limit = 0
+monthly_credit_limit = 0
+emergency_reserve = 0
+deny_when_unknown_live_state = true
+
+[[quote_assets]]
+mint = "So11111111111111111111111111111111111111112"
+asset_type = "wrapped_sol"
+min_trade_size_quote = "0.05"
+max_trade_size_quote = "2.50"
+min_edge_bps = 100
+
+[feature_families.launch_identity]
+enabled = true
+max_compute_units = 500
+max_memory_bytes = 65536
+
+[feature_families.wallet_quality]
+enabled = true
+max_compute_units = 2500
+max_memory_bytes = 262144
+
+[feature_families.path_similarity]
+enabled = false
+max_compute_units = 10000
+max_memory_bytes = 1048576

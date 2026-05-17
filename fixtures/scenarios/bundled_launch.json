@@ -1,0 +1,13 @@
+{
+  "name": "bundled_launch",
+  "kind": "bundled_launch",
+  "description": "First buyers share profiles and funders.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0",
+    "min_bundle_score": "0.40"
+  }
+}

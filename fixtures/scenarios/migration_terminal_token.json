@@ -1,0 +1,13 @@
+{
+  "name": "migration_terminal_token",
+  "kind": "migration_terminal_token",
+  "description": "Migration marks the token terminal for pre-migration strategies.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0",
+    "min_bundle_score": "0"
+  }
+}

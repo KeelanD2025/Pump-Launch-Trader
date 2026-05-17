@@ -1,0 +1,13 @@
+{
+  "name": "top_holder_dump",
+  "kind": "top_holder_dump",
+  "description": "Concentrated holder base with an early whale exit.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0.10",
+    "min_bundle_score": "0"
+  }
+}

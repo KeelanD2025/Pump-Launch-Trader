@@ -1,0 +1,22 @@
+[Unit]
+Description=Pump Launch Quant Autopilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pump-launch-quant
+EnvironmentFile=/home/ubuntu/.config/pump-launch-quant-autopilot.env
+ExecStart=/opt/pump-launch-quant/bin/cli run-autopilot --config config/default.toml --config-override /opt/pump-launch-quant/config/local.toml --stream-only --continuous
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+User=ubuntu
+# Set GRPC_URL, GEYSER_AUTH_TOKEN, and any R2 env vars in the EnvironmentFile.
+# Keep config/local.toml out of git and enable R2 there without embedding credentials.
+# Autopilot remains stream-only and paper-only; live trading stays disabled.
+# Rebuild and refresh bin/cli after code changes before restarting this service.
+
+[Install]
+WantedBy=multi-user.target

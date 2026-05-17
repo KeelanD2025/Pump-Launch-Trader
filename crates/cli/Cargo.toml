@@ -1,0 +1,34 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+production-shred-decoder = ["runtime/production-shred-decoder"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common = { path = "../common" }
+decoder = { path = "../decoder" }
+decision = { path = "../decision" }
+executor = { path = "../executor" }
+features = { path = "../features" }
+idl = { path = "../idl" }
+ingest-geyser = { path = "../ingest-geyser" }
+metrics = { path = "../metrics" }
+r2-storage = { path = "../r2-storage" }
+risk = { path = "../risk" }
+rpc-budget = { path = "../rpc-budget" }
+runtime = { path = "../runtime" }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sim = { path = "../sim" }
+state = { path = "../state" }
+storage = { path = "../storage" }
+time.workspace = true
+tokio.workspace = true
+zstd.workspace = true

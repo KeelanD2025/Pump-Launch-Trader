@@ -1,0 +1,13 @@
+{
+  "name": "dev_dump_launch",
+  "kind": "dev_dump_launch",
+  "description": "Creator exits early into weak holder growth.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": true,
+    "expect_data_gap": false,
+    "expect_discard": true,
+    "min_rug_score": "0.10",
+    "min_bundle_score": "0"
+  }
+}

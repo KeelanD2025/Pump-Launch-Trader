@@ -1,0 +1,217 @@
+[runtime]
+mode = "edge_collector"
+
+[geyser]
+endpoint_env = "GRPC_URL"
+auth_token_env = "GEYSER_AUTH_TOKEN"
+
+[ingest.geyser]
+endpoint_env = "GRPC_URL"
+auth_token_env = "GEYSER_AUTH_TOKEN"
+
+[ingest.deshred]
+endpoint_env = "GRPC_URL"
+auth_token_env = "GEYSER_AUTH_TOKEN"
+
+[r2]
+enabled = true
+upload_enabled = true
+dry_run = true
+
+[r2.buckets]
+datasets_bucket_env = "R2_DATASET_BUCKET"
+reports_bucket_env = "R2_REPORTS_BUCKET"
+calibration_bucket_env = "R2_CALIBRATION_BUCKET"
+provider_compat_bucket_env = "R2_PROVIDER_COMPAT_BUCKET"
+
+[autopilot]
+enabled = true
+mode = "edge_collector"
+
+[edge_collector]
+enabled = true
+stream_only_required = true
+paper_decisions_enabled = false
+feature_engine_enabled = false
+risk_engine_enabled = false
+decision_engine_enabled = false
+paper_executor_enabled = false
+research_reports_enabled = false
+large_exports_enabled = false
+local_analysis_enabled = false
+r2_upload_required = true
+r2_verify_required = true
+minimal_status_reports = true
+max_local_runtime_mb = 256
+flush_interval_seconds = 15
+segment_max_size_mb = 4
+segment_max_age_seconds = 30
+keep_local_segments_after_verify = false
+keep_only_last_open_segment = true
+
+[edge_collector.storage]
+segment_dir = "data/edge_segments"
+max_open_segments = 4
+max_local_segment_mb = 64
+delete_verified_segments_immediately = true
+require_r2_verified_before_delete = true
+forbid_large_local_exports = true
+forbid_feature_snapshot_files = true
+forbid_research_reports = true
+
+[research_worker]
+enabled = false
+input = "r2"
+r2_dataset_index_required = true
+download_segments = true
+stream_segments_from_r2 = true
+compute_features = true
+compute_risk = true
+compute_decisions = true
+run_backtests = true
+generate_reports = true
+generate_exports = true
+update_calibration = true
+local_output_dir = "research_output"
+
+[enrichment]
+enabled = true
+mode = "research_only"
+run_after_replay = true
+run_on_vps = false
+require_stream_source_first = true
+cache_enabled = true
+cache_dir = "research_output/enrichment_cache"
+ledger_path = "research_output/enrichment_ledger.jsonl"
+max_daily_rpc_calls = 5000
+max_daily_rpc_credits = 5000
+max_daily_http_metadata_fetches = 2000
+max_wallets_per_run = 500
+max_tokens_per_run = 1000
+max_signatures_per_wallet = 25
+max_metadata_bytes = 262144
+request_timeout_ms = 5000
+max_retries = 2
+respect_robots = false
+block_private_ips = true
+deny_localhost = true
+deny_link_local = true
+deny_private_ranges = true
+
+[enrichment.rpc]
+allow_funding_graph_rpc = true
+allow_bundle_evidence_rpc = true
+allow_wallet_age_rpc = true
+allow_metadata_account_rpc = true
+allow_token_largest_accounts_rpc = false
+allow_get_program_accounts = false
+allow_backfill_large_history = false
+allow_transaction_history_scans = false
+
+[enrichment.metadata]
+allow_uri_fetch = true
+allow_social_detection = true
+fetch_only_token_metadata_uri = true
+do_not_fetch_images = true
+do_not_execute_javascript = true
+max_redirects = 2
+allowed_schemes = ["https", "ipfs"]
+extract_social_links_only = true
+
+[storage.segments]
+enabled = true
+max_segment_size_mb = 8
+max_segment_age_seconds = 60
+delete_verified_segments = true
+keep_last_n_segments_local = 1
+
+[storage.segments.upload]
+enabled = true
+upload_closed_segments_during_run = true
+verify_closed_segments = true
+delete_verified_closed_segments = true
+max_concurrent_segment_uploads = 6
+max_pending_segments_warning = 10
+max_pending_segments_pause = 20
+max_pending_segments_stop = 30
+pause_collection_if_pending_segments_exceed = 30
+pause_new_token_tracking_on_backlog = true
+pause_feature_snapshot_writes_on_backlog = true
+force_close_and_upload_on_backlog = true
+
+[storage.segments.finalization]
+drain_pending_segments_on_finalize = true
+max_finalize_segment_upload_wait_seconds = 300
+max_finalize_upload_retries = 3
+allow_partial_manifest = true
+mark_partial_if_pending_segments = true
+fail_finalization_if_manifest_missing = true
+
+[storage.low_disk_mode]
+enabled = true
+target_local_runtime_mb = 500
+warning_free_mb = 2048
+critical_free_mb = 1536
+emergency_free_mb = 768
+max_local_verified_segments = 1
+max_local_unverified_closed_segments = 20
+max_local_export_mb = 64
+forbid_monolithic_feature_export = true
+forbid_monolithic_large_exports = true
+lite_reports_after_upload = true
+remote_first_analysis = true
+remote_first_exports = true
+delete_verified_segments_immediately = true
+delete_verified_exports_immediately = true
+keep_open_segments_only = true
+keep_small_summaries_local = true
+keep_rpc_ledger_local = true
+keep_calibration_local = true
+keep_manifest_local = true
+
+[autopilot.disk]
+warning_free_mb = 2048
+pre_cycle_min_free_mb = 1536
+critical_free_mb = 1024
+emergency_free_mb = 512
+close_segments_on_warning = true
+prune_verified_segments_on_warning = true
+stop_collection_on_critical = true
+block_new_cycle_below_warning = false
+block_new_cycle_below_pre_cycle_min = true
+allow_cycle_below_warning_if_r2_healthy = true
+require_no_unuploaded_runs_below_warning = true
+aggressive_low_disk_mode_below_warning = true
+
+[autopilot.post_cycle_cleanup]
+enabled = true
+target_free_mb_after_cycle = 2048
+run_clean_build_artifacts = true
+prune_verified_exports = true
+prune_verified_segments = true
+prune_verified_reports = false
+stop_if_unable_to_reach_pre_cycle_min = true
+allow_next_cycle_if_above_pre_cycle_min = true
+
+[exports]
+chunked_enabled = true
+max_uncompressed_export_mb = 64
+compress_exports = true
+upload_export_chunks_to_r2 = true
+verify_export_chunks = true
+delete_local_verified_export_chunks = true
+prevent_monolithic_large_exports = true
+
+[reports.low_disk]
+enabled = true
+max_local_report_mb = 10
+remote_full_reports = true
+compress_full_reports = true
+delete_local_full_reports_after_verified_upload = true
+
+[analysis.remote]
+enabled = true
+max_restore_mb = 256
+delete_temp_after_segment = true
+stream_segments_one_at_a_time = true
+allow_full_restore = false

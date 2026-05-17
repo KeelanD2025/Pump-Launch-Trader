@@ -1,0 +1,13 @@
+{
+  "name": "clean_organic_launch",
+  "kind": "clean_organic_launch",
+  "description": "Broad early buying, healthy holder growth, no creator sell.",
+  "expected": {
+    "expect_enter_paper": true,
+    "expect_no_enter_paper": false,
+    "expect_data_gap": false,
+    "expect_discard": false,
+    "min_rug_score": "0",
+    "min_bundle_score": "0"
+  }
+}

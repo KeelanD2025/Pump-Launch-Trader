@@ -1,0 +1,17 @@
+[package]
+name = "features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+state = { path = "../state" }
+rust_decimal.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

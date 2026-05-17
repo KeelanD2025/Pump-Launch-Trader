@@ -1,0 +1,15 @@
+{
+  "name": "false_discard_winner",
+  "kind": "false_discard_winner",
+  "description": "Initially weak token that later recovers into a winner.",
+  "expected": {
+    "expect_enter_paper": false,
+    "expect_no_enter_paper": false,
+    "expect_data_gap": false,
+    "expect_discard": true,
+    "min_rug_score": "0",
+    "min_bundle_score": "0",
+    "expected_false_discard": true,
+    "expected_discard_state": "soft_discarded"
+  }
+}

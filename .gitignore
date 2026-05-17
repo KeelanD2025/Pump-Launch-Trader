@@ -1,0 +1,15 @@
+/target
+/.idea
+/.DS_Store
+/reports
+/research_output
+/tmp
+/data
+/config/local.toml
+.env
+*.env
+pump-launch-quant.env
+deploy/systemd/generated/*.env
+/deploy/systemd/generated
+*.pem
+*.key

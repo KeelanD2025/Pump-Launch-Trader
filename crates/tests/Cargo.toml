@@ -1,0 +1,24 @@
+[package]
+name = "tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+decoder = { path = "../decoder" }
+event-bus = { path = "../event-bus" }
+executor = { path = "../executor" }
+features = { path = "../features" }
+idl = { path = "../idl" }
+ingest-geyser = { path = "../ingest-geyser" }
+ingest-shred = { path = "../ingest-shred" }
+risk = { path = "../risk" }
+rpc-budget = { path = "../rpc-budget" }
+sim = { path = "../sim" }
+state = { path = "../state" }
+storage = { path = "../storage" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+time.workspace = true

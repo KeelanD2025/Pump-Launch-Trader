@@ -1,0 +1,526 @@
+[environment]
+cluster = "mainnet-beta"
+run_id = "paper-mainnet"
+strategy_version = "phase-13-runtime-paper"
+schema_version = 1
+
+[runtime]
+mode = "paper_from_store"
+queue_capacity_canonical = 2048
+queue_capacity_tentative = 512
+queue_capacity_decisions = 256
+shutdown_drain_timeout_ms = 2000
+health_report_interval_ms = 1000
+
+[ingest.geyser]
+enabled = true
+required = true
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "YELLOWSTONE_AUTH_TOKEN"
+auth_metadata_key = "x-token"
+auth_metadata_value_env = ""
+auth_required = false
+connect_timeout_ms = 10000
+request_timeout_ms = 30000
+keepalive_interval_ms = 10000
+commitment = "processed"
+reconnect_backoff_ms = [250, 500, 1000, 2000]
+max_reconnect_backoff_ms = 30000
+max_reconnect_attempts = 10
+subscribe_transactions = true
+subscribe_accounts = true
+subscribe_slots = true
+subscribe_blocks = false
+subscribe_blocks_meta = true
+geyser_only_allowed = true
+ping_interval_ms = 15000
+max_decoded_message_size = 67108864
+max_inflight_messages = 8192
+slot_gap_tolerance = 1
+program_filters = ["Pump111111111111111111111111111111111111111"]
+account_filters = []
+
+[ingest.shred]
+enabled = true
+required = false
+udp_bind = "127.0.0.1:19001"
+decoder = "fixture"
+allow_geyser_only_fallback = true
+max_packet_size = 1500
+dedup_window = 8192
+tentative_ttl_ms = 3000
+
+[ingest.deshred]
+enabled = false
+required = false
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "GEYSER_AUTH_TOKEN"
+auth_metadata_key = "x-token"
+auth_required = false
+subscribe_transactions = true
+program_filters_from_pump_ids = true
+connect_timeout_ms = 10000
+request_timeout_ms = 30000
+keepalive_interval_ms = 10000
+reconnect_backoff_ms = 1000
+max_reconnect_backoff_ms = 30000
+max_reconnect_attempts = 10
+fail_if_unsupported = false
+max_decoded_message_size = 67108864
+
+[geyser]
+endpoint = ""
+endpoint_env = "GEYSER_ENDPOINT"
+auth_token_env = "YELLOWSTONE_AUTH_TOKEN"
+auth_required = false
+connect_timeout_ms = 10000
+commitment = "processed"
+reconnect_backoff_ms = [250, 500, 1000, 2000]
+max_reconnect_backoff_ms = 30000
+subscribe_transactions = true
+subscribe_accounts = true
+subscribe_slots = true
+subscribe_blocks = false
+geyser_only_allowed = true
+max_inflight_messages = 8192
+slot_gap_tolerance = 1
+program_filters = ["Pump111111111111111111111111111111111111111"]
+account_filters = []
+
+[shred]
+bind_addr = "127.0.0.1:19001"
+max_packet_size = 1500
+dedup_window = 8192
+tentative_ttl_ms = 3000
+
+[pump]
+program_ids = ["Pump111111111111111111111111111111111111111"]
+pump_swap_program_ids = []
+idl_paths = ["../fixtures/idl/pump_mock_idl.json"]
+
+[storage]
+root = "data/paper"
+event_log_dir = "data/paper/events"
+snapshot_dir = "data/paper/snapshots"
+report_dir = "reports/paper"
+run_metadata_log_path = "runs.jsonl"
+decision_log_path = "decisions.jsonl"
+fill_log_path = "fills.jsonl"
+runtime_audit_log_path = "runtime_audit.jsonl"
+
+[metrics]
+bind_addr = "127.0.0.1:9308"
+enabled = true
+enable_prometheus = true
+enable_healthz = true
+enable_readyz = true
+json_tracing = true
+service_name = "pump-launch-quant-paper"
+
+[reports]
+auto_generate = true
+include_strategy_summary = true
+include_edge_calibration = true
+include_data_gaps = true
+include_top_tokens = true
+
+[early_intent]
+enabled = true
+sources = ["fixture", "mock", "deshred", "raw_shred"]
+prefer_deshred_when_available = true
+allow_raw_shred_fixture_in_dev = true
+allow_production_raw_shred = false
+require_early_intent_for_live_shred_exit = true
+max_tentative_event_age_ms = 750
+deduplicate_sources = true
+dedup_amount_tolerance_pct = "5.0"
+dedup_slot_tolerance = 0
+
+[early_intent.mock]
+enabled = true
+allow_in_live_data_paper = true
+allow_in_guarded_live = false
+
+[early_intent.source_precedence]
+deshred = 100
+raw_shred = 90
+fixture = 10
+mock = 10
+replay = 5
+
+[provider]
+name = ""
+record_compatibility = true
+endpoint_host_hash_only = true
+
+[autopilot]
+enabled = false
+mode = "paper_collection"
+stream_only_required = true
+live_trading_allowed = false
+dry_run = true
+allow_mock_when_endpoint_missing = false
+allow_geyser_only_when_deshred_unsupported = true
+require_geyser = true
+require_deshred = false
+max_parallel_runs = 1
+state_path = "data/paper/autopilot/autopilot_state.json"
+lock_path = "data/paper/autopilot/autopilot.lock"
+status_path = "data/paper/autopilot/status.json"
+report_dir = "reports/paper/autopilot"
+heartbeat_interval_seconds = 30
+cycle_sleep_seconds = 60
+max_cycle_runtime_seconds = 7200
+graceful_shutdown_timeout_seconds = 30
+
+[autopilot.schedule]
+startup_smoke = true
+continuous = true
+collection_preset = "medium"
+collection_duration_seconds = 1800
+checkpoint_interval_seconds = 300
+run_research_cycle_after_collection = true
+run_backtest_when_ready = true
+export_after_collection = true
+export_after_research_cycle = true
+
+[autopilot.provider]
+run_precheck_each_cycle = true
+run_geyser_smoke_each_cycle = false
+run_deshred_smoke_each_cycle = false
+run_stream_smoke_on_startup = true
+smoke_duration_seconds = 30
+provider_error_retry_seconds = 300
+missing_endpoint_retry_seconds = 600
+auth_error_retry_seconds = 1800
+
+[autopilot.retention]
+enabled = true
+max_total_storage_gb = 50
+max_run_age_days = 14
+keep_last_n_runs = 100
+keep_last_n_backtests = 50
+keep_failed_runs = true
+keep_provider_smoke_reports = true
+compress_old_reports = false
+delete_old_exports = false
+
+[autopilot.alerts]
+enabled = true
+write_local_alerts = true
+alerts_path = "data/paper/autopilot/alerts.jsonl"
+webhook_enabled = false
+webhook_url_env = ""
+alert_on_provider_failure = true
+alert_on_data_gap = true
+alert_on_rpc_denial = true
+alert_on_nonzero_rpc_usage = true
+alert_on_queue_overflow = true
+alert_on_backtest_ready = true
+alert_on_autopilot_crash = true
+
+[autopilot.safety]
+stop_on_nonzero_rpc_usage = true
+stop_on_stream_only_failure = true
+stop_on_live_enabled = true
+stop_on_signer_config_present = false
+stop_on_global_data_gap = false
+stop_on_repeated_provider_failures = false
+max_provider_failures_before_pause = 10
+max_queue_overflows_before_pause = 3
+
+[autopilot.disk]
+min_free_mb_before_cycle = 1024
+min_free_mb_during_cycle = 512
+pause_if_below_min_free = true
+run_prune_before_cycle = true
+run_prune_after_verified_upload = true
+allow_prune_verified_exports = true
+allow_prune_verified_reports = false
+allow_prune_verified_raw_events = false
+keep_minimal_manifest = true
+keep_rpc_ledger = true
+keep_calibration = true
+
+[autopilot.backtest_thresholds]
+min_duration_seconds = 3600
+min_tokens_discovered = 100
+min_complete_lifecycles = 20
+min_feature_snapshots = 1000
+min_decisions = 10
+require_stream_only = true
+require_zero_rpc = true
+max_global_data_gaps = 0
+min_holder_confidence = "0.5"
+
+[r2]
+enabled = false
+upload_enabled = false
+delete_enabled = false
+dry_run = true
+account_id_env = "CF_ACCOUNT_ID"
+endpoint_env = "R2_ENDPOINT"
+access_key_id_env = "R2_ACCESS_KEY_ID"
+secret_access_key_env = "R2_SECRET_ACCESS_KEY"
+managed_prefix = "pump-launch-quant"
+region = "auto"
+force_path_style = true
+max_concurrent_uploads = 4
+multipart_threshold_mb = 64
+part_size_mb = 16
+upload_timeout_seconds = 600
+verify_after_upload = true
+verify_checksum = true
+compress_before_upload = true
+compression = "zstd"
+encryption_mode = "none"
+fail_collection_if_upload_fails = false
+prune_local_only_after_verified_upload = true
+
+[r2.buckets]
+datasets_bucket_env = "R2_DATASET_BUCKET"
+reports_bucket_env = "R2_REPORTS_BUCKET"
+calibration_bucket_env = "R2_CALIBRATION_BUCKET"
+provider_compat_bucket_env = "R2_PROVIDER_COMPAT_BUCKET"
+create_if_missing = false
+allow_bucket_delete = false
+allow_bucket_empty = false
+allow_object_delete = false
+destructive_requires_flag = true
+
+[r2.paths]
+runs_prefix = "runs"
+reports_prefix = "reports"
+exports_prefix = "exports"
+calibration_prefix = "calibration"
+provider_compat_prefix = "provider_compatibility"
+rpc_ledger_prefix = "rpc_ledger"
+manifests_prefix = "manifests"
+
+[r2.retention]
+enabled = true
+keep_local_after_upload_hours = 24
+keep_last_n_local_runs = 10
+delete_local_exports_after_upload = true
+delete_local_reports_after_upload = false
+delete_local_raw_events_after_upload = false
+max_local_storage_gb = 50
+
+[r2.autopilot]
+upload_after_collection = true
+upload_after_research_cycle = true
+upload_after_exports = true
+upload_provider_smoke_reports = true
+upload_rpc_ledger = true
+upload_calibration = true
+upload_artifact_manifest = true
+pause_autopilot_on_upload_failure = false
+
+[stream_only]
+enabled = true
+fail_on_hot_path_rpc = true
+fail_on_unbudgeted_rpc = true
+allow_tracking_rpc = false
+allow_holder_rpc = false
+allow_top_holder_rpc = false
+allow_metadata_rpc = false
+allow_backfill_rpc = false
+allow_reconciliation_rpc = false
+allow_confirmation_rpc = false
+allow_execution_rpc = false
+allow_blockhash_rpc = false
+allow_send_rpc = false
+allow_emergency_rpc = false
+rpc_daily_credit_budget = 0
+rpc_monthly_credit_budget = 0
+
+[rpc]
+hot_path_enabled = false
+daily_credit_budget = 0
+monthly_credit_budget = 0
+
+[confirmation]
+source = "geyser_stream"
+allow_rpc_status_fallback = false
+
+[metadata]
+fetch_uri = false
+hot_path_fetch_enabled = false
+offline_import_path = ""
+
+[shred_exit]
+enabled = true
+paper_enabled = true
+live_enabled = false
+min_decode_confidence_warn = "0.55"
+min_decode_confidence_arm = "0.70"
+min_decode_confidence_paper_exit = "0.82"
+min_decode_confidence_live_exit = "0.95"
+warn_impact_pct = "8.0"
+arm_impact_pct = "15.0"
+paper_exit_impact_pct = "25.0"
+live_exit_impact_pct = "35.0"
+min_expected_saved_loss_quote = "0.02"
+min_emergency_exit_net_benefit_quote = "0.01"
+min_latency_edge_ratio = "1.10"
+allow_arm_when_net_benefit_negative = true
+allow_emergency_when_net_benefit_negative = false
+absorption_downgrade_enabled = true
+absorption_downgrade_threshold = "0.75"
+dev_sell_exit_threshold_pct = "5.0"
+top_holder_exit_threshold_pct = "10.0"
+bundle_cluster_exit_threshold_pct = "12.0"
+same_slot_multi_sell_escalation = true
+max_tentative_event_age_ms = 750
+tentative_reconciliation_ttl_ms = 5000
+false_positive_penalty_enabled = true
+tighten_stop_on_arm = true
+prebuild_live_exit_on_arm = false
+allow_paper_exit_on_tentative = true
+allow_live_exit_on_tentative = false
+required_confirmation_level_for_live_exit = "geyser_processed_tx_seen"
+prefer_account_effect_confirmation = true
+
+[shred_exit.calibration]
+enabled = true
+paper_only = true
+path = "data/calibration/shred_exit_calibration.json"
+min_samples_before_adapt = 50
+max_threshold_adjustment_per_hour = "0.05"
+false_positive_rate_limit = "0.10"
+missed_sell_rate_limit = "0.05"
+persist_calibration = true
+max_live_threshold_adjustment = "0.0"
+
+[execution]
+enabled = false
+live_enabled = false
+paper_enabled = true
+use_rpc_send = false
+use_stream_blockhash_cache = true
+max_daily_loss_quote = "250.0"
+max_open_positions = 2
+max_position_size_quote = "1.00"
+max_trades_per_minute = 8
+max_fee_quote = "0.20"
+max_slippage_bps = 250
+
+[paper]
+enabled = true
+initial_balance_quote = "5000.0"
+max_positions = 2
+max_position_size_quote = "1.00"
+max_daily_loss_quote = "250.0"
+close_on_shutdown = false
+scenario_end_liquidation = true
+
+[live]
+enabled = false
+dry_run = true
+require_explicit_enable = true
+explicit_send_confirmation = false
+allow_shred_emergency_exit = false
+max_fee_per_transaction_quote = "0.20"
+max_priority_fee_lamports = 500000
+max_tip_lamports = 250000
+max_slippage_bps = 250
+
+[edge]
+min_expected_net_edge_quote = "0.02"
+min_expected_net_edge_pct = "0.01"
+min_edge_confidence = "0.35"
+fee_safety_margin_multiplier = "1.20"
+latency_safety_margin_multiplier = "1.20"
+allow_watch_without_trade = true
+
+[ttl]
+discovered_secs = 900
+active_light_secs = 1800
+active_deep_secs = 7200
+discarded_summary_secs = 259200
+research_sample_secs = 604800
+
+[strategy]
+min_fee_adjusted_edge_bps = 80
+min_data_quality_score = "0.75"
+max_bundle_risk = "0.50"
+max_rug_risk = "0.40"
+max_fake_momentum_risk = "0.45"
+min_holder_growth = "0.20"
+min_trade_eligibility_score = "0.30"
+min_holder_stickiness_score = "0.20"
+min_momentum_authenticity_score = "0.15"
+max_profit_overhang_score = "0.90"
+
+[strategy.launch_momentum]
+take_profit_pct = "0.18"
+trailing_stop_pct = "0.08"
+stop_loss_pct = "0.09"
+max_hold_ms = 20000
+
+[strategy.holder_growth]
+take_profit_pct = "0.28"
+trailing_stop_pct = "0.12"
+stop_loss_pct = "0.12"
+max_hold_ms = 90000
+
+[strategy.absorption_bounce]
+take_profit_pct = "0.14"
+trailing_stop_pct = "0.07"
+stop_loss_pct = "0.08"
+max_hold_ms = 35000
+
+[strategy.smart_rotation]
+take_profit_pct = "0.20"
+trailing_stop_pct = "0.10"
+stop_loss_pct = "0.10"
+max_hold_ms = 60000
+
+[strategy.organic_slow_grind]
+take_profit_pct = "0.24"
+trailing_stop_pct = "0.10"
+stop_loss_pct = "0.11"
+max_hold_ms = 120000
+
+[strategy.exit_on_shred]
+launch_momentum = true
+holder_growth = true
+absorption_bounce = true
+smart_rotation = true
+organic_slow_grind = true
+
+[risk]
+max_rug_score = "0.40"
+max_bundle_score = "0.50"
+max_fake_momentum_score = "0.45"
+max_profit_overhang_score = "0.90"
+min_data_quality_score = "0.75"
+
+[decision]
+min_trade_eligibility_score = "0.30"
+min_fee_adjusted_edge_bps = 80
+min_holder_stickiness_score = "0.20"
+min_momentum_authenticity_score = "0.15"
+
+[features]
+enable_advanced_cost_basis = true
+enable_cohort_ranking = true
+enable_funding_graph = true
+enable_transaction_fingerprint = true
+enable_absorption = true
+enable_fake_momentum = true
+
+[rpc_budget]
+daily_credit_limit = 0
+monthly_credit_limit = 0
+emergency_reserve = 0
+deny_when_unknown_live_state = true
+
+[[quote_assets]]
+mint = "So11111111111111111111111111111111111111112"
+asset_type = "wrapped_sol"
+min_trade_size_quote = "0.05"
+max_trade_size_quote = "1.00"
+min_edge_bps = 90

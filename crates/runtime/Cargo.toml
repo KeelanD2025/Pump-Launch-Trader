@@ -1,0 +1,48 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bs58.workspace = true
+common = { path = "../common" }
+futures.workspace = true
+decision = { path = "../decision" }
+hex.workspace = true
+event-bus = { path = "../event-bus" }
+executor = { path = "../executor" }
+features = { path = "../features" }
+idl = { path = "../idl" }
+ingest-geyser = { path = "../ingest-geyser" }
+ingest-shred = { path = "../ingest-shred" }
+metrics = { path = "../metrics" }
+risk = { path = "../risk" }
+r2-storage = { path = "../r2-storage" }
+rpc-budget = { path = "../rpc-budget" }
+rust_decimal.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sim = { path = "../sim" }
+state = { path = "../state" }
+storage = { path = "../storage" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+yellowstone-grpc-proto.workspace = true
+zstd.workspace = true
+
+[features]
+default = []
+production-shred-decoder = []
+
+[dev-dependencies]
+tempfile.workspace = true

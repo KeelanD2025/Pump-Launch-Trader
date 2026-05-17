@@ -1,0 +1,17 @@
+[package]
+name = "risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+features = { path = "../features" }
+state = { path = "../state" }
+rust_decimal.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
