@@ -6333,11 +6333,22 @@ fn refresh_manifest_verification_state(manifest: &mut ArtifactManifest) {
         && manifest.upload_summary.uploaded_count == manifest.artifacts.len() as u64;
 }
 
+fn is_terminal_manifest_repair_warning(warning: &str) -> bool {
+    !(warning == "segment_manifest_artifact_manifest_drift_repaired"
+        || warning.starts_with("segment_pruned_bytes=")
+        || warning.starts_with("verified_export_bytes_pruned=")
+        || warning.starts_with("removed_monolithic_export_bytes="))
+}
+
 fn current_manifest_run_status(manifest: &ArtifactManifest) -> String {
     let missing_required_summary = manifest.run_role != "source_run"
         && (!manifest.analysis_present || !manifest.readiness_present);
+    let has_terminal_repair_warnings = manifest
+        .repair_warnings
+        .iter()
+        .any(|warning| is_terminal_manifest_repair_warning(warning));
     let has_warnings = manifest.data_gap_summary.data_gap_active
-        || !manifest.repair_warnings.is_empty()
+        || has_terminal_repair_warnings
         || !manifest.stream_only_passed
         || manifest.rpc_network_calls_total > 0
         || missing_required_summary;
@@ -28895,6 +28906,32 @@ mod tests {
         manifest.run_role = "derived_replay".to_owned();
         manifest.analysis_present = false;
         manifest.readiness_present = false;
+
+        refresh_manifest_verification_state(&mut manifest);
+
+        assert_eq!(manifest.r2_full_verification_status, "verified");
+        assert_eq!(
+            current_manifest_run_status(&manifest),
+            "completed_with_warnings"
+        );
+    }
+
+    #[test]
+    fn repaired_manifest_drift_note_does_not_force_warning_after_consistency_passes() {
+        let mut manifest = test_manifest();
+        manifest.repair_warnings =
+            vec!["segment_manifest_artifact_manifest_drift_repaired".to_owned()];
+
+        refresh_manifest_verification_state(&mut manifest);
+
+        assert_eq!(manifest.r2_full_verification_status, "verified");
+        assert_eq!(current_manifest_run_status(&manifest), "completed_verified");
+    }
+
+    #[test]
+    fn terminal_repair_warning_still_marks_completed_with_warnings() {
+        let mut manifest = test_manifest();
+        manifest.repair_warnings = vec!["finalize_pending_segment_wait_timeout_reached".to_owned()];
 
         refresh_manifest_verification_state(&mut manifest);
 
