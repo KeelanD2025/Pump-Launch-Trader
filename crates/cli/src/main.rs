@@ -13,7 +13,8 @@ use metrics::init_tracing;
 use r2_storage::{
     ArtifactManifest, ArtifactManifestDataGapSummary, ArtifactManifestEntry,
     ArtifactManifestPruningSummary, ArtifactManifestSegmentState, ArtifactManifestSegmentSummary,
-    ArtifactManifestUploadSummary, R2Client, load_manifest, write_manifest,
+    ArtifactManifestUploadSummary, R2Client, SegmentIntegrityValidationOptions,
+    SegmentIntegrityValidationReport, SegmentIntegrityValidator, load_manifest, write_manifest,
 };
 use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
@@ -547,6 +548,12 @@ enum Command {
         #[arg(long)]
         latest_live_paper_run: bool,
     },
+    VerifyEdgeRunIntegrity {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        dataset_index_r2: bool,
+    },
     RestoreRunSegments {
         #[arg(long)]
         run_id: Option<String>,
@@ -982,9 +989,30 @@ enum Command {
         enrichment_canary: bool,
         #[arg(long)]
         max_runs_this_invocation: Option<usize>,
+        #[arg(long)]
+        require_normalized_events: bool,
+        #[arg(long)]
+        allow_source_events_fallback: bool,
+        #[arg(long)]
+        skip_completed_research: bool,
         #[arg(long, default_value_t = true)]
         no_live_streams: bool,
     },
+    ListNormalizedCompleteRuns {
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long)]
+        latest_n: Option<usize>,
+    },
+    RefreshResearchWorkerSummary {
+        #[arg(long)]
+        source_run_id: String,
+        #[arg(long)]
+        local_output_dir: String,
+        #[arg(long)]
+        dataset_index_r2: bool,
+    },
+    EnrichmentReadinessCheck,
     InspectResearchBatch {
         #[arg(long)]
         batch_id: String,
@@ -1572,6 +1600,16 @@ struct DatasetIndexRunEntry {
     unresolved_segment_warnings: Vec<String>,
     #[serde(default)]
     fallback_replay_affected: bool,
+    #[serde(default)]
+    normalized_replay_warning: bool,
+    #[serde(default)]
+    normalized_replay_affected: bool,
+    #[serde(default)]
+    normalized_invalid_segment_count: usize,
+    #[serde(default)]
+    source_fallback_warning: bool,
+    #[serde(default)]
+    source_fallback_affected: bool,
     segment_count: usize,
     segment_uploaded_count: usize,
     segment_pending_count: usize,
@@ -1821,13 +1859,31 @@ struct EdgeRunHydrationSummary {
     unresolved_segment_warnings: Vec<String>,
     #[serde(default)]
     fallback_replay_affected: bool,
+    #[serde(default)]
+    normalized_replay_warning: bool,
+    #[serde(default)]
+    normalized_replay_affected: bool,
+    #[serde(default)]
+    normalized_invalid_segment_count: usize,
+    #[serde(default)]
+    source_fallback_warning: bool,
+    #[serde(default)]
+    source_fallback_affected: bool,
+    #[serde(default)]
+    source_artifact_type_used: Option<String>,
+    #[serde(default)]
+    source_segments_verified: bool,
     skipped_segments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ResearchWorkerRunSummary {
     run_id: String,
+    #[serde(default)]
+    source_run_id: String,
     replay_run_id: Option<String>,
+    #[serde(default)]
+    derived_run_id: Option<String>,
     hydrated_from_r2: bool,
     normalized_segments_processed: usize,
     normalized_records_loaded: usize,
@@ -1880,6 +1936,20 @@ struct ResearchWorkerRunSummary {
     unresolved_segment_warnings: Vec<String>,
     #[serde(default)]
     fallback_replay_affected: bool,
+    #[serde(default)]
+    normalized_replay_warning: bool,
+    #[serde(default)]
+    normalized_replay_affected: bool,
+    #[serde(default)]
+    normalized_invalid_segment_count: usize,
+    #[serde(default)]
+    source_fallback_warning: bool,
+    #[serde(default)]
+    source_fallback_affected: bool,
+    #[serde(default)]
+    source_artifact_type_used: Option<String>,
+    #[serde(default)]
+    source_segments_verified: bool,
     warnings: Vec<String>,
 }
 
@@ -1888,6 +1958,51 @@ struct ResearchWorkerBatchSummary {
     command: String,
     run_count: usize,
     summaries: Vec<ResearchWorkerRunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NormalizedCompleteRunRecord {
+    run_id: String,
+    created_at: Option<OffsetDateTime>,
+    normalized_events_segments_count: usize,
+    normalized_events_segments_verified: usize,
+    source_events_segments_count: usize,
+    edge_segments_count: usize,
+    fallback_used: bool,
+    edge_dataset_complete: bool,
+    r2_full_verification_status: String,
+    r2_full_consistency_status: String,
+    research_worker_processed: bool,
+    research_latest_derived_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NormalizedCompleteRunsSummary {
+    command: String,
+    count: usize,
+    runs: Vec<NormalizedCompleteRunRecord>,
+    markdown_path: String,
+    json_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EnrichmentReadinessSummary {
+    command: String,
+    ready_for_metadata_social_canary: bool,
+    ready_for_funding_bundle_canary: bool,
+    ready_for_any_enrichment: bool,
+    metadata_social_canary_possible_without_rpc: bool,
+    cache_dir_exists: bool,
+    ledger_exists: bool,
+    rpc_budget_config_present: bool,
+    metadata_fetch_budget_config_present: bool,
+    required_env_missing: Vec<String>,
+    canary_limits: BTreeMap<String, String>,
+    vps_enrichment_disabled: bool,
+    cache_dir: String,
+    ledger_path: String,
+    markdown_path: String,
+    json_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1961,9 +2076,62 @@ struct R2SegmentDiagnosisSummary {
     decoded_record_count: usize,
     manifest_record_count: u64,
     final_newline_present: bool,
+    decoded_prefix_hex: String,
+    decoded_prefix_is_zstd: bool,
     segment_status: String,
     warning_reason: Option<String>,
     fallback_replay_affected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EdgeSegmentIntegrityCheck {
+    segment_id: String,
+    artifact_type: String,
+    sequence_number: usize,
+    remote_key: String,
+    remote_exists: bool,
+    manifest_size_bytes: u64,
+    manifest_checksum_sha256: String,
+    manifest_record_count: u64,
+    remote_size_bytes: u64,
+    remote_checksum_sha256: String,
+    remote_size_matches_manifest: bool,
+    remote_checksum_matches_manifest: bool,
+    remote_integrity: SegmentIntegrityValidationReport,
+    local_integrity: Option<SegmentIntegrityValidationReport>,
+    artifact_manifest_entry_present: bool,
+    valid: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EdgeRunIntegritySummary {
+    command: String,
+    run_id: String,
+    edge_mode: bool,
+    checked_segments: usize,
+    valid_segments: usize,
+    warning_count: usize,
+    warnings: Vec<String>,
+    missing_required_artifact_types: Vec<String>,
+    normalized_events_segments_count: usize,
+    normalized_events_segments_verified: usize,
+    normalized_events_missing: bool,
+    edge_dataset_complete: bool,
+    r2_full_verification_status: String,
+    r2_full_consistency_status: String,
+    manifest_consistency_checked: bool,
+    manifest_consistency_passed: bool,
+    manifest_drift_detected: bool,
+    feature_snapshot_count: usize,
+    decision_count_total: usize,
+    fill_count_total: usize,
+    stream_only_passed: bool,
+    rpc_network_calls_total: u64,
+    no_live_orders: bool,
+    segment_checks: Vec<EdgeSegmentIntegrityCheck>,
+    markdown_path: String,
+    json_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -3611,6 +3779,9 @@ async fn main() -> Result<()> {
             enable_enrichment,
             enrichment_canary,
             max_runs_this_invocation,
+            require_normalized_events,
+            allow_source_events_fallback,
+            skip_completed_research,
             no_live_streams,
         } => {
             run_research_worker_command(
@@ -3630,10 +3801,31 @@ async fn main() -> Result<()> {
                 enable_enrichment,
                 enrichment_canary,
                 max_runs_this_invocation,
+                require_normalized_events,
+                allow_source_events_fallback,
+                skip_completed_research,
                 no_live_streams,
             )
             .await
         }
+        Command::ListNormalizedCompleteRuns {
+            dataset_index_r2,
+            latest_n,
+        } => list_normalized_complete_runs_command(&loaded, dataset_index_r2, latest_n).await,
+        Command::RefreshResearchWorkerSummary {
+            source_run_id,
+            local_output_dir,
+            dataset_index_r2,
+        } => {
+            refresh_research_worker_summary_command(
+                &loaded,
+                &source_run_id,
+                &local_output_dir,
+                dataset_index_r2,
+            )
+            .await
+        }
+        Command::EnrichmentReadinessCheck => enrichment_readiness_check_command(&loaded),
         Command::InspectResearchBatch {
             batch_id,
             local_output_dir,
@@ -3720,6 +3912,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::VerifyEdgeRunIntegrity {
+            run_id,
+            dataset_index_r2,
+        } => verify_edge_run_integrity_command(&loaded, &run_id, dataset_index_r2).await,
         Command::RestoreRunSegments {
             run_id,
             latest_run,
@@ -4865,9 +5061,6 @@ async fn hydrate_normalized_event_segments_for_run(
         existing_local_records,
         ..Default::default()
     };
-    if existing_local_records > 0 {
-        return Ok(summary);
-    }
     let manifest = load_run_segment_manifest_local_or_r2(loaded, run_id, allow_remote)
         .await
         .with_context(|| format!("loading segment manifest for {run_id}"))?;
@@ -4881,20 +5074,42 @@ async fn hydrate_normalized_event_segments_for_run(
         .iter()
         .filter(|segment| segment.artifact_type == "source_events")
         .count();
-    let mut normalized_segments = manifest
+    let normalized_segments = manifest
         .segments
         .iter()
         .filter(|segment| segment.artifact_type == "normalized_events")
         .cloned()
         .collect::<Vec<_>>();
-    if normalized_segments.is_empty() {
-        normalized_segments = manifest
+    let source_segments = manifest
+        .segments
+        .iter()
+        .filter(|segment| segment.artifact_type == "source_events")
+        .cloned()
+        .collect::<Vec<_>>();
+    summary.edge_dataset_complete = summary.normalized_events_segments_count > 0
+        && summary.normalized_events_segments_count
+            == manifest
+                .segments
+                .iter()
+                .filter(|segment| {
+                    segment.artifact_type == "normalized_events" && segment.verified
+                })
+                .count()
+        && manifest.summary.failed_segments == 0
+        && manifest
             .segments
             .iter()
-            .filter(|segment| segment.artifact_type == "source_events")
-            .cloned()
-            .collect::<Vec<_>>();
-        if !normalized_segments.is_empty() {
+            .filter(|segment| {
+                segment.artifact_type.starts_with("edge_")
+                    || matches!(
+                        segment.artifact_type.as_str(),
+                        "normalized_events" | "source_events"
+                    )
+            })
+            .all(|segment| segment.verified);
+    summary.normalized_events_missing = normalized_segments.is_empty();
+    let mut selected_segments = if normalized_segments.is_empty() {
+        if !source_segments.is_empty() {
             summary.fallback_used = true;
             summary.fallback_reason = Some(
                 "normalized_events segments were missing; using verified source_events instead"
@@ -4902,25 +5117,48 @@ async fn hydrate_normalized_event_segments_for_run(
             );
             summary.fallback_source = Some("source_events".to_owned());
             summary.research_replay_confidence = Decimal::new(60, 2);
-            summary.normalized_events_missing = true;
             summary.fallback_replay_affected = true;
+            summary.source_fallback_warning = true;
+            summary.source_fallback_affected = true;
             summary
                 .skipped_segments
                 .push("normalized_events_missing_using_source_events_fallback".to_owned());
+            summary.source_artifact_type_used = Some("source_events".to_owned());
         }
-    }
-    summary.edge_dataset_complete = summary.normalized_events_segments_count > 0;
-    normalized_segments.sort_by(|left, right| {
+        source_segments.clone()
+    } else {
+        summary.source_artifact_type_used = Some("normalized_events".to_owned());
+        normalized_segments.clone()
+    };
+    summary.source_segments_verified =
+        !selected_segments.is_empty() && selected_segments.iter().all(|segment| segment.verified);
+    selected_segments.sort_by(|left, right| {
         left.sequence_number
             .cmp(&right.sequence_number)
             .then_with(|| left.segment_id.cmp(&right.segment_id))
     });
-    if normalized_segments.is_empty() {
+    if selected_segments.is_empty() {
         return Err(anyhow!(
             "no normalized_events segments available for research worker hydration on {run_id}"
         ));
     }
-    for segment in normalized_segments {
+    if existing_local_records > 0 {
+        summary.normalized_segments_processed = selected_segments.len();
+        let manifest_record_count = selected_segments
+            .iter()
+            .map(|segment| segment.record_count as usize)
+            .sum::<usize>();
+        summary.normalized_records_loaded = manifest_record_count.max(existing_local_records);
+        summary.invalid_segments = union_string_lists(summary.invalid_segments, &[]);
+        summary.invalid_segment_count = summary.invalid_segments.len();
+        summary.unresolved_segment_warnings =
+            union_string_lists(summary.unresolved_segment_warnings, &[]);
+        if !summary.fallback_used && summary.research_replay_confidence <= Decimal::ZERO {
+            summary.research_replay_confidence = default_research_replay_confidence();
+        }
+        return Ok(summary);
+    }
+    for segment in &selected_segments {
         let bytes = match read_segment_bytes_local_or_r2(loaded, &segment, allow_remote).await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -4932,8 +5170,12 @@ async fn hydrate_normalized_event_segments_for_run(
                 if error.to_string().contains("checksum mismatch")
                     || error.to_string().contains("not remotely verified")
                 {
-                    summary.invalid_segments.push(segment.segment_id.clone());
-                    summary.fallback_replay_affected = true;
+                    mark_replay_segment_warning(
+                        &mut summary,
+                        &segment.artifact_type,
+                        &segment.segment_id,
+                        segment.record_count,
+                    );
                 }
                 continue;
             }
@@ -4946,8 +5188,12 @@ async fn hydrate_normalized_event_segments_for_run(
                 summary
                     .unresolved_segment_warnings
                     .push(detail.clone());
-                summary.invalid_segments.push(segment.segment_id.clone());
-                summary.fallback_replay_affected = true;
+                mark_replay_segment_warning(
+                    &mut summary,
+                    &segment.artifact_type,
+                    &segment.segment_id,
+                    segment.record_count,
+                );
                 continue;
             }
         };
@@ -4965,8 +5211,12 @@ async fn hydrate_normalized_event_segments_for_run(
                 summary
                     .unresolved_segment_warnings
                     .push(detail.clone());
-                summary.invalid_segments.push(segment.segment_id.clone());
-                summary.fallback_replay_affected = true;
+                mark_replay_segment_warning(
+                    &mut summary,
+                    &segment.artifact_type,
+                    &segment.segment_id,
+                    segment.record_count,
+                );
                 continue;
             }
         };
@@ -4979,10 +5229,116 @@ async fn hydrate_normalized_event_segments_for_run(
             store.append_normalized_event(&record)?;
         }
     }
+    if !summary.fallback_used
+        && summary.normalized_records_loaded == 0
+        && !source_segments.is_empty()
+    {
+        summary.fallback_used = true;
+        summary.fallback_reason = Some(
+            "normalized_events segments were present but unusable; using verified source_events instead"
+                .to_owned(),
+        );
+        summary.fallback_source = Some("source_events".to_owned());
+        summary.research_replay_confidence = Decimal::new(60, 2);
+        summary.fallback_replay_affected = true;
+        summary.source_fallback_warning = true;
+        summary.source_fallback_affected = true;
+        summary.source_artifact_type_used = Some("source_events".to_owned());
+        summary.source_segments_verified = source_segments.iter().all(|segment| segment.verified);
+        summary.normalized_segments_processed = 0;
+        summary.normalized_records_loaded = 0;
+        let mut fallback_segments = source_segments.clone();
+        fallback_segments.sort_by(|left, right| {
+            left.sequence_number
+                .cmp(&right.sequence_number)
+                .then_with(|| left.segment_id.cmp(&right.segment_id))
+        });
+        for segment in &fallback_segments {
+            let bytes = match read_segment_bytes_local_or_r2(loaded, &segment, allow_remote).await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let detail = format!("{}:reading segment bytes: {error}", segment.segment_id);
+                    summary.skipped_segments.push(detail.clone());
+                    summary
+                        .unresolved_segment_warnings
+                        .push(detail.clone());
+                    if error.to_string().contains("checksum mismatch")
+                        || error.to_string().contains("not remotely verified")
+                    {
+                        mark_replay_segment_warning(
+                            &mut summary,
+                            &segment.artifact_type,
+                            &segment.segment_id,
+                            segment.record_count,
+                        );
+                    }
+                    continue;
+                }
+            };
+            let raw = match decode_segment_payload_bytes(&segment, bytes) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    let detail =
+                        format!("{}:decoding segment payload: {error}", segment.segment_id);
+                    summary.skipped_segments.push(detail.clone());
+                    summary
+                        .unresolved_segment_warnings
+                        .push(detail.clone());
+                    mark_replay_segment_warning(
+                        &mut summary,
+                        &segment.artifact_type,
+                        &segment.segment_id,
+                        segment.record_count,
+                    );
+                    continue;
+                }
+            };
+            let records = match parse_normalized_event_segment_bytes(&raw) {
+                Ok(records) => records
+                    .into_iter()
+                    .filter(|record| record.run_id.as_deref() == Some(run_id))
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    let detail = format!(
+                        "{}:parsing normalized event records: {error}",
+                        segment.segment_id
+                    );
+                    summary.skipped_segments.push(detail.clone());
+                    summary
+                        .unresolved_segment_warnings
+                        .push(detail.clone());
+                    mark_replay_segment_warning(
+                        &mut summary,
+                        &segment.artifact_type,
+                        &segment.segment_id,
+                        segment.record_count,
+                    );
+                    continue;
+                }
+            };
+            summary.normalized_segments_processed =
+                summary.normalized_segments_processed.saturating_add(1);
+            summary.normalized_records_loaded = summary
+                .normalized_records_loaded
+                .saturating_add(records.len());
+            for record in records {
+                store.append_normalized_event(&record)?;
+            }
+        }
+    }
     summary.invalid_segments = union_string_lists(summary.invalid_segments, &[]);
     summary.invalid_segment_count = summary.invalid_segments.len();
     summary.unresolved_segment_warnings =
         union_string_lists(summary.unresolved_segment_warnings, &[]);
+    if !summary.fallback_used {
+        summary.fallback_replay_affected = false;
+        summary.source_fallback_warning = false;
+        summary.source_fallback_affected = false;
+    }
+    if !summary.fallback_used && summary.research_replay_confidence <= Decimal::ZERO {
+        summary.research_replay_confidence = default_research_replay_confidence();
+    }
     Ok(summary)
 }
 
@@ -5011,6 +5367,150 @@ fn prefer_nonempty_string(incoming: String, existing: &str) -> String {
     } else {
         incoming
     }
+}
+
+fn run_completed_at(entry: &DatasetIndexRunEntry) -> OffsetDateTime {
+    entry.completed_at
+        .or(entry.created_at)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn run_is_normalized_complete(entry: &DatasetIndexRunEntry) -> bool {
+    entry.edge_mode
+        && entry.edge_dataset_complete
+        && entry.normalized_events_segments_count > 0
+        && entry.normalized_events_segments_verified == entry.normalized_events_segments_count
+        && entry.r2_full_verification_status == "verified"
+        && entry.r2_full_consistency_status == "verified"
+}
+
+fn run_has_verified_research_outputs(entry: &DatasetIndexRunEntry) -> bool {
+    entry.research_outputs_available
+        && entry.research_worker_processed
+        && entry.research_r2_verified
+        && entry.research_latest_derived_run_id.is_some()
+}
+
+fn selected_source_segments_verified(entry: &DatasetIndexRunEntry, artifact_type: &str) -> bool {
+    match artifact_type {
+        "normalized_events" => {
+            entry.normalized_events_segments_count > 0
+                && entry.normalized_events_segments_count
+                    == entry.normalized_events_segments_verified
+        }
+        "source_events" => {
+            entry.source_events_segments_count > 0
+                && entry.source_events_segments_count == entry.source_events_segments_verified
+        }
+        _ => false,
+    }
+}
+
+fn mark_replay_segment_warning(
+    summary: &mut EdgeRunHydrationSummary,
+    artifact_type: &str,
+    segment_id: &str,
+    record_count: u64,
+) {
+    let already_recorded = summary
+        .invalid_segments
+        .iter()
+        .any(|existing| existing == segment_id);
+    if !already_recorded {
+        summary.invalid_segments.push(segment_id.to_owned());
+    }
+    match artifact_type {
+        "normalized_events" => {
+            summary.normalized_replay_warning = true;
+            summary.normalized_replay_affected |= record_count > 0;
+            if !already_recorded {
+                summary.normalized_invalid_segment_count =
+                    summary.normalized_invalid_segment_count.saturating_add(1);
+            }
+        }
+        "source_events" => {
+            summary.source_fallback_warning = true;
+            summary.source_fallback_affected = true;
+            summary.fallback_replay_affected = true;
+        }
+        _ => {}
+    }
+}
+
+fn normalize_research_worker_summary_from_source_entry(
+    loaded: &LoadedConfig,
+    source_entry: Option<&DatasetIndexRunEntry>,
+    summary: &mut ResearchWorkerRunSummary,
+) -> Result<()> {
+    if summary.source_run_id.trim().is_empty() {
+        summary.source_run_id = summary.run_id.clone();
+    }
+    if summary.derived_run_id.is_none() {
+        summary.derived_run_id = summary.replay_run_id.clone();
+    }
+    if let Some(entry) = source_entry {
+        summary.edge_dataset_complete = entry.edge_dataset_complete;
+        summary.normalized_events_missing = entry.normalized_events_missing;
+        summary.normalized_replay_warning = entry.normalized_replay_warning;
+        summary.normalized_replay_affected = entry.normalized_replay_affected;
+        summary.normalized_invalid_segment_count = entry.normalized_invalid_segment_count;
+        summary.source_fallback_warning = entry.source_fallback_warning;
+        summary.source_fallback_affected = entry.source_fallback_affected;
+        if !summary.fallback_used {
+            summary.source_artifact_type_used = Some("normalized_events".to_owned());
+            summary.fallback_replay_affected = false;
+            summary.source_fallback_warning = false;
+            summary.source_fallback_affected = false;
+        } else if summary.source_artifact_type_used.is_none() {
+            summary.source_artifact_type_used = summary
+                .fallback_source
+                .clone()
+                .or_else(|| Some("source_events".to_owned()));
+        }
+        if let Some(artifact_type) = summary.source_artifact_type_used.as_deref() {
+            summary.source_segments_verified =
+                selected_source_segments_verified(entry, artifact_type);
+            if artifact_type == "normalized_events" {
+                summary.normalized_segments_processed = summary
+                    .normalized_segments_processed
+                    .max(entry.normalized_events_segments_count);
+            } else if artifact_type == "source_events" {
+                summary.normalized_segments_processed = summary
+                    .normalized_segments_processed
+                    .max(entry.source_events_segments_count);
+            }
+        }
+        if summary.source_artifact_type_used.as_deref() == Some("normalized_events")
+            && !summary.unresolved_segment_warnings.is_empty()
+            && summary.normalized_invalid_segment_count == 0
+        {
+            summary.normalized_replay_warning = true;
+            summary.normalized_invalid_segment_count = summary.invalid_segment_count;
+            summary.normalized_replay_affected = summary.invalid_segment_count > 0;
+        }
+        if !summary.fallback_used {
+            summary.research_replay_confidence = if summary.research_replay_confidence
+                <= Decimal::ZERO
+            {
+                default_research_replay_confidence()
+            } else {
+                summary
+                    .research_replay_confidence
+                    .max(default_research_replay_confidence())
+            };
+        } else if summary.research_replay_confidence <= Decimal::ZERO {
+            summary.research_replay_confidence = Decimal::new(60, 2);
+        }
+    }
+    if summary.normalized_records_loaded == 0 && !summary.source_run_id.trim().is_empty() {
+        let local_records = storage_engine(loaded)?
+            .read_normalized_events_filtered(Some(&summary.source_run_id), None)?
+            .len();
+        if local_records > 0 {
+            summary.normalized_records_loaded = local_records;
+        }
+    }
+    Ok(())
 }
 
 fn prefer_some_string(incoming: Option<String>, existing: &Option<String>) -> Option<String> {
@@ -5107,6 +5607,9 @@ fn merge_dataset_index_entry(
     existing: &DatasetIndexRunEntry,
     mut incoming: DatasetIndexRunEntry,
 ) -> DatasetIndexRunEntry {
+    let incoming_has_research_semantics = incoming.research_worker_processed
+        || incoming.research_outputs_available
+        || incoming.research_latest_derived_run_id.is_some();
     incoming.run_status = stronger_run_status(incoming.run_status, &existing.run_status);
     incoming.finalization_status =
         stronger_finalization_status(incoming.finalization_status, &existing.finalization_status);
@@ -5249,7 +5752,16 @@ fn merge_dataset_index_entry(
         incoming.unresolved_segment_warnings,
         &existing.unresolved_segment_warnings,
     );
-    incoming.fallback_replay_affected |= existing.fallback_replay_affected;
+    if !incoming_has_research_semantics {
+        incoming.fallback_replay_affected |= existing.fallback_replay_affected;
+        incoming.source_fallback_warning |= existing.source_fallback_warning;
+        incoming.source_fallback_affected |= existing.source_fallback_affected;
+    }
+    incoming.normalized_replay_warning |= existing.normalized_replay_warning;
+    incoming.normalized_replay_affected |= existing.normalized_replay_affected;
+    incoming.normalized_invalid_segment_count = incoming
+        .normalized_invalid_segment_count
+        .max(existing.normalized_invalid_segment_count);
     incoming
 }
 
@@ -5363,6 +5875,8 @@ async fn diagnose_r2_segment_command(
     let mut parse_error_count = 0usize;
     let mut decoded_record_count = 0usize;
     let mut final_newline_present = false;
+    let mut decoded_prefix_hex = String::new();
+    let mut decoded_prefix_is_zstd = false;
     let mut warning_reason = None;
     if !segment.remote_key.trim().is_empty() {
         match client.download_object(&bucket, &segment.remote_key).await {
@@ -5378,6 +5892,14 @@ async fn diagnose_r2_segment_command(
                 match decode_segment_payload_bytes(&segment, remote_bytes) {
                     Ok(decoded_bytes) => {
                         zstd_decode_ok = true;
+                        decoded_prefix_hex = decoded_bytes
+                            .iter()
+                            .take(8)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        decoded_prefix_is_zstd =
+                            decoded_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
                         let (record_count, errors, final_newline) =
                             parse_jsonl_value_record_count(&decoded_bytes);
                         decoded_record_count = record_count;
@@ -5385,7 +5907,11 @@ async fn diagnose_r2_segment_command(
                         final_newline_present = final_newline;
                         jsonl_parse_ok = errors == 0;
                         if !jsonl_parse_ok {
-                            warning_reason = Some("jsonl_parse_errors".to_owned());
+                            warning_reason = if decoded_prefix_is_zstd {
+                                Some("double_compressed_zstd_payload".to_owned())
+                            } else {
+                                Some("jsonl_parse_errors".to_owned())
+                            };
                         } else if !final_newline_present {
                             warning_reason = Some("missing_final_newline".to_owned());
                         }
@@ -5438,6 +5964,8 @@ async fn diagnose_r2_segment_command(
         decoded_record_count,
         manifest_record_count: segment.record_count,
         final_newline_present,
+        decoded_prefix_hex,
+        decoded_prefix_is_zstd,
         segment_status,
         warning_reason,
         fallback_replay_affected: artifact_type == "source_events",
@@ -7026,6 +7554,302 @@ async fn verify_run_segments_command(
     Ok(())
 }
 
+async fn load_artifact_manifest_local_or_r2_for_integrity(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    dataset_index: Option<&DatasetIndex>,
+) -> Result<Option<ArtifactManifest>> {
+    if let Some(manifest) = load_manifest_if_present(loaded, run_id)? {
+        return Ok(Some(manifest));
+    }
+    let Some(index) = dataset_index else {
+        return Ok(None);
+    };
+    let Some(entry) = index.runs.iter().find(|entry| entry.run_id == run_id) else {
+        return Ok(None);
+    };
+    if entry.remote_manifest_key.trim().is_empty() {
+        return Ok(None);
+    }
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let bytes = client
+        .download_object(&bucket, &entry.remote_manifest_key)
+        .await
+        .with_context(|| format!("downloading artifact manifest for {run_id}"))?;
+    Ok(Some(parse_json_bytes_maybe_zstd(&bytes)?))
+}
+
+async fn verify_edge_run_integrity_command(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    dataset_index_r2: bool,
+) -> Result<()> {
+    let manifest = load_run_segment_manifest_local_or_r2(loaded, run_id, true)
+        .await
+        .with_context(|| format!("loading segment manifest for integrity check on {run_id}"))?;
+    let dataset_index = load_dataset_index_local_or_r2(loaded, dataset_index_r2)
+        .await
+        .ok();
+    let dataset_entry = dataset_index
+        .as_ref()
+        .and_then(|index| index.runs.iter().find(|entry| entry.run_id == run_id));
+    let artifact_manifest =
+        load_artifact_manifest_local_or_r2_for_integrity(loaded, run_id, dataset_index.as_ref())
+            .await?;
+    let artifact_keys = artifact_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.remote_key.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_datasets()?;
+    let mut checks = Vec::new();
+    let mut warnings = Vec::new();
+    for segment in &manifest.segments {
+        let mut check = EdgeSegmentIntegrityCheck {
+            segment_id: segment.segment_id.clone(),
+            artifact_type: segment.artifact_type.clone(),
+            sequence_number: segment.sequence_number,
+            remote_key: segment.remote_key.clone(),
+            manifest_size_bytes: segment.size_bytes,
+            manifest_checksum_sha256: segment.checksum_sha256.clone(),
+            manifest_record_count: segment.record_count,
+            artifact_manifest_entry_present: artifact_keys.contains(&segment.remote_key),
+            ..Default::default()
+        };
+        let mut segment_warnings = Vec::new();
+        let remote_bytes = if segment.remote_key.trim().is_empty() {
+            segment_warnings.push("remote_key_missing".to_owned());
+            Vec::new()
+        } else {
+            match client.download_object(&bucket, &segment.remote_key).await {
+                Ok(bytes) => {
+                    check.remote_exists = true;
+                    bytes
+                }
+                Err(error) => {
+                    segment_warnings.push(format!("remote_download_failed:{error}"));
+                    Vec::new()
+                }
+            }
+        };
+        check.remote_size_bytes = remote_bytes.len() as u64;
+        check.remote_checksum_sha256 = checksum_hex(&remote_bytes);
+        check.remote_size_matches_manifest = check.remote_size_bytes == segment.size_bytes;
+        check.remote_checksum_matches_manifest = check.remote_checksum_sha256 == segment.checksum_sha256;
+        if !check.remote_size_matches_manifest {
+            segment_warnings.push("remote_size_mismatch".to_owned());
+        }
+        if !check.remote_checksum_matches_manifest {
+            segment_warnings.push("remote_checksum_mismatch".to_owned());
+        }
+        check.remote_integrity = SegmentIntegrityValidator::validate_bytes(
+            &remote_bytes,
+            SegmentIntegrityValidationOptions {
+                artifact_type: segment.artifact_type.clone(),
+                sequence_number: segment.sequence_number,
+                expected_record_count: segment.record_count,
+                compression: segment.compression.clone(),
+                explicitly_empty: segment.record_count == 0,
+            },
+        );
+        if !check.remote_integrity.valid {
+            segment_warnings.extend(
+                check
+                    .remote_integrity
+                    .errors
+                    .iter()
+                    .map(|error| format!("remote_integrity:{error}")),
+            );
+        }
+        let local_path = PathBuf::from(&segment.local_path);
+        if local_path.exists() {
+            let local_integrity = SegmentIntegrityValidator::validate_file(
+                &local_path,
+                SegmentIntegrityValidationOptions {
+                    artifact_type: segment.artifact_type.clone(),
+                    sequence_number: segment.sequence_number,
+                    expected_record_count: segment.record_count,
+                    compression: segment.compression.clone(),
+                    explicitly_empty: segment.record_count == 0,
+                },
+            )?;
+            if !local_integrity.valid {
+                segment_warnings.extend(
+                    local_integrity
+                        .errors
+                        .iter()
+                        .map(|error| format!("local_integrity:{error}")),
+                );
+            }
+            check.local_integrity = Some(local_integrity);
+        }
+        if artifact_manifest.is_some() && !check.artifact_manifest_entry_present {
+            segment_warnings.push("artifact_manifest_entry_missing".to_owned());
+        }
+        check.valid = segment_warnings.is_empty();
+        check.warnings = segment_warnings.clone();
+        warnings.extend(
+            segment_warnings
+                .into_iter()
+                .map(|warning| format!("{}:{warning}", segment.segment_id)),
+        );
+        checks.push(check);
+    }
+    let required_types = [
+        "normalized_events",
+        "source_events",
+        "edge_events",
+        "edge_transactions",
+        "edge_accounts",
+        "edge_slots",
+        "edge_data_gaps",
+    ];
+    let present_types = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.artifact_type.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing_required_artifact_types = required_types
+        .iter()
+        .filter(|artifact_type| !present_types.contains(**artifact_type))
+        .map(|artifact_type| (*artifact_type).to_owned())
+        .collect::<Vec<_>>();
+    warnings.extend(
+        missing_required_artifact_types
+            .iter()
+            .map(|artifact_type| format!("missing_required_artifact_type:{artifact_type}")),
+    );
+    let normalized_events_segments_count = manifest
+        .segments
+        .iter()
+        .filter(|segment| segment.artifact_type == "normalized_events")
+        .count();
+    let normalized_events_segments_verified = manifest
+        .segments
+        .iter()
+        .filter(|segment| segment.artifact_type == "normalized_events" && segment.verified)
+        .count();
+    let valid_segments = checks.iter().filter(|check| check.valid).count();
+    let report_root = PathBuf::from("reports").join("segment_integrity");
+    fs::create_dir_all(&report_root)?;
+    let md_path = report_root.join(format!("{run_id}_integrity.md"));
+    let json_path = report_root.join(format!("{run_id}_integrity.json"));
+    let summary = EdgeRunIntegritySummary {
+        command: "verify-edge-run-integrity".to_owned(),
+        run_id: run_id.to_owned(),
+        edge_mode: dataset_entry.map(|entry| entry.edge_mode).unwrap_or(false),
+        checked_segments: checks.len(),
+        valid_segments,
+        warning_count: warnings.len(),
+        warnings,
+        missing_required_artifact_types,
+        normalized_events_segments_count,
+        normalized_events_segments_verified,
+        normalized_events_missing: normalized_events_segments_count == 0,
+        edge_dataset_complete: dataset_entry
+            .map(|entry| entry.edge_dataset_complete)
+            .unwrap_or(false),
+        r2_full_verification_status: dataset_entry
+            .map(|entry| entry.r2_full_verification_status.clone())
+            .unwrap_or_default(),
+        r2_full_consistency_status: dataset_entry
+            .map(|entry| entry.r2_full_consistency_status.clone())
+            .unwrap_or_default(),
+        manifest_consistency_checked: dataset_entry
+            .map(|entry| entry.manifest_consistency_checked)
+            .unwrap_or(false),
+        manifest_consistency_passed: dataset_entry
+            .map(|entry| entry.manifest_consistency_passed)
+            .unwrap_or(false),
+        manifest_drift_detected: dataset_entry
+            .map(|entry| entry.manifest_drift_detected)
+            .unwrap_or(false),
+        feature_snapshot_count: dataset_entry.map(|entry| entry.feature_rows).unwrap_or_default(),
+        decision_count_total: dataset_entry.map(|entry| entry.decision_rows).unwrap_or_default(),
+        fill_count_total: dataset_entry.map(|entry| entry.fill_rows).unwrap_or_default(),
+        stream_only_passed: dataset_entry
+            .map(|entry| entry.stream_only_passed)
+            .unwrap_or(false),
+        rpc_network_calls_total: dataset_entry
+            .map(|entry| entry.rpc_network_calls_total)
+            .unwrap_or_default(),
+        no_live_orders: dataset_entry
+            .map(|entry| entry.fill_rows == 0 && !entry.run_kind.eq_ignore_ascii_case("live"))
+            .unwrap_or(true),
+        segment_checks: checks,
+        markdown_path: md_path.display().to_string(),
+        json_path: json_path.display().to_string(),
+    };
+    let markdown = render_edge_run_integrity_markdown(&summary);
+    write_report(&md_path, &markdown)?;
+    fs::write(&json_path, serde_json::to_vec_pretty(&summary)?)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if summary.warning_count > 0 {
+        return Err(anyhow!(
+            "edge run integrity check found {} warning(s) for {run_id}",
+            summary.warning_count
+        ));
+    }
+    Ok(())
+}
+
+fn render_edge_run_integrity_markdown(summary: &EdgeRunIntegritySummary) -> String {
+    let mut lines = vec![
+        format!("# Edge Run Integrity {}", summary.run_id),
+        String::new(),
+        format!("- edge_mode: {}", summary.edge_mode),
+        format!(
+            "- normalized_events_segments: {}/{}",
+            summary.normalized_events_segments_verified, summary.normalized_events_segments_count
+        ),
+        format!("- checked_segments: {}", summary.checked_segments),
+        format!("- valid_segments: {}", summary.valid_segments),
+        format!("- warning_count: {}", summary.warning_count),
+        format!("- edge_dataset_complete: {}", summary.edge_dataset_complete),
+        format!("- r2_full_verification_status: {}", summary.r2_full_verification_status),
+        format!("- r2_full_consistency_status: {}", summary.r2_full_consistency_status),
+        format!("- manifest_consistency_passed: {}", summary.manifest_consistency_passed),
+        format!("- manifest_drift_detected: {}", summary.manifest_drift_detected),
+        format!("- stream_only_passed: {}", summary.stream_only_passed),
+        format!("- rpc_network_calls_total: {}", summary.rpc_network_calls_total),
+        format!("- feature_snapshot_count: {}", summary.feature_snapshot_count),
+        format!("- decision_count_total: {}", summary.decision_count_total),
+        format!("- fill_count_total: {}", summary.fill_count_total),
+        String::new(),
+        "## Warnings".to_owned(),
+    ];
+    if summary.warnings.is_empty() {
+        lines.push("- none".to_owned());
+    } else {
+        for warning in &summary.warnings {
+            lines.push(format!("- {warning}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Segment Checks".to_owned());
+    for check in &summary.segment_checks {
+        lines.push(format!(
+            "- {} {} valid={} remote_size_matches_manifest={} remote_checksum_matches_manifest={} records={}/{} decoded_prefix_is_zstd={}",
+            check.artifact_type,
+            check.segment_id,
+            check.valid,
+            check.remote_size_matches_manifest,
+            check.remote_checksum_matches_manifest,
+            check.remote_integrity.decoded_record_count,
+            check.manifest_record_count,
+            check.remote_integrity.decoded_prefix_is_zstd,
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
 async fn list_run_segments_command(
     loaded: &LoadedConfig,
     run_id: Option<&str>,
@@ -7606,6 +8430,9 @@ fn should_include_r2_path(
     if file_name == "artifact_manifest.json" || file_name.starts_with("r2_upload_summary.") {
         return false;
     }
+    if file_name.ends_with(".open") {
+        return false;
+    }
     if file_name == "segment_manifest.json" || file_name.starts_with("segment_") {
         return true;
     }
@@ -7926,13 +8753,24 @@ fn build_artifact_manifest(
     let stream_summary = stream_only_run_summary(loaded, run_id, Some(&metadata))?;
     let mut artifacts = Vec::new();
     for candidate in &candidates {
+        let candidate_compress_override = if candidate
+            .local_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name.ends_with(".jsonl.zst") || name.starts_with("segment_"))
+            .unwrap_or(false)
+        {
+            Some(false)
+        } else {
+            compress_override
+        };
         let prepared = client.prepare_upload(
             &candidate.local_path,
             candidate.bucket.clone(),
             candidate.remote_key.clone(),
             candidate.content_type.clone(),
             BTreeMap::new(),
-            compress_override,
+            candidate_compress_override,
         )?;
         artifacts.push(ArtifactManifestEntry {
             artifact_type: candidate.artifact_type.clone(),
@@ -8498,13 +9336,24 @@ async fn upload_manifest_candidates(
     let mut failed_count = 0u64;
     let dry_run = client.config().dry_run || !client.config().upload_enabled;
     for candidate in candidates {
+        let candidate_compress_override = if candidate
+            .local_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name.ends_with(".jsonl.zst") || name.starts_with("segment_"))
+            .unwrap_or(false)
+        {
+            Some(false)
+        } else {
+            compress_override
+        };
         let prepared = client.prepare_upload(
             &candidate.local_path,
             candidate.bucket.clone(),
             candidate.remote_key.clone(),
             candidate.content_type.clone(),
             BTreeMap::new(),
-            compress_override,
+            candidate_compress_override,
         )?;
         match client.upload_prepared(&prepared, verify_override).await {
             Ok(result) => {
@@ -11944,6 +12793,26 @@ fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
                     .as_ref()
                     .map(|summary| summary.fallback_replay_affected)
                     .unwrap_or(false),
+                normalized_replay_warning: research_worker_summary
+                    .as_ref()
+                    .map(|summary| summary.normalized_replay_warning)
+                    .unwrap_or(false),
+                normalized_replay_affected: research_worker_summary
+                    .as_ref()
+                    .map(|summary| summary.normalized_replay_affected)
+                    .unwrap_or(false),
+                normalized_invalid_segment_count: research_worker_summary
+                    .as_ref()
+                    .map(|summary| summary.normalized_invalid_segment_count)
+                    .unwrap_or_default(),
+                source_fallback_warning: research_worker_summary
+                    .as_ref()
+                    .map(|summary| summary.source_fallback_warning)
+                    .unwrap_or(false),
+                source_fallback_affected: research_worker_summary
+                    .as_ref()
+                    .map(|summary| summary.source_fallback_affected)
+                    .unwrap_or(false),
                 segment_count: segment_manifest
                     .as_ref()
                     .map(|summary| summary.summary.total_segments)
@@ -12305,6 +13174,11 @@ async fn apply_research_outputs_to_dataset_index(
     entry.invalid_segments = run_summary.invalid_segments.clone();
     entry.unresolved_segment_warnings = run_summary.unresolved_segment_warnings.clone();
     entry.fallback_replay_affected = run_summary.fallback_replay_affected;
+    entry.normalized_replay_warning = run_summary.normalized_replay_warning;
+    entry.normalized_replay_affected = run_summary.normalized_replay_affected;
+    entry.normalized_invalid_segment_count = run_summary.normalized_invalid_segment_count;
+    entry.source_fallback_warning = run_summary.source_fallback_warning;
+    entry.source_fallback_affected = run_summary.source_fallback_affected;
     entry.edge_dataset_complete = run_summary.edge_dataset_complete;
     let _ = populate_edge_dataset_fields_from_remote_manifest(loaded, entry).await;
     entry.normalized_events_missing = entry.edge_mode && entry.normalized_events_segments_count == 0;
@@ -12590,6 +13464,191 @@ async fn inspect_dataset_index_command(
             "provider_compat": index.provider_compat,
         }))?
     );
+    Ok(())
+}
+
+fn normalized_complete_run_records(
+    index: &DatasetIndex,
+    latest_n: Option<usize>,
+) -> Vec<NormalizedCompleteRunRecord> {
+    let mut runs = index
+        .runs
+        .iter()
+        .filter(|entry| run_is_normalized_complete(entry))
+        .map(|entry| NormalizedCompleteRunRecord {
+            run_id: entry.run_id.clone(),
+            created_at: entry.created_at.or(entry.completed_at),
+            normalized_events_segments_count: entry.normalized_events_segments_count,
+            normalized_events_segments_verified: entry.normalized_events_segments_verified,
+            source_events_segments_count: entry.source_events_segments_count,
+            edge_segments_count: entry.edge_segments_count,
+            fallback_used: entry.fallback_used,
+            edge_dataset_complete: entry.edge_dataset_complete,
+            r2_full_verification_status: entry.r2_full_verification_status.clone(),
+            r2_full_consistency_status: entry.r2_full_consistency_status.clone(),
+            research_worker_processed: entry.research_worker_processed,
+            research_latest_derived_run_id: entry.research_latest_derived_run_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    runs.sort_by(|left, right| {
+        right
+            .created_at
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            .cmp(&left.created_at.unwrap_or(OffsetDateTime::UNIX_EPOCH))
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    if let Some(limit) = latest_n {
+        runs.truncate(limit);
+    }
+    runs
+}
+
+async fn list_normalized_complete_runs_command(
+    loaded: &LoadedConfig,
+    dataset_index_r2: bool,
+    latest_n: Option<usize>,
+) -> Result<()> {
+    let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+    let runs = normalized_complete_run_records(&index, latest_n);
+    let report_root = resolve_user_path(loaded, &loaded.config.research_worker.local_output_dir);
+    fs::create_dir_all(&report_root)?;
+    let markdown_path = report_root.join("normalized_events_complete_runs.md");
+    let json_path = report_root.join("normalized_events_complete_runs.json");
+    let markdown = format!(
+        "# Normalized-Complete Edge Runs\n\n- count: {}\n- runs: {:?}\n",
+        runs.len(),
+        runs.iter().map(|run| &run.run_id).collect::<Vec<_>>()
+    );
+    write_report(&markdown_path, &markdown)?;
+    let summary = NormalizedCompleteRunsSummary {
+        command: "list-normalized-complete-runs".to_owned(),
+        count: runs.len(),
+        runs,
+        markdown_path: markdown_path.display().to_string(),
+        json_path: json_path.display().to_string(),
+    };
+    fs::write(&json_path, serde_json::to_vec_pretty(&summary)?)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn enrichment_required_env_missing() -> Vec<String> {
+    [
+        "HELIUS_API_KEY",
+        "BIRDEYE_API_KEY",
+        "SHYFT_API_KEY",
+        "TWITTER_BEARER_TOKEN",
+        "X_API_KEY",
+        "DISCORD_TOKEN",
+    ]
+    .into_iter()
+    .filter(|name| std::env::var(name).map(|value| value.trim().is_empty()).unwrap_or(true))
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>()
+}
+
+fn enrichment_readiness_check_command(loaded: &LoadedConfig) -> Result<()> {
+    let report_root = resolve_user_path(loaded, &loaded.config.research_worker.local_output_dir);
+    fs::create_dir_all(&report_root)?;
+    let cache_dir = resolve_user_path(loaded, &loaded.config.enrichment.cache_dir);
+    fs::create_dir_all(&cache_dir)?;
+    let ledger_path = resolve_user_path(loaded, &loaded.config.enrichment.ledger_path);
+    if !ledger_path.exists() {
+        if let Some(parent) = ledger_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&ledger_path, b"")?;
+    }
+    let required_env_missing = enrichment_required_env_missing();
+    let cache_dir_exists = cache_dir.exists();
+    let ledger_exists = ledger_path.exists();
+    let rpc_budget_config_present = loaded.config.enrichment.max_daily_rpc_calls > 0
+        && loaded.config.enrichment.max_daily_rpc_credits > 0;
+    let metadata_fetch_budget_config_present =
+        loaded.config.enrichment.max_daily_http_metadata_fetches > 0;
+    let metadata_social_canary_possible_without_rpc = loaded.config.enrichment.metadata.allow_uri_fetch
+        && loaded.config.enrichment.metadata.allow_social_detection;
+    let ready_for_metadata_social_canary = metadata_social_canary_possible_without_rpc
+        && cache_dir_exists
+        && ledger_exists
+        && required_env_missing.is_empty();
+    let ready_for_funding_bundle_canary = cache_dir_exists
+        && ledger_exists
+        && rpc_budget_config_present
+        && required_env_missing.is_empty()
+        && loaded.config.enrichment.rpc.allow_funding_graph_rpc
+        && loaded.config.enrichment.rpc.allow_bundle_evidence_rpc;
+    let ready_for_any_enrichment =
+        ready_for_metadata_social_canary || ready_for_funding_bundle_canary;
+    let mut canary_limits = BTreeMap::new();
+    canary_limits.insert(
+        "max_daily_rpc_calls".to_owned(),
+        loaded.config.enrichment.max_daily_rpc_calls.to_string(),
+    );
+    canary_limits.insert(
+        "max_daily_rpc_credits".to_owned(),
+        loaded.config.enrichment.max_daily_rpc_credits.to_string(),
+    );
+    canary_limits.insert(
+        "max_daily_http_metadata_fetches".to_owned(),
+        loaded
+            .config
+            .enrichment
+            .max_daily_http_metadata_fetches
+            .to_string(),
+    );
+    canary_limits.insert(
+        "max_wallets_per_run".to_owned(),
+        loaded.config.enrichment.max_wallets_per_run.to_string(),
+    );
+    canary_limits.insert(
+        "max_tokens_per_run".to_owned(),
+        loaded.config.enrichment.max_tokens_per_run.to_string(),
+    );
+    canary_limits.insert(
+        "max_signatures_per_wallet".to_owned(),
+        loaded.config.enrichment.max_signatures_per_wallet.to_string(),
+    );
+    let markdown_path = report_root.join("enrichment_readiness_check.md");
+    let json_path = report_root.join("enrichment_readiness_check.json");
+    let summary = EnrichmentReadinessSummary {
+        command: "enrichment-readiness-check".to_owned(),
+        ready_for_metadata_social_canary,
+        ready_for_funding_bundle_canary,
+        ready_for_any_enrichment,
+        metadata_social_canary_possible_without_rpc,
+        cache_dir_exists,
+        ledger_exists,
+        rpc_budget_config_present,
+        metadata_fetch_budget_config_present,
+        required_env_missing,
+        canary_limits,
+        vps_enrichment_disabled: !loaded.config.enrichment.run_on_vps
+            && !loaded.config.edge_collector.allow_rpc_enrichment
+            && !loaded.config.edge_collector.allow_metadata_fetch
+            && !loaded.config.edge_collector.allow_social_fetch
+            && !loaded.config.edge_collector.allow_wallet_history_rpc
+            && !loaded.config.edge_collector.allow_bundle_enrichment_rpc,
+        cache_dir: cache_dir.display().to_string(),
+        ledger_path: ledger_path.display().to_string(),
+        markdown_path: markdown_path.display().to_string(),
+        json_path: json_path.display().to_string(),
+    };
+    let markdown = format!(
+        "# Enrichment Readiness Check\n\n- ready_for_metadata_social_canary: {}\n- ready_for_funding_bundle_canary: {}\n- ready_for_any_enrichment: {}\n- metadata_social_canary_possible_without_rpc: {}\n- cache_dir_exists: {}\n- ledger_exists: {}\n- required_env_missing: {:?}\n- canary_limits: {:?}\n- vps_enrichment_disabled: {}\n",
+        summary.ready_for_metadata_social_canary,
+        summary.ready_for_funding_bundle_canary,
+        summary.ready_for_any_enrichment,
+        summary.metadata_social_canary_possible_without_rpc,
+        summary.cache_dir_exists,
+        summary.ledger_exists,
+        summary.required_env_missing,
+        summary.canary_limits,
+        summary.vps_enrichment_disabled,
+    );
+    write_report(&markdown_path, &markdown)?;
+    fs::write(&json_path, serde_json::to_vec_pretty(&summary)?)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
 
@@ -13313,6 +14372,66 @@ fn write_canonical_run_summary_reports(
     )?;
     fs::write(
         report_root.join("run_summary.json"),
+        serde_json::to_vec_pretty(&json_summary)?,
+    )?;
+    Ok(())
+}
+
+fn write_canonical_runtime_health_reports(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    backfill: &RunMetadataBackfillSummary,
+) -> Result<()> {
+    let store = storage_engine(loaded)?;
+    let metadata = latest_metadata_for_run(&store, run_id)?;
+    let stream_only = stream_only_run_summary(loaded, run_id, metadata.as_ref())?;
+    let report_root = store.run_report_dir(run_id);
+    fs::create_dir_all(&report_root)?;
+    let json_summary = json!({
+        "run_id": run_id,
+        "stream_only_enabled": stream_only.stream_only_enabled,
+        "stream_only_passed": stream_only.stream_only_passed,
+        "rpc_network_calls_total": stream_only.rpc_network_calls_total,
+        "rpc_credits_used_total": stream_only.rpc_credits_used_total,
+        "rpc_denials_total": stream_only.rpc_denials_total,
+        "r2_verified": backfill.r2_verified,
+        "run_terminal_status": backfill.run_terminal_status,
+        "finalization_status": backfill.finalization_status,
+        "manifest_consistency_passed": backfill.manifest_consistency_passed,
+        "data_gap_active": backfill.data_gap_active,
+        "source_data_gaps": backfill.source_data_gaps,
+        "slot_gap_count": backfill.slot_gap_count,
+        "paper_pnl": backfill.paper_pnl,
+        "fill_count": backfill.fill_count,
+        "feature_snapshot_count": backfill.feature_snapshot_count,
+        "decision_count": backfill.decision_count,
+    });
+    write_report(
+        report_root.join("runtime_health.md"),
+        &format!(
+            "# Runtime Health {}\n\n- stream_only_enabled: {}\n- stream_only_passed: {}\n- rpc_network_calls_total: {}\n- rpc_credits_used_total: {}\n- rpc_denials_total: {}\n- r2_verified: {}\n- run_terminal_status: {}\n- finalization_status: {}\n- manifest_consistency_passed: {}\n- data_gap_active: {}\n- source_data_gaps: {}\n- slot_gap_count: {}\n- paper_pnl: {}\n- fill_count: {}\n- feature_snapshot_count: {}\n- decision_count: {}\n{}",
+            run_id,
+            stream_only.stream_only_enabled,
+            stream_only.stream_only_passed,
+            stream_only.rpc_network_calls_total,
+            stream_only.rpc_credits_used_total,
+            stream_only.rpc_denials_total,
+            backfill.r2_verified,
+            backfill.run_terminal_status,
+            backfill.finalization_status,
+            backfill.manifest_consistency_passed,
+            backfill.data_gap_active,
+            backfill.source_data_gaps,
+            backfill.slot_gap_count,
+            backfill.paper_pnl,
+            backfill.fill_count,
+            backfill.feature_snapshot_count,
+            backfill.decision_count,
+            render_stream_only_proof(&stream_only),
+        ),
+    )?;
+    fs::write(
+        report_root.join("runtime_health.json"),
         serde_json::to_vec_pretty(&json_summary)?,
     )?;
     Ok(())
@@ -20451,8 +21570,20 @@ fn select_research_worker_run_ids(
     run_id: Option<&str>,
     latest_run: bool,
     latest_n_runs: Option<usize>,
+    require_normalized_events: bool,
+    allow_source_events_fallback: bool,
 ) -> Result<Vec<String>> {
     if let Some(run_id) = run_id {
+        if let Some(entry) = index.runs.iter().find(|entry| entry.run_id == run_id) {
+            if require_normalized_events
+                && !allow_source_events_fallback
+                && !run_is_normalized_complete(entry)
+            {
+                return Err(anyhow!(
+                    "normalized_events_required_but_unavailable for source run {run_id}"
+                ));
+            }
+        }
         return Ok(vec![run_id.to_owned()]);
     }
     let mut runs = index
@@ -20463,21 +21594,15 @@ fn select_research_worker_run_ids(
                 && entry.r2_verified
                 && entry.edge_segments_count > 0
                 && entry.edge_segments_verified == entry.edge_segments_count
+                && (!require_normalized_events || run_is_normalized_complete(entry))
         })
         .collect::<Vec<_>>();
-    if runs.is_empty() {
+    if runs.is_empty() && !require_normalized_events {
         runs = index.runs.iter().collect::<Vec<_>>();
     }
     runs.sort_by(|left, right| {
-        left.completed_at
-            .or(left.created_at)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            .cmp(
-                &right
-                    .completed_at
-                    .or(right.created_at)
-                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            )
+        run_completed_at(left)
+            .cmp(&run_completed_at(right))
             .then_with(|| left.run_id.cmp(&right.run_id))
     });
     let take = latest_n_runs.unwrap_or_else(|| usize::from(latest_run).max(1));
@@ -20567,10 +21692,17 @@ fn write_research_worker_summary_files(
     fs::create_dir_all(report_dir)?;
     fs::create_dir_all(output_dir)?;
     let markdown = format!(
-        "# Research Worker Summary\n\n- run_id: {}\n- replay_run_id: {}\n- hydrated_from_r2: {}\n- normalized_segments_processed: {}\n- normalized_records_loaded: {}\n- compute_features: {}\n- run_backtests: {}\n- generate_exports: {}\n- update_calibration: {}\n- research_outputs_available: {}\n- research_worker_processed: {}\n- local_output_dir: {}\n- research_outputs_remote_prefix: {}\n- feature_outputs_remote_key: {}\n- decision_outputs_remote_key: {}\n- fill_outputs_remote_key: {}\n- backtest_outputs_remote_key: {}\n- calibration_outputs_remote_key: {}\n- research_manifest_remote_key: {}\n- research_r2_verified: {}\n- research_r2_verified_count: {}\n- research_r2_failed_count: {}\n- research_derived_ready: {}\n- research_derived_readiness_level: {:?}\n- edge_dataset_complete: {}\n- normalized_events_missing: {}\n- fallback_used: {}\n- fallback_reason: {}\n- fallback_source: {}\n- fallback_replay_affected: {}\n- invalid_segment_count: {}\n- invalid_segments: {:?}\n- unresolved_segment_warnings: {:?}\n- research_replay_confidence: {}\n- generated_artifacts: {:?}\n- warnings: {:?}\n",
+        "# Research Worker Summary\n\n- run_id: {}\n- source_run_id: {}\n- replay_run_id: {}\n- derived_run_id: {}\n- hydrated_from_r2: {}\n- source_artifact_type_used: {}\n- source_segments_verified: {}\n- normalized_segments_processed: {}\n- normalized_records_loaded: {}\n- compute_features: {}\n- run_backtests: {}\n- generate_exports: {}\n- update_calibration: {}\n- research_outputs_available: {}\n- research_worker_processed: {}\n- local_output_dir: {}\n- research_outputs_remote_prefix: {}\n- feature_outputs_remote_key: {}\n- decision_outputs_remote_key: {}\n- fill_outputs_remote_key: {}\n- backtest_outputs_remote_key: {}\n- calibration_outputs_remote_key: {}\n- research_manifest_remote_key: {}\n- research_r2_verified: {}\n- research_r2_verified_count: {}\n- research_r2_failed_count: {}\n- research_derived_ready: {}\n- research_derived_readiness_level: {:?}\n- edge_dataset_complete: {}\n- normalized_events_missing: {}\n- fallback_used: {}\n- fallback_reason: {}\n- fallback_source: {}\n- fallback_replay_affected: {}\n- normalized_replay_warning: {}\n- normalized_replay_affected: {}\n- normalized_invalid_segment_count: {}\n- source_fallback_warning: {}\n- source_fallback_affected: {}\n- invalid_segment_count: {}\n- invalid_segments: {:?}\n- unresolved_segment_warnings: {:?}\n- research_replay_confidence: {}\n- generated_artifacts: {:?}\n- warnings: {:?}\n",
         summary.run_id,
+        summary.source_run_id,
         summary.replay_run_id.clone().unwrap_or_default(),
+        summary.derived_run_id.clone().unwrap_or_default(),
         summary.hydrated_from_r2,
+        summary
+            .source_artifact_type_used
+            .clone()
+            .unwrap_or_default(),
+        summary.source_segments_verified,
         summary.normalized_segments_processed,
         summary.normalized_records_loaded,
         summary.compute_features,
@@ -20619,6 +21751,11 @@ fn write_research_worker_summary_files(
         summary.fallback_reason.clone().unwrap_or_default(),
         summary.fallback_source.clone().unwrap_or_default(),
         summary.fallback_replay_affected,
+        summary.normalized_replay_warning,
+        summary.normalized_replay_affected,
+        summary.normalized_invalid_segment_count,
+        summary.source_fallback_warning,
+        summary.source_fallback_affected,
         summary.invalid_segment_count,
         summary.invalid_segments,
         summary.unresolved_segment_warnings,
@@ -20658,6 +21795,7 @@ async fn refresh_replay_research_metadata(
     persist_backfilled_run_metadata(loaded, &backfill)?;
     let _ = write_metadata_backfill_reports(loaded, &backfill)?;
     let _ = write_canonical_run_summary_reports(loaded, replay_run_id, &backfill)?;
+    let _ = write_canonical_runtime_health_reports(loaded, replay_run_id, &backfill)?;
     let _ = refresh_backtest_readiness_reports_from_backfill(loaded, replay_run_id, &backfill)?;
     let mut manifest = load_manifest_if_present(loaded, replay_run_id)?;
     if let Some(entry) = manifest.as_mut() {
@@ -20839,6 +21977,11 @@ async fn upload_research_results_r2_internal(
     }
     let mut summary = read_json_file::<ResearchWorkerRunSummary>(&summary_path)
         .ok_or_else(|| anyhow!("failed to parse {}", summary_path.display()))?;
+    let source_index = load_dataset_index_local_or_r2(loaded, true).await.ok();
+    let source_entry = source_index
+        .as_ref()
+        .and_then(|index| index.runs.iter().find(|entry| entry.run_id == source_run_id));
+    normalize_research_worker_summary_from_source_entry(loaded, source_entry, &mut summary)?;
     let source_report_dir = run_report_dir_for(loaded, source_run_id)?;
     let client = r2_client_for_command(loaded, false, true, false)?;
     let bucket = client.bucket_for_reports()?;
@@ -21090,6 +22233,53 @@ async fn upload_research_results_r2_command(
     Ok(())
 }
 
+async fn refresh_research_worker_summary_command(
+    loaded: &LoadedConfig,
+    source_run_id: &str,
+    local_output_dir: &str,
+    dataset_index_r2: bool,
+) -> Result<()> {
+    let output_dir = resolve_research_worker_output_dir(Path::new(local_output_dir), source_run_id);
+    let summary_path = output_dir.join("research_worker_summary.json");
+    if !summary_path.exists() {
+        return Err(anyhow!(
+            "research worker summary not found at {}",
+            summary_path.display()
+        ));
+    }
+    let mut summary = read_json_file::<ResearchWorkerRunSummary>(&summary_path)
+        .ok_or_else(|| anyhow!("failed to parse {}", summary_path.display()))?;
+    let source_index = load_dataset_index_local_or_r2(loaded, dataset_index_r2)
+        .await
+        .with_context(|| "loading dataset index for research summary refresh")?;
+    let source_entry = source_index
+        .runs
+        .iter()
+        .find(|entry| entry.run_id == source_run_id);
+    normalize_research_worker_summary_from_source_entry(loaded, source_entry, &mut summary)?;
+    let source_report_dir = run_report_dir_for(loaded, source_run_id)?;
+    write_research_worker_summary_files(&source_report_dir, &output_dir, &summary)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "command": "refresh-research-worker-summary",
+            "source_run_id": source_run_id,
+            "output_dir": output_dir.display().to_string(),
+            "summary_path": summary_path.display().to_string(),
+            "fallback_used": summary.fallback_used,
+            "fallback_source": summary.fallback_source,
+            "normalized_segments_processed": summary.normalized_segments_processed,
+            "normalized_records_loaded": summary.normalized_records_loaded,
+            "edge_dataset_complete": summary.edge_dataset_complete,
+            "research_replay_confidence": summary.research_replay_confidence,
+            "source_artifact_type_used": summary.source_artifact_type_used,
+            "source_segments_verified": summary.source_segments_verified,
+            "derived_run_id": summary.derived_run_id,
+        }))?
+    );
+    Ok(())
+}
+
 async fn run_research_worker_command(
     loaded: &LoadedConfig,
     run_id: Option<&str>,
@@ -21107,6 +22297,9 @@ async fn run_research_worker_command(
     enable_enrichment: bool,
     enrichment_canary: bool,
     max_runs_this_invocation: Option<usize>,
+    require_normalized_events: bool,
+    allow_source_events_fallback: bool,
+    skip_completed_research: bool,
     no_live_streams: bool,
 ) -> Result<()> {
     forbid_heavy_vps_research_paths_in_edge_mode(loaded, "run-research-worker")?;
@@ -21152,7 +22345,14 @@ async fn run_research_worker_command(
         .with_context(|| {
             format!("loading dataset index for research worker (prefer_r2_index={prefer_r2_index})")
         })?;
-    let selected_run_ids = select_research_worker_run_ids(&index, run_id, latest_run, latest_n_runs)?;
+    let selected_run_ids = select_research_worker_run_ids(
+        &index,
+        run_id,
+        latest_run,
+        latest_n_runs,
+        require_normalized_events,
+        allow_source_events_fallback,
+    )?;
     let base_output_dir =
         PathBuf::from(local_output_dir.unwrap_or(&loaded.config.research_worker.local_output_dir));
     let batch_id = derive_research_batch_id(&base_output_dir, resume_batch);
@@ -21187,10 +22387,83 @@ async fn run_research_worker_command(
         if batch_state.completed_source_runs.contains(&source_run_id) {
             continue;
         }
+        let source_entry = index
+            .runs
+            .iter()
+            .find(|entry| entry.run_id == source_run_id)
+            .cloned();
+        if skip_completed_research {
+            if let Some(entry) = source_entry.as_ref() {
+                if run_has_verified_research_outputs(entry) {
+                    batch_state.in_progress_source_run = None;
+                    if !batch_state.completed_source_runs.contains(&source_run_id) {
+                        batch_state.completed_source_runs.push(source_run_id.clone());
+                    }
+                    if !batch_state.skipped_source_runs.contains(&source_run_id) {
+                        batch_state.skipped_source_runs.push(source_run_id.clone());
+                    }
+                    batch_state.per_run_status.insert(
+                        source_run_id.clone(),
+                        "skipped_existing_verified_research".to_owned(),
+                    );
+                    if let Some(derived_run_id) = entry.research_latest_derived_run_id.clone() {
+                        batch_state
+                            .per_run_derived_run_id
+                            .insert(source_run_id.clone(), derived_run_id);
+                    }
+                    batch_state.per_run_r2_upload_status.insert(
+                        source_run_id.clone(),
+                        format!(
+                            "verified_existing:{}/{}",
+                            entry.research_r2_verified_count,
+                            entry.research_r2_verified_count + entry.research_r2_failed_count
+                        ),
+                    );
+                    batch_state.aggregate_status = if batch_state.completed_source_runs.len()
+                        == batch_state.selected_source_runs.len()
+                    {
+                        "completed".to_owned()
+                    } else if batch_state.failed_source_runs.is_empty() {
+                        "partial_incomplete".to_owned()
+                    } else {
+                        "partial_with_failures".to_owned()
+                    };
+                    write_research_batch_state(&batch_root, &batch_state)?;
+                    continue;
+                }
+            }
+        }
         if let Some(limit) = max_runs_this_invocation {
             if processed_this_invocation >= limit {
                 break;
             }
+        }
+        if require_normalized_events
+            && !allow_source_events_fallback
+            && source_entry
+                .as_ref()
+                .map(|entry| !run_is_normalized_complete(entry))
+                .unwrap_or(false)
+        {
+            if !batch_state.skipped_source_runs.contains(&source_run_id) {
+                batch_state.skipped_source_runs.push(source_run_id.clone());
+            }
+            batch_state.per_run_status.insert(
+                source_run_id.clone(),
+                "normalized_events_required_but_unavailable".to_owned(),
+            );
+            batch_state.in_progress_source_run = None;
+            batch_state.aggregate_status = if batch_state.completed_source_runs.len()
+                == batch_state.selected_source_runs.len()
+            {
+                "completed".to_owned()
+            } else if batch_state.failed_source_runs.is_empty() {
+                "partial_incomplete".to_owned()
+            } else {
+                "partial_with_failures".to_owned()
+            };
+            write_research_batch_state(&batch_root, &batch_state)?;
+            continue;
         }
         batch_state.in_progress_source_run = Some(source_run_id.clone());
         batch_state
@@ -21206,6 +22479,17 @@ async fn run_research_worker_command(
             )
             .await
             .with_context(|| format!("hydrating normalized edge segments for {source_run_id}"))?;
+            if require_normalized_events
+                && !allow_source_events_fallback
+                && (hydration.fallback_used
+                    || hydration.source_artifact_type_used.as_deref()
+                        != Some("normalized_events")
+                    || hydration.normalized_records_loaded == 0)
+            {
+                return Err(anyhow!(
+                    "normalized_events_required_but_unavailable for source run {source_run_id}"
+                ));
+            }
             let mut loaded_for_run = loaded.clone();
             loaded_for_run.config.runtime.mode = RuntimeModeName::ResearchWorker;
             loaded_for_run.config.research_worker.enabled = true;
@@ -21361,9 +22645,11 @@ async fn run_research_worker_command(
                     .map(|artifact| artifact.path)
                     .collect::<Vec<_>>();
             let source_report_dir = run_report_dir_for(&loaded_for_run, &source_run_id)?;
-            let summary = ResearchWorkerRunSummary {
+            let mut summary = ResearchWorkerRunSummary {
                 run_id: source_run_id.clone(),
+                source_run_id: source_run_id.clone(),
                 replay_run_id: Some(replay_run_id.clone()),
+                derived_run_id: Some(replay_run_id.clone()),
                 hydrated_from_r2: hydration.hydrated_from_r2,
                 normalized_segments_processed: hydration.normalized_segments_processed,
                 normalized_records_loaded: hydration.normalized_records_loaded,
@@ -21417,9 +22703,21 @@ async fn run_research_worker_command(
                 invalid_segments: hydration.invalid_segments.clone(),
                 unresolved_segment_warnings: hydration.unresolved_segment_warnings.clone(),
                 fallback_replay_affected: hydration.fallback_replay_affected,
+                normalized_replay_warning: hydration.normalized_replay_warning,
+                normalized_replay_affected: hydration.normalized_replay_affected,
+                normalized_invalid_segment_count: hydration.normalized_invalid_segment_count,
+                source_fallback_warning: hydration.source_fallback_warning,
+                source_fallback_affected: hydration.source_fallback_affected,
+                source_artifact_type_used: hydration.source_artifact_type_used.clone(),
+                source_segments_verified: hydration.source_segments_verified,
                 research_replay_confidence: hydration.research_replay_confidence,
                 warnings,
             };
+            normalize_research_worker_summary_from_source_entry(
+                loaded,
+                source_entry.as_ref(),
+                &mut summary,
+            )?;
             write_research_worker_summary_files(&source_report_dir, &output_dir, &summary)?;
             let mut upload_status = "not_uploaded".to_owned();
             if loaded_for_run.config.r2.enabled && loaded_for_run.config.r2.upload_enabled {
@@ -27523,5 +28821,43 @@ mod tests {
         assert_eq!(manifest.r2_full_verification_status, "verified");
         assert_eq!(current_manifest_run_status(&manifest), "completed_verified");
         assert!(manifest_verified(&manifest));
+    }
+
+    #[test]
+    fn r2_artifact_collection_never_includes_open_segments() {
+        let provider = Path::new("/tmp/provider.json");
+        let calibration = Path::new("/tmp/calibration.json");
+        let open = Path::new("/tmp/segment_normalized_events_00001.jsonl.open");
+
+        assert!(!should_include_r2_path(
+            open,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            provider,
+            calibration,
+        ));
+    }
+
+    #[test]
+    fn r2_artifact_collection_keeps_closed_segments_visible() {
+        let provider = Path::new("/tmp/provider.json");
+        let calibration = Path::new("/tmp/calibration.json");
+        let closed = Path::new("/tmp/segment_normalized_events_00001.jsonl.zst");
+
+        assert!(should_include_r2_path(
+            closed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            provider,
+            calibration,
+        ));
     }
 }

@@ -206,6 +206,155 @@ pub struct PreparedUpload {
     pub compression: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SegmentIntegrityValidationOptions {
+    pub artifact_type: String,
+    pub sequence_number: usize,
+    pub expected_record_count: u64,
+    pub compression: Option<String>,
+    pub explicitly_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SegmentIntegrityValidationReport {
+    pub path: String,
+    pub artifact_type: String,
+    pub sequence_number: usize,
+    pub path_is_open: bool,
+    pub file_exists: bool,
+    pub size_bytes: u64,
+    pub checksum_sha256: String,
+    pub compression: Option<String>,
+    pub zstd_decode_ok: bool,
+    pub jsonl_parse_ok: bool,
+    pub parse_error_count: usize,
+    pub decoded_record_count: usize,
+    pub expected_record_count: u64,
+    pub record_count_matches: bool,
+    pub final_newline_present: bool,
+    pub decoded_prefix_hex: String,
+    pub decoded_prefix_is_zstd: bool,
+    pub valid: bool,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentIntegrityValidator;
+
+impl SegmentIntegrityValidator {
+    pub fn validate_file(
+        path: &Path,
+        options: SegmentIntegrityValidationOptions,
+    ) -> Result<SegmentIntegrityValidationReport> {
+        let path_is_open = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name.ends_with(".open"))
+            .unwrap_or(false);
+        let file_exists = path.exists();
+        let mut report = SegmentIntegrityValidationReport {
+            path: path.display().to_string(),
+            artifact_type: options.artifact_type.clone(),
+            sequence_number: options.sequence_number,
+            path_is_open,
+            file_exists,
+            expected_record_count: options.expected_record_count,
+            compression: options.compression.clone(),
+            ..Default::default()
+        };
+        if path_is_open {
+            report.errors.push("open_segment_path".to_owned());
+        }
+        if !file_exists {
+            report.errors.push("file_missing".to_owned());
+            report.valid = false;
+            return Ok(report);
+        }
+        let bytes = fs::read(path)?;
+        Self::validate_bytes_into(&bytes, options, &mut report);
+        Ok(report)
+    }
+
+    pub fn validate_bytes(
+        bytes: &[u8],
+        options: SegmentIntegrityValidationOptions,
+    ) -> SegmentIntegrityValidationReport {
+        let mut report = SegmentIntegrityValidationReport {
+            artifact_type: options.artifact_type.clone(),
+            sequence_number: options.sequence_number,
+            file_exists: true,
+            expected_record_count: options.expected_record_count,
+            compression: options.compression.clone(),
+            ..Default::default()
+        };
+        Self::validate_bytes_into(bytes, options, &mut report);
+        report
+    }
+
+    fn validate_bytes_into(
+        bytes: &[u8],
+        options: SegmentIntegrityValidationOptions,
+        report: &mut SegmentIntegrityValidationReport,
+    ) {
+        report.size_bytes = bytes.len() as u64;
+        report.checksum_sha256 = checksum_hex(bytes);
+        if bytes.is_empty() && !options.explicitly_empty {
+            report.errors.push("segment_empty".to_owned());
+        }
+        let compressed = options
+            .compression
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("zstd"))
+            .unwrap_or(false);
+        let decoded = if compressed {
+            match zstd::stream::decode_all(bytes) {
+                Ok(decoded) => {
+                    report.zstd_decode_ok = true;
+                    decoded
+                }
+                Err(error) => {
+                    report.zstd_decode_ok = false;
+                    report.errors.push(format!("zstd_decode_failed:{error}"));
+                    Vec::new()
+                }
+            }
+        } else {
+            report.zstd_decode_ok = true;
+            bytes.to_vec()
+        };
+        report.decoded_prefix_hex = bytes_hex_prefix(&decoded, 8);
+        report.decoded_prefix_is_zstd = decoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+        report.final_newline_present = if decoded.is_empty() {
+            options.explicitly_empty
+        } else {
+            decoded.last() == Some(&b'\n')
+        };
+        if !report.final_newline_present && !options.explicitly_empty {
+            report.errors.push("missing_final_newline".to_owned());
+        }
+        let (record_count, parse_errors) = parse_jsonl_value_record_count(&decoded);
+        report.decoded_record_count = record_count;
+        report.parse_error_count = parse_errors;
+        report.jsonl_parse_ok = parse_errors == 0;
+        if !report.jsonl_parse_ok {
+            report.errors.push("jsonl_parse_failed".to_owned());
+        }
+        report.record_count_matches = options.expected_record_count == record_count as u64;
+        if !report.record_count_matches {
+            report.errors.push(format!(
+                "record_count_mismatch:expected={} actual={}",
+                options.expected_record_count, record_count
+            ));
+        }
+        if report.decoded_prefix_is_zstd {
+            report
+                .errors
+                .push("decoded_payload_is_zstd_magic_double_compression_suspected".to_owned());
+        }
+        report.valid = report.errors.is_empty();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListObjectResult {
     pub key: String,
@@ -345,8 +494,11 @@ impl R2Client {
         compress_override: Option<bool>,
     ) -> Result<PreparedUpload> {
         let local_path = local_path.to_path_buf();
+        let content_type = content_type.into();
         let mut body = fs::read(&local_path)?;
-        let compress = compress_override.unwrap_or(self.config.compress_before_upload);
+        let already_compressed = is_zstd_payload_path(&local_path) || content_type_is_zstd(&content_type);
+        let compress = compress_override
+            .unwrap_or(self.config.compress_before_upload && !already_compressed);
         let compression = normalize_compression(&self.config.compression);
         let compressed = compress && compression.as_deref() == Some("zstd");
         if compressed {
@@ -358,7 +510,7 @@ impl R2Client {
             bucket: bucket.into(),
             key: key.into(),
             body,
-            content_type: content_type.into(),
+            content_type,
             checksum_sha256,
             metadata,
             compressed,
@@ -646,6 +798,31 @@ pub fn checksum_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn bytes_hex_prefix(bytes: &[u8], max_len: usize) -> String {
+    bytes
+        .iter()
+        .take(max_len)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn parse_jsonl_value_record_count(bytes: &[u8]) -> (usize, usize) {
+    let mut decoded_record_count = 0usize;
+    let mut parse_error_count = 0usize;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
+            decoded_record_count = decoded_record_count.saturating_add(1);
+            continue;
+        }
+        parse_error_count = parse_error_count.saturating_add(1);
+    }
+    (decoded_record_count, parse_error_count)
+}
+
 pub fn load_manifest(path: &Path) -> Result<ArtifactManifest> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -706,6 +883,20 @@ fn normalize_compression(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_ascii_lowercase())
     }
+}
+
+fn is_zstd_payload_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("zst"))
+        .unwrap_or(false)
+}
+
+fn content_type_is_zstd(content_type: &str) -> bool {
+    let lower = content_type.to_ascii_lowercase();
+    lower.contains("zstd")
+        || lower.contains("zst")
+        || lower == "application/octet-stream+zstd"
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -830,6 +1021,145 @@ mod tests {
                 assert_eq!(result.bucket, "reports-bucket");
             },
         );
+    }
+
+    #[test]
+    fn zstd_payloads_are_not_double_compressed_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("segment_normalized_events_00010.jsonl.zst");
+        let payload = zstd::stream::encode_all(br#"{"event":"ok"}
+"#.as_slice(), 3)
+        .expect("zstd");
+        fs::write(&path, &payload).expect("write");
+        with_env_vars(
+            &[
+                ("CF_ACCOUNT_ID", Some("example-account")),
+                ("R2_ACCESS_KEY_ID", None),
+                ("R2_SECRET_ACCESS_KEY", None),
+            ],
+            || {
+                let client = R2Client::new(&config()).expect("client");
+                let prepared = client
+                    .prepare_upload(
+                        &path,
+                        "datasets-bucket",
+                        client.managed_key(
+                            "runs/run-id/segments",
+                            "segment_normalized_events_00010.jsonl.zst",
+                        ),
+                        "application/zstd",
+                        BTreeMap::new(),
+                        None,
+                    )
+                    .expect("prepare");
+                assert!(!prepared.compressed);
+                assert_eq!(prepared.body, payload);
+                assert_eq!(prepared.checksum_sha256, checksum_hex(&payload));
+            },
+        );
+    }
+
+    #[test]
+    fn segment_integrity_validator_accepts_valid_zstd_jsonl() {
+        let payload = zstd::stream::encode_all(br#"{"event":"one"}
+{"event":"two"}
+"#.as_slice(), 3)
+        .expect("zstd");
+        let report = SegmentIntegrityValidator::validate_bytes(
+            &payload,
+            SegmentIntegrityValidationOptions {
+                artifact_type: "normalized_events".to_owned(),
+                sequence_number: 1,
+                expected_record_count: 2,
+                compression: Some("zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        );
+        assert!(report.valid, "{:?}", report.errors);
+        assert!(report.zstd_decode_ok);
+        assert!(report.jsonl_parse_ok);
+        assert!(report.final_newline_present);
+        assert_eq!(report.decoded_record_count, 2);
+    }
+
+    #[test]
+    fn segment_integrity_validator_rejects_missing_final_newline() {
+        let payload = zstd::stream::encode_all(br#"{"event":"one"}"#.as_slice(), 3)
+            .expect("zstd");
+        let report = SegmentIntegrityValidator::validate_bytes(
+            &payload,
+            SegmentIntegrityValidationOptions {
+                artifact_type: "normalized_events".to_owned(),
+                sequence_number: 1,
+                expected_record_count: 1,
+                compression: Some("zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        );
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| error == "missing_final_newline"));
+    }
+
+    #[test]
+    fn segment_integrity_validator_rejects_malformed_jsonl() {
+        let payload = zstd::stream::encode_all(b"{bad json}\n".as_slice(), 3).expect("zstd");
+        let report = SegmentIntegrityValidator::validate_bytes(
+            &payload,
+            SegmentIntegrityValidationOptions {
+                artifact_type: "normalized_events".to_owned(),
+                sequence_number: 1,
+                expected_record_count: 1,
+                compression: Some("zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        );
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|error| error == "jsonl_parse_failed"));
+    }
+
+    #[test]
+    fn segment_integrity_validator_rejects_open_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("segment_normalized_events_00001.jsonl.open");
+        fs::write(&path, b"{\"event\":\"one\"}\n").expect("write");
+        let report = SegmentIntegrityValidator::validate_file(
+            &path,
+            SegmentIntegrityValidationOptions {
+                artifact_type: "normalized_events".to_owned(),
+                sequence_number: 1,
+                expected_record_count: 1,
+                compression: None,
+                explicitly_empty: false,
+            },
+        )
+        .expect("validate");
+        assert!(!report.valid);
+        assert!(report.path_is_open);
+        assert!(report.errors.iter().any(|error| error == "open_segment_path"));
+    }
+
+    #[test]
+    fn segment_integrity_validator_flags_double_compressed_zstd() {
+        let payload = zstd::stream::encode_all(br#"{"event":"one"}
+"#.as_slice(), 3)
+        .expect("zstd");
+        let double_compressed = zstd::stream::encode_all(payload.as_slice(), 3).expect("zstd");
+        let report = SegmentIntegrityValidator::validate_bytes(
+            &double_compressed,
+            SegmentIntegrityValidationOptions {
+                artifact_type: "normalized_events".to_owned(),
+                sequence_number: 1,
+                expected_record_count: 1,
+                compression: Some("zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        );
+        assert!(!report.valid);
+        assert!(report.decoded_prefix_is_zstd);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("double_compression")));
     }
 
     #[test]

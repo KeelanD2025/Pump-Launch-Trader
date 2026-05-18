@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, anyhow, Context};
 use common::{LoadedConfig, RuntimeModeName, SCHEMA_VERSION};
 use features::FeatureSnapshot;
-use r2_storage::R2Client;
+use r2_storage::{R2Client, SegmentIntegrityValidationOptions, SegmentIntegrityValidator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::StoredRecord;
@@ -1017,11 +1017,66 @@ impl LiveRunSegmentManager {
         let final_name =
             segment_file_name(artifact_type, open.sequence_number, compressed, "jsonl");
         let final_path = self.report_root.join(&final_name);
-        let integrity_error =
-            validate_segment_integrity(artifact_type, &final_bytes, compressed, open.record_count)
-                .err()
-                .map(|error| format!("segment_integrity_failed:{error}"));
+        let prewrite_report = SegmentIntegrityValidator::validate_bytes(
+            &final_bytes,
+            SegmentIntegrityValidationOptions {
+                artifact_type: artifact_type.to_owned(),
+                sequence_number: open.sequence_number,
+                expected_record_count: open.record_count,
+                compression: compressed.then(|| "zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        );
+        if !prewrite_report.valid {
+            let message = format!(
+                "segment_integrity_failed_before_write:{}",
+                prewrite_report.errors.join(",")
+            );
+            self.last_segment_upload_error = Some(message.clone());
+            self.disk_actions.push(DiskActionRecord {
+                at: OffsetDateTime::now_utc(),
+                level: "error".to_owned(),
+                action: message,
+                free_mb: filesystem_free_mb(&self.report_root).unwrap_or_default(),
+                pending_segments: self.pending_segment_count(),
+                pruned_bytes: 0,
+                notes: prewrite_report.errors.clone(),
+            });
+            self.open_segments.insert(artifact_type.to_owned(), open);
+            self.write_all_reports()?;
+            return Ok(false);
+        }
         atomic_write_bytes(&final_path, &final_bytes)?;
+        let final_report = SegmentIntegrityValidator::validate_file(
+            &final_path,
+            SegmentIntegrityValidationOptions {
+                artifact_type: artifact_type.to_owned(),
+                sequence_number: open.sequence_number,
+                expected_record_count: open.record_count,
+                compression: compressed.then(|| "zstd".to_owned()),
+                explicitly_empty: false,
+            },
+        )?;
+        if !final_report.valid {
+            let message = format!(
+                "segment_integrity_failed_after_write:{}",
+                final_report.errors.join(",")
+            );
+            self.last_segment_upload_error = Some(message.clone());
+            self.disk_actions.push(DiskActionRecord {
+                at: OffsetDateTime::now_utc(),
+                level: "error".to_owned(),
+                action: message,
+                free_mb: filesystem_free_mb(&self.report_root).unwrap_or_default(),
+                pending_segments: self.pending_segment_count(),
+                pruned_bytes: 0,
+                notes: final_report.errors.clone(),
+            });
+            self.open_segments.insert(artifact_type.to_owned(), open);
+            self.write_all_reports()?;
+            return Ok(false);
+        }
+        let final_bytes = fs::read(&final_path)?;
         let _ = fs::remove_file(&open.open_path);
         let segment_id = format!(
             "{}:{}:{:05}",
@@ -1048,7 +1103,7 @@ impl LiveRunSegmentManager {
             uploaded: false,
             verified: false,
             pruned_local: false,
-            error: integrity_error,
+            error: None,
         });
         self.write_all_reports()?;
         Ok(true)
@@ -1088,6 +1143,25 @@ impl LiveRunSegmentManager {
         let segment = self.manifest.segments[idx].clone();
         let local_path = PathBuf::from(&segment.local_path);
         if !local_path.exists() {
+            return Ok(false);
+        }
+        let integrity = SegmentIntegrityValidator::validate_file(
+            &local_path,
+            SegmentIntegrityValidationOptions {
+                artifact_type: segment.artifact_type.clone(),
+                sequence_number: segment.sequence_number,
+                expected_record_count: segment.record_count,
+                compression: segment.compression.clone(),
+                explicitly_empty: false,
+            },
+        )?;
+        if !integrity.valid {
+            let entry = &mut self.manifest.segments[idx];
+            entry.error = Some(format!(
+                "segment_integrity_failed_before_upload:{}",
+                integrity.errors.join(",")
+            ));
+            self.last_segment_upload_error = entry.error.clone();
             return Ok(false);
         }
         let bucket = client.bucket_for_datasets()?;
