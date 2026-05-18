@@ -6334,12 +6334,13 @@ fn refresh_manifest_verification_state(manifest: &mut ArtifactManifest) {
 }
 
 fn current_manifest_run_status(manifest: &ArtifactManifest) -> String {
+    let missing_required_summary = manifest.run_role != "source_run"
+        && (!manifest.analysis_present || !manifest.readiness_present);
     let has_warnings = manifest.data_gap_summary.data_gap_active
         || !manifest.repair_warnings.is_empty()
         || !manifest.stream_only_passed
         || manifest.rpc_network_calls_total > 0
-        || !manifest.analysis_present
-        || !manifest.readiness_present;
+        || missing_required_summary;
     match current_manifest_r2_status(manifest).as_str() {
         "verified" if !has_warnings => "completed_verified".to_owned(),
         "verified" => "completed_with_warnings".to_owned(),
@@ -28873,6 +28874,35 @@ mod tests {
         assert_eq!(manifest.r2_full_verification_status, "verified");
         assert_eq!(current_manifest_run_status(&manifest), "completed_verified");
         assert!(manifest_verified(&manifest));
+    }
+
+    #[test]
+    fn source_run_missing_optional_summaries_does_not_force_warning_status() {
+        let mut manifest = test_manifest();
+        manifest.run_role = "source_run".to_owned();
+        manifest.analysis_present = false;
+        manifest.readiness_present = false;
+
+        refresh_manifest_verification_state(&mut manifest);
+
+        assert_eq!(manifest.r2_full_verification_status, "verified");
+        assert_eq!(current_manifest_run_status(&manifest), "completed_verified");
+    }
+
+    #[test]
+    fn derived_run_missing_summaries_still_warns() {
+        let mut manifest = test_manifest();
+        manifest.run_role = "derived_replay".to_owned();
+        manifest.analysis_present = false;
+        manifest.readiness_present = false;
+
+        refresh_manifest_verification_state(&mut manifest);
+
+        assert_eq!(manifest.r2_full_verification_status, "verified");
+        assert_eq!(
+            current_manifest_run_status(&manifest),
+            "completed_with_warnings"
+        );
     }
 
     #[test]
