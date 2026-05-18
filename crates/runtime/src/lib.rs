@@ -2,9 +2,10 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap, VecDeque},
     env,
+    fs,
     io::{Read, Write},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1281,14 +1282,25 @@ impl Supervisor {
         source_run_id: Option<&str>,
         scenario_id: Option<&str>,
     ) -> Result<RuntimeSummary> {
-        let latest_run = self.storage.latest_normalized_event_run_id()?;
-        let Some(source_run_id) = source_run_id.map(ToOwned::to_owned).or(latest_run) else {
-            return Ok(self.summary());
+        let source_run_id = if let Some(source_run_id) = source_run_id {
+            source_run_id.to_owned()
+        } else {
+            let Some(latest_run) = self.storage.latest_normalized_event_run_id()? else {
+                return Ok(self.summary());
+            };
+            latest_run
         };
 
         let records = self
             .storage
             .deterministic_replay_for_run_and_scenario(Some(&source_run_id), scenario_id)?;
+        self.write_replay_progress(
+            "loaded_records",
+            &source_run_id,
+            Some(records.len()),
+            0,
+            0,
+        )?;
         let grouped = group_records_by_scenario(records);
         self.source_run_id = Some(source_run_id.clone());
         self.persist_normalized_events = false;
@@ -1306,11 +1318,19 @@ impl Supervisor {
         )?;
 
         for (group_scenario_id, group_records) in grouped {
+            let group_len = group_records.len();
             let mut child = Supervisor::new(self.resolved.clone())?;
             child.persist_normalized_events = false;
             child.liquidate_on_finalize = true;
             child.source_run_id = Some(source_run_id.clone());
             child.current_scenario_id = group_scenario_id.clone();
+            child.write_replay_progress(
+                "scenario_started",
+                &source_run_id,
+                Some(group_len),
+                0,
+                0,
+            )?;
             child.audit(
                 RuntimeAuditKind::RuntimeStarted,
                 BTreeMap::from([
@@ -1324,13 +1344,30 @@ impl Supervisor {
                 ]),
                 Vec::new(),
             )?;
-            for record in group_records {
+            for (index, record) in group_records.into_iter().enumerate() {
                 match record.record.meta.canonicality {
                     Canonicality::Tentative => child.publish_tentative(record.record)?,
                     _ => child.publish_canonical(record.record)?,
                 }
                 child.drain_pipeline().await?;
+                let processed = index + 1;
+                if processed == group_len || processed % 1_000 == 0 {
+                    child.write_replay_progress(
+                        "scenario_replaying",
+                        &source_run_id,
+                        Some(group_len),
+                        processed,
+                        child.health.events_processed,
+                    )?;
+                }
             }
+            child.write_replay_progress(
+                "scenario_finalizing",
+                &source_run_id,
+                Some(group_len),
+                group_len,
+                child.health.events_processed,
+            )?;
             child.finalize_run().await?;
             child.audit(
                 RuntimeAuditKind::RuntimeStopped,
@@ -1338,6 +1375,13 @@ impl Supervisor {
                 Vec::new(),
             )?;
             self.merge_summary(child.summary());
+            self.write_replay_progress(
+                "scenario_completed",
+                &source_run_id,
+                Some(group_len),
+                group_len,
+                self.health.events_processed,
+            )?;
         }
 
         self.audit(
@@ -1352,6 +1396,38 @@ impl Supervisor {
         self.persist_default_run_report()?;
         self.refresh_health();
         Ok(self.summary())
+    }
+
+    fn replay_progress_path(&self, source_run_id: &str) -> PathBuf {
+        self.storage
+            .run_report_dir(&self.resolved.loaded.config.environment.run_id)
+            .join(format!("replay_progress_{source_run_id}.json"))
+    }
+
+    fn write_replay_progress(
+        &self,
+        phase: &str,
+        source_run_id: &str,
+        records_total: Option<usize>,
+        records_processed: usize,
+        events_processed: u64,
+    ) -> Result<()> {
+        let path = self.replay_progress_path(source_run_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = json!({
+            "phase": phase,
+            "source_run_id": source_run_id,
+            "derived_run_id": self.resolved.loaded.config.environment.run_id,
+            "scenario_id": self.current_scenario_id,
+            "records_total": records_total,
+            "records_processed": records_processed,
+            "events_processed": events_processed,
+            "written_at": unix_now(),
+        });
+        fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+        Ok(())
     }
 
     pub fn live_data_readiness(&mut self) -> Result<RuntimeSummary> {

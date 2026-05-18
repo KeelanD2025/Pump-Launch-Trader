@@ -444,9 +444,7 @@ impl StorageEngine {
         run_id: Option<&str>,
         scenario_id: Option<&str>,
     ) -> Result<Vec<StoredRecord<NormalizedEvent>>, StorageError> {
-        let mut events = self.read_normalized_events()?;
-        filter_records(&mut events, run_id, scenario_id);
-        Ok(events)
+        read_stored_jsonl_filtered(&self.layout.normalized_event_log, run_id, scenario_id)
     }
 
     pub fn latest_normalized_event_run_id(&self) -> Result<Option<String>, StorageError> {
@@ -1576,6 +1574,71 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, Stora
     Ok(rows)
 }
 
+fn read_stored_jsonl_filtered<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    run_id: Option<&str>,
+    scenario_id: Option<&str>,
+) -> Result<Vec<StoredRecord<T>>, StorageError> {
+    if run_id.is_none() && scenario_id.is_none() {
+        return read_jsonl(path);
+    }
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let run_hint = run_id
+        .map(|value| serde_json::to_string(value).map(|encoded| format!("\"run_id\":{encoded}")))
+        .transpose()?;
+    let scenario_hint = scenario_id
+        .map(|value| {
+            serde_json::to_string(value).map(|encoded| format!("\"scenario_id\":{encoded}"))
+        })
+        .transpose()?;
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(run_id) = run_id {
+            let hint_matches = run_hint
+                .as_ref()
+                .map(|hint| line.contains(hint))
+                .unwrap_or(false);
+            if !hint_matches && !line.contains(run_id) {
+                continue;
+            }
+        }
+        if let Some(scenario_id) = scenario_id {
+            let hint_matches = scenario_hint
+                .as_ref()
+                .map(|hint| line.contains(hint))
+                .unwrap_or(false);
+            if !hint_matches && !line.contains(scenario_id) {
+                continue;
+            }
+        }
+        if let Ok(row) = serde_json::from_str::<StoredRecord<T>>(&line) {
+            if run_id
+                .map(|value| row.run_id.as_deref() != Some(value))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if scenario_id
+                .map(|value| row.scenario_id.as_deref() != Some(value))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
 fn write_json<T: Serialize>(path: &Path, record: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2093,6 +2156,43 @@ mod tests {
             .expect("filtered");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].run_id.as_deref(), Some("run-a"));
+    }
+
+    #[test]
+    fn run_filtered_replay_skips_unrelated_jsonl_before_deserializing() {
+        let store = storage();
+        for (slot, run_id) in [(1u64, "run-a"), (2u64, "run-b")] {
+            let event = buy(slot);
+            let record = StoredRecord::new(
+                DatasetKind::NormalizedEventLog,
+                "config-hash",
+                "idl-hash",
+                None,
+                "geyser_processed",
+                "processed",
+                Some(event.meta.received_at_wall_time),
+                event,
+            )
+            .with_run_id(run_id);
+            store.append_normalized_event(&record).expect("append");
+        }
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&store.layout.normalized_event_log)
+            .expect("open normalized log");
+        writeln!(
+            file,
+            "{{\"run_id\":\"run-b\",\"record\":{{\"malformed\":\"not a StoredRecord\"}}}}"
+        )
+        .expect("write unrelated malformed row");
+        writeln!(file, "not-json-and-not-the-target-run").expect("write malformed row");
+
+        let filtered = store
+            .deterministic_replay_for_run(Some("run-a"))
+            .expect("filtered replay");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].run_id.as_deref(), Some("run-a"));
+        assert_eq!(filtered[0].record.meta.slot, 1);
     }
 
     #[test]

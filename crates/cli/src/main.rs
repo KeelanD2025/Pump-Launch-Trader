@@ -22026,10 +22026,16 @@ async fn upload_research_results_r2_internal(
             upload_paths.push(path);
         }
     }
-    for artifact in &summary.generated_artifacts {
-        let path = PathBuf::from(artifact);
-        if path.exists() {
-            upload_paths.push(path);
+    let derived_artifacts_already_verified = summary.research_r2_verified
+        && summary.research_r2_failed_count == 0
+        && summary.research_r2_verified_count > 0
+        && summary.research_manifest_remote_key.is_some();
+    if !derived_artifacts_already_verified {
+        for artifact in &summary.generated_artifacts {
+            let path = PathBuf::from(artifact);
+            if path.exists() {
+                upload_paths.push(path);
+            }
         }
     }
     upload_paths.sort();
@@ -22127,7 +22133,8 @@ async fn upload_research_results_r2_internal(
         }
     }
 
-    summary.research_outputs_available = !uploaded_files.is_empty();
+    summary.research_outputs_available =
+        !uploaded_files.is_empty() || derived_artifacts_already_verified;
     summary.research_worker_processed = true;
     summary.research_outputs_remote_prefix = research_outputs_remote_prefix.clone();
     summary.feature_outputs_remote_key = feature_outputs_remote_key.clone();
@@ -22136,9 +22143,21 @@ async fn upload_research_results_r2_internal(
     summary.decision_outputs_remote_key = decision_outputs_remote_key.clone();
     summary.fill_outputs_remote_key = fill_outputs_remote_key.clone();
     summary.research_manifest_remote_key = research_manifest_remote_key.clone();
-    summary.research_r2_verified = verify && failed_files.is_empty() && !verified_files.is_empty();
-    summary.research_r2_verified_count = verified_files.len() as u64;
-    summary.research_r2_failed_count = failed_files.len() as u64;
+    let prior_verified_count = if derived_artifacts_already_verified {
+        summary.research_r2_verified_count
+    } else {
+        0
+    };
+    let prior_failed_count = if derived_artifacts_already_verified {
+        summary.research_r2_failed_count
+    } else {
+        0
+    };
+    summary.research_r2_verified = verify
+        && failed_files.is_empty()
+        && (derived_artifacts_already_verified || !verified_files.is_empty());
+    summary.research_r2_verified_count = prior_verified_count + verified_files.len() as u64;
+    summary.research_r2_failed_count = prior_failed_count + failed_files.len() as u64;
     write_research_worker_summary_files(&source_report_dir, &output_dir, &summary)?;
 
     let upload_summary = ResearchResultsUploadSummary {
