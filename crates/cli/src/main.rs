@@ -7580,6 +7580,43 @@ async fn load_artifact_manifest_local_or_r2_for_integrity(
     Ok(Some(parse_json_bytes_maybe_zstd(&bytes)?))
 }
 
+fn artifact_manifest_segment_keys(manifest: &ArtifactManifest) -> BTreeSet<String> {
+    let mut keys = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.remote_key.clone())
+        .collect::<BTreeSet<_>>();
+    keys.extend(
+        manifest
+            .verified_segments
+            .iter()
+            .map(|segment| segment.remote_key.clone()),
+    );
+    keys.extend(
+        manifest
+            .pending_segments
+            .iter()
+            .map(|segment| segment.remote_key.clone()),
+    );
+    keys.extend(
+        manifest
+            .failed_segments
+            .iter()
+            .map(|segment| segment.remote_key.clone()),
+    );
+    keys.retain(|key| !key.trim().is_empty());
+    keys
+}
+
+fn edge_required_artifact_type_present(present_types: &BTreeSet<&str>, required: &str) -> bool {
+    match required {
+        "edge_data_gaps" => {
+            present_types.contains("edge_data_gaps") || present_types.contains("data_gaps")
+        }
+        other => present_types.contains(other),
+    }
+}
+
 async fn verify_edge_run_integrity_command(
     loaded: &LoadedConfig,
     run_id: &str,
@@ -7599,13 +7636,7 @@ async fn verify_edge_run_integrity_command(
             .await?;
     let artifact_keys = artifact_manifest
         .as_ref()
-        .map(|manifest| {
-            manifest
-                .artifacts
-                .iter()
-                .map(|artifact| artifact.remote_key.clone())
-                .collect::<BTreeSet<_>>()
-        })
+        .map(artifact_manifest_segment_keys)
         .unwrap_or_default();
     let client = r2_client_for_command(loaded, false, true, false)?;
     let bucket = client.bucket_for_datasets()?;
@@ -7718,7 +7749,9 @@ async fn verify_edge_run_integrity_command(
         .collect::<BTreeSet<_>>();
     let missing_required_artifact_types = required_types
         .iter()
-        .filter(|artifact_type| !present_types.contains(**artifact_type))
+        .filter(|artifact_type| {
+            !edge_required_artifact_type_present(&present_types, artifact_type)
+        })
         .map(|artifact_type| (*artifact_type).to_owned())
         .collect::<Vec<_>>();
     warnings.extend(
@@ -28821,6 +28854,50 @@ mod tests {
         assert_eq!(manifest.r2_full_verification_status, "verified");
         assert_eq!(current_manifest_run_status(&manifest), "completed_verified");
         assert!(manifest_verified(&manifest));
+    }
+
+    #[test]
+    fn integrity_artifact_keys_include_verified_segment_states() {
+        let mut manifest = test_manifest();
+        manifest.verified_segments.push(ArtifactManifestSegmentState {
+            segment_id: "live-paper-test:normalized_events:00001".to_owned(),
+            artifact_type: "normalized_events".to_owned(),
+            sequence_number: 1,
+            local_path: "/tmp/segment_normalized_events_00001.jsonl.zst".to_owned(),
+            remote_key:
+                "pump-launch-quant/runs/live-paper-test/segments/segment_normalized_events_00001.jsonl.zst"
+                    .to_owned(),
+            size_bytes: 42,
+            checksum_sha256: "def".to_owned(),
+            uploaded: true,
+            verified: true,
+            pruned_local: true,
+            error: None,
+        });
+
+        let keys = artifact_manifest_segment_keys(&manifest);
+
+        assert!(keys.contains(
+            "pump-launch-quant/runs/live-paper-test/segments/segment_normalized_events_00001.jsonl.zst"
+        ));
+    }
+
+    #[test]
+    fn edge_data_gaps_requirement_accepts_data_gaps_segments() {
+        let present = BTreeSet::from(["normalized_events", "source_events", "data_gaps"]);
+
+        assert!(edge_required_artifact_type_present(
+            &present,
+            "edge_data_gaps"
+        ));
+        assert!(edge_required_artifact_type_present(
+            &present,
+            "normalized_events"
+        ));
+        assert!(!edge_required_artifact_type_present(
+            &present,
+            "edge_accounts"
+        ));
     }
 
     #[test]
