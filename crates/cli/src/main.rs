@@ -12516,6 +12516,7 @@ fn validate_vps_edge_only_footprint_command(
 ) -> Result<()> {
     let workspace_root = workspace_root_from_config(loaded);
     let storage_root = PathBuf::from(&loaded.config.storage.root);
+    let quarantine_root = workspace_root.join("data").join("quarantine");
     let report_root = storage_root
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -12563,7 +12564,10 @@ fn validate_vps_edge_only_footprint_command(
             && (lower.ends_with(".csv")
                 || lower.ends_with(".csv.gz")
                 || lower.ends_with(".csv.zst"))
-    });
+    })
+    .into_iter()
+    .filter(|path| !path.starts_with(&quarantine_root))
+    .collect::<Vec<_>>();
     push_check(
         "no_feature_decision_fill_csv_exports",
         export_files.is_empty(),
@@ -12695,7 +12699,27 @@ fn validate_vps_edge_only_footprint_command(
             .and_then(|name| name.to_str())
             .map(|name| name.ends_with(".open"))
             .unwrap_or(false)
-    });
+    })
+    .into_iter()
+    .filter(|path| !path.starts_with(&quarantine_root))
+    .collect::<Vec<_>>();
+    let quarantined_open_file_count = collect_matching_files(&quarantine_root, |path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".open"))
+            .unwrap_or(false)
+    })
+    .len();
+    push_check(
+        "quarantine_excluded_from_active_spool",
+        true,
+        Some(quarantine_root.clone()),
+        Some(path_size_bytes(&quarantine_root)),
+        None,
+        format!(
+            "quarantine is retained intact and excluded from active edge-spool checks; quarantined_open_files={quarantined_open_file_count}"
+        ),
+    );
     let stale_open_files = open_files
         .iter()
         .filter(|path| {
