@@ -735,6 +735,20 @@ enum Command {
         i_understand_this_deletes_cloudflare_r2_data: bool,
     },
     VpsStorageStatus,
+    ValidateVpsEdgeOnlyFootprint {
+        #[arg(long, default_value_t = 512)]
+        max_var_log_mb: u64,
+        #[arg(long, default_value_t = 256)]
+        max_target_mb: u64,
+        #[arg(long, default_value_t = 64)]
+        max_app_temp_cache_mb: u64,
+        #[arg(long, default_value_t = 64)]
+        max_active_spool_mb: u64,
+        #[arg(long, default_value_t = 2)]
+        max_rollback_binaries: usize,
+        #[arg(long, default_value_t = true)]
+        fail_on_arbo_service: bool,
+    },
     BuildDatasetIndex,
     RefreshDatasetIndex,
     BackfillRunMetadata {
@@ -1738,6 +1752,29 @@ struct DiskPreflightSummary {
     min_free_mb_before_cycle: u64,
     min_free_mb_during_cycle: u64,
     free_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VpsEdgeOnlyFootprintCheck {
+    name: String,
+    passed: bool,
+    path: Option<String>,
+    size_bytes: Option<u64>,
+    threshold_bytes: Option<u64>,
+    details: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VpsEdgeOnlyFootprintSummary {
+    command: String,
+    passed: bool,
+    workspace_root: String,
+    storage_root: String,
+    active_run_id: Option<String>,
+    free_mb: u64,
+    pre_cycle_min_free_mb: u64,
+    warning_free_mb: u64,
+    checks: Vec<VpsEdgeOnlyFootprintCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -4115,6 +4152,22 @@ async fn main() -> Result<()> {
             .await
         }
         Command::VpsStorageStatus => vps_storage_status_command(&loaded),
+        Command::ValidateVpsEdgeOnlyFootprint {
+            max_var_log_mb,
+            max_target_mb,
+            max_app_temp_cache_mb,
+            max_active_spool_mb,
+            max_rollback_binaries,
+            fail_on_arbo_service,
+        } => validate_vps_edge_only_footprint_command(
+            &loaded,
+            max_var_log_mb,
+            max_target_mb,
+            max_app_temp_cache_mb,
+            max_active_spool_mb,
+            max_rollback_binaries,
+            fail_on_arbo_service,
+        ),
         Command::BuildDatasetIndex => build_dataset_index_command(&loaded),
         Command::RefreshDatasetIndex => refresh_dataset_index_command(&loaded),
         Command::BackfillRunMetadata {
@@ -5091,9 +5144,7 @@ async fn hydrate_normalized_event_segments_for_run(
             == manifest
                 .segments
                 .iter()
-                .filter(|segment| {
-                    segment.artifact_type == "normalized_events" && segment.verified
-                })
+                .filter(|segment| segment.artifact_type == "normalized_events" && segment.verified)
                 .count()
         && manifest.summary.failed_segments == 0
         && manifest
@@ -5164,9 +5215,7 @@ async fn hydrate_normalized_event_segments_for_run(
             Err(error) => {
                 let detail = format!("{}:reading segment bytes: {error}", segment.segment_id);
                 summary.skipped_segments.push(detail.clone());
-                summary
-                    .unresolved_segment_warnings
-                    .push(detail.clone());
+                summary.unresolved_segment_warnings.push(detail.clone());
                 if error.to_string().contains("checksum mismatch")
                     || error.to_string().contains("not remotely verified")
                 {
@@ -5185,9 +5234,7 @@ async fn hydrate_normalized_event_segments_for_run(
             Err(error) => {
                 let detail = format!("{}:decoding segment payload: {error}", segment.segment_id);
                 summary.skipped_segments.push(detail.clone());
-                summary
-                    .unresolved_segment_warnings
-                    .push(detail.clone());
+                summary.unresolved_segment_warnings.push(detail.clone());
                 mark_replay_segment_warning(
                     &mut summary,
                     &segment.artifact_type,
@@ -5208,9 +5255,7 @@ async fn hydrate_normalized_event_segments_for_run(
                     segment.segment_id
                 );
                 summary.skipped_segments.push(detail.clone());
-                summary
-                    .unresolved_segment_warnings
-                    .push(detail.clone());
+                summary.unresolved_segment_warnings.push(detail.clone());
                 mark_replay_segment_warning(
                     &mut summary,
                     &segment.artifact_type,
@@ -5254,15 +5299,12 @@ async fn hydrate_normalized_event_segments_for_run(
                 .then_with(|| left.segment_id.cmp(&right.segment_id))
         });
         for segment in &fallback_segments {
-            let bytes = match read_segment_bytes_local_or_r2(loaded, &segment, allow_remote).await
-            {
+            let bytes = match read_segment_bytes_local_or_r2(loaded, &segment, allow_remote).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let detail = format!("{}:reading segment bytes: {error}", segment.segment_id);
                     summary.skipped_segments.push(detail.clone());
-                    summary
-                        .unresolved_segment_warnings
-                        .push(detail.clone());
+                    summary.unresolved_segment_warnings.push(detail.clone());
                     if error.to_string().contains("checksum mismatch")
                         || error.to_string().contains("not remotely verified")
                     {
@@ -5282,9 +5324,7 @@ async fn hydrate_normalized_event_segments_for_run(
                     let detail =
                         format!("{}:decoding segment payload: {error}", segment.segment_id);
                     summary.skipped_segments.push(detail.clone());
-                    summary
-                        .unresolved_segment_warnings
-                        .push(detail.clone());
+                    summary.unresolved_segment_warnings.push(detail.clone());
                     mark_replay_segment_warning(
                         &mut summary,
                         &segment.artifact_type,
@@ -5305,9 +5345,7 @@ async fn hydrate_normalized_event_segments_for_run(
                         segment.segment_id
                     );
                     summary.skipped_segments.push(detail.clone());
-                    summary
-                        .unresolved_segment_warnings
-                        .push(detail.clone());
+                    summary.unresolved_segment_warnings.push(detail.clone());
                     mark_replay_segment_warning(
                         &mut summary,
                         &segment.artifact_type,
@@ -5370,7 +5408,8 @@ fn prefer_nonempty_string(incoming: String, existing: &str) -> String {
 }
 
 fn run_completed_at(entry: &DatasetIndexRunEntry) -> OffsetDateTime {
-    entry.completed_at
+    entry
+        .completed_at
         .or(entry.created_at)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
@@ -5489,15 +5528,14 @@ fn normalize_research_worker_summary_from_source_entry(
             summary.normalized_replay_affected = summary.invalid_segment_count > 0;
         }
         if !summary.fallback_used {
-            summary.research_replay_confidence = if summary.research_replay_confidence
-                <= Decimal::ZERO
-            {
-                default_research_replay_confidence()
-            } else {
-                summary
-                    .research_replay_confidence
-                    .max(default_research_replay_confidence())
-            };
+            summary.research_replay_confidence =
+                if summary.research_replay_confidence <= Decimal::ZERO {
+                    default_research_replay_confidence()
+                } else {
+                    summary
+                        .research_replay_confidence
+                        .max(default_research_replay_confidence())
+                };
         } else if summary.research_replay_confidence <= Decimal::ZERO {
             summary.research_replay_confidence = Decimal::new(60, 2);
         }
@@ -5745,9 +5783,11 @@ fn merge_dataset_index_entry(
         existing.segment_warning_count,
     );
     incoming.normalized_events_missing |= existing.normalized_events_missing;
-    incoming.invalid_segment_count =
-        incoming.invalid_segment_count.max(existing.invalid_segment_count);
-    incoming.invalid_segments = union_string_lists(incoming.invalid_segments, &existing.invalid_segments);
+    incoming.invalid_segment_count = incoming
+        .invalid_segment_count
+        .max(existing.invalid_segment_count);
+    incoming.invalid_segments =
+        union_string_lists(incoming.invalid_segments, &existing.invalid_segments);
     incoming.unresolved_segment_warnings = union_string_lists(
         incoming.unresolved_segment_warnings,
         &existing.unresolved_segment_warnings,
@@ -5781,7 +5821,10 @@ fn upsert_dataset_index_entry(index: &mut DatasetIndex, entry: DatasetIndexRunEn
     index.generated_at = OffsetDateTime::now_utc();
 }
 
-fn dataset_index_changed_run_ids(before: &DatasetIndex, after: &DatasetIndex) -> Result<Vec<String>> {
+fn dataset_index_changed_run_ids(
+    before: &DatasetIndex,
+    after: &DatasetIndex,
+) -> Result<Vec<String>> {
     let before_map = before
         .runs
         .iter()
@@ -7685,7 +7728,8 @@ async fn verify_edge_run_integrity_command(
         check.remote_size_bytes = remote_bytes.len() as u64;
         check.remote_checksum_sha256 = checksum_hex(&remote_bytes);
         check.remote_size_matches_manifest = check.remote_size_bytes == segment.size_bytes;
-        check.remote_checksum_matches_manifest = check.remote_checksum_sha256 == segment.checksum_sha256;
+        check.remote_checksum_matches_manifest =
+            check.remote_checksum_sha256 == segment.checksum_sha256;
         if !check.remote_size_matches_manifest {
             segment_warnings.push("remote_size_mismatch".to_owned());
         }
@@ -7761,9 +7805,7 @@ async fn verify_edge_run_integrity_command(
         .collect::<BTreeSet<_>>();
     let missing_required_artifact_types = required_types
         .iter()
-        .filter(|artifact_type| {
-            !edge_required_artifact_type_present(&present_types, artifact_type)
-        })
+        .filter(|artifact_type| !edge_required_artifact_type_present(&present_types, artifact_type))
         .map(|artifact_type| (*artifact_type).to_owned())
         .collect::<Vec<_>>();
     warnings.extend(
@@ -7816,9 +7858,15 @@ async fn verify_edge_run_integrity_command(
         manifest_drift_detected: dataset_entry
             .map(|entry| entry.manifest_drift_detected)
             .unwrap_or(false),
-        feature_snapshot_count: dataset_entry.map(|entry| entry.feature_rows).unwrap_or_default(),
-        decision_count_total: dataset_entry.map(|entry| entry.decision_rows).unwrap_or_default(),
-        fill_count_total: dataset_entry.map(|entry| entry.fill_rows).unwrap_or_default(),
+        feature_snapshot_count: dataset_entry
+            .map(|entry| entry.feature_rows)
+            .unwrap_or_default(),
+        decision_count_total: dataset_entry
+            .map(|entry| entry.decision_rows)
+            .unwrap_or_default(),
+        fill_count_total: dataset_entry
+            .map(|entry| entry.fill_rows)
+            .unwrap_or_default(),
         stream_only_passed: dataset_entry
             .map(|entry| entry.stream_only_passed)
             .unwrap_or(false),
@@ -7858,13 +7906,31 @@ fn render_edge_run_integrity_markdown(summary: &EdgeRunIntegritySummary) -> Stri
         format!("- valid_segments: {}", summary.valid_segments),
         format!("- warning_count: {}", summary.warning_count),
         format!("- edge_dataset_complete: {}", summary.edge_dataset_complete),
-        format!("- r2_full_verification_status: {}", summary.r2_full_verification_status),
-        format!("- r2_full_consistency_status: {}", summary.r2_full_consistency_status),
-        format!("- manifest_consistency_passed: {}", summary.manifest_consistency_passed),
-        format!("- manifest_drift_detected: {}", summary.manifest_drift_detected),
+        format!(
+            "- r2_full_verification_status: {}",
+            summary.r2_full_verification_status
+        ),
+        format!(
+            "- r2_full_consistency_status: {}",
+            summary.r2_full_consistency_status
+        ),
+        format!(
+            "- manifest_consistency_passed: {}",
+            summary.manifest_consistency_passed
+        ),
+        format!(
+            "- manifest_drift_detected: {}",
+            summary.manifest_drift_detected
+        ),
         format!("- stream_only_passed: {}", summary.stream_only_passed),
-        format!("- rpc_network_calls_total: {}", summary.rpc_network_calls_total),
-        format!("- feature_snapshot_count: {}", summary.feature_snapshot_count),
+        format!(
+            "- rpc_network_calls_total: {}",
+            summary.rpc_network_calls_total
+        ),
+        format!(
+            "- feature_snapshot_count: {}",
+            summary.feature_snapshot_count
+        ),
         format!("- decision_count_total: {}", summary.decision_count_total),
         format!("- fill_count_total: {}", summary.fill_count_total),
         String::new(),
@@ -12439,6 +12505,299 @@ fn vps_storage_status_command(loaded: &LoadedConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_vps_edge_only_footprint_command(
+    loaded: &LoadedConfig,
+    max_var_log_mb: u64,
+    max_target_mb: u64,
+    max_app_temp_cache_mb: u64,
+    max_active_spool_mb: u64,
+    max_rollback_binaries: usize,
+    fail_on_arbo_service: bool,
+) -> Result<()> {
+    let workspace_root = workspace_root_from_config(loaded);
+    let storage_root = PathBuf::from(&loaded.config.storage.root);
+    let report_root = storage_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join("reports");
+    let state = load_or_default_autopilot_state(loaded);
+    let active_run_id = active_autopilot_run_id_from_state(&state).map(ToOwned::to_owned);
+    let disk_preflight = collect_disk_preflight_summary(loaded)?;
+    let mut checks = Vec::new();
+
+    let mut push_check = |name: &str,
+                          passed: bool,
+                          path: Option<PathBuf>,
+                          size_bytes: Option<u64>,
+                          threshold_bytes: Option<u64>,
+                          details: String| {
+        checks.push(VpsEdgeOnlyFootprintCheck {
+            name: name.to_owned(),
+            passed,
+            path: path.map(|path| path.display().to_string()),
+            size_bytes,
+            threshold_bytes,
+            details,
+        });
+    };
+
+    let research_output = workspace_root.join("research_output");
+    let research_output_size = path_size_bytes(&research_output);
+    push_check(
+        "no_heavy_research_output",
+        research_output_size == 0,
+        Some(research_output),
+        Some(research_output_size),
+        Some(0),
+        "research_output must not persist on an edge-only VPS".to_owned(),
+    );
+
+    let export_files = collect_matching_files(&workspace_root.join("data"), |path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let lower = name.to_ascii_lowercase();
+        (lower.contains("feature") || lower.contains("decision") || lower.contains("fill"))
+            && (lower.ends_with(".csv")
+                || lower.ends_with(".csv.gz")
+                || lower.ends_with(".csv.zst"))
+    });
+    push_check(
+        "no_feature_decision_fill_csv_exports",
+        export_files.is_empty(),
+        Some(workspace_root.join("data")),
+        Some(export_files.len() as u64),
+        Some(0),
+        if export_files.is_empty() {
+            "no feature/decision/fill CSV exports found under app data".to_owned()
+        } else {
+            format!(
+                "found export files: {}",
+                export_files
+                    .iter()
+                    .take(20)
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    let duplicate_home_data = PathBuf::from("/home/ubuntu/data");
+    let duplicate_home_data_size = path_size_bytes(&duplicate_home_data);
+    push_check(
+        "no_duplicate_home_ubuntu_data_root",
+        duplicate_home_data_size == 0,
+        Some(duplicate_home_data),
+        Some(duplicate_home_data_size),
+        Some(0),
+        "duplicate /home/ubuntu/data must be absent or empty on edge-only VPS".to_owned(),
+    );
+
+    let dev_shm_build_dirs = collect_dev_shm_build_dirs();
+    let dev_shm_build_bytes = dev_shm_build_dirs
+        .iter()
+        .map(|path| path_size_bytes(path))
+        .sum::<u64>();
+    push_check(
+        "no_stale_dev_shm_build_dirs",
+        dev_shm_build_dirs.is_empty(),
+        Some(PathBuf::from("/dev/shm")),
+        Some(dev_shm_build_bytes),
+        Some(0),
+        if dev_shm_build_dirs.is_empty() {
+            "no pump target/build directories found in /dev/shm".to_owned()
+        } else {
+            format!(
+                "found /dev/shm build dirs: {}",
+                dev_shm_build_dirs
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    let rollback_binaries = collect_cli_rollback_binaries(&workspace_root);
+    push_check(
+        "rollback_binary_count_within_limit",
+        rollback_binaries.len() <= max_rollback_binaries,
+        Some(workspace_root.join("target").join("release")),
+        Some(rollback_binaries.len() as u64),
+        Some(max_rollback_binaries as u64),
+        format!(
+            "rollback binaries: {}",
+            rollback_binaries
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+
+    let target_dir = workspace_root.join("target");
+    let target_size = path_size_bytes(&target_dir);
+    let max_target_bytes = mb_to_bytes(max_target_mb);
+    push_check(
+        "target_build_cache_under_threshold",
+        target_size <= max_target_bytes,
+        Some(target_dir),
+        Some(target_size),
+        Some(max_target_bytes),
+        format!("target build cache threshold is {max_target_mb} MB"),
+    );
+
+    let var_log = PathBuf::from("/var/log");
+    let var_log_size = path_size_bytes(&var_log);
+    let max_var_log_bytes = mb_to_bytes(max_var_log_mb);
+    push_check(
+        "var_log_under_threshold",
+        var_log_size <= max_var_log_bytes,
+        Some(var_log),
+        Some(var_log_size),
+        Some(max_var_log_bytes),
+        format!("/var/log threshold is {max_var_log_mb} MB"),
+    );
+
+    let temp_cache_paths = [
+        workspace_root.join("data").join("tmp"),
+        workspace_root.join("data").join("restore"),
+        workspace_root.join("data").join("r2_cache"),
+        workspace_root.join("data").join("export_tmp"),
+        workspace_root.join("data").join("analysis_tmp"),
+    ];
+    let temp_cache_bytes = temp_cache_paths
+        .iter()
+        .map(|path| path_size_bytes(path))
+        .sum::<u64>();
+    let max_app_temp_cache_bytes = mb_to_bytes(max_app_temp_cache_mb);
+    push_check(
+        "app_temp_cache_dirs_under_threshold",
+        temp_cache_bytes <= max_app_temp_cache_bytes,
+        Some(workspace_root.join("data")),
+        Some(temp_cache_bytes),
+        Some(max_app_temp_cache_bytes),
+        format!(
+            "checked temp/cache paths: {}",
+            temp_cache_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+
+    let open_files = collect_matching_files(&workspace_root.join("data"), |path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".open"))
+            .unwrap_or(false)
+    });
+    let stale_open_files = open_files
+        .iter()
+        .filter(|path| {
+            active_run_id
+                .as_deref()
+                .map(|run_id| !path.to_string_lossy().contains(run_id))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    push_check(
+        "no_open_files_outside_active_run",
+        stale_open_files.is_empty(),
+        Some(workspace_root.join("data")),
+        Some(stale_open_files.len() as u64),
+        Some(0),
+        if stale_open_files.is_empty() {
+            format!(
+                "open files are absent or belong to active run {}",
+                active_run_id.clone().unwrap_or_else(|| "none".to_owned())
+            )
+        } else {
+            format!(
+                "stale open files: {}",
+                stale_open_files
+                    .iter()
+                    .take(20)
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    let active_spool_path = active_run_id
+        .as_ref()
+        .map(|run_id| report_root.join(run_id))
+        .unwrap_or_else(|| report_root.join("__no_active_run__"));
+    let active_spool_size = active_run_id
+        .as_ref()
+        .map(|_| path_size_bytes(&active_spool_path))
+        .unwrap_or(0);
+    let max_active_spool_bytes = mb_to_bytes(max_active_spool_mb);
+    push_check(
+        "active_edge_spool_under_budget",
+        active_spool_size <= max_active_spool_bytes,
+        Some(active_spool_path),
+        Some(active_spool_size),
+        Some(max_active_spool_bytes),
+        format!("active edge spool threshold is {max_active_spool_mb} MB"),
+    );
+
+    push_check(
+        "free_space_above_pre_cycle_floor",
+        disk_preflight.free_mb >= disk_preflight.pre_cycle_min_free_mb,
+        Some(PathBuf::from("/")),
+        Some(disk_preflight.free_mb),
+        Some(disk_preflight.pre_cycle_min_free_mb),
+        format!(
+            "free_mb={} pre_cycle_min_free_mb={} warning_free_mb={}",
+            disk_preflight.free_mb,
+            disk_preflight.pre_cycle_min_free_mb,
+            disk_preflight.warning_free_mb
+        ),
+    );
+
+    let arbo_active = systemd_service_is_active("arbo.service");
+    push_check(
+        "known_unrelated_arbo_service_inactive",
+        !fail_on_arbo_service || arbo_active != Some(true),
+        None,
+        None,
+        None,
+        match arbo_active {
+            Some(true) => "arbo.service is active and may consume VPS disk/CPU".to_owned(),
+            Some(false) => "arbo.service is inactive or not installed".to_owned(),
+            None => {
+                "systemctl unavailable or arbo.service status could not be determined".to_owned()
+            }
+        },
+    );
+
+    let passed = checks.iter().all(|check| check.passed);
+    let summary = VpsEdgeOnlyFootprintSummary {
+        command: "validate-vps-edge-only-footprint".to_owned(),
+        passed,
+        workspace_root: workspace_root.display().to_string(),
+        storage_root: storage_root.display().to_string(),
+        active_run_id,
+        free_mb: disk_preflight.free_mb,
+        pre_cycle_min_free_mb: disk_preflight.pre_cycle_min_free_mb,
+        warning_free_mb: disk_preflight.warning_free_mb,
+        checks,
+    };
+    write_vps_edge_only_footprint_reports(loaded, &summary)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if !summary.passed {
+        return Err(anyhow!("VPS edge-only footprint validation failed"));
+    }
+    Ok(())
+}
+
 fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
     let client = r2_client_for_command(loaded, true, true, false)?;
     let store = storage_engine(loaded)?;
@@ -12460,12 +12819,13 @@ fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
             let readiness = read_json_file::<BacktestReadinessSummary>(
                 &report_dir.join("backtest_readiness.json"),
             );
-            let segment_manifest = read_json_file::<RunSegmentManifest>(
-                &report_dir.join("segment_manifest.json"),
-            )
-            .or_else(|| {
-                read_json_file::<RunSegmentManifest>(&report_dir.join("edge_segment_manifest.json"))
-            });
+            let segment_manifest =
+                read_json_file::<RunSegmentManifest>(&report_dir.join("segment_manifest.json"))
+                    .or_else(|| {
+                        read_json_file::<RunSegmentManifest>(
+                            &report_dir.join("edge_segment_manifest.json"),
+                        )
+                    });
             let segment_status =
                 read_json_file::<SegmentStatusFileSummary>(&report_dir.join("segment_status.json"));
             let export_chunk_manifest = load_export_chunk_manifest_if_present(&report_dir);
@@ -12779,7 +13139,11 @@ fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
                 research_derived_ready: research_worker_summary
                     .as_ref()
                     .map(|summary| summary.research_derived_ready)
-                    .or_else(|| derived_backfill.as_ref().map(|summary| summary.backtest_ready))
+                    .or_else(|| {
+                        derived_backfill
+                            .as_ref()
+                            .map(|summary| summary.backtest_ready)
+                    })
                     .or_else(|| derived_readiness.as_ref().map(|summary| summary.ready))
                     .unwrap_or(false),
                 research_derived_readiness_level: research_worker_summary
@@ -13188,7 +13552,11 @@ async fn apply_research_outputs_to_dataset_index(
     run_summary: &ResearchWorkerRunSummary,
     summary: &ResearchResultsUploadSummary,
 ) -> Result<()> {
-    let Some(entry) = index.runs.iter_mut().find(|entry| entry.run_id == source_run_id) else {
+    let Some(entry) = index
+        .runs
+        .iter_mut()
+        .find(|entry| entry.run_id == source_run_id)
+    else {
         return Err(anyhow!(
             "source run {source_run_id} not present in authoritative dataset index"
         ));
@@ -13207,8 +13575,7 @@ async fn apply_research_outputs_to_dataset_index(
     entry.research_r2_verified_count = summary.research_r2_verified_count;
     entry.research_r2_failed_count = summary.research_r2_failed_count;
     entry.research_derived_ready = run_summary.research_derived_ready;
-    entry.research_derived_readiness_level =
-        run_summary.research_derived_readiness_level.clone();
+    entry.research_derived_readiness_level = run_summary.research_derived_readiness_level.clone();
     entry.normalized_events_missing = run_summary.normalized_events_missing;
     entry.fallback_used = run_summary.fallback_used;
     entry.fallback_reason = run_summary.fallback_reason.clone();
@@ -13226,7 +13593,8 @@ async fn apply_research_outputs_to_dataset_index(
     entry.source_fallback_affected = run_summary.source_fallback_affected;
     entry.edge_dataset_complete = run_summary.edge_dataset_complete;
     let _ = populate_edge_dataset_fields_from_remote_manifest(loaded, entry).await;
-    entry.normalized_events_missing = entry.edge_mode && entry.normalized_events_segments_count == 0;
+    entry.normalized_events_missing =
+        entry.edge_mode && entry.normalized_events_segments_count == 0;
     index.generated_at = OffsetDateTime::now_utc();
     Ok(())
 }
@@ -13444,8 +13812,7 @@ async fn upload_dataset_index_r2_internal(
         });
     }
     refresh_dataset_index_lock(&guard, "upload-dataset-index-r2")?;
-    let mut summary =
-        upload_dataset_index_value_r2(loaded, &merged_index, dry_run, verify).await?;
+    let mut summary = upload_dataset_index_value_r2(loaded, &merged_index, dry_run, verify).await?;
     summary.authoritative_run_count_before = authoritative_run_count_before;
     summary.merged_run_count_after = merged_index.runs.len();
     summary.changed_run_ids = changed_run_ids;
@@ -13587,7 +13954,11 @@ fn enrichment_required_env_missing() -> Vec<String> {
         "DISCORD_TOKEN",
     ]
     .into_iter()
-    .filter(|name| std::env::var(name).map(|value| value.trim().is_empty()).unwrap_or(true))
+    .filter(|name| {
+        std::env::var(name)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    })
     .map(ToOwned::to_owned)
     .collect::<Vec<_>>()
 }
@@ -13611,8 +13982,9 @@ fn enrichment_readiness_check_command(loaded: &LoadedConfig) -> Result<()> {
         && loaded.config.enrichment.max_daily_rpc_credits > 0;
     let metadata_fetch_budget_config_present =
         loaded.config.enrichment.max_daily_http_metadata_fetches > 0;
-    let metadata_social_canary_possible_without_rpc = loaded.config.enrichment.metadata.allow_uri_fetch
-        && loaded.config.enrichment.metadata.allow_social_detection;
+    let metadata_social_canary_possible_without_rpc =
+        loaded.config.enrichment.metadata.allow_uri_fetch
+            && loaded.config.enrichment.metadata.allow_social_detection;
     let ready_for_metadata_social_canary = metadata_social_canary_possible_without_rpc
         && cache_dir_exists
         && ledger_exists
@@ -13652,7 +14024,11 @@ fn enrichment_readiness_check_command(loaded: &LoadedConfig) -> Result<()> {
     );
     canary_limits.insert(
         "max_signatures_per_wallet".to_owned(),
-        loaded.config.enrichment.max_signatures_per_wallet.to_string(),
+        loaded
+            .config
+            .enrichment
+            .max_signatures_per_wallet
+            .to_string(),
     );
     let markdown_path = report_root.join("enrichment_readiness_check.md");
     let json_path = report_root.join("enrichment_readiness_check.json");
@@ -17776,6 +18152,110 @@ fn path_size_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+fn mb_to_bytes(value: u64) -> u64 {
+    value.saturating_mul(1024).saturating_mul(1024)
+}
+
+fn collect_matching_files<F>(root: &Path, matches: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    fn visit<F>(path: &Path, matches: &F, out: &mut Vec<PathBuf>)
+    where
+        F: Fn(&Path) -> bool,
+    {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_file() {
+            if matches(path) {
+                out.push(path.to_path_buf());
+            }
+            return;
+        }
+        if !metadata.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            visit(&entry.path(), matches, out);
+        }
+    }
+
+    let mut matches_out = Vec::new();
+    if root.exists() {
+        visit(root, &matches, &mut matches_out);
+    }
+    matches_out.sort();
+    matches_out
+}
+
+fn collect_dev_shm_build_dirs() -> Vec<PathBuf> {
+    let root = Path::new("/dev/shm");
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.starts_with("pump") && (name.contains("target") || name.contains("build"))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+fn collect_cli_rollback_binaries(workspace_root: &Path) -> Vec<PathBuf> {
+    let release_dir = workspace_root.join("target").join("release");
+    let Ok(entries) = fs::read_dir(&release_dir) else {
+        return Vec::new();
+    };
+    let mut binaries = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("cli.prev."))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    binaries.sort();
+    binaries
+}
+
+fn systemd_service_is_active(service: &str) -> Option<bool> {
+    let output = ProcessCommand::new("systemctl")
+        .arg("is-active")
+        .arg(service)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim() == "active" {
+        Some(true)
+    } else if stdout.trim() == "inactive"
+        || stdout.trim() == "failed"
+        || stdout.trim() == "unknown"
+        || !output.status.success()
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn active_autopilot_run_id_from_state(state: &AutopilotPersistedState) -> Option<&str> {
     if autopilot_phase_holds_run_id(state.current_state) {
         state.current_run_id.as_deref()
@@ -17881,6 +18361,53 @@ fn write_disk_preflight_reports(
     let markdown_path = disk_preflight_markdown_path(loaded);
     fs::write(&json_path, serde_json::to_vec_pretty(summary)?)?;
     write_report(&markdown_path, &render_disk_preflight_markdown(summary))?;
+    Ok((markdown_path, json_path))
+}
+
+fn render_vps_edge_only_footprint_markdown(summary: &VpsEdgeOnlyFootprintSummary) -> String {
+    let mut out = format!(
+        "# VPS Edge-Only Footprint\n\n- passed: {}\n- workspace_root: {}\n- storage_root: {}\n- active_run_id: {}\n- free_mb: {}\n- pre_cycle_min_free_mb: {}\n- warning_free_mb: {}\n\n## Checks\n\n",
+        summary.passed,
+        summary.workspace_root,
+        summary.storage_root,
+        summary.active_run_id.clone().unwrap_or_default(),
+        summary.free_mb,
+        summary.pre_cycle_min_free_mb,
+        summary.warning_free_mb,
+    );
+    for check in &summary.checks {
+        out.push_str(&format!(
+            "- {}: {} | path={} | size_bytes={} | threshold_bytes={} | {}\n",
+            check.name,
+            if check.passed { "pass" } else { "fail" },
+            check.path.clone().unwrap_or_default(),
+            check
+                .size_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            check
+                .threshold_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            check.details
+        ));
+    }
+    out
+}
+
+fn write_vps_edge_only_footprint_reports(
+    loaded: &LoadedConfig,
+    summary: &VpsEdgeOnlyFootprintSummary,
+) -> Result<(PathBuf, PathBuf)> {
+    let root = autopilot_report_root(loaded);
+    fs::create_dir_all(&root)?;
+    let json_path = root.join("vps_edge_only_footprint.json");
+    let markdown_path = root.join("vps_edge_only_footprint.md");
+    fs::write(&json_path, serde_json::to_vec_pretty(summary)?)?;
+    write_report(
+        &markdown_path,
+        &render_vps_edge_only_footprint_markdown(summary),
+    )?;
     Ok((markdown_path, json_path))
 }
 
@@ -21769,10 +22296,7 @@ fn write_research_worker_summary_files(
             .decision_outputs_remote_key
             .clone()
             .unwrap_or_default(),
-        summary
-            .fill_outputs_remote_key
-            .clone()
-            .unwrap_or_default(),
+        summary.fill_outputs_remote_key.clone().unwrap_or_default(),
         summary
             .backtest_outputs_remote_key
             .clone()
@@ -21821,7 +22345,11 @@ fn write_research_worker_summary_files(
 async fn refresh_replay_research_metadata(
     loaded: &LoadedConfig,
     replay_run_id: &str,
-) -> Result<(BacktestReadinessSummary, RunMetadataBackfillSummary, Option<ArtifactManifest>)> {
+) -> Result<(
+    BacktestReadinessSummary,
+    RunMetadataBackfillSummary,
+    Option<ArtifactManifest>,
+)> {
     let _ = verify_r2_manifest_for_run(loaded, replay_run_id, false, true).await?;
     let refreshed_quality = analyze_live_collection_summary(loaded, replay_run_id, false).await?;
     let refreshed_readiness = backtest_readiness_summary(
@@ -21885,12 +22413,7 @@ fn derive_research_batch_id(base_output_dir: &Path, explicit: Option<&str>) -> S
 }
 
 fn research_batch_root(base_output_dir: &Path, batch_id: &str, explicit: bool) -> PathBuf {
-    if explicit
-        && base_output_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some(batch_id)
-    {
+    if explicit && base_output_dir.file_name().and_then(|value| value.to_str()) != Some(batch_id) {
         base_output_dir.join(batch_id)
     } else {
         base_output_dir.to_path_buf()
@@ -22023,9 +22546,12 @@ async fn upload_research_results_r2_internal(
     let mut summary = read_json_file::<ResearchWorkerRunSummary>(&summary_path)
         .ok_or_else(|| anyhow!("failed to parse {}", summary_path.display()))?;
     let source_index = load_dataset_index_local_or_r2(loaded, true).await.ok();
-    let source_entry = source_index
-        .as_ref()
-        .and_then(|index| index.runs.iter().find(|entry| entry.run_id == source_run_id));
+    let source_entry = source_index.as_ref().and_then(|index| {
+        index
+            .runs
+            .iter()
+            .find(|entry| entry.run_id == source_run_id)
+    });
     normalize_research_worker_summary_from_source_entry(loaded, source_entry, &mut summary)?;
     let source_report_dir = run_report_dir_for(loaded, source_run_id)?;
     let client = r2_client_for_command(loaded, false, true, false)?;
@@ -22058,10 +22584,8 @@ async fn upload_research_results_r2_internal(
         .as_deref()
         .map(|run_id| run_report_dir_for(loaded, run_id))
         .transpose()?;
-    let remote_prefix = research_outputs_remote_prefix(
-        source_run_id,
-        summary.replay_run_id.as_deref(),
-    );
+    let remote_prefix =
+        research_outputs_remote_prefix(source_run_id, summary.replay_run_id.as_deref());
 
     let mut uploaded_files = Vec::new();
     let mut verified_files = Vec::new();
@@ -22079,8 +22603,12 @@ async fn upload_research_results_r2_internal(
     let mut research_manifest_remote_key = summary.research_manifest_remote_key.clone();
 
     for (idx, path) in upload_paths.iter().enumerate() {
-        let relative =
-            classify_research_output_relative_path(&output_dir, replay_report_dir.as_deref(), path, idx);
+        let relative = classify_research_output_relative_path(
+            &output_dir,
+            replay_report_dir.as_deref(),
+            path,
+            idx,
+        );
         let remote_key = client.managed_key(
             &research_remote_base_prefix(&client),
             &format!("{remote_prefix}/{relative}"),
@@ -22139,7 +22667,8 @@ async fn upload_research_results_r2_internal(
         }
         if path_text_lower.contains("artifact_manifest") {
             research_manifest_remote_key = Some(remote_key.clone());
-        } else if research_manifest_remote_key.is_none() && path_text_lower.contains("r2_upload_summary")
+        } else if research_manifest_remote_key.is_none()
+            && path_text_lower.contains("r2_upload_summary")
         {
             research_manifest_remote_key = Some(remote_key.clone());
         }
@@ -22241,8 +22770,7 @@ async fn upload_research_results_r2_internal(
         )?;
     }
 
-    let dataset_index_guard =
-        acquire_dataset_index_lock(loaded, "upload-research-results-r2")?;
+    let dataset_index_guard = acquire_dataset_index_lock(loaded, "upload-research-results-r2")?;
     refresh_dataset_index_lock(&dataset_index_guard, "upload-research-results-r2")?;
     let mut authoritative_index = match download_dataset_index_from_r2(loaded).await {
         Ok(index) => index,
@@ -22461,7 +22989,9 @@ async fn run_research_worker_command(
                 if run_has_verified_research_outputs(entry) {
                     batch_state.in_progress_source_run = None;
                     if !batch_state.completed_source_runs.contains(&source_run_id) {
-                        batch_state.completed_source_runs.push(source_run_id.clone());
+                        batch_state
+                            .completed_source_runs
+                            .push(source_run_id.clone());
                     }
                     if !batch_state.skipped_source_runs.contains(&source_run_id) {
                         batch_state.skipped_source_runs.push(source_run_id.clone());
@@ -22546,8 +23076,7 @@ async fn run_research_worker_command(
             if require_normalized_events
                 && !allow_source_events_fallback
                 && (hydration.fallback_used
-                    || hydration.source_artifact_type_used.as_deref()
-                        != Some("normalized_events")
+                    || hydration.source_artifact_type_used.as_deref() != Some("normalized_events")
                     || hydration.normalized_records_loaded == 0)
             {
                 return Err(anyhow!(
@@ -22612,7 +23141,9 @@ async fn run_research_worker_command(
                 .with_context(|| format!("exporting features for replay run {replay_run_id}"))?;
                 export_decisions(&loaded_for_run, Some(&replay_run_id), false, false, None)
                     .await
-                    .with_context(|| format!("exporting decisions for replay run {replay_run_id}"))?;
+                    .with_context(|| {
+                        format!("exporting decisions for replay run {replay_run_id}")
+                    })?;
                 export_fills(&loaded_for_run, Some(&replay_run_id), false, false, None)
                     .await
                     .with_context(|| format!("exporting fills for replay run {replay_run_id}"))?;
@@ -22620,7 +23151,9 @@ async fn run_research_worker_command(
             if effective_run_backtests || effective_generate_exports {
                 export_rpc_ledger(&loaded_for_run, Some(&replay_run_id), false, false)
                     .await
-                    .with_context(|| format!("exporting RPC ledger for replay run {replay_run_id}"))?;
+                    .with_context(|| {
+                        format!("exporting RPC ledger for replay run {replay_run_id}")
+                    })?;
             }
             let mut warnings = hydration.skipped_segments.clone();
             if effective_update_calibration {
@@ -22640,8 +23173,7 @@ async fn run_research_worker_command(
             }
             if enable_enrichment {
                 warnings.push(
-                    "enrichment_requested_but_not_yet_executed_in_phase48_batch_runner"
-                        .to_owned(),
+                    "enrichment_requested_but_not_yet_executed_in_phase48_batch_runner".to_owned(),
                 );
             }
             if enrichment_canary {
@@ -22684,14 +23216,14 @@ async fn run_research_worker_command(
                 .with_context(|| {
                     format!("uploading research replay artifacts for {replay_run_id}")
                 })?;
-                let (readiness, backfill, manifest) =
-                    refresh_replay_research_metadata(&loaded_for_run, &replay_run_id)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "refreshing replay metadata after verified upload for {replay_run_id}"
-                            )
-                        })?;
+                let (readiness, backfill, manifest) = refresh_replay_research_metadata(
+                    &loaded_for_run,
+                    &replay_run_id,
+                )
+                .await
+                .with_context(|| {
+                    format!("refreshing replay metadata after verified upload for {replay_run_id}")
+                })?;
                 refreshed_readiness = Some(readiness);
                 refreshed_backfill = Some(backfill);
                 replay_manifest = manifest;
@@ -22818,7 +23350,9 @@ async fn run_research_worker_command(
             Ok((summary, upload_status)) => {
                 batch_state.in_progress_source_run = None;
                 if !batch_state.completed_source_runs.contains(&source_run_id) {
-                    batch_state.completed_source_runs.push(source_run_id.clone());
+                    batch_state
+                        .completed_source_runs
+                        .push(source_run_id.clone());
                 }
                 batch_state.failed_source_runs.remove(&source_run_id);
                 batch_state
@@ -22847,15 +23381,14 @@ async fn run_research_worker_command(
                     .insert(source_run_id.clone(), "failed".to_owned());
             }
         }
-        batch_state.aggregate_status = if batch_state.completed_source_runs.len()
-            == batch_state.selected_source_runs.len()
-        {
-            "completed".to_owned()
-        } else if batch_state.failed_source_runs.is_empty() {
-            "partial_incomplete".to_owned()
-        } else {
-            "partial_with_failures".to_owned()
-        };
+        batch_state.aggregate_status =
+            if batch_state.completed_source_runs.len() == batch_state.selected_source_runs.len() {
+                "completed".to_owned()
+            } else if batch_state.failed_source_runs.is_empty() {
+                "partial_incomplete".to_owned()
+            } else {
+                "partial_with_failures".to_owned()
+            };
         write_research_batch_state(&batch_root, &batch_state)?;
     }
     println!("{}", serde_json::to_string_pretty(&batch)?);
@@ -28627,6 +29160,17 @@ mod tests {
         }
     }
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pump_launch_quant_cli_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp test dir");
+        path
+    }
+
     #[test]
     fn resolve_backtest_thresholds_uses_loaded_config_defaults_when_cli_omits_values() {
         let loaded = load_default_config_for_test();
@@ -28692,6 +29236,48 @@ mod tests {
             active_autopilot_run_id_from_state(&state),
             Some("live-paper-active")
         );
+    }
+
+    #[test]
+    fn collect_matching_files_finds_nested_edge_export_residue() {
+        let dir = temp_test_dir("matching_files");
+        let nested = dir.join("data").join("reports").join("run");
+        fs::create_dir_all(&nested).expect("mkdir");
+        fs::write(nested.join("features.csv.zst"), b"feature").expect("write feature");
+        fs::write(nested.join("notes.md"), b"notes").expect("write notes");
+
+        let matches = collect_matching_files(&dir, |path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".csv.zst"))
+                .unwrap_or(false)
+        });
+
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].ends_with("features.csv.zst"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_cli_rollback_binaries_counts_only_cli_prev_files() {
+        let dir = temp_test_dir("rollback_binaries");
+        let release = dir.join("target").join("release");
+        fs::create_dir_all(&release).expect("mkdir");
+        fs::write(release.join("cli"), b"current").expect("write current");
+        fs::write(release.join("cli.prev.1"), b"prev1").expect("write prev1");
+        fs::write(release.join("cli.prev.2"), b"prev2").expect("write prev2");
+        fs::write(release.join("other.prev.1"), b"other").expect("write other");
+
+        let rollbacks = collect_cli_rollback_binaries(&dir);
+
+        assert_eq!(rollbacks.len(), 2);
+        assert!(rollbacks.iter().all(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("cli.prev."))
+                .unwrap_or(false)
+        }));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
