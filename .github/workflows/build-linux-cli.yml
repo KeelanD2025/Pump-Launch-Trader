@@ -363,13 +363,7 @@ jobs:
                 "status_next_scheduled_action": status.get("next_scheduled_action"),
             }, indent=2))
             PY
-            LOCK_PID="$(python3 - <<'PY'
-            import json
-            import os
-            from pathlib import Path
-            print(json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8")).get("pid", ""))
-            PY
-            )"
+            LOCK_PID="$(python3 -c 'import json, os; from pathlib import Path; print(json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8")).get("pid", ""))')"
             if [[ -n "${LOCK_PID}" ]]; then
               ps -fp "${LOCK_PID}" || true
             fi
