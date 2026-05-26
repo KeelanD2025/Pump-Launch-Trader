@@ -1318,6 +1318,7 @@ mod tests {
                 mint: pubkey("mint"),
                 owner_wallet: pubkey(owner),
                 token_account: pubkey(&format!("ata-{owner}")),
+                token_decimals: Some(common::DEFAULT_PUMP_TOKEN_DECIMALS),
                 old_balance: None,
                 new_balance: Decimal::from(balance),
                 delta: Decimal::from(balance),

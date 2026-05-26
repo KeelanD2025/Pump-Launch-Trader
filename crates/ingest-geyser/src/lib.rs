@@ -105,6 +105,8 @@ pub struct TransactionUpdate {
     pub signature: String,
     pub transaction_index: Option<u32>,
     pub succeeded: bool,
+    #[serde(default)]
+    pub error_code: Option<String>,
     pub account_keys: Vec<String>,
     pub instructions: Vec<TransactionInstruction>,
     #[serde(default)]
@@ -569,6 +571,9 @@ fn transaction_update_from_proto(update: SubscribeUpdateTransaction) -> Option<T
             .as_ref()
             .map(|value| value.err.is_none())
             .unwrap_or(true),
+        error_code: meta
+            .as_ref()
+            .and_then(|value| value.err.as_ref().map(|error| format!("{error:?}"))),
         account_keys,
         instructions,
         inner_instructions,
@@ -640,6 +645,7 @@ pub fn transaction_update_from_deshred_proto(
         signature: bytes_to_signature(&info.signature),
         transaction_index: None,
         succeeded: true,
+        error_code: None,
         account_keys,
         instructions,
         inner_instructions: Vec::new(),
@@ -662,6 +668,7 @@ fn transaction_status_update_from_proto(
         signature: bytes_to_signature(&update.signature),
         transaction_index: Some(update.index as u32),
         succeeded: update.err.is_none(),
+        error_code: update.err.as_ref().map(|error| format!("{error:?}")),
         account_keys: Vec::new(),
         instructions: Vec::new(),
         inner_instructions: Vec::new(),
@@ -926,6 +933,7 @@ mod tests {
             signature: "sig-1".to_owned(),
             transaction_index: Some(1),
             succeeded: true,
+            error_code: None,
             account_keys: vec![],
             instructions: vec![TransactionInstruction {
                 program_id: "Pump111111111111111111111111111111111111111".to_owned(),

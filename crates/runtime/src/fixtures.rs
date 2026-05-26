@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, path::Path};
 
 use common::{
-    Canonicality, DataGapEvent, DataGapType, EventMeta, EventPayload, EventSource, GapSeverity,
-    HolderBalanceUpdateEvent, NormalizedEvent, ObservedTransactionEvent, PubkeyValue, PumpBuyEvent,
-    PumpSellEvent, QuoteAssetType, ReasonCode, TokenCreatedEvent, TokenProgramType,
-    TokenTerminalEvent, TokenTerminalVariant, TransactionStatus, WalletFundingEvent,
+    Canonicality, DEFAULT_PUMP_TOKEN_DECIMALS, DataGapEvent, DataGapType, EventMeta, EventPayload,
+    EventSource, GapSeverity, HolderBalanceUpdateEvent, NormalizedEvent, ObservedTransactionEvent,
+    PubkeyValue, PumpBuyEvent, PumpSellEvent, QuoteAssetType, ReasonCode, TokenCreatedEvent,
+    TokenProgramType, TokenTerminalEvent, TokenTerminalVariant, TransactionStatus,
+    WalletFundingEvent,
 };
 use ingest_shred::{DecodedShredBatch, DecodedShredPayload, DecodedShredTransaction};
 use rust_decimal::Decimal;
@@ -2383,6 +2384,7 @@ fn holder_delta_event(
             mint: pubkey(mint),
             owner_wallet: pubkey(owner),
             token_account: pubkey(&format!("ata-{mint}-{owner}")),
+            token_decimals: Some(DEFAULT_PUMP_TOKEN_DECIMALS),
             old_balance: Some(Decimal::from(old_balance)),
             new_balance: Decimal::from(new_balance),
             delta: Decimal::from(new_balance) - Decimal::from(old_balance),
@@ -2505,9 +2507,20 @@ fn canonical_observed_tx(
             slot_hint: Some(slot),
             entry_index: Some(0),
             tx_position_estimate: Some(0),
+            signer: None,
             program_ids,
             account_count,
             instruction_count,
+            account_list_hash: None,
+            instruction_shape_hash: None,
+            compute_unit_limit: None,
+            compute_unit_price: None,
+            estimated_priority_fee_lamports: None,
+            tx_fee_lamports: None,
+            compute_units_consumed: None,
+            failed_transaction: false,
+            error_code: None,
+            bundle_like_evidence: None,
             raw_packet_hash: format!("packet-{signature}"),
             first_seen_by_shred_ns: slot * 1_000_000,
             decode_confidence: dec(90, 2),
@@ -2637,6 +2650,7 @@ fn holder_event(slot: u64, mint: &str, owner: &str, balance: u64) -> NormalizedE
             mint: pubkey(mint),
             owner_wallet: pubkey(owner),
             token_account: pubkey(&format!("ata-{mint}-{owner}")),
+            token_decimals: Some(DEFAULT_PUMP_TOKEN_DECIMALS),
             old_balance: None,
             new_balance: Decimal::from(balance),
             delta: Decimal::from(balance),

@@ -463,6 +463,189 @@ pub struct ResearchWorkerConfig {
     pub update_calibration: bool,
     #[serde(default = "default_research_worker_local_output_dir")]
     pub local_output_dir: String,
+    #[serde(default)]
+    pub persistence: ResearchWorkerPersistenceConfig,
+    #[serde(default)]
+    pub replay: ResearchWorkerReplayConfig,
+    #[serde(default)]
+    pub exports: ResearchWorkerExportsConfig,
+    #[serde(default)]
+    pub pnl_sanity: ResearchWorkerPnlSanityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchWorkerPnlSanityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_research_max_fill_to_reserve_price_ratio")]
+    pub max_fill_to_reserve_price_ratio: Decimal,
+    #[serde(default = "default_true")]
+    pub exclude_scenario_end_without_decision: bool,
+    #[serde(default = "default_true")]
+    pub exclude_missing_trigger_event: bool,
+    #[serde(default = "default_true")]
+    pub preserve_artifact_fills_in_audit: bool,
+}
+
+impl Default for ResearchWorkerPnlSanityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_fill_to_reserve_price_ratio: default_research_max_fill_to_reserve_price_ratio(),
+            exclude_scenario_end_without_decision: true,
+            exclude_missing_trigger_event: true,
+            preserve_artifact_fills_in_audit: true,
+        }
+    }
+}
+
+impl ResearchWorkerPnlSanityConfig {
+    fn apply_defaults(&mut self) {
+        if self.max_fill_to_reserve_price_ratio <= Decimal::ZERO {
+            self.max_fill_to_reserve_price_ratio =
+                default_research_max_fill_to_reserve_price_ratio();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchWorkerReplayConfig {
+    #[serde(default = "default_true")]
+    pub dirty_token_only: bool,
+    #[serde(default = "default_research_cohort_recompute_interval_events")]
+    pub cohort_recompute_interval_events: u64,
+    #[serde(default = "default_research_cohort_recompute_interval_ms")]
+    pub cohort_recompute_interval_ms: u64,
+    #[serde(default = "default_research_feature_snapshot_min_interval_events_per_token")]
+    pub feature_snapshot_min_interval_events_per_token: u64,
+    #[serde(default = "default_research_feature_snapshot_min_interval_ms_per_token")]
+    pub feature_snapshot_min_interval_ms_per_token: u64,
+    #[serde(default = "default_true")]
+    pub force_snapshot_on_lifecycle_change: bool,
+    #[serde(default = "default_true")]
+    pub force_snapshot_on_decision_boundary: bool,
+}
+
+impl Default for ResearchWorkerReplayConfig {
+    fn default() -> Self {
+        Self {
+            dirty_token_only: true,
+            cohort_recompute_interval_events: default_research_cohort_recompute_interval_events(),
+            cohort_recompute_interval_ms: default_research_cohort_recompute_interval_ms(),
+            feature_snapshot_min_interval_events_per_token:
+                default_research_feature_snapshot_min_interval_events_per_token(),
+            feature_snapshot_min_interval_ms_per_token:
+                default_research_feature_snapshot_min_interval_ms_per_token(),
+            force_snapshot_on_lifecycle_change: true,
+            force_snapshot_on_decision_boundary: true,
+        }
+    }
+}
+
+impl ResearchWorkerReplayConfig {
+    fn apply_defaults(&mut self) {
+        if self.cohort_recompute_interval_events == 0 {
+            self.cohort_recompute_interval_events =
+                default_research_cohort_recompute_interval_events();
+        }
+        if self.cohort_recompute_interval_ms == 0 {
+            self.cohort_recompute_interval_ms = default_research_cohort_recompute_interval_ms();
+        }
+        if self.feature_snapshot_min_interval_events_per_token == 0 {
+            self.feature_snapshot_min_interval_events_per_token =
+                default_research_feature_snapshot_min_interval_events_per_token();
+        }
+        if self.feature_snapshot_min_interval_ms_per_token == 0 {
+            self.feature_snapshot_min_interval_ms_per_token =
+                default_research_feature_snapshot_min_interval_ms_per_token();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchWorkerExportsConfig {
+    #[serde(default = "default_true")]
+    pub compressed_only: bool,
+    #[serde(default = "default_research_export_chunk_rows")]
+    pub chunk_rows: usize,
+    #[serde(default = "default_true")]
+    pub buffered_writes: bool,
+    #[serde(default)]
+    pub skip_csv_by_default: bool,
+    #[serde(default = "default_true")]
+    pub allow_skip_csv_export: bool,
+}
+
+impl Default for ResearchWorkerExportsConfig {
+    fn default() -> Self {
+        Self {
+            compressed_only: true,
+            chunk_rows: default_research_export_chunk_rows(),
+            buffered_writes: true,
+            skip_csv_by_default: false,
+            allow_skip_csv_export: true,
+        }
+    }
+}
+
+impl ResearchWorkerExportsConfig {
+    fn apply_defaults(&mut self) {
+        if self.chunk_rows == 0 {
+            self.chunk_rows = default_research_export_chunk_rows();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchWorkerPersistenceConfig {
+    #[serde(default = "default_research_feature_snapshot_chunk_rows")]
+    pub feature_snapshot_chunk_rows: usize,
+    #[serde(default = "default_true")]
+    pub feature_snapshot_compress: bool,
+    #[serde(default = "default_research_feature_snapshot_format")]
+    pub feature_snapshot_format: String,
+    #[serde(default = "default_research_decision_chunk_rows")]
+    pub decision_chunk_rows: usize,
+    #[serde(default = "default_true")]
+    pub decision_compress: bool,
+    #[serde(default = "default_true")]
+    pub disable_per_snapshot_files: bool,
+    #[serde(default = "default_true")]
+    pub buffered_writes: bool,
+    #[serde(default = "default_research_max_local_uncompressed_mb")]
+    pub max_local_uncompressed_mb: u64,
+}
+
+impl Default for ResearchWorkerPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            feature_snapshot_chunk_rows: default_research_feature_snapshot_chunk_rows(),
+            feature_snapshot_compress: true,
+            feature_snapshot_format: default_research_feature_snapshot_format(),
+            decision_chunk_rows: default_research_decision_chunk_rows(),
+            decision_compress: true,
+            disable_per_snapshot_files: true,
+            buffered_writes: true,
+            max_local_uncompressed_mb: default_research_max_local_uncompressed_mb(),
+        }
+    }
+}
+
+impl ResearchWorkerPersistenceConfig {
+    fn apply_defaults(&mut self) {
+        if self.feature_snapshot_chunk_rows == 0 {
+            self.feature_snapshot_chunk_rows = default_research_feature_snapshot_chunk_rows();
+        }
+        if self.feature_snapshot_format.trim().is_empty() {
+            self.feature_snapshot_format = default_research_feature_snapshot_format();
+        }
+        if self.decision_chunk_rows == 0 {
+            self.decision_chunk_rows = default_research_decision_chunk_rows();
+        }
+        if self.max_local_uncompressed_mb == 0 {
+            self.max_local_uncompressed_mb = default_research_max_local_uncompressed_mb();
+        }
+    }
 }
 
 impl Default for ResearchWorkerConfig {
@@ -481,6 +664,10 @@ impl Default for ResearchWorkerConfig {
             generate_exports: true,
             update_calibration: true,
             local_output_dir: default_research_worker_local_output_dir(),
+            persistence: ResearchWorkerPersistenceConfig::default(),
+            replay: ResearchWorkerReplayConfig::default(),
+            exports: ResearchWorkerExportsConfig::default(),
+            pnl_sanity: ResearchWorkerPnlSanityConfig::default(),
         }
     }
 }
@@ -493,6 +680,10 @@ impl ResearchWorkerConfig {
         if self.local_output_dir.trim().is_empty() {
             self.local_output_dir = default_research_worker_local_output_dir();
         }
+        self.persistence.apply_defaults();
+        self.replay.apply_defaults();
+        self.exports.apply_defaults();
+        self.pnl_sanity.apply_defaults();
     }
 }
 
@@ -561,8 +752,7 @@ impl Default for EnrichmentConfig {
             ledger_path: default_enrichment_ledger_path(),
             max_daily_rpc_calls: default_enrichment_max_daily_rpc_calls(),
             max_daily_rpc_credits: default_enrichment_max_daily_rpc_credits(),
-            max_daily_http_metadata_fetches:
-                default_enrichment_max_daily_http_metadata_fetches(),
+            max_daily_http_metadata_fetches: default_enrichment_max_daily_http_metadata_fetches(),
             max_wallets_per_run: default_enrichment_max_wallets_per_run(),
             max_tokens_per_run: default_enrichment_max_tokens_per_run(),
             max_signatures_per_wallet: default_enrichment_max_signatures_per_wallet(),
@@ -3767,9 +3957,9 @@ impl LoadedConfig {
             || self.config.edge_collector.allow_wallet_history_rpc
             || self.config.edge_collector.allow_bundle_enrichment_rpc
         {
-            summary.violations.push(
-                "edge_collector mode must keep rpc/api/http enrichment disabled".to_owned(),
-            );
+            summary
+                .violations
+                .push("edge_collector mode must keep rpc/api/http enrichment disabled".to_owned());
         }
         if summary.r2_upload_required && !summary.r2_upload_enabled {
             summary
@@ -3902,6 +4092,46 @@ fn default_research_worker_input() -> String {
 
 fn default_research_worker_local_output_dir() -> String {
     "research_output".to_owned()
+}
+
+const fn default_research_feature_snapshot_chunk_rows() -> usize {
+    50_000
+}
+
+fn default_research_feature_snapshot_format() -> String {
+    "jsonl.zst".to_owned()
+}
+
+const fn default_research_decision_chunk_rows() -> usize {
+    50_000
+}
+
+const fn default_research_max_local_uncompressed_mb() -> u64 {
+    256
+}
+
+const fn default_research_cohort_recompute_interval_events() -> u64 {
+    250
+}
+
+const fn default_research_cohort_recompute_interval_ms() -> u64 {
+    5_000
+}
+
+const fn default_research_feature_snapshot_min_interval_events_per_token() -> u64 {
+    5
+}
+
+const fn default_research_feature_snapshot_min_interval_ms_per_token() -> u64 {
+    1_000
+}
+
+const fn default_research_export_chunk_rows() -> usize {
+    50_000
+}
+
+fn default_research_max_fill_to_reserve_price_ratio() -> Decimal {
+    Decimal::new(100, 1)
 }
 
 fn default_autopilot_mode() -> String {

@@ -389,8 +389,34 @@ pub struct BondingCurveUpdateEvent {
     pub virtual_token_reserves: Decimal,
     pub real_quote_reserves: Decimal,
     pub real_token_reserves: Decimal,
+    #[serde(default)]
+    pub token_decimals: Option<u8>,
+    #[serde(default)]
+    pub price_lamports_per_raw_token: Option<Decimal>,
+    #[serde(default)]
+    pub price_sol_per_token: Option<Decimal>,
+    #[serde(default)]
+    pub reserve_price_source: Option<String>,
+    #[serde(default)]
+    pub reserve_price_confidence: Option<Decimal>,
     pub price: Decimal,
+    #[serde(default)]
+    pub market_cap_quote_1b: Option<Decimal>,
+    #[serde(default)]
+    pub market_cap_quote_total_supply: Option<Decimal>,
+    #[serde(default)]
+    pub market_cap_source: Option<String>,
+    #[serde(default)]
+    pub market_cap_confidence: Option<Decimal>,
     pub market_cap_proxy: Option<Decimal>,
+    #[serde(default)]
+    pub curve_complete_flag: Option<bool>,
+    #[serde(default)]
+    pub curve_progress_pct: Option<Decimal>,
+    #[serde(default)]
+    pub curve_progress_source: Option<String>,
+    #[serde(default)]
+    pub curve_progress_confidence: Option<Decimal>,
     pub curve_completion_pct: Option<Decimal>,
     pub quote_reserve_delta: Option<Decimal>,
     pub token_reserve_delta: Option<Decimal>,
@@ -404,6 +430,8 @@ pub struct HolderBalanceUpdateEvent {
     pub mint: PubkeyValue,
     pub owner_wallet: PubkeyValue,
     pub token_account: PubkeyValue,
+    #[serde(default)]
+    pub token_decimals: Option<u8>,
     pub old_balance: Option<Decimal>,
     pub new_balance: Decimal,
     pub delta: Decimal,
@@ -431,9 +459,31 @@ pub struct ObservedTransactionEvent {
     pub slot_hint: Option<u64>,
     pub entry_index: Option<u32>,
     pub tx_position_estimate: Option<u32>,
+    #[serde(default)]
+    pub signer: Option<String>,
     pub program_ids: Vec<String>,
     pub account_count: usize,
     pub instruction_count: usize,
+    #[serde(default)]
+    pub account_list_hash: Option<String>,
+    #[serde(default)]
+    pub instruction_shape_hash: Option<String>,
+    #[serde(default)]
+    pub compute_unit_limit: Option<u32>,
+    #[serde(default)]
+    pub compute_unit_price: Option<u64>,
+    #[serde(default)]
+    pub estimated_priority_fee_lamports: Option<Lamports>,
+    #[serde(default)]
+    pub tx_fee_lamports: Option<Lamports>,
+    #[serde(default)]
+    pub compute_units_consumed: Option<u64>,
+    #[serde(default)]
+    pub failed_transaction: bool,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub bundle_like_evidence: Option<String>,
     pub raw_packet_hash: String,
     pub first_seen_by_shred_ns: u64,
     pub decode_confidence: Decimal,

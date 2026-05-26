@@ -63,6 +63,39 @@ generate_exports = true
 update_calibration = true
 local_output_dir = "research_output"
 
+[research_worker.persistence]
+feature_snapshot_chunk_rows = 50000
+feature_snapshot_compress = true
+feature_snapshot_format = "jsonl.zst"
+decision_chunk_rows = 50000
+decision_compress = true
+disable_per_snapshot_files = true
+buffered_writes = true
+max_local_uncompressed_mb = 256
+
+[research_worker.replay]
+dirty_token_only = true
+cohort_recompute_interval_events = 250
+cohort_recompute_interval_ms = 5000
+feature_snapshot_min_interval_events_per_token = 5
+feature_snapshot_min_interval_ms_per_token = 1000
+force_snapshot_on_lifecycle_change = true
+force_snapshot_on_decision_boundary = true
+
+[research_worker.exports]
+compressed_only = true
+chunk_rows = 50000
+buffered_writes = true
+skip_csv_by_default = false
+allow_skip_csv_export = true
+
+[research_worker.pnl_sanity]
+enabled = true
+max_fill_to_reserve_price_ratio = 10.0
+exclude_scenario_end_without_decision = true
+exclude_missing_trigger_event = true
+preserve_artifact_fills_in_audit = true
+
 [enrichment]
 enabled = true
 mode = "research_only"

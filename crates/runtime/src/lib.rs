@@ -1,8 +1,7 @@
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap, VecDeque},
-    env,
-    fs,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    env, fs,
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -11,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -267,6 +266,13 @@ pub struct RuntimeSummary {
     pub latest_risk: HashMap<String, RiskAssessment>,
     pub snapshot: StateSnapshot,
     pub audits: Vec<RuntimeAuditEvent>,
+    pub replay_profile: RuntimeReplayProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeReplayProfile {
+    pub substage_timings_ms: BTreeMap<String, u128>,
+    pub counters: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,12 +684,17 @@ pub struct Supervisor {
     calibration_snapshot_hash: Option<String>,
     calibration_snapshot_path: Option<String>,
     started_at: OffsetDateTime,
+    replay_profile: RuntimeReplayProfile,
+    emitted_feature_snapshot_identities: HashSet<String>,
+    replay_seen_mints: HashSet<String>,
 }
 
 impl Supervisor {
     pub fn new(resolved: RuntimeResolvedConfig) -> Result<Self> {
         let layout = StorageLayout::from_config(&resolved.loaded.config.storage)?;
-        let storage = StorageEngine::new(layout);
+        let storage = StorageEngine::new(layout).with_feature_snapshot_persistence(
+            resolved.loaded.config.research_worker.persistence.clone(),
+        );
         let metrics = QuantMetrics::new()?;
         let rpc_budget = RpcBudgetManager::new(
             resolved.loaded.config.rpc_budget.clone(),
@@ -858,6 +869,9 @@ impl Supervisor {
             calibration_snapshot_hash,
             calibration_snapshot_path,
             started_at,
+            replay_profile: RuntimeReplayProfile::default(),
+            emitted_feature_snapshot_identities: HashSet::new(),
+            replay_seen_mints: HashSet::new(),
         };
         if supervisor.edge_collector_mode() {
             supervisor.safety.trade_allowed = false;
@@ -1034,6 +1048,26 @@ impl Supervisor {
                     map.insert("estimated_tip_lamports".to_owned(), value.0.to_string());
                 }
             }
+            EventPayload::ObservedTransaction(event) => {
+                if let Some(value) = event.compute_unit_limit {
+                    map.insert("compute_unit_limit".to_owned(), value.to_string());
+                }
+                if let Some(value) = event.compute_unit_price {
+                    map.insert("compute_unit_price".to_owned(), value.to_string());
+                }
+                if let Some(value) = event.estimated_priority_fee_lamports {
+                    map.insert(
+                        "estimated_priority_fee_lamports".to_owned(),
+                        value.0.to_string(),
+                    );
+                }
+                if let Some(value) = event.tx_fee_lamports {
+                    map.insert("tx_fee_lamports".to_owned(), value.0.to_string());
+                }
+                if let Some(value) = event.compute_units_consumed {
+                    map.insert("compute_units_consumed".to_owned(), value.to_string());
+                }
+            }
             _ => {}
         }
         map
@@ -1180,6 +1214,45 @@ impl Supervisor {
         }
     }
 
+    fn profile_add_time(&mut self, stage: &str, started: Instant) {
+        let elapsed = started.elapsed().as_millis();
+        *self
+            .replay_profile
+            .substage_timings_ms
+            .entry(stage.to_owned())
+            .or_default() += elapsed;
+    }
+
+    fn profile_inc(&mut self, counter: &str, amount: u64) {
+        *self
+            .replay_profile
+            .counters
+            .entry(counter.to_owned())
+            .or_default() += amount;
+    }
+
+    fn profile_set_max(&mut self, counter: &str, value: u64) {
+        let entry = self
+            .replay_profile
+            .counters
+            .entry(counter.to_owned())
+            .or_default();
+        *entry = (*entry).max(value);
+    }
+
+    fn feature_snapshot_identity(&self, feature_record: &StoredRecord<FeatureSnapshot>) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.source_run_id
+                .as_deref()
+                .unwrap_or(self.resolved.loaded.config.environment.run_id.as_str()),
+            feature_record.run_id.as_deref().unwrap_or_default(),
+            feature_record.record.mint.0,
+            feature_record.record.observed_at.unix_timestamp_nanos(),
+            feature_record.record.vector_hash
+        )
+    }
+
     fn deterministic_decision_id(
         &self,
         event: &NormalizedEvent,
@@ -1291,17 +1364,15 @@ impl Supervisor {
             latest_run
         };
 
+        let replay_load_started = Instant::now();
         let records = self
             .storage
             .deterministic_replay_for_run_and_scenario(Some(&source_run_id), scenario_id)?;
-        self.write_replay_progress(
-            "loaded_records",
-            &source_run_id,
-            Some(records.len()),
-            0,
-            0,
-        )?;
+        self.profile_add_time("event_deserialization", replay_load_started);
+        self.write_replay_progress("loaded_records", &source_run_id, Some(records.len()), 0, 0)?;
+        let ordering_started = Instant::now();
         let grouped = group_records_by_scenario(records);
+        self.profile_add_time("event_ordering", ordering_started);
         self.source_run_id = Some(source_run_id.clone());
         self.persist_normalized_events = false;
         self.liquidate_on_finalize = true;
@@ -1324,6 +1395,7 @@ impl Supervisor {
             child.liquidate_on_finalize = true;
             child.source_run_id = Some(source_run_id.clone());
             child.current_scenario_id = group_scenario_id.clone();
+            child.profile_inc("events_processed", group_len as u64);
             child.write_replay_progress(
                 "scenario_started",
                 &source_run_id,
@@ -1394,6 +1466,8 @@ impl Supervisor {
             vec![format!("source_run_id={source_run_id}")],
         )?;
         self.persist_default_run_report()?;
+        let active_tokens = self.current_snapshot().tokens.len() as u64;
+        self.profile_set_max("active_tokens", active_tokens);
         self.refresh_health();
         Ok(self.summary())
     }
@@ -3184,7 +3258,10 @@ impl Supervisor {
             }
         }
 
+        let state_apply_started = Instant::now();
         self.state_engine.apply_event(&event)?;
+        self.profile_add_time("state_apply_event", state_apply_started);
+        self.profile_inc("token_dirty_set_update", 1);
 
         if let EventPayload::DataGap(payload) = &event.payload {
             if !tentative {
@@ -3202,21 +3279,38 @@ impl Supervisor {
             self.refresh_health();
             return Ok(());
         };
-        let mut snapshot = self.state_engine.snapshot();
-        let Some(mut token_before_risk) = snapshot.tokens.get(&mint.0).cloned() else {
+        self.replay_seen_mints.insert(mint.0.clone());
+        self.profile_set_max("unique_mints_seen", self.replay_seen_mints.len() as u64);
+        self.profile_set_max("active_tokens", self.state_engine.token_count() as u64);
+        let Some(mut token_before_risk) = self.state_engine.token(&mint).cloned() else {
             self.refresh_health();
             return Ok(());
         };
-        let mut features = self.feature_engine.compute_snapshot(
+        self.profile_inc("feature_compute_calls", 1);
+        let feature_started = Instant::now();
+        let (mut features, feature_timings) = self.feature_engine.compute_snapshot_profiled(
             &token_before_risk,
-            &snapshot,
+            &self.state_engine,
             event.meta.received_at_wall_time,
         );
+        self.profile_add_time("feature_compute", feature_started);
+        for (stage, elapsed) in feature_timings {
+            *self
+                .replay_profile
+                .substage_timings_ms
+                .entry(stage)
+                .or_default() += elapsed;
+        }
+        self.profile_inc("cohort_recompute_count", 1);
+        self.profile_inc("holder_index_recompute_count", 1);
+        self.profile_inc("risk_compute_calls", 1);
+        let risk_started = Instant::now();
         let mut risk = self.risk_engine.evaluate(
             &token_before_risk,
             &features,
             event.meta.received_at_wall_time,
         );
+        self.profile_add_time("risk_compute", risk_started);
         let mut derived_events = Vec::new();
         if tentative && matches!(event.payload, EventPayload::PumpSell(_)) {
             derived_events.extend(self.tentative_sell_manager.detect_tentative_sell(
@@ -3229,48 +3323,72 @@ impl Supervisor {
         } else if !tentative {
             derived_events.extend(
                 self.tentative_sell_manager
-                    .reconcile(&event, snapshot.tokens.get(&mint.0)),
+                    .reconcile(&event, self.state_engine.token(&mint)),
             );
         }
         for derived in &derived_events {
             self.apply_derived_runtime_event(derived)?;
         }
-        let expired = self.tentative_sell_manager.expire(
-            event.meta.received_at_wall_time,
-            &self.state_engine.snapshot(),
-        );
+        let expired = if self.tentative_sell_manager.has_pending() {
+            let snapshot_started = Instant::now();
+            let snapshot = self.state_engine.snapshot();
+            self.profile_add_time("full_state_scan", snapshot_started);
+            self.profile_inc("full_state_scans", 1);
+            self.tentative_sell_manager
+                .expire(event.meta.received_at_wall_time, &snapshot)
+        } else {
+            Vec::new()
+        };
         for derived in &expired {
             self.apply_derived_runtime_event(derived)?;
         }
         if !derived_events.is_empty() || !expired.is_empty() {
-            snapshot = self.state_engine.snapshot();
-            let Some(updated_token) = snapshot.tokens.get(&mint.0).cloned() else {
+            let Some(updated_token) = self.state_engine.token(&mint).cloned() else {
                 self.refresh_health();
                 return Ok(());
             };
             token_before_risk = updated_token;
-            features = self.feature_engine.compute_snapshot(
-                &token_before_risk,
-                &snapshot,
-                event.meta.received_at_wall_time,
-            );
+            self.profile_inc("feature_compute_calls", 1);
+            let feature_started = Instant::now();
+            let (updated_features, feature_timings) =
+                self.feature_engine.compute_snapshot_profiled(
+                    &token_before_risk,
+                    &self.state_engine,
+                    event.meta.received_at_wall_time,
+                );
+            features = updated_features;
+            self.profile_add_time("feature_compute", feature_started);
+            for (stage, elapsed) in feature_timings {
+                *self
+                    .replay_profile
+                    .substage_timings_ms
+                    .entry(stage)
+                    .or_default() += elapsed;
+            }
+            self.profile_inc("cohort_recompute_count", 1);
+            self.profile_inc("holder_index_recompute_count", 1);
+            self.profile_inc("risk_compute_calls", 1);
+            let risk_started = Instant::now();
             risk = self.risk_engine.evaluate(
                 &token_before_risk,
                 &features,
                 event.meta.received_at_wall_time,
             );
+            self.profile_add_time("risk_compute", risk_started);
         }
         self.latest_features
             .insert(mint.0.clone(), features.clone());
         self.latest_risk.insert(mint.0.clone(), risk.clone());
-        if !tentative {
-            self.apply_risk_terminal(&mint, &risk, event.meta.received_at_wall_time)?;
-        }
-        snapshot = self.state_engine.snapshot();
-        let Some(token) = snapshot.tokens.get(&mint.0).cloned() else {
-            self.refresh_health();
-            return Ok(());
+        let mut token = token_before_risk;
+        if !tentative && self.apply_risk_terminal(&mint, &risk, event.meta.received_at_wall_time)? {
+            let Some(updated_token) = self.state_engine.token(&mint).cloned() else {
+                self.refresh_health();
+                return Ok(());
+            };
+            token = updated_token;
         };
+        self.profile_inc("decision_compute_calls", 1);
+        let decision_started = Instant::now();
         let mut decision = self.decision_engine.evaluate(
             &token,
             &features,
@@ -3280,6 +3398,7 @@ impl Supervisor {
             &self.resolved.loaded.config.environment.strategy_version,
             event.meta.received_at_wall_time,
         );
+        self.profile_add_time("decision_compute", decision_started);
         if tentative
             && matches!(
                 decision.decision_event.decision,
@@ -3327,6 +3446,7 @@ impl Supervisor {
             Some(event.meta.received_at_wall_time),
             decision.decision_event.clone(),
         ));
+        let decision_write_started = Instant::now();
         self.storage.append_trade_decision(&decision_record)?;
         if let Some(segment_manager) = self.segment_manager.as_mut() {
             segment_manager.append_json_record(
@@ -3335,11 +3455,14 @@ impl Supervisor {
                 decision_record.no_lookahead_timestamp,
             )?;
         }
+        self.profile_add_time("decision_write", decision_write_started);
+        self.profile_inc("rows_written", 1);
         self.decisions.push(decision.decision_event.clone());
         self.decision_outcomes.push(decision.clone());
 
         let mut fill_emitted = false;
         if self.safety.paper_allowed {
+            let paper_execution_started = Instant::now();
             if let Some(fill) = self.paper_executor.handle_decision(
                 &decision,
                 &token,
@@ -3368,6 +3491,7 @@ impl Supervisor {
                     Some(event.meta.received_at_wall_time),
                     fill.clone(),
                 ));
+                let fill_write_started = Instant::now();
                 self.storage.append_fill(&fill_record)?;
                 if let Some(segment_manager) = self.segment_manager.as_mut() {
                     segment_manager.append_json_record(
@@ -3376,8 +3500,11 @@ impl Supervisor {
                         fill_record.no_lookahead_timestamp,
                     )?;
                 }
+                self.profile_add_time("fill_write", fill_write_started);
+                self.profile_inc("rows_written", 1);
                 fill_emitted = true;
             }
+            self.profile_add_time("paper_execution", paper_execution_started);
         }
 
         if self.should_persist_feature_snapshot_for_event(
@@ -3404,10 +3531,30 @@ impl Supervisor {
                 Some(event.meta.received_at_wall_time),
                 features.clone(),
             ));
-            if let Some(segment_manager) = self.segment_manager.as_mut() {
-                segment_manager.append_feature_snapshot(&feature_record)?;
+            let dedup_started = Instant::now();
+            let identity = self.feature_snapshot_identity(&feature_record);
+            let duplicate = !self.emitted_feature_snapshot_identities.insert(identity);
+            self.profile_add_time("feature_snapshot_dedup", dedup_started);
+            if duplicate {
+                self.profile_inc("duplicate_feature_snapshots_suppressed", 1);
             } else {
-                let _ = self.storage.write_feature_snapshot(&feature_record)?;
+                let write_started = Instant::now();
+                let mut written_path = None;
+                if let Some(segment_manager) = self.segment_manager.as_mut() {
+                    segment_manager.append_feature_snapshot(&feature_record)?;
+                } else {
+                    written_path = Some(self.storage.write_feature_snapshot(&feature_record)?);
+                }
+                self.profile_add_time("feature_snapshot_write", write_started);
+                self.profile_inc("feature_snapshots_emitted", 1);
+                self.profile_inc("rows_written", 1);
+                if let Some(path) = written_path {
+                    if path.exists() {
+                        if let Ok(bytes) = serde_json::to_vec(&feature_record) {
+                            self.profile_inc("bytes_written", bytes.len() as u64 + 1);
+                        }
+                    }
+                }
             }
             self.last_feature_snapshot_at_by_mint
                 .insert(mint.0.clone(), event.meta.received_at_wall_time);
@@ -3418,7 +3565,9 @@ impl Supervisor {
     }
 
     fn apply_derived_runtime_event(&mut self, event: &NormalizedEvent) -> Result<()> {
+        let state_apply_started = Instant::now();
         self.state_engine.apply_event(event)?;
+        self.profile_add_time("state_apply_event", state_apply_started);
         if let EventPayload::DataGap(payload) = &event.payload {
             self.update_data_gap_state(payload)?;
         }
@@ -3470,7 +3619,9 @@ impl Supervisor {
                     vec![ReasonCode::CanonicalQueueOverflow],
                 )?;
                 let gap = synthetic_gap_event(event.meta.slot, EventSource::GeyserProcessed);
+                let state_apply_started = Instant::now();
                 self.state_engine.apply_event(&gap)?;
+                self.profile_add_time("state_apply_event", state_apply_started);
                 self.update_data_gap_state(match &gap.payload {
                     EventPayload::DataGap(payload) => payload,
                     _ => unreachable!("synthetic gap must be a gap event"),
@@ -3526,7 +3677,7 @@ impl Supervisor {
         mint: &PubkeyValue,
         risk: &RiskAssessment,
         observed_at: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let variant = match risk.discard_policy {
             DiscardPolicyDecision::SoftDiscard => Some(TokenTerminalVariant::SoftDiscarded),
             DiscardPolicyDecision::HardDiscard => Some(TokenTerminalVariant::HardDiscarded),
@@ -3535,7 +3686,7 @@ impl Supervisor {
             DiscardPolicyDecision::Keep | DiscardPolicyDecision::ResearchSample => None,
         };
         let Some(variant) = variant else {
-            return Ok(());
+            return Ok(false);
         };
         let event = NormalizedEvent {
             meta: EventMeta {
@@ -3566,7 +3717,9 @@ impl Supervisor {
                 details: BTreeMap::new(),
             }),
         };
+        let state_apply_started = Instant::now();
         self.state_engine.apply_event(&event)?;
+        self.profile_add_time("state_apply_event", state_apply_started);
         if self.persist_normalized_events {
             let record = self.tag_record(StoredRecord::new(
                 DatasetKind::NormalizedEventLog,
@@ -3587,7 +3740,7 @@ impl Supervisor {
             ));
             self.storage.append_normalized_event(&record)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn finalize_run(&mut self) -> Result<()> {
@@ -3698,16 +3851,37 @@ impl Supervisor {
         }
         self.tentative_sell_manager
             .persist_calibration(&self.resolved.loaded.config)?;
+        self.storage.finalize_feature_snapshot_chunks_for_run(
+            &self.resolved.loaded.config.environment.run_id,
+            self.current_scenario_id.as_deref(),
+        )?;
         self.refresh_health();
         Ok(())
     }
 
     fn refresh_health(&mut self) {
-        let snapshot = self.current_snapshot();
+        let (active_tokens, discarded_tokens, rugged_tokens) =
+            if let Some(snapshot) = self.aggregated_snapshot.as_ref() {
+                (
+                    snapshot.tokens.len(),
+                    snapshot.discarded_summaries.len(),
+                    snapshot
+                        .tokens
+                        .values()
+                        .filter(|token| token.lifecycle == TokenLifecycle::RugArchive)
+                        .count(),
+                )
+            } else {
+                (
+                    self.state_engine.token_count(),
+                    self.state_engine.discarded_token_count(),
+                    self.state_engine.rugged_token_count(),
+                )
+            };
         let budget = self.rpc_budget.summary();
         let stream_only = self.resolved.loaded.stream_only_validation_summary();
         let aggregate_mode = self.aggregated_snapshot.is_some();
-        self.health.active_tokens = snapshot.tokens.len();
+        self.health.active_tokens = active_tokens;
         self.health.active_positions = self.paper_executor.positions().len();
         self.health.paper_pnl = self.paper_executor.ledger().closed_pnl;
         self.health.realized_pnl = self.paper_executor.ledger().closed_pnl;
@@ -3733,12 +3907,8 @@ impl Supervisor {
             .map(|gap| format!("{:?}", gap.scope));
         self.health.runtime_uptime_ms =
             (unix_now() - self.started_at).whole_milliseconds().max(0) as u64;
-        self.health.discarded_tokens = snapshot.discarded_summaries.len();
-        self.health.rugged_tokens = snapshot
-            .tokens
-            .values()
-            .filter(|token| token.lifecycle == TokenLifecycle::RugArchive)
-            .count();
+        self.health.discarded_tokens = discarded_tokens;
+        self.health.rugged_tokens = rugged_tokens;
         self.health.early_intent_enabled = self.resolved.loaded.config.early_intent.enabled;
         let source_metrics = self.tentative_sell_manager.source_metrics();
         self.health.deshred_tentative_sells_total = source_metrics
@@ -3846,6 +4016,7 @@ impl Supervisor {
             latest_risk: self.latest_risk.clone(),
             snapshot: self.current_snapshot(),
             audits: self.audits.clone(),
+            replay_profile: self.replay_profile.clone(),
         }
     }
 
@@ -3861,6 +4032,9 @@ impl Supervisor {
         self.active_data_gaps.clear();
         self.aggregated_snapshot = None;
         self.audits.clear();
+        self.replay_profile = RuntimeReplayProfile::default();
+        self.emitted_feature_snapshot_identities.clear();
+        self.replay_seen_mints.clear();
         self.health.data_gap_active = false;
         self.health.data_gap_scope = None;
         self.health.paper_pnl = Decimal::ZERO;
@@ -4031,6 +4205,25 @@ impl Supervisor {
         self.safety.max_loss_allowed &= summary.safety.max_loss_allowed;
         self.safety.stale_data_allowed &= summary.safety.stale_data_allowed;
         self.safety.reason_codes.extend(summary.safety.reason_codes);
+        for (stage, elapsed) in summary.replay_profile.substage_timings_ms {
+            *self
+                .replay_profile
+                .substage_timings_ms
+                .entry(stage)
+                .or_default() += elapsed;
+        }
+        for (counter, value) in summary.replay_profile.counters {
+            let entry = self
+                .replay_profile
+                .counters
+                .entry(counter.clone())
+                .or_default();
+            if matches!(counter.as_str(), "unique_mints_seen" | "active_tokens") {
+                *entry = (*entry).max(value);
+            } else {
+                *entry += value;
+            }
+        }
     }
 
     fn update_data_gap_state(&mut self, payload: &common::DataGapEvent) -> Result<()> {

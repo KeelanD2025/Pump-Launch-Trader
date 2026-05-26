@@ -170,6 +170,7 @@ fn transaction_messages_survive_dedup_once() {
         signature: "sig-a".to_owned(),
         transaction_index: Some(1),
         succeeded: true,
+        error_code: None,
         account_keys: vec![],
         instructions: vec![TransactionInstruction {
             program_id: "Pump111111111111111111111111111111111111111".to_owned(),

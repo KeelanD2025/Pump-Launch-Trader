@@ -834,6 +834,10 @@ impl TentativeSellManager {
         matched
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn expire(
         &mut self,
         now: OffsetDateTime,

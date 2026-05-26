@@ -19,7 +19,9 @@ pub struct FeeParameters {
     pub compute_unit_price_micro_lamports: u64,
     pub tip_lamports: u64,
     pub ata_rent_lamports: u64,
+    pub creator_fee_bps: u64,
     pub protocol_fee_bps: u64,
+    pub lp_fee_bps: u64,
     pub buy_slippage_bps: u64,
     pub sell_slippage_bps: u64,
     pub failed_transaction_fee_lamports: u64,
@@ -33,7 +35,9 @@ impl Default for FeeParameters {
             compute_unit_price_micro_lamports: 50_000,
             tip_lamports: 0,
             ata_rent_lamports: 0,
-            protocol_fee_bps: 100,
+            creator_fee_bps: 30,
+            protocol_fee_bps: 95,
+            lp_fee_bps: 0,
             buy_slippage_bps: 100,
             sell_slippage_bps: 100,
             failed_transaction_fee_lamports: 5_000,
@@ -47,7 +51,9 @@ pub struct FeeBreakdown {
     pub priority_fee_quote: Decimal,
     pub tip_quote: Decimal,
     pub ata_rent_quote: Decimal,
+    pub creator_fee_quote: Decimal,
     pub protocol_fee_quote: Decimal,
+    pub lp_fee_quote: Decimal,
     pub failed_transaction_fee_quote: Decimal,
     pub total_quote: Decimal,
 }
@@ -59,6 +65,8 @@ pub struct SimulatedOrderRequest {
     pub intended_time: OffsetDateTime,
     pub signal_time: OffsetDateTime,
     pub size_quote: Decimal,
+    #[serde(default)]
+    pub size_tokens: Option<Decimal>,
     pub reference_price: Decimal,
     pub liquidity_quote_depth: Decimal,
     pub max_slippage_bps: u64,
@@ -162,20 +170,26 @@ impl FeeModel {
         } else {
             Decimal::ZERO
         };
+        let creator_fee =
+            notional_quote * Decimal::from(self.params.creator_fee_bps) / Decimal::from(10_000u64);
         let protocol_fee =
             notional_quote * Decimal::from(self.params.protocol_fee_bps) / Decimal::from(10_000u64);
+        let lp_fee =
+            notional_quote * Decimal::from(self.params.lp_fee_bps) / Decimal::from(10_000u64);
         let failed_fee = if failed {
             lamports_to_quote(self.params.failed_transaction_fee_lamports)
         } else {
             Decimal::ZERO
         };
-        let total = base + priority + tip + ata + protocol_fee + failed_fee;
+        let total = base + priority + tip + ata + creator_fee + protocol_fee + lp_fee + failed_fee;
         FeeBreakdown {
             base_fee_quote: base,
             priority_fee_quote: priority,
             tip_quote: tip,
             ata_rent_quote: ata,
+            creator_fee_quote: creator_fee,
             protocol_fee_quote: protocol_fee,
+            lp_fee_quote: lp_fee,
             failed_transaction_fee_quote: failed_fee,
             total_quote: total,
         }
@@ -203,8 +217,15 @@ impl Simulator {
     }
 
     pub fn simulate_order(&self, request: &SimulatedOrderRequest) -> SimulatedOrderResult {
+        let reference_notional = match request.side {
+            ExecutionSide::Buy => request.size_quote,
+            ExecutionSide::Sell => request
+                .size_tokens
+                .map(|tokens| tokens * request.reference_price)
+                .unwrap_or(request.size_quote),
+        };
         let impact_pct = if request.liquidity_quote_depth > Decimal::ZERO {
-            clamp_nonnegative(request.size_quote / request.liquidity_quote_depth)
+            clamp_nonnegative(reference_notional / request.liquidity_quote_depth)
         } else {
             Decimal::ONE
         };
@@ -220,15 +241,23 @@ impl Simulator {
             ExecutionSide::Sell => request.reference_price / impact_multiplier,
         };
         let landed = request.signal_time + request.latency;
-        let notional = request.size_quote;
+        let notional = match request.side {
+            ExecutionSide::Buy => request.size_quote,
+            ExecutionSide::Sell => request
+                .size_tokens
+                .map(|tokens| tokens * impacted_price)
+                .unwrap_or(request.size_quote),
+        };
         let fees = self
             .fee_model
             .fee_breakdown(notional, false, request.force_fail);
         let failed = request.force_fail;
         let filled_size = if failed || impacted_price <= Decimal::ZERO {
             Decimal::ZERO
+        } else if matches!(request.side, ExecutionSide::Sell) {
+            request.size_tokens.unwrap_or(notional / impacted_price)
         } else {
-            notional / impacted_price
+            request.size_quote / impacted_price
         };
         let fill = FillEvent {
             mint: request.mint.clone(),
@@ -238,7 +267,7 @@ impl Simulator {
             send_time: request.signal_time,
             landing_time: Some(landed),
             confirmation_time: Some(landed + Duration::milliseconds(400)),
-            intended_size: request.size_quote,
+            intended_size: request.size_tokens.unwrap_or(request.size_quote),
             filled_size,
             fill_price: impacted_price,
             notional,
@@ -312,16 +341,17 @@ impl Simulator {
             reference_price: intent.entry_price,
             liquidity_quote_depth: intent.liquidity_quote_depth,
             max_slippage_bps: self.fee_model.params.buy_slippage_bps,
+            size_tokens: None,
             latency: Duration::milliseconds(150),
             force_fail: false,
         });
-        let sell_notional = buy.fill.filled_size * intent.exit_price;
         let sell = self.simulate_order(&SimulatedOrderRequest {
             mint: intent.mint.clone(),
             side: ExecutionSide::Sell,
             intended_time: intent.exit_time,
             signal_time: intent.exit_time,
-            size_quote: sell_notional,
+            size_quote: buy.fill.filled_size * intent.exit_price,
+            size_tokens: Some(buy.fill.filled_size),
             reference_price: intent.exit_price,
             liquidity_quote_depth: intent.liquidity_quote_depth,
             max_slippage_bps: self.fee_model.params.sell_slippage_bps,
@@ -343,7 +373,7 @@ impl Simulator {
             summary.net_pnl += pnl;
             summary.fee_drag += buy.fees.total_quote + sell.fees.total_quote;
             summary.slippage_drag +=
-                buy.fill.slippage * intent.size_quote + sell.fill.slippage * intent.size_quote;
+                buy.fill.slippage * buy.fill.notional + sell.fill.slippage * sell.fill.notional;
             summary.failed_transaction_drag +=
                 buy.fees.failed_transaction_fee_quote + sell.fees.failed_transaction_fee_quote;
             summary.trade_count += 1;
@@ -716,6 +746,17 @@ mod tests {
         assert!(model.priority_fee_lamports() > 0);
         let breakdown = model.fee_breakdown(Decimal::from(10u64), false, false);
         assert!(breakdown.total_quote > Decimal::ZERO);
+        assert_eq!(model.params().creator_fee_bps, 30);
+        assert_eq!(model.params().protocol_fee_bps, 95);
+        assert_eq!(model.params().lp_fee_bps, 0);
+        assert_eq!(
+            model.params().creator_fee_bps
+                + model.params().protocol_fee_bps
+                + model.params().lp_fee_bps,
+            125
+        );
+        assert_eq!(breakdown.creator_fee_quote, dec!(0.03));
+        assert_eq!(breakdown.protocol_fee_quote, dec!(0.095));
     }
 
     #[test]
@@ -727,6 +768,7 @@ mod tests {
             intended_time: OffsetDateTime::UNIX_EPOCH,
             signal_time: OffsetDateTime::UNIX_EPOCH,
             size_quote: Decimal::from(10u64),
+            size_tokens: None,
             reference_price: dec!(0.10),
             liquidity_quote_depth: Decimal::from(20u64),
             max_slippage_bps: 150,
@@ -785,6 +827,7 @@ mod tests {
             intended_time: OffsetDateTime::UNIX_EPOCH,
             signal_time: OffsetDateTime::UNIX_EPOCH,
             size_quote: Decimal::from(10u64),
+            size_tokens: None,
             reference_price: dec!(0.10),
             liquidity_quote_depth: Decimal::from(50u64),
             max_slippage_bps: 100,
@@ -793,5 +836,39 @@ mod tests {
         });
         assert!(result.failed);
         assert!(result.fees.failed_transaction_fee_quote > Decimal::ZERO);
+    }
+
+    #[test]
+    fn sell_simulation_preserves_token_size_and_slippage_reduces_proceeds() {
+        let simulator = Simulator::new(FeeModel::default());
+        let no_slip = simulator.simulate_order(&SimulatedOrderRequest {
+            mint: pubkey("mint"),
+            side: ExecutionSide::Sell,
+            intended_time: OffsetDateTime::UNIX_EPOCH,
+            signal_time: OffsetDateTime::UNIX_EPOCH,
+            size_quote: Decimal::from(10u64),
+            size_tokens: Some(Decimal::from(100u64)),
+            reference_price: dec!(0.10),
+            liquidity_quote_depth: Decimal::from(1_000_000u64),
+            max_slippage_bps: 0,
+            latency: Duration::milliseconds(100),
+            force_fail: false,
+        });
+        let slipped = simulator.simulate_order(&SimulatedOrderRequest {
+            mint: pubkey("mint"),
+            side: ExecutionSide::Sell,
+            intended_time: OffsetDateTime::UNIX_EPOCH,
+            signal_time: OffsetDateTime::UNIX_EPOCH,
+            size_quote: Decimal::from(10u64),
+            size_tokens: Some(Decimal::from(100u64)),
+            reference_price: dec!(0.10),
+            liquidity_quote_depth: Decimal::from(1_000_000u64),
+            max_slippage_bps: 100,
+            latency: Duration::milliseconds(100),
+            force_fail: false,
+        });
+        assert_eq!(slipped.fill.filled_size, Decimal::from(100u64));
+        assert!(slipped.fill.fill_price < no_slip.fill.fill_price);
+        assert!(slipped.fill.notional < no_slip.fill.notional);
     }
 }

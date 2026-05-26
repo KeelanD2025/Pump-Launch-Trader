@@ -10,11 +10,14 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::Engine as _;
 use common::{
-    BondingCurveUpdateEvent, Canonicality, DataGapEvent, DataGapType, EventMeta, EventPayload,
-    EventSource, GapSeverity, HolderBalanceUpdateEvent, Lamports, LoadedConfig, NormalizedEvent,
-    ObservedTransactionEvent, PubkeyValue, PumpBuyEvent, PumpSellEvent, QuoteAssetType,
-    RawEventReference, TokenCreatedEvent, TokenProgramType, TransactionStatus, WalletFundingEvent,
-    monotonic_now_ns,
+    BondingCurveUpdateEvent, Canonicality, DEFAULT_PUMP_TOKEN_DECIMALS, DataGapEvent, DataGapType,
+    EventMeta, EventPayload, EventSource, GapSeverity, HolderBalanceUpdateEvent, Lamports,
+    LoadedConfig, NormalizedEvent, ObservedTransactionEvent, PUMP_TOTAL_SUPPLY_UI, PubkeyValue,
+    PumpBuyEvent, PumpSellEvent, QuoteAssetType, RawEventReference, TokenCreatedEvent,
+    TokenProgramType, TransactionStatus, WalletFundingEvent, monotonic_now_ns,
+    price_lamports_per_raw_token, pump_curve_progress_pct_from_real_token_reserves_raw,
+    pump_market_cap_quote_1b, pump_market_cap_quote_total_supply,
+    pump_virtual_reserve_price_sol_per_token,
 };
 use futures::Stream;
 use idl::{AccountDecode, InstructionDecode, LoadedIdl};
@@ -25,6 +28,7 @@ use ingest_geyser::{
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -381,6 +385,7 @@ impl GeyserEventNormalizer {
                 slot_hint: Some(update.slot),
                 entry_index: Some(0),
                 tx_position_estimate: update.transaction_index,
+                signer: update.account_keys.first().cloned(),
                 program_ids: update
                     .instructions
                     .iter()
@@ -388,6 +393,18 @@ impl GeyserEventNormalizer {
                     .collect(),
                 account_count: update.account_keys.len(),
                 instruction_count: update.instructions.len(),
+                account_list_hash: Some(hash_strings(&update.account_keys)),
+                instruction_shape_hash: Some(hash_instruction_shape(&update.instructions)),
+                compute_unit_limit: compute_budget.0,
+                compute_unit_price: compute_budget.1,
+                estimated_priority_fee_lamports: compute_budget.0.zip(compute_budget.1).map(
+                    |(limit, price)| Lamports((limit as u64).saturating_mul(price) / 1_000_000),
+                ),
+                tx_fee_lamports: Some(Lamports(update.fee_lamports)),
+                compute_units_consumed: update.compute_units_consumed,
+                failed_transaction: !update.succeeded,
+                error_code: update.error_code.clone(),
+                bundle_like_evidence: bundle_like_evidence(&update, compute_budget),
                 raw_packet_hash: format!("{observed_source_prefix}:{}", update.signature),
                 first_seen_by_shred_ns: if meta.canonicality == Canonicality::Tentative {
                     meta.observed_at_monotonic_ns
@@ -660,6 +677,17 @@ impl GeyserEventNormalizer {
                 .get("complete")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let token_decimals = DEFAULT_PUMP_TOKEN_DECIMALS;
+            let price_lamports_per_raw = price_lamports_per_raw_token(virtual_quote, virtual_token);
+            let price_sol_per_token = pump_virtual_reserve_price_sol_per_token(
+                virtual_quote,
+                virtual_token,
+                token_decimals,
+            )
+            .unwrap_or(Decimal::ZERO);
+            let curve_progress_pct =
+                pump_curve_progress_pct_from_real_token_reserves_raw(real_token, token_decimals);
+            let market_cap_quote_1b = pump_market_cap_quote_1b(price_sol_per_token);
             return vec![NormalizedEvent {
                 meta,
                 payload: EventPayload::BondingCurveUpdate(BondingCurveUpdateEvent {
@@ -668,13 +696,33 @@ impl GeyserEventNormalizer {
                     virtual_token_reserves: virtual_token,
                     real_quote_reserves: real_quote,
                     real_token_reserves: real_token,
-                    price: safe_price(real_quote.max(virtual_quote), real_token.max(virtual_token)),
-                    market_cap_proxy: Some(real_quote.max(virtual_quote)),
-                    curve_completion_pct: Some(if complete {
+                    token_decimals: Some(token_decimals),
+                    price_lamports_per_raw_token: price_lamports_per_raw,
+                    price_sol_per_token: Some(price_sol_per_token),
+                    reserve_price_source: Some("virtual_reserves".to_owned()),
+                    reserve_price_confidence: Some(if price_lamports_per_raw.is_some() {
                         Decimal::ONE
                     } else {
                         Decimal::ZERO
                     }),
+                    price: price_sol_per_token,
+                    market_cap_quote_1b: Some(market_cap_quote_1b),
+                    market_cap_quote_total_supply: Some(pump_market_cap_quote_total_supply(
+                        price_sol_per_token,
+                        Decimal::from(PUMP_TOTAL_SUPPLY_UI),
+                    )),
+                    market_cap_source: Some("price_times_supply".to_owned()),
+                    market_cap_confidence: Some(if price_lamports_per_raw.is_some() {
+                        Decimal::ONE
+                    } else {
+                        Decimal::ZERO
+                    }),
+                    market_cap_proxy: None,
+                    curve_complete_flag: Some(complete),
+                    curve_progress_pct,
+                    curve_progress_source: Some("real_token_reserves_ui_minus_reserved".to_owned()),
+                    curve_progress_confidence: curve_progress_pct.map(|_| Decimal::ONE),
+                    curve_completion_pct: curve_progress_pct,
                     quote_reserve_delta: None,
                     token_reserve_delta: None,
                     update_reason: "geyser_account_update".to_owned(),
@@ -1616,6 +1664,45 @@ fn parse_compute_budget(instructions: &[TransactionInstruction]) -> (Option<u32>
     (unit_limit, unit_price)
 }
 
+fn hash_strings(values: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.as_bytes());
+        hasher.update([0xff]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_instruction_shape(instructions: &[TransactionInstruction]) -> String {
+    let mut hasher = Sha256::new();
+    for instruction in instructions {
+        hasher.update(instruction.program_id.as_bytes());
+        hasher.update([0xfe]);
+        hasher.update(instruction.accounts.len().to_string().as_bytes());
+        hasher.update([0xfd]);
+        hasher.update(instruction.data_hex.len().to_string().as_bytes());
+        hasher.update([0xfc]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn bundle_like_evidence(
+    update: &TransactionUpdate,
+    compute_budget: (Option<u32>, Option<u64>),
+) -> Option<String> {
+    let mut evidence = Vec::new();
+    if update.transaction_index.is_some() {
+        evidence.push("transaction_index_observed");
+    }
+    if compute_budget.1.unwrap_or_default() > 0 {
+        evidence.push("priority_fee_bid_observed");
+    }
+    if update.compute_units_consumed.is_some() {
+        evidence.push("compute_units_observed");
+    }
+    (!evidence.is_empty()).then(|| evidence.join("|"))
+}
+
 fn holder_balance_events(meta: &EventMeta, update: &TransactionUpdate) -> Vec<NormalizedEvent> {
     let mut pre = HashMap::<(String, String), (Option<String>, Decimal, u32)>::new();
     for balance in &update.pre_token_balances {
@@ -1643,6 +1730,7 @@ fn holder_balance_events(meta: &EventMeta, update: &TransactionUpdate) -> Vec<No
             .map(|(_, amount, _)| *amount);
         let new_balance = token_amount(balance);
         let delta = new_balance - old.unwrap_or(Decimal::ZERO);
+        let token_decimals = u8::try_from(balance.decimals).ok();
         let mut holder_meta = meta.clone();
         holder_meta.account_pubkey = Some(PubkeyValue(account_key_at(
             &update.account_keys,
@@ -1657,6 +1745,7 @@ fn holder_balance_events(meta: &EventMeta, update: &TransactionUpdate) -> Vec<No
                     &update.account_keys,
                     balance.account_index,
                 )),
+                token_decimals,
                 old_balance: old,
                 new_balance,
                 delta,

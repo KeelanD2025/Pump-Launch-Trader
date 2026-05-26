@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Context, Result, anyhow};
 use common::{LoadedConfig, RuntimeModeName, SCHEMA_VERSION};
 use features::FeatureSnapshot;
 use r2_storage::{R2Client, SegmentIntegrityValidationOptions, SegmentIntegrityValidator};

@@ -1,13 +1,14 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use common::{
     EventPayload, FillEvent, NormalizedEvent, ReasonCode, SCHEMA_VERSION, StorageConfig,
-    TradeDecisionEvent,
+    TradeDecisionEvent, config::ResearchWorkerPersistenceConfig,
 };
 use features::{FeatureDatum, FeatureEngine, FeatureSnapshot};
 use rust_decimal::Decimal;
@@ -404,11 +405,23 @@ impl StorageLayout {
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
     layout: StorageLayout,
+    feature_snapshot_persistence: ResearchWorkerPersistenceConfig,
 }
 
 impl StorageEngine {
     pub fn new(layout: StorageLayout) -> Self {
-        Self { layout }
+        Self {
+            layout,
+            feature_snapshot_persistence: ResearchWorkerPersistenceConfig::default(),
+        }
+    }
+
+    pub fn with_feature_snapshot_persistence(
+        mut self,
+        config: ResearchWorkerPersistenceConfig,
+    ) -> Self {
+        self.feature_snapshot_persistence = config;
+        self
     }
 
     pub fn layout(&self) -> &StorageLayout {
@@ -801,6 +814,9 @@ impl StorageEngine {
         &self,
         record: &StoredRecord<FeatureSnapshot>,
     ) -> Result<PathBuf, StorageError> {
+        if self.feature_snapshot_persistence.disable_per_snapshot_files {
+            return self.write_feature_snapshot_chunked(record);
+        }
         let path = scoped_snapshot_path(
             &self.layout.feature_snapshot_dir,
             record.run_id.as_deref(),
@@ -815,6 +831,91 @@ impl StorageEngine {
         Ok(path)
     }
 
+    fn write_feature_snapshot_chunked(
+        &self,
+        record: &StoredRecord<FeatureSnapshot>,
+    ) -> Result<PathBuf, StorageError> {
+        let run_id = record.run_id.as_deref().unwrap_or("_legacy");
+        let scenario_id = record.scenario_id.as_deref().unwrap_or("_all");
+        let base_dir = self
+            .layout
+            .feature_snapshot_dir
+            .join(run_id)
+            .join(scenario_id);
+        fs::create_dir_all(&base_dir)?;
+        let mut writers = feature_snapshot_writers().lock().map_err(|_| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "feature snapshot writer lock poisoned",
+            ))
+        })?;
+        let chunk_rows = self
+            .feature_snapshot_persistence
+            .feature_snapshot_chunk_rows
+            .max(1);
+        if let Some(existing) = writers.get_mut(&base_dir) {
+            if existing.row_count >= chunk_rows {
+                let existing = writers.remove(&base_dir).expect("writer exists");
+                finalize_feature_chunk_writer(existing, &self.feature_snapshot_persistence)?;
+            }
+        }
+        if !writers.contains_key(&base_dir) {
+            let chunk_index = next_feature_snapshot_chunk_index(&base_dir)?;
+            writers.insert(
+                base_dir.clone(),
+                FeatureSnapshotChunkWriter::new(base_dir.clone(), chunk_index)?,
+            );
+        }
+        let writer = writers.get_mut(&base_dir).expect("writer inserted");
+        let mut raw = serde_json::to_vec(record)?;
+        raw.push(b'\n');
+        writer.writer.write_all(&raw)?;
+        writer.row_count = writer.row_count.saturating_add(1);
+        Ok(writer.open_path.clone())
+    }
+
+    pub fn finalize_feature_snapshot_chunks_for_run(
+        &self,
+        run_id: &str,
+        scenario_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let run_dir = self.layout.feature_snapshot_dir.join(run_id);
+        let target_dir = scenario_id.map(|scenario| run_dir.join(scenario));
+        {
+            let mut writers = feature_snapshot_writers().lock().map_err(|_| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "feature snapshot writer lock poisoned",
+                ))
+            })?;
+            let keys = writers
+                .keys()
+                .filter(|path| {
+                    target_dir
+                        .as_ref()
+                        .map(|target| path.starts_with(target))
+                        .unwrap_or_else(|| path.starts_with(&run_dir))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in keys {
+                if let Some(writer) = writers.remove(&key) {
+                    finalize_feature_chunk_writer(writer, &self.feature_snapshot_persistence)?;
+                }
+            }
+        }
+        let manifest_roots = if let Some(target) = target_dir {
+            vec![target]
+        } else {
+            feature_snapshot_leaf_dirs(&run_dir)?
+        };
+        for dir in manifest_roots {
+            finalize_open_feature_chunks_in_dir(&dir, &self.feature_snapshot_persistence)?;
+            write_feature_snapshot_chunk_manifest(&dir)?;
+        }
+        Ok(())
+    }
+
     pub fn export_feature_snapshots_csv(
         &self,
         records: &[StoredRecord<FeatureSnapshot>],
@@ -822,14 +923,19 @@ impl StorageEngine {
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
         let path = report_artifact_path(&self.layout, associated_run_id, filename);
-        let mut file = File::create(&path)?;
+        let mut file = BufWriter::new(File::create(&path)?);
         let feature_engine = FeatureEngine::default();
         let run_lookup = latest_run_lookup(self.list_runs()?);
         let mut decision_lookup = std::collections::HashMap::<
             (String, Option<String>, String),
             StoredRecord<TradeDecisionEvent>,
         >::new();
-        for record in self.read_trade_decisions()? {
+        let decision_records = if let Some(run_id) = associated_run_id {
+            self.read_trade_decisions_filtered(Some(run_id), None)?
+        } else {
+            self.read_trade_decisions()?
+        };
+        for record in decision_records {
             let Some(run_id) = &record.run_id else {
                 continue;
             };
@@ -1112,9 +1218,14 @@ impl StorageEngine {
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
         let path = report_artifact_path(&self.layout, associated_run_id, filename);
-        let mut file = File::create(&path)?;
+        let mut file = BufWriter::new(File::create(&path)?);
         let run_lookup = latest_run_lookup(self.list_runs()?);
-        let feature_lookup = feature_snapshot_lookup(self.read_all_feature_snapshots()?);
+        let feature_records = if let Some(run_id) = associated_run_id {
+            self.read_feature_snapshots_filtered(Some(run_id), None)?
+        } else {
+            self.read_all_feature_snapshots()?
+        };
+        let feature_lookup = feature_snapshot_lookup(feature_records);
         writeln!(
             file,
             "run_id,source_run_id,scenario_id,run_kind,run_role,schema_version,config_hash,idl_hash,calibration_snapshot_hash,runtime_sequence_number,event_id,source_event_id,trigger_event_id,decision_id,mint,strategy,decision_type,reason_codes,feature_snapshot_hash,risk_snapshot_hash,expected_net_edge_quote,expected_net_edge_pct,expected_executable_edge_confidence,shred_warning_active,emergency_exit_net_benefit,data_gap_scope,source,canonicality,decision_time"
@@ -1228,7 +1339,7 @@ impl StorageEngine {
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
         let path = report_artifact_path(&self.layout, associated_run_id, filename);
-        let mut file = File::create(&path)?;
+        let mut file = BufWriter::new(File::create(&path)?);
         let run_lookup = latest_run_lookup(self.list_runs()?);
         writeln!(
             file,
@@ -1538,7 +1649,7 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-fn write_csv_row(file: &mut File, row: &[String]) -> Result<(), StorageError> {
+fn write_csv_row<W: Write>(file: &mut W, row: &[String]) -> Result<(), StorageError> {
     let rendered = row.iter().map(|cell| csv_field(cell)).collect::<Vec<_>>();
     writeln!(file, "{}", rendered.join(","))?;
     Ok(())
@@ -1719,6 +1830,287 @@ fn scoped_snapshot_path(
     Ok(path)
 }
 
+struct FeatureSnapshotChunkWriter {
+    base_dir: PathBuf,
+    open_path: PathBuf,
+    chunk_index: usize,
+    row_count: usize,
+    writer: BufWriter<File>,
+}
+
+impl FeatureSnapshotChunkWriter {
+    fn new(base_dir: PathBuf, chunk_index: usize) -> Result<Self, StorageError> {
+        fs::create_dir_all(&base_dir)?;
+        let open_path = base_dir.join(format!("feature_snapshots_{chunk_index:05}.jsonl.open"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&open_path)?;
+        Ok(Self {
+            base_dir,
+            open_path,
+            chunk_index,
+            row_count: 0,
+            writer: BufWriter::new(file),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeatureSnapshotChunkManifest {
+    format: String,
+    total_rows: usize,
+    chunks: Vec<FeatureSnapshotChunkManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeatureSnapshotChunkManifestEntry {
+    path: String,
+    chunk_index: usize,
+    row_count: usize,
+    size_bytes: u64,
+    checksum_sha256: String,
+    compression: String,
+}
+
+static FEATURE_SNAPSHOT_WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, FeatureSnapshotChunkWriter>>> =
+    OnceLock::new();
+
+fn feature_snapshot_writers() -> &'static Mutex<BTreeMap<PathBuf, FeatureSnapshotChunkWriter>> {
+    FEATURE_SNAPSHOT_WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn next_feature_snapshot_chunk_index(base_dir: &Path) -> Result<usize, StorageError> {
+    let mut max_index = 0usize;
+    if base_dir.exists() {
+        for entry in fs::read_dir(base_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if let Some(index) = parse_feature_chunk_index(name) {
+                max_index = max_index.max(index);
+            }
+        }
+    }
+    Ok(max_index.saturating_add(1))
+}
+
+fn parse_feature_chunk_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("feature_snapshots_")?;
+    let digits = rest.get(..5)?;
+    if !digits.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn finalize_feature_chunk_writer(
+    mut writer: FeatureSnapshotChunkWriter,
+    config: &ResearchWorkerPersistenceConfig,
+) -> Result<PathBuf, StorageError> {
+    writer.writer.flush()?;
+    writer.writer.get_ref().sync_all()?;
+    drop(writer.writer);
+    finalize_feature_chunk_file(
+        &writer.base_dir,
+        writer.chunk_index,
+        &writer.open_path,
+        config,
+    )
+}
+
+fn finalize_feature_chunk_file(
+    base_dir: &Path,
+    chunk_index: usize,
+    open_path: &Path,
+    config: &ResearchWorkerPersistenceConfig,
+) -> Result<PathBuf, StorageError> {
+    if !open_path.exists() {
+        return Ok(open_path.to_path_buf());
+    }
+    let compress = config.feature_snapshot_compress
+        || config
+            .feature_snapshot_format
+            .trim()
+            .eq_ignore_ascii_case("jsonl.zst");
+    let final_path = if compress {
+        base_dir.join(format!("feature_snapshots_{chunk_index:05}.jsonl.zst"))
+    } else {
+        base_dir.join(format!("feature_snapshots_{chunk_index:05}.jsonl"))
+    };
+    if compress {
+        let mut input = File::open(open_path)?;
+        let mut output = File::create(&final_path)?;
+        zstd::stream::copy_encode(&mut input, &mut output, 3)?;
+        output.sync_all()?;
+        fs::remove_file(open_path)?;
+    } else {
+        fs::rename(open_path, &final_path)?;
+    }
+    Ok(final_path)
+}
+
+fn finalize_open_feature_chunks_in_dir(
+    dir: &Path,
+    config: &ResearchWorkerPersistenceConfig,
+) -> Result<(), StorageError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            finalize_open_feature_chunks_in_dir(&path, config)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jsonl.open") {
+            continue;
+        }
+        if let Some(index) = parse_feature_chunk_index(name) {
+            finalize_feature_chunk_file(dir, index, &path, config)?;
+        }
+    }
+    Ok(())
+}
+
+fn feature_snapshot_leaf_dirs(run_dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
+    let mut dirs = Vec::new();
+    if !run_dir.exists() {
+        return Ok(dirs);
+    }
+    for entry in fs::read_dir(run_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.extend(feature_snapshot_leaf_dirs(&path)?);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(run_dir.to_path_buf());
+    }
+    Ok(dirs)
+}
+
+fn write_feature_snapshot_chunk_manifest(dir: &Path) -> Result<(), StorageError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_feature_snapshot_chunk_file(&path) {
+            continue;
+        }
+        let raw = fs::read(&path)?;
+        let decoded = read_feature_snapshot_chunk_bytes(&path)?;
+        let row_count = decoded
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        let mut hasher = Sha256::new();
+        hasher.update(&raw);
+        let checksum_sha256 = format!("{:x}", hasher.finalize());
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        entries.push(FeatureSnapshotChunkManifestEntry {
+            chunk_index: parse_feature_chunk_index(&name).unwrap_or_default(),
+            path: name,
+            row_count,
+            size_bytes: raw.len() as u64,
+            checksum_sha256,
+            compression: if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.ends_with(".zst"))
+                .unwrap_or(false)
+            {
+                "zstd".to_owned()
+            } else {
+                "none".to_owned()
+            },
+        });
+    }
+    entries.sort_by(|left, right| left.chunk_index.cmp(&right.chunk_index));
+    let total_rows = entries.iter().map(|entry| entry.row_count).sum();
+    let manifest = FeatureSnapshotChunkManifest {
+        format: "stored_record_feature_snapshot_jsonl".to_owned(),
+        total_rows,
+        chunks: entries,
+    };
+    write_json(
+        &dir.join("feature_snapshot_chunks_manifest.json"),
+        &manifest,
+    )?;
+    Ok(())
+}
+
+fn is_ignored_artifact_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".DS_Store" | "Thumbs.db" | ".Spotlight-V100" | ".fseventsd" | "__MACOSX"
+    ) || name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".tmp")
+}
+
+fn is_feature_snapshot_chunk_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    name.starts_with("feature_snapshots_")
+        && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+}
+
+fn read_feature_snapshot_chunk_bytes(path: &Path) -> Result<String, StorageError> {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Ok(String::new());
+    };
+    if name.ends_with(".zst") {
+        let mut file = File::open(path)?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        let decoded = zstd::decode_all(raw.as_slice())?;
+        Ok(String::from_utf8_lossy(&decoded).to_string())
+    } else {
+        Ok(fs::read_to_string(path)?)
+    }
+}
+
+fn read_feature_snapshot_chunk_file(
+    path: &Path,
+    out: &mut Vec<StoredRecord<FeatureSnapshot>>,
+) -> Result<(), StorageError> {
+    let decoded = read_feature_snapshot_chunk_bytes(path)?;
+    for line in decoded.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<StoredRecord<FeatureSnapshot>>(line) {
+            Ok(record) => out.push(record),
+            Err(err) => eprintln!(
+                "warning: skipping malformed JSON artifact {}: {}",
+                path.display(),
+                err
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn read_feature_snapshot_dir(
     dir: &Path,
     out: &mut Vec<StoredRecord<FeatureSnapshot>>,
@@ -1729,11 +2121,25 @@ fn read_feature_snapshot_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if is_ignored_artifact_path(&path) {
+            continue;
+        }
         if path.is_dir() {
             read_feature_snapshot_dir(&path, out)?;
         } else if path.is_file() {
-            if let Some(record) = read_json_best_effort(&path)? {
-                out.push(record);
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name == "feature_snapshot_chunks_manifest.json" || name.ends_with(".open") {
+                continue;
+            }
+            if is_feature_snapshot_chunk_file(&path) {
+                read_feature_snapshot_chunk_file(&path, out)?;
+            } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                if let Some(record) = read_json_best_effort(&path)? {
+                    out.push(record);
+                }
             }
         }
     }
@@ -1750,9 +2156,14 @@ fn read_token_summary_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if is_ignored_artifact_path(&path) {
+            continue;
+        }
         if path.is_dir() {
             read_token_summary_dir(&path, out)?;
-        } else if path.is_file() {
+        } else if path.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("json")
+        {
             if let Some(record) = read_json_best_effort(&path)? {
                 out.push(record);
             }
@@ -2282,6 +2693,9 @@ mod tests {
         store
             .write_feature_snapshot(&feature_record)
             .expect("write feature");
+        store
+            .finalize_feature_snapshot_chunks_for_run("run-good", None)
+            .expect("finalize feature chunks");
         let bad_dir = store
             .layout
             .feature_snapshot_dir
@@ -2289,10 +2703,60 @@ mod tests {
             .join("_all");
         fs::create_dir_all(&bad_dir).expect("bad dir");
         fs::write(bad_dir.join("broken.json"), b"{\"unterminated\":\"value").expect("bad write");
+        fs::write(bad_dir.join(".DS_Store"), b"mac junk").expect("junk write");
 
         let records = store.read_all_feature_snapshots().expect("bulk read");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].run_id.as_deref(), Some("run-good"));
+    }
+
+    #[test]
+    fn feature_snapshots_are_written_in_chunk_manifest() {
+        let store = storage();
+        let mut engine = StateEngine::new(ttl());
+        engine.apply_event(&token_created()).expect("create");
+        let snapshot = engine.snapshot();
+        let token = snapshot.tokens.get("mint").expect("token");
+        for offset in 0..3 {
+            let feature_snapshot = FeatureEngine::default().compute_snapshot(
+                token,
+                &snapshot,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(5 + offset),
+            );
+            let feature_record = StoredRecord::new(
+                DatasetKind::TokenFeatureSnapshots,
+                "config-hash",
+                "idl-hash",
+                Some("strategy-v1".to_owned()),
+                "feature_engine",
+                "processed",
+                Some(feature_snapshot.observed_at),
+                feature_snapshot,
+            )
+            .with_run_id("run-chunked");
+            store
+                .write_feature_snapshot(&feature_record)
+                .expect("write feature");
+        }
+        store
+            .finalize_feature_snapshot_chunks_for_run("run-chunked", None)
+            .expect("finalize chunks");
+        let manifest_path = store
+            .layout
+            .feature_snapshot_dir
+            .join("run-chunked")
+            .join("_all")
+            .join("feature_snapshot_chunks_manifest.json");
+        assert!(manifest_path.exists());
+        let manifest: FeatureSnapshotChunkManifest =
+            serde_json::from_slice(&fs::read(manifest_path).expect("manifest bytes"))
+                .expect("manifest json");
+        assert_eq!(manifest.total_rows, 3);
+        assert_eq!(manifest.chunks.len(), 1);
+        let records = store
+            .read_feature_snapshots_filtered(Some("run-chunked"), None)
+            .expect("read chunks");
+        assert_eq!(records.len(), 3);
     }
 
     #[test]

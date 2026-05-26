@@ -496,9 +496,10 @@ impl R2Client {
         let local_path = local_path.to_path_buf();
         let content_type = content_type.into();
         let mut body = fs::read(&local_path)?;
-        let already_compressed = is_zstd_payload_path(&local_path) || content_type_is_zstd(&content_type);
-        let compress = compress_override
-            .unwrap_or(self.config.compress_before_upload && !already_compressed);
+        let already_compressed =
+            is_zstd_payload_path(&local_path) || content_type_is_zstd(&content_type);
+        let compress =
+            compress_override.unwrap_or(self.config.compress_before_upload && !already_compressed);
         let compression = normalize_compression(&self.config.compression);
         let compressed = compress && compression.as_deref() == Some("zstd");
         if compressed {
@@ -894,9 +895,7 @@ fn is_zstd_payload_path(path: &Path) -> bool {
 
 fn content_type_is_zstd(content_type: &str) -> bool {
     let lower = content_type.to_ascii_lowercase();
-    lower.contains("zstd")
-        || lower.contains("zst")
-        || lower == "application/octet-stream+zstd"
+    lower.contains("zstd") || lower.contains("zst") || lower == "application/octet-stream+zstd"
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -1027,8 +1026,12 @@ mod tests {
     fn zstd_payloads_are_not_double_compressed_by_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("segment_normalized_events_00010.jsonl.zst");
-        let payload = zstd::stream::encode_all(br#"{"event":"ok"}
-"#.as_slice(), 3)
+        let payload = zstd::stream::encode_all(
+            br#"{"event":"ok"}
+"#
+            .as_slice(),
+            3,
+        )
         .expect("zstd");
         fs::write(&path, &payload).expect("write");
         with_env_vars(
@@ -1061,9 +1064,13 @@ mod tests {
 
     #[test]
     fn segment_integrity_validator_accepts_valid_zstd_jsonl() {
-        let payload = zstd::stream::encode_all(br#"{"event":"one"}
+        let payload = zstd::stream::encode_all(
+            br#"{"event":"one"}
 {"event":"two"}
-"#.as_slice(), 3)
+"#
+            .as_slice(),
+            3,
+        )
         .expect("zstd");
         let report = SegmentIntegrityValidator::validate_bytes(
             &payload,
@@ -1084,8 +1091,7 @@ mod tests {
 
     #[test]
     fn segment_integrity_validator_rejects_missing_final_newline() {
-        let payload = zstd::stream::encode_all(br#"{"event":"one"}"#.as_slice(), 3)
-            .expect("zstd");
+        let payload = zstd::stream::encode_all(br#"{"event":"one"}"#.as_slice(), 3).expect("zstd");
         let report = SegmentIntegrityValidator::validate_bytes(
             &payload,
             SegmentIntegrityValidationOptions {
@@ -1097,7 +1103,12 @@ mod tests {
             },
         );
         assert!(!report.valid);
-        assert!(report.errors.iter().any(|error| error == "missing_final_newline"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error == "missing_final_newline")
+        );
     }
 
     #[test]
@@ -1114,13 +1125,20 @@ mod tests {
             },
         );
         assert!(!report.valid);
-        assert!(report.errors.iter().any(|error| error == "jsonl_parse_failed"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error == "jsonl_parse_failed")
+        );
     }
 
     #[test]
     fn segment_integrity_validator_rejects_open_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("segment_normalized_events_00001.jsonl.open");
+        let path = dir
+            .path()
+            .join("segment_normalized_events_00001.jsonl.open");
         fs::write(&path, b"{\"event\":\"one\"}\n").expect("write");
         let report = SegmentIntegrityValidator::validate_file(
             &path,
@@ -1135,13 +1153,22 @@ mod tests {
         .expect("validate");
         assert!(!report.valid);
         assert!(report.path_is_open);
-        assert!(report.errors.iter().any(|error| error == "open_segment_path"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error == "open_segment_path")
+        );
     }
 
     #[test]
     fn segment_integrity_validator_flags_double_compressed_zstd() {
-        let payload = zstd::stream::encode_all(br#"{"event":"one"}
-"#.as_slice(), 3)
+        let payload = zstd::stream::encode_all(
+            br#"{"event":"one"}
+"#
+            .as_slice(),
+            3,
+        )
         .expect("zstd");
         let double_compressed = zstd::stream::encode_all(payload.as_slice(), 3).expect("zstd");
         let report = SegmentIntegrityValidator::validate_bytes(
@@ -1156,10 +1183,12 @@ mod tests {
         );
         assert!(!report.valid);
         assert!(report.decoded_prefix_is_zstd);
-        assert!(report
-            .errors
-            .iter()
-            .any(|error| error.contains("double_compression")));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("double_compression"))
+        );
     }
 
     #[test]

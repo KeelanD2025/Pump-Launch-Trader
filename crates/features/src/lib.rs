@@ -1,10 +1,22 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::Instant,
+};
 
-use common::{EventSource, PubkeyValue, TentativeSellRiskLevel};
+pub mod metric_engine;
+
+use common::{
+    EventSource, PUMP_TOTAL_SUPPLY_UI, PubkeyValue, TentativeSellRiskLevel, raw_tokens_to_ui,
+    ui_tokens_to_raw,
+};
+use metric_engine::{MetricConfidence, MetricEngine, metric_decimal};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use state::{StateSnapshot, TokenLifecycle, TokenState};
+use state::{
+    ClusterIndex, FundingGraph, StateEngine, StateSnapshot, TokenLifecycle, TokenState,
+    WalletSummary,
+};
 use time::{Duration, OffsetDateTime};
 
 const WINDOW_5S: Duration = Duration::seconds(5);
@@ -284,6 +296,10 @@ impl Default for FeatureRegistry {
             "creator_is_top3_holder",
             "creator_is_top5_holder",
             "creator_is_top10_holder",
+            "dev_balance",
+            "creator_ownership_pct",
+            "dev_holding_pct_total_supply",
+            "dev_holding_pct_circulating",
         ] {
             registry.register_core(
                 feature_id,
@@ -299,9 +315,19 @@ impl Default for FeatureRegistry {
             "virtual_token_reserves",
             "real_quote_reserves",
             "real_token_reserves",
+            "token_decimals",
+            "price_lamports_per_raw_token",
+            "price_sol_per_token",
+            "reserve_price_confidence",
             "price_current",
             "price_launch",
             "price_change_from_launch_pct",
+            "market_cap_quote_1b",
+            "market_cap_quote_total_supply",
+            "market_cap_confidence",
+            "curve_complete_flag",
+            "curve_progress_pct",
+            "curve_progress_confidence",
             "curve_completion_pct",
             "curve_staleness_ms",
             "quote_asset_specific_depth_score",
@@ -374,6 +400,11 @@ impl Default for FeatureRegistry {
 
         for feature_id in [
             "holder_count_current",
+            "holder_count_owner_wallets",
+            "holder_count_excluding_curve",
+            "holder_count_excluding_curve_and_dev",
+            "observed_holder_supply",
+            "circulating_holder_supply",
             "holder_growth_rate",
             "holders_with_nonzero_balance",
             "average_holder_balance",
@@ -382,12 +413,23 @@ impl Default for FeatureRegistry {
             "holder_balance_gini",
             "holder_balance_hhi",
             "top1_holder_pct",
+            "top1_holder_pct_observed",
+            "top1_holder_pct_total_supply",
+            "top1_holder_pct_circulating",
             "top3_holder_pct",
             "top5_holder_pct",
             "top10_holder_pct",
             "top20_holder_pct",
             "holder_distribution_improvement_score",
             "sustained_holder_growth_score",
+            "holder_metric_confidence",
+            "missing_owner_mapping_count",
+            "holder_updates_seen",
+            "holder_updates_applied",
+            "holder_updates_deduped",
+            "holder_owner_changes",
+            "holder_missing_owner_mapping",
+            "holder_fallback_trade_updates_used",
         ] {
             registry.register_core(
                 feature_id,
@@ -825,6 +867,49 @@ pub struct FeatureEngine {
     registry: FeatureRegistry,
 }
 
+pub trait FeatureStateView {
+    fn tokens(&self) -> &HashMap<String, TokenState>;
+    fn wallets(&self) -> &HashMap<String, WalletSummary>;
+    fn funding_graph(&self) -> &FundingGraph;
+    fn cluster_index(&self) -> &ClusterIndex;
+}
+
+impl FeatureStateView for StateSnapshot {
+    fn tokens(&self) -> &HashMap<String, TokenState> {
+        &self.tokens
+    }
+
+    fn wallets(&self) -> &HashMap<String, WalletSummary> {
+        &self.wallets
+    }
+
+    fn funding_graph(&self) -> &FundingGraph {
+        &self.funding_graph
+    }
+
+    fn cluster_index(&self) -> &ClusterIndex {
+        &self.cluster_index
+    }
+}
+
+impl FeatureStateView for StateEngine {
+    fn tokens(&self) -> &HashMap<String, TokenState> {
+        self.tokens()
+    }
+
+    fn wallets(&self) -> &HashMap<String, WalletSummary> {
+        self.wallets()
+    }
+
+    fn funding_graph(&self) -> &FundingGraph {
+        self.funding_graph()
+    }
+
+    fn cluster_index(&self) -> &ClusterIndex {
+        self.cluster_index()
+    }
+}
+
 impl Default for FeatureEngine {
     fn default() -> Self {
         Self {
@@ -845,9 +930,19 @@ impl FeatureEngine {
     pub fn compute_snapshot(
         &self,
         token: &TokenState,
-        state: &StateSnapshot,
+        state: &dyn FeatureStateView,
         observed_at: OffsetDateTime,
     ) -> FeatureSnapshot {
+        self.compute_snapshot_profiled(token, state, observed_at).0
+    }
+
+    pub fn compute_snapshot_profiled(
+        &self,
+        token: &TokenState,
+        state: &dyn FeatureStateView,
+        observed_at: OffsetDateTime,
+    ) -> (FeatureSnapshot, BTreeMap<String, u128>) {
+        let mut timings = BTreeMap::new();
         let mut values = BTreeMap::new();
         for (feature_id, descriptor) in self.registry.descriptors() {
             let value = match descriptor.default_status {
@@ -867,16 +962,30 @@ impl FeatureEngine {
         compute_curve_features(token, observed_at, &mut values);
         compute_price_path_features(token, observed_at, &mut values);
         compute_trade_flow_features(token, observed_at, &mut values);
+        let holder_started = Instant::now();
         compute_holder_features(token, observed_at, &mut values);
         compute_top_holder_features(token, &mut values);
+        timings.insert(
+            "holder_feature_compute".to_owned(),
+            holder_started.elapsed().as_millis(),
+        );
         compute_bundle_features(token, state, &mut values);
         compute_rug_features(token, observed_at, &mut values);
+        let cohort_started = Instant::now();
         compute_cohort_features(token, state, observed_at, &mut values);
         compute_rotation_features(token, state, &mut values);
+        timings.insert(
+            "cohort_relative_feature_compute".to_owned(),
+            cohort_started.elapsed().as_millis(),
+        );
         compute_cost_basis_features(token, &mut values);
         compute_survival_features(token, observed_at, &mut values);
         compute_execution_features(token, &mut values);
+        let holder_lifecycle_started = Instant::now();
         compute_holder_lifecycle_features(token, state, observed_at, &mut values);
+        *timings
+            .entry("holder_feature_compute".to_owned())
+            .or_default() += holder_lifecycle_started.elapsed().as_millis();
         compute_transaction_fingerprint_features(token, &mut values);
         compute_funding_graph_features(token, state, observed_at, &mut values);
         compute_fee_competition_features(token, &mut values);
@@ -912,16 +1021,19 @@ impl FeatureEngine {
         }
         let vector_hash = format!("{:x}", hasher.finalize());
 
-        FeatureSnapshot {
-            mint: token.mint.clone(),
-            lifecycle: token.lifecycle,
-            observed_at,
-            values,
-            vector_hash,
-            available_count,
-            missing_count,
-            unavailable_count,
-        }
+        (
+            FeatureSnapshot {
+                mint: token.mint.clone(),
+                lifecycle: token.lifecycle,
+                observed_at,
+                values,
+                vector_hash,
+                available_count,
+                missing_count,
+                unavailable_count,
+            },
+            timings,
+        )
     }
 }
 
@@ -933,6 +1045,16 @@ fn set_numeric(
 ) {
     if let Some(feature) = values.get_mut(feature_id) {
         *feature = FeatureValue::available(feature_id, FeatureDatum::Numeric(value), confidence);
+    }
+}
+
+fn set_unavailable(
+    values: &mut BTreeMap<String, FeatureValue>,
+    feature_id: &str,
+    notes: impl Into<String>,
+) {
+    if let Some(feature) = values.get_mut(feature_id) {
+        *feature = FeatureValue::unavailable(feature_id, notes);
     }
 }
 
@@ -961,7 +1083,7 @@ fn set_text(
 
 fn compute_launch_identity(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     observed_at: OffsetDateTime,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
@@ -1085,7 +1207,7 @@ fn compute_launch_identity(
         "duplicate_name_seen_historically",
         Decimal::from(
             state
-                .tokens
+                .tokens()
                 .values()
                 .filter(|other| {
                     other.mint != token.mint && !other.name.is_empty() && other.name == token.name
@@ -1099,7 +1221,7 @@ fn compute_launch_identity(
         "duplicate_symbol_seen_historically",
         Decimal::from(
             state
-                .tokens
+                .tokens()
                 .values()
                 .filter(|other| {
                     other.mint != token.mint
@@ -1115,7 +1237,7 @@ fn compute_launch_identity(
         "duplicate_uri_seen_historically",
         Decimal::from(
             state
-                .tokens
+                .tokens()
                 .values()
                 .filter(|other| {
                     other.mint != token.mint && !other.uri.is_empty() && other.uri == token.uri
@@ -1160,14 +1282,14 @@ fn compute_launch_identity(
 
 fn compute_creator_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     observed_at: OffsetDateTime,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
     let Some(creator) = &token.creator else {
         return;
     };
-    if let Some(wallet) = state.wallets.get(&creator.0) {
+    if let Some(wallet) = state.wallets().get(&creator.0) {
         if let Some(first_seen) = wallet.first_seen {
             set_numeric(
                 values,
@@ -1185,7 +1307,7 @@ fn compute_creator_features(
     }
 
     let launches_last_hour = state
-        .tokens
+        .tokens()
         .values()
         .filter(|other| other.creator.as_ref() == Some(creator))
         .filter_map(|other| other.launch_time)
@@ -1198,12 +1320,12 @@ fn compute_creator_features(
         dec!(0.9),
     );
 
-    if let Some(cluster_id) = state.cluster_index.cluster_id_for(&creator.0) {
+    if let Some(cluster_id) = state.cluster_index().cluster_id_for(&creator.0) {
         set_text(values, "creator_cluster_id", cluster_id, dec!(0.8));
     }
 
     let same_payer_reuse = state
-        .tokens
+        .tokens()
         .values()
         .filter(|other| other.mint != token.mint)
         .filter(|other| other.creator.as_ref() == Some(creator))
@@ -1218,7 +1340,7 @@ fn compute_creator_features(
 
     let same_uri_domain = if let Some(domain) = uri_host(&token.uri) {
         state
-            .tokens
+            .tokens()
             .values()
             .filter(|other| other.mint != token.mint)
             .any(|other| uri_host(&other.uri).as_deref() == Some(domain.as_str()))
@@ -1245,19 +1367,118 @@ fn compute_dev_holdings(
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
     let dev = &token.developer_state;
+    let token_decimals = token.reserve_state.token_decimals;
+    let holder_state_dev_balance_raw = token
+        .creator
+        .as_ref()
+        .and_then(|creator| token.holder_state.owner_balances.get(&creator.0))
+        .map(|holder| holder.balance.max(Decimal::ZERO));
+    let dev_balance_raw =
+        holder_state_dev_balance_raw.unwrap_or_else(|| dev.creator_net_tokens.max(Decimal::ZERO));
+    let dev_balance_source = if holder_state_dev_balance_raw.is_some() {
+        "holder_state.owner_balance"
+    } else {
+        "developer_state.creator_net_tokens_fallback"
+    };
+    let (dev_balance_metric, total_pct_metric, circulating_pct_metric) =
+        MetricEngine::dev_holding_metrics(
+            Some(dev_balance_raw),
+            token_decimals,
+            dev_balance_source,
+        );
     set_numeric(
         values,
         "creator_initial_token_balance",
-        dev.creator_initial_holding,
+        raw_tokens_to_ui(dev.creator_initial_holding, token_decimals),
         Decimal::ONE,
     );
-    if dev.creator_initial_holding > Decimal::ZERO {
+    if let Some(dev_balance_ui) = metric_decimal(&dev_balance_metric) {
         set_numeric(
             values,
-            "creator_retained_supply_pct",
-            clamp01(dev.creator_net_tokens.max(Decimal::ZERO) / dev.creator_initial_holding),
-            Decimal::ONE,
+            "dev_balance",
+            dev_balance_ui,
+            if holder_state_dev_balance_raw.is_some()
+                && dev_balance_metric.confidence == MetricConfidence::Verified
+            {
+                Decimal::ONE
+            } else {
+                dec!(0.45)
+            },
         );
+    } else {
+        set_unavailable(
+            values,
+            "dev_balance",
+            dev_balance_metric
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "dev balance unavailable".to_owned()),
+        );
+    }
+    if let Some(total_pct) = metric_decimal(&total_pct_metric) {
+        let confidence = if holder_state_dev_balance_raw.is_some()
+            && total_pct_metric.confidence == MetricConfidence::Verified
+        {
+            Decimal::ONE
+        } else {
+            dec!(0.45)
+        };
+        set_numeric(
+            values,
+            "dev_holding_pct_total_supply",
+            total_pct,
+            confidence,
+        );
+        set_numeric(values, "creator_ownership_pct", total_pct, confidence);
+    } else {
+        let reason = total_pct_metric
+            .unavailable_reason
+            .clone()
+            .unwrap_or_else(|| "dev total-supply denominator unavailable".to_owned());
+        set_unavailable(values, "dev_holding_pct_total_supply", reason.clone());
+        set_unavailable(values, "creator_ownership_pct", reason);
+    }
+    if let Some(circulating_pct) = metric_decimal(&circulating_pct_metric) {
+        set_numeric(
+            values,
+            "dev_holding_pct_circulating",
+            circulating_pct,
+            if holder_state_dev_balance_raw.is_some() {
+                dec!(0.8)
+            } else {
+                dec!(0.35)
+            },
+        );
+    } else {
+        set_unavailable(
+            values,
+            "dev_holding_pct_circulating",
+            circulating_pct_metric
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "dev circulating denominator unavailable".to_owned()),
+        );
+    }
+    let creator_initial_holding_ui = raw_tokens_to_ui(dev.creator_initial_holding, token_decimals);
+    if creator_initial_holding_ui > Decimal::ZERO {
+        if let Some(dev_balance_ui) = metric_decimal(&dev_balance_metric) {
+            set_numeric(
+                values,
+                "creator_retained_supply_pct",
+                clamp01(dev_balance_ui / creator_initial_holding_ui),
+                if holder_state_dev_balance_raw.is_some() {
+                    Decimal::ONE
+                } else {
+                    dec!(0.45)
+                },
+            );
+        } else {
+            set_unavailable(
+                values,
+                "creator_retained_supply_pct",
+                "dev balance unavailable for retained-supply calculation",
+            );
+        }
     }
 
     for (feature_id, threshold) in [
@@ -1358,7 +1579,35 @@ fn compute_curve_features(
         curve.real_token_reserves,
         Decimal::ONE,
     );
-    set_numeric(values, "price_current", token.latest_price, Decimal::ONE);
+    set_numeric(
+        values,
+        "token_decimals",
+        Decimal::from(curve.token_decimals),
+        Decimal::ONE,
+    );
+    if let Some(price) = curve.price_lamports_per_raw_token {
+        set_numeric(values, "price_lamports_per_raw_token", price, Decimal::ONE);
+    }
+    if let Some(price) = curve.price_sol_per_token {
+        set_numeric(
+            values,
+            "price_sol_per_token",
+            price,
+            curve.reserve_price_confidence,
+        );
+    }
+    set_numeric(
+        values,
+        "reserve_price_confidence",
+        curve.reserve_price_confidence,
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "price_current",
+        curve.price_sol_per_token.unwrap_or(token.latest_price),
+        curve.reserve_price_confidence.max(dec!(0.5)),
+    );
     if let Some(launch_price) = curve.launch_price {
         set_numeric(values, "price_launch", launch_price, Decimal::ONE);
         if launch_price > Decimal::ZERO {
@@ -1370,9 +1619,60 @@ fn compute_curve_features(
             );
         }
     }
-    if let Some(completion) = curve.curve_completion_pct {
-        set_numeric(values, "curve_completion_pct", completion, dec!(0.9));
+    if let Some(market_cap) = curve.market_cap_quote_1b {
+        set_numeric(
+            values,
+            "market_cap_quote_1b",
+            market_cap,
+            curve.market_cap_confidence,
+        );
     }
+    if let Some(market_cap) = curve.market_cap_quote_total_supply {
+        set_numeric(
+            values,
+            "market_cap_quote_total_supply",
+            market_cap,
+            curve.market_cap_confidence,
+        );
+    } else if let Some(price) = curve.price_sol_per_token {
+        set_numeric(
+            values,
+            "market_cap_quote_total_supply",
+            price * Decimal::from(PUMP_TOTAL_SUPPLY_UI),
+            curve.market_cap_confidence.max(dec!(0.8)),
+        );
+    }
+    set_numeric(
+        values,
+        "market_cap_confidence",
+        curve.market_cap_confidence,
+        Decimal::ONE,
+    );
+    if let Some(complete) = curve.curve_complete_flag {
+        set_bool(values, "curve_complete_flag", complete, Decimal::ONE);
+    }
+    if let Some(progress) = curve.curve_progress_pct {
+        set_numeric(
+            values,
+            "curve_progress_pct",
+            progress,
+            curve.curve_progress_confidence,
+        );
+        set_numeric(
+            values,
+            "curve_completion_pct",
+            progress,
+            curve.curve_progress_confidence,
+        );
+    } else if let Some(completion) = curve.curve_completion_pct {
+        set_numeric(values, "curve_completion_pct", completion, dec!(0.4));
+    }
+    set_numeric(
+        values,
+        "curve_progress_confidence",
+        curve.curve_progress_confidence,
+        Decimal::ONE,
+    );
     if let Some(staleness_ms) = curve.staleness_ms(observed_at) {
         set_numeric(
             values,
@@ -1660,6 +1960,132 @@ fn compute_holder_features(
         Decimal::from(token.holder_state.nonzero_holder_count as u64),
         Decimal::ONE,
     );
+    set_numeric(
+        values,
+        "holder_count_owner_wallets",
+        Decimal::from(token.holder_state.nonzero_holder_count as u64),
+        Decimal::ONE,
+    );
+    let holder_counters = token.holder_state.counters;
+    set_numeric(
+        values,
+        "holder_updates_seen",
+        Decimal::from(holder_counters.holder_updates_seen),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_updates_applied",
+        Decimal::from(holder_counters.holder_updates_applied),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_updates_deduped",
+        Decimal::from(holder_counters.holder_updates_deduped),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_owner_changes",
+        Decimal::from(holder_counters.holder_owner_changes),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_missing_owner_mapping",
+        Decimal::from(holder_counters.holder_missing_owner_mapping),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_fallback_trade_updates_used",
+        Decimal::from(holder_counters.holder_fallback_trade_updates_used),
+        Decimal::ONE,
+    );
+    let mut curve_exclusions = HashSet::<String>::new();
+    if let Some(curve) = token.bonding_curve.as_ref() {
+        curve_exclusions.insert(curve.0.clone());
+    }
+    if let Some(associated_curve) = token.associated_bonding_curve.as_ref() {
+        curve_exclusions.insert(associated_curve.0.clone());
+    }
+    let mut curve_and_dev_exclusions = curve_exclusions.clone();
+    if let Some(creator) = token.creator.as_ref() {
+        curve_and_dev_exclusions.insert(creator.0.clone());
+    }
+    let holder_denominator_context_reliable = token.bonding_curve.is_some()
+        || token.associated_bonding_curve.is_some()
+        || token.reserve_state.account_update_confidence > Decimal::ZERO
+        || token.reserve_state.price_sol_per_token.is_some();
+    set_numeric(
+        values,
+        "holder_count_excluding_curve",
+        Decimal::from(token.holder_state.holder_count_excluding(&curve_exclusions) as u64),
+        dec!(0.9),
+    );
+    set_numeric(
+        values,
+        "holder_count_excluding_curve_and_dev",
+        Decimal::from(
+            token
+                .holder_state
+                .holder_count_excluding(&curve_and_dev_exclusions) as u64,
+        ),
+        dec!(0.9),
+    );
+    let token_decimals = token.reserve_state.token_decimals;
+    let observed_supply_raw = token.holder_state.observed_holder_supply();
+    let observed_supply_ui = raw_tokens_to_ui(observed_supply_raw, token_decimals);
+    let total_supply = Decimal::from(PUMP_TOTAL_SUPPLY_UI);
+    let total_supply_raw = ui_tokens_to_raw(total_supply, token_decimals);
+    let dev_balance_raw = token
+        .creator
+        .as_ref()
+        .and_then(|creator| token.holder_state.owner_balances.get(&creator.0))
+        .map(|holder| holder.balance.max(Decimal::ZERO))
+        .unwrap_or_else(|| token.developer_state.creator_net_tokens.max(Decimal::ZERO));
+    let dev_balance_ui = raw_tokens_to_ui(dev_balance_raw, token_decimals);
+    let circulating_supply = (total_supply - dev_balance_ui).max(Decimal::ZERO);
+    let circulating_supply_raw = (total_supply_raw - dev_balance_raw).max(Decimal::ZERO);
+    let holder_supply_invariant_ok = observed_supply_ui <= total_supply + Decimal::new(1, 6);
+    if holder_denominator_context_reliable && holder_supply_invariant_ok {
+        set_numeric(
+            values,
+            "observed_holder_supply",
+            observed_supply_ui,
+            dec!(0.9),
+        );
+        set_numeric(
+            values,
+            "circulating_holder_supply",
+            circulating_supply,
+            dec!(0.8),
+        );
+    } else if holder_denominator_context_reliable {
+        set_unavailable(
+            values,
+            "observed_holder_supply",
+            "holder supply invariant failed; likely transient same-transaction balance group",
+        );
+        set_numeric(
+            values,
+            "circulating_holder_supply",
+            circulating_supply,
+            dec!(0.5),
+        );
+    } else {
+        set_unavailable(
+            values,
+            "observed_holder_supply",
+            "holder denominator requires token decimals plus Pump curve/create context",
+        );
+        set_unavailable(
+            values,
+            "circulating_holder_supply",
+            "circulating holder supply requires Pump curve/create context",
+        );
+    }
     if let Some(growth) = holder_growth_rate(token, observed_at) {
         set_numeric(values, "holder_growth_rate", growth, dec!(0.8));
         set_numeric(
@@ -1706,6 +2132,66 @@ fn compute_holder_features(
     );
     set_numeric(
         values,
+        "top1_holder_pct_observed",
+        token.holder_state.top_holder_pct(1),
+        Decimal::ONE,
+    );
+    if holder_denominator_context_reliable && holder_supply_invariant_ok {
+        let top1_total = token.holder_state.top_holder_pct_with_denominator(
+            1,
+            total_supply_raw,
+            &curve_exclusions,
+        );
+        let top1_circulating = token.holder_state.top_holder_pct_with_denominator(
+            1,
+            circulating_supply_raw,
+            &curve_exclusions,
+        );
+        set_numeric(
+            values,
+            "top1_holder_pct_total_supply",
+            top1_total,
+            dec!(0.8),
+        );
+        if top1_circulating <= Decimal::ONE + Decimal::new(1, 6) {
+            set_numeric(
+                values,
+                "top1_holder_pct_circulating",
+                top1_circulating,
+                dec!(0.7),
+            );
+        } else {
+            set_unavailable(
+                values,
+                "top1_holder_pct_circulating",
+                "top-holder circulating denominator invariant failed",
+            );
+        }
+    } else if holder_denominator_context_reliable {
+        set_unavailable(
+            values,
+            "top1_holder_pct_total_supply",
+            "top-holder total-supply denominator invariant failed",
+        );
+        set_unavailable(
+            values,
+            "top1_holder_pct_circulating",
+            "top-holder circulating denominator invariant failed",
+        );
+    } else {
+        set_unavailable(
+            values,
+            "top1_holder_pct_total_supply",
+            "top-holder total-supply denominator requires Pump curve/create context",
+        );
+        set_unavailable(
+            values,
+            "top1_holder_pct_circulating",
+            "top-holder circulating denominator requires Pump curve/create context",
+        );
+    }
+    set_numeric(
+        values,
         "top3_holder_pct",
         token.holder_state.top_holder_pct(3),
         Decimal::ONE,
@@ -1726,6 +2212,24 @@ fn compute_holder_features(
         values,
         "top20_holder_pct",
         token.holder_state.top_holder_pct(20),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "holder_metric_confidence",
+        if !holder_denominator_context_reliable {
+            dec!(0.3)
+        } else if token.holder_state.missing_owner_mapping_count() == 0 {
+            dec!(0.9)
+        } else {
+            dec!(0.5)
+        },
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "missing_owner_mapping_count",
+        Decimal::from(token.holder_state.missing_owner_mapping_count() as u64),
         Decimal::ONE,
     );
     let distribution_improvement = clamp01(
@@ -1803,7 +2307,7 @@ fn compute_top_holder_features(token: &TokenState, values: &mut BTreeMap<String,
 
 fn compute_bundle_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
     let first_buys = token
@@ -1967,7 +2471,7 @@ fn compute_rug_features(
 
 fn compute_cohort_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     observed_at: OffsetDateTime,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
@@ -2214,14 +2718,14 @@ fn compute_cohort_features(
 
 fn compute_rotation_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
     let mint = token.mint.0.as_str();
     let mut wallets_rotating = 0u64;
     let mut rotated_notional = Decimal::ZERO;
 
-    for wallet in state.wallets.values() {
+    for wallet in state.wallets().values() {
         if !wallet.tokens_bought.contains_key(mint) {
             continue;
         }
@@ -2249,8 +2753,9 @@ fn compute_rotation_features(
         rotated_notional,
         dec!(0.7),
     );
-    let smart_rotation =
-        clamp01(Decimal::from(wallets_rotating) / Decimal::from(state.wallets.len().max(1) as u64));
+    let smart_rotation = clamp01(
+        Decimal::from(wallets_rotating) / Decimal::from(state.wallets().len().max(1) as u64),
+    );
     set_numeric(
         values,
         "smart_capital_rotation_score",
@@ -2830,7 +3335,7 @@ fn compute_survival_features(
 
 fn compute_holder_lifecycle_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     observed_at: OffsetDateTime,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
@@ -2994,7 +3499,7 @@ fn compute_holder_lifecycle_features(
         })
         .count();
     let exited = state
-        .wallets
+        .wallets()
         .values()
         .filter(|wallet| {
             wallet
@@ -3225,13 +3730,13 @@ fn compute_transaction_fingerprint_features(
 
 fn compute_funding_graph_features(
     token: &TokenState,
-    state: &StateSnapshot,
+    state: &dyn FeatureStateView,
     observed_at: OffsetDateTime,
     values: &mut BTreeMap<String, FeatureValue>,
 ) {
     let creator_wallet = token.creator.as_ref().map(|creator| creator.0.as_str());
     let creator_funder =
-        creator_wallet.and_then(|wallet| latest_funder_for_wallet(&state.funding_graph, wallet));
+        creator_wallet.and_then(|wallet| latest_funder_for_wallet(state.funding_graph(), wallet));
     if let Some(funder) = creator_funder.as_ref() {
         set_text(
             values,
@@ -3267,8 +3772,8 @@ fn compute_funding_graph_features(
         .take(5)
         .map(|holder| holder.owner.0.clone())
         .collect::<Vec<_>>();
-    let first_funders = wallet_funders(&state.funding_graph, &first_buyers);
-    let top_funders = wallet_funders(&state.funding_graph, &top_holders);
+    let first_funders = wallet_funders(state.funding_graph(), &first_buyers);
+    let top_funders = wallet_funders(state.funding_graph(), &top_holders);
     set_numeric(
         values,
         "buyer_recent_funder_overlap_count",
@@ -3293,7 +3798,7 @@ fn compute_funding_graph_features(
     if let Some(funder) = first_funders
         .first()
         .and_then(|_| first_buyers.first())
-        .and_then(|wallet| latest_funder_for_wallet(&state.funding_graph, wallet))
+        .and_then(|wallet| latest_funder_for_wallet(state.funding_graph(), wallet))
     {
         if let Some(launch_time) = token.launch_time {
             set_numeric(
@@ -3310,13 +3815,13 @@ fn compute_funding_graph_features(
     }
     if let Some(funder) = creator_funder.as_ref() {
         let launch_count = state
-            .tokens
+            .tokens()
             .values()
             .filter(|other| {
                 other
                     .creator
                     .as_ref()
-                    .and_then(|creator| latest_funder_for_wallet(&state.funding_graph, &creator.0))
+                    .and_then(|creator| latest_funder_for_wallet(state.funding_graph(), &creator.0))
                     .map(|edge| edge.funder == funder.funder)
                     .unwrap_or(false)
             })
@@ -3329,7 +3834,7 @@ fn compute_funding_graph_features(
         );
     }
     let same_amount_pattern = repeated_amount_pattern(
-        &state.funding_graph,
+        state.funding_graph(),
         creator_funder.as_ref().map(|edge| edge.funder.as_str()),
     );
     set_numeric(
@@ -3339,7 +3844,7 @@ fn compute_funding_graph_features(
         dec!(0.6),
     );
     let burst = state
-        .funding_graph
+        .funding_graph()
         .edges
         .values()
         .filter(|edge| {
@@ -3358,7 +3863,7 @@ fn compute_funding_graph_features(
     let just_before_buy = first_buyers
         .iter()
         .filter(|wallet| {
-            latest_funder_for_wallet(&state.funding_graph, wallet)
+            latest_funder_for_wallet(state.funding_graph(), wallet)
                 .map(|edge| observed_at - edge.last_seen <= WINDOW_1M)
                 .unwrap_or(false)
         })
@@ -3373,7 +3878,7 @@ fn compute_funding_graph_features(
         .as_ref()
         .map(|funder| {
             state
-                .funding_graph
+                .funding_graph()
                 .edges
                 .values()
                 .filter(|edge| edge.funder == funder.funder)
@@ -3386,8 +3891,8 @@ fn compute_funding_graph_features(
         Decimal::from(known_factory as u64),
         dec!(0.6),
     );
-    let wallet_count = state.wallets.len().max(1);
-    let density = Decimal::from(state.funding_graph.edges.len() as u64)
+    let wallet_count = state.wallets().len().max(1);
+    let density = Decimal::from(state.funding_graph().edges.len() as u64)
         / Decimal::from((wallet_count * wallet_count) as u64);
     set_numeric(
         values,
@@ -4051,7 +4556,7 @@ where
 
 fn same_time_cohort<'a>(
     token: &'a TokenState,
-    state: &'a StateSnapshot,
+    state: &'a dyn FeatureStateView,
     observed_at: OffsetDateTime,
     window: Duration,
 ) -> Vec<&'a TokenState> {
@@ -4059,7 +4564,7 @@ fn same_time_cohort<'a>(
         return vec![token];
     };
     state
-        .tokens
+        .tokens()
         .values()
         .filter(|other| {
             other
@@ -4107,9 +4612,9 @@ fn identical_amounts(first_buys: &[&state::TradeObservation]) -> usize {
     counts.values().copied().max().unwrap_or_default()
 }
 
-fn same_funder_pair_count(buyers: &[String], state: &StateSnapshot) -> usize {
+fn same_funder_pair_count(buyers: &[String], state: &dyn FeatureStateView) -> usize {
     let mut funding_map: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for edge in state.funding_graph.edges.values() {
+    for edge in state.funding_graph().edges.values() {
         funding_map
             .entry(edge.wallet.as_str())
             .or_default()
@@ -4444,9 +4949,9 @@ fn clamp01(value: Decimal) -> Decimal {
 #[cfg(test)]
 mod tests {
     use common::{
-        Canonicality, EventMeta, EventPayload, EventSource, HolderBalanceUpdateEvent,
-        NormalizedEvent, PumpBuyEvent, PumpSellEvent, QuoteAssetType, TokenCreatedEvent,
-        TokenProgramType, TransactionStatus, TtlConfig, WalletFundingEvent,
+        Canonicality, DEFAULT_PUMP_TOKEN_DECIMALS, EventMeta, EventPayload, EventSource,
+        HolderBalanceUpdateEvent, NormalizedEvent, PumpBuyEvent, PumpSellEvent, QuoteAssetType,
+        TokenCreatedEvent, TokenProgramType, TransactionStatus, TtlConfig, WalletFundingEvent,
     };
     use state::StateEngine;
 
@@ -4580,6 +5085,7 @@ mod tests {
                 mint: pubkey(mint),
                 owner_wallet: pubkey(owner),
                 token_account: pubkey(&format!("ata-{mint}-{owner}")),
+                token_decimals: Some(DEFAULT_PUMP_TOKEN_DECIMALS),
                 old_balance: None,
                 new_balance: Decimal::from(balance),
                 delta: Decimal::from(balance),
@@ -4646,6 +5152,129 @@ mod tests {
         assert!(features.decimal("buy_count").unwrap() >= Decimal::from(2u64));
         assert!(features.decimal("holder_count_current").unwrap() >= Decimal::from(2u64));
         assert!(features.decimal("rug_probability_score").unwrap() >= Decimal::ZERO);
+    }
+
+    #[test]
+    fn holder_denominator_features_use_ui_supply_units() {
+        let mut engine = StateEngine::new(ttl());
+        engine
+            .apply_event(&token_created(
+                "mint-a",
+                "creator-a",
+                "payer-a",
+                "Alpha",
+                "ALP",
+            ))
+            .expect("create");
+        engine
+            .apply_event(&holder(2, "mint-a", "buyer-a", 500_000_000_000_000))
+            .expect("holder-a");
+        engine
+            .apply_event(&holder(3, "mint-a", "buyer-b", 250_000_000_000_000))
+            .expect("holder-b");
+
+        let snapshot = engine.snapshot();
+        let token = snapshot.tokens.get("mint-a").expect("token");
+        let features = FeatureEngine::default().compute_snapshot(
+            token,
+            &snapshot,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(10),
+        );
+
+        assert_eq!(
+            features.decimal("observed_holder_supply").unwrap(),
+            Decimal::from(750_000_000u64)
+        );
+        assert_eq!(
+            features.decimal("top1_holder_pct_total_supply").unwrap(),
+            dec!(0.5)
+        );
+        assert_eq!(
+            features.decimal("top1_holder_pct_circulating").unwrap(),
+            dec!(0.5)
+        );
+        assert_eq!(
+            features.decimal("top1_holder_pct_observed").unwrap(),
+            dec!(0.6666666666666666666666666667)
+        );
+    }
+
+    #[test]
+    fn dev_holding_prefers_owner_summed_holder_balance() {
+        let mut engine = StateEngine::new(ttl());
+        engine
+            .apply_event(&token_created(
+                "mint-a",
+                "creator-a",
+                "payer-a",
+                "Alpha",
+                "ALP",
+            ))
+            .expect("create");
+        engine
+            .apply_event(&buy(2, "mint-a", "creator-a", 10, 800_000_000_000_000))
+            .expect("creator buy flow");
+        engine
+            .apply_event(&holder(3, "mint-a", "creator-a", 100_000_000_000_000))
+            .expect("creator holder snapshot");
+
+        let snapshot = engine.snapshot();
+        let token = snapshot.tokens.get("mint-a").expect("token");
+        let features = FeatureEngine::default().compute_snapshot(
+            token,
+            &snapshot,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(10),
+        );
+
+        assert_eq!(
+            features.decimal("dev_balance"),
+            Some(Decimal::from(100_000_000u64))
+        );
+        assert_eq!(
+            features.decimal("dev_holding_pct_total_supply"),
+            Some(dec!(0.1))
+        );
+        assert_eq!(features.decimal("creator_ownership_pct"), Some(dec!(0.1)));
+    }
+
+    #[test]
+    fn dev_holding_over_total_supply_is_unavailable_not_clamped() {
+        let mut engine = StateEngine::new(ttl());
+        engine
+            .apply_event(&token_created(
+                "mint-a",
+                "creator-a",
+                "payer-a",
+                "Alpha",
+                "ALP",
+            ))
+            .expect("create");
+        engine
+            .apply_event(&holder(3, "mint-a", "creator-a", 1_000_000_001_000_000))
+            .expect("invalid creator holder snapshot");
+
+        let snapshot = engine.snapshot();
+        let token = snapshot.tokens.get("mint-a").expect("token");
+        let features = FeatureEngine::default().compute_snapshot(
+            token,
+            &snapshot,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(10),
+        );
+
+        assert_eq!(
+            features
+                .value("dev_holding_pct_total_supply")
+                .expect("dev pct")
+                .status,
+            FeatureStatus::Unavailable
+        );
+        assert_eq!(
+            features
+                .value("creator_ownership_pct")
+                .expect("creator ownership")
+                .status,
+            FeatureStatus::Unavailable
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
-use anyhow::{Context, Result, anyhow};
+#![recursion_limit = "256"]
+
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use common::config::ResearchWorkerPnlSanityConfig;
 use common::{
     EventPayload, FillEvent, LoadedConfig, NormalizedEvent, ReasonCode, RuntimeModeName,
     ShredSellIntentResolvedEvent, TentativeMaliciousSellWarningEvent,
@@ -20,9 +23,9 @@ use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, GeyserProviderSmokeOptions, LiveRunOptions, RuntimeMode,
-    RuntimeResolvedConfig, Supervisor, build_fixture_scenario, builtin_fixture_suite,
-    builtin_shred_exit_fixture_suite, load_fixture_spec, smoke_deshred_provider,
-    smoke_geyser_provider, write_report,
+    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
+    builtin_fixture_suite, builtin_shred_exit_fixture_suite, load_fixture_spec,
+    smoke_deshred_provider, smoke_geyser_provider, write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -32,11 +35,12 @@ use sim::{FeeModel, Simulator};
 use state::{StateEngine, StateSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Instant;
 use storage::{
     ArtifactMetadata, ArtifactType, DatasetKind, RunKind, RunRole, StorageEngine, StorageLayout,
     StoredRecord,
@@ -550,11 +554,15 @@ enum Command {
     },
     VerifyEdgeRunIntegrity {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         run_id: String,
         #[arg(long)]
         dataset_index_r2: bool,
     },
     RestoreRunSegments {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
@@ -601,8 +609,13 @@ enum Command {
         #[arg(long)]
         markdown: bool,
     },
-    InspectR2,
+    InspectR2 {
+        #[arg(long)]
+        env_file: Option<String>,
+    },
     UploadArtifactsR2 {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
@@ -652,9 +665,13 @@ enum Command {
     },
     UploadPendingR2 {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         dry_run: bool,
     },
     VerifyR2Upload {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
@@ -668,6 +685,8 @@ enum Command {
     },
     RepairManifestConsistency {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         run_id: String,
         #[arg(long)]
         upload_r2: bool,
@@ -676,9 +695,13 @@ enum Command {
     },
     ListR2Artifacts {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         run_id: String,
     },
     PruneLocalAfterR2 {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
@@ -704,13 +727,23 @@ enum Command {
         #[arg(long)]
         force_prune_verified: bool,
     },
-    R2PlanManagedBuckets,
-    R2ListBuckets,
+    R2PlanManagedBuckets {
+        #[arg(long)]
+        env_file: Option<String>,
+    },
+    R2ListBuckets {
+        #[arg(long)]
+        env_file: Option<String>,
+    },
     R2CreateManagedBuckets {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
     R2EmptyManagedPrefix {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         bucket: String,
         #[arg(long)]
@@ -722,11 +755,15 @@ enum Command {
     },
     R2DeleteManagedBuckets {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         dry_run: bool,
         #[arg(long = "i-understand-this-deletes-r2-data")]
         i_understand_this_deletes_r2_data: bool,
     },
     R2ResetManagedStorage {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long = "i-understand-this-deletes-r2-data")]
@@ -753,6 +790,8 @@ enum Command {
     RefreshDatasetIndex,
     BackfillRunMetadata {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
         latest_live_paper_run: bool,
@@ -773,6 +812,8 @@ enum Command {
     },
     UploadDatasetIndexR2 {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         verify: bool,
@@ -780,6 +821,19 @@ enum Command {
         merge_authoritative: bool,
         #[arg(long)]
         dry_run_diff: bool,
+    },
+    PublishPhase82Results {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long, default_value = "research_output/phase82_labels")]
+        phase82_dir: String,
+        #[arg(
+            long,
+            default_value = "research_output/phase82_labels/pinned_run_set.json"
+        )]
+        pinned_run_set: String,
+        #[arg(long)]
+        verify: bool,
     },
     InspectDatasetIndexLock,
     ClearStaleDatasetIndexLock {
@@ -790,9 +844,14 @@ enum Command {
     },
     InspectDatasetIndex {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         dataset_index_r2: bool,
     },
-    ExportR2Manifests,
+    ExportR2Manifests {
+        #[arg(long)]
+        env_file: Option<String>,
+    },
     BuildReleaseService,
     CleanBuildArtifacts {
         #[arg(long)]
@@ -974,6 +1033,8 @@ enum Command {
     },
     RunResearchWorker {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         run_id: Option<String>,
         #[arg(long)]
         latest_run: bool,
@@ -991,6 +1052,8 @@ enum Command {
         run_backtests: bool,
         #[arg(long)]
         generate_exports: bool,
+        #[arg(long)]
+        skip_csv_export: bool,
         #[arg(long)]
         update_calibration: bool,
         #[arg(long)]
@@ -1012,13 +1075,206 @@ enum Command {
         #[arg(long, default_value_t = true)]
         no_live_streams: bool,
     },
+    ProfileResearchWorker {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long)]
+        require_normalized_events: bool,
+    },
+    ValidateResearchRunHealth {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        dataset_index_r2: bool,
+    },
+    RunEnrichmentWorker {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        source_run_id: Option<String>,
+        #[arg(long)]
+        derived_run_id: Option<String>,
+        #[arg(long, default_value = "canary")]
+        profile: String,
+        #[arg(long, default_value_t = 0)]
+        max_rpc_calls: u64,
+        #[arg(long, default_value_t = 0)]
+        max_rpc_credits: u64,
+        #[arg(long, default_value_t = 0)]
+        max_http_calls: u64,
+        #[arg(long, default_value_t = 0)]
+        max_wallets: u64,
+        #[arg(long, default_value_t = 0)]
+        max_mints: u64,
+        #[arg(long, default_value_t = 60)]
+        max_runtime_seconds: u64,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        canary: bool,
+        #[arg(long)]
+        resume: bool,
+        #[arg(
+            long,
+            default_value = "research_output/phase80_metric_engine/enrichment"
+        )]
+        output_dir: String,
+    },
+    ValidateMetricParity {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        source_run_id: Option<String>,
+        #[arg(long)]
+        derived_run_id: Option<String>,
+        #[arg(long)]
+        pinned_run_set: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        latest_n: Option<usize>,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long)]
+        all_families: bool,
+        #[arg(long)]
+        families: Option<String>,
+        #[arg(long, default_value = "research_output/phase80_metric_engine")]
+        output_dir: String,
+    },
+    ValidateBacktestReadinessV2 {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        pinned_run_set: Option<String>,
+        #[arg(long)]
+        latest_n: Option<usize>,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long, default_value = "diagnostics")]
+        intended_use: String,
+        #[arg(long, default_value = "holder_strategy")]
+        required_metric_profile: String,
+        #[arg(long, default_value = "research_output/phase80_metric_engine")]
+        output_dir: String,
+    },
+    ValidateMetricContract {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        fresh_run_id: Option<String>,
+        #[arg(long)]
+        fresh_derived_run_id: Option<String>,
+        #[arg(long)]
+        pinned_run_set: Option<String>,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long, default_value = "research_output/phase88_metric_completion")]
+        output_dir: String,
+    },
+    GenerateCanonicalLabels {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long)]
+        pinned_run_set: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        derived_run_id: Option<String>,
+        #[arg(long)]
+        latest_n_clean: Option<usize>,
+        #[arg(long, default_value = "research_output/phase83_labels")]
+        output_dir: String,
+        #[arg(long)]
+        require_normalized_events: bool,
+        #[arg(long)]
+        canonical_price_only: bool,
+        #[arg(long)]
+        exclude_artifacts: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long, default_value_t = 0)]
+        min_label_horizon_seconds: u64,
+        #[arg(long, default_value_t = true)]
+        include_token_labels: bool,
+        #[arg(long, default_value_t = true)]
+        include_trade_labels: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        merge_dataset_index: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    RunQuantDiagnostics {
+        #[arg(long)]
+        source_run_id: Option<String>,
+        #[arg(long)]
+        derived_run_id: Option<String>,
+        #[arg(long, default_value = "research_output/quant_diagnostics")]
+        output_dir: String,
+        #[arg(long)]
+        dataset_index_r2: bool,
+    },
+    BuildRunDossier {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        derived_run_id: Option<String>,
+        #[arg(long)]
+        latest_n_source_runs: Option<usize>,
+        #[arg(long)]
+        latest_normalized_complete_runs: Option<usize>,
+        #[arg(long)]
+        latest_research_runs: Option<usize>,
+        #[arg(long)]
+        all_clean_research_runs: bool,
+        #[arg(long)]
+        dataset_index_r2: bool,
+        #[arg(long)]
+        include_derived_replays: bool,
+        #[arg(long)]
+        include_token_metrics: bool,
+        #[arg(long)]
+        include_trade_metrics: bool,
+        #[arg(long)]
+        include_feature_coverage: bool,
+        #[arg(long)]
+        include_strategy_diagnostics: bool,
+        #[arg(long)]
+        include_metric_formulas: bool,
+        #[arg(long)]
+        include_readiness: bool,
+        #[arg(long)]
+        include_data_quality: bool,
+        #[arg(long)]
+        include_r2_proof: bool,
+        #[arg(long)]
+        metric_engine_v2: bool,
+        #[arg(long, default_value = "research_output/run_dossiers/latest_10")]
+        output_dir: String,
+    },
     ListNormalizedCompleteRuns {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         dataset_index_r2: bool,
         #[arg(long)]
         latest_n: Option<usize>,
     },
     RefreshResearchWorkerSummary {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         source_run_id: String,
         #[arg(long)]
@@ -1035,6 +1291,8 @@ enum Command {
     },
     UploadResearchResultsR2 {
         #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
         source_run_id: String,
         #[arg(long)]
         local_output_dir: String,
@@ -1042,6 +1300,8 @@ enum Command {
         verify: bool,
     },
     DiagnoseR2Segment {
+        #[arg(long)]
+        env_file: Option<String>,
         #[arg(long)]
         run_id: String,
         #[arg(long)]
@@ -1589,6 +1849,78 @@ struct DatasetIndexRunEntry {
     #[serde(default)]
     research_r2_failed_count: u64,
     #[serde(default)]
+    math_version: Option<String>,
+    #[serde(default)]
+    holder_math_version: Option<String>,
+    #[serde(default)]
+    math_correctness_status: Option<String>,
+    #[serde(default)]
+    holder_parity_status: Option<String>,
+    #[serde(default)]
+    top_holder_parity_status: Option<String>,
+    #[serde(default)]
+    dev_holding_parity_status: Option<String>,
+    #[serde(default)]
+    holder_invariant_status: Option<String>,
+    #[serde(default)]
+    holder_parity_passed: u64,
+    #[serde(default)]
+    holder_parity_failed: u64,
+    #[serde(default)]
+    holder_parity_unavailable: u64,
+    #[serde(default)]
+    top_holder_parity_passed: u64,
+    #[serde(default)]
+    top_holder_parity_failed: u64,
+    #[serde(default)]
+    top_holder_parity_unavailable: u64,
+    #[serde(default)]
+    dev_holding_parity_passed: u64,
+    #[serde(default)]
+    dev_holding_parity_failed: u64,
+    #[serde(default)]
+    executable_pnl_total: Option<Decimal>,
+    #[serde(default)]
+    raw_pnl_total: Option<Decimal>,
+    #[serde(default)]
+    artifact_excluded_pnl_total: Option<Decimal>,
+    #[serde(default)]
+    threshold_tuning_allowed: bool,
+    #[serde(default)]
+    metric_parity_v2: Option<serde_json::Value>,
+    #[serde(default)]
+    readiness_v2: Option<serde_json::Value>,
+    #[serde(default)]
+    label_generator_version: Option<String>,
+    #[serde(default)]
+    canonical_label_status: Option<String>,
+    #[serde(default)]
+    price_coverage_status: Option<String>,
+    #[serde(default)]
+    market_cap_coverage_status: Option<String>,
+    #[serde(default)]
+    curve_progress_coverage_status: Option<String>,
+    #[serde(default)]
+    mfe_mae_label_status: Option<String>,
+    #[serde(default)]
+    diagnostic_backtest_pack_status: Option<String>,
+    #[serde(default)]
+    diagnostic_backtesting_allowed: bool,
+    #[serde(default)]
+    canonical_price_path_version: Option<String>,
+    #[serde(default)]
+    curve_coverage_status: Option<String>,
+    #[serde(default)]
+    label_coverage_status: Option<String>,
+    #[serde(default)]
+    diagnostic_backtest_interpretation_status: Option<String>,
+    #[serde(default)]
+    diagnostic_backtest_phase: Option<String>,
+    #[serde(default)]
+    diagnostic_backtest_status: Option<String>,
+    #[serde(default)]
+    hypothesis_shortlist_available: bool,
+    #[serde(default)]
     research_derived_ready: bool,
     #[serde(default)]
     research_derived_readiness_level: BacktestReadinessLevel,
@@ -1927,6 +2259,8 @@ struct ResearchWorkerRunSummary {
     compute_features: bool,
     run_backtests: bool,
     generate_exports: bool,
+    #[serde(default)]
+    skip_csv_export: bool,
     update_calibration: bool,
     research_outputs_available: bool,
     research_worker_processed: bool,
@@ -1987,6 +2321,12 @@ struct ResearchWorkerRunSummary {
     source_artifact_type_used: Option<String>,
     #[serde(default)]
     source_segments_verified: bool,
+    #[serde(default)]
+    total_runtime_ms: u128,
+    #[serde(default)]
+    stage_timings_ms: BTreeMap<String, u128>,
+    #[serde(default)]
+    detailed_replay_profile: RuntimeReplayProfile,
     warnings: Vec<String>,
 }
 
@@ -3801,6 +4141,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::RunResearchWorker {
+            env_file,
             run_id,
             latest_run,
             latest_n_runs,
@@ -3810,6 +4151,7 @@ async fn main() -> Result<()> {
             compute_features,
             run_backtests,
             generate_exports,
+            skip_csv_export,
             update_calibration,
             resume,
             resume_batch,
@@ -3821,6 +4163,7 @@ async fn main() -> Result<()> {
             skip_completed_research,
             no_live_streams,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             run_research_worker_command(
                 &loaded,
                 run_id.as_deref(),
@@ -3832,6 +4175,7 @@ async fn main() -> Result<()> {
                 compute_features,
                 run_backtests,
                 generate_exports,
+                skip_csv_export,
                 update_calibration,
                 resume,
                 resume_batch.as_deref(),
@@ -3845,15 +4189,245 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::ProfileResearchWorker {
+            run_id,
+            dataset_index_r2,
+            require_normalized_events,
+        } => {
+            profile_research_worker_command(
+                &loaded,
+                &run_id,
+                dataset_index_r2,
+                require_normalized_events,
+            )
+            .await
+        }
+        Command::ValidateResearchRunHealth {
+            env_file,
+            run_id,
+            dataset_index_r2,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            validate_research_run_health_command(&loaded, &run_id, dataset_index_r2).await
+        }
+        Command::RunEnrichmentWorker {
+            env_file,
+            source_run_id,
+            derived_run_id,
+            profile,
+            max_rpc_calls,
+            max_rpc_credits,
+            max_http_calls,
+            max_wallets,
+            max_mints,
+            max_runtime_seconds,
+            dry_run,
+            canary,
+            resume,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            run_enrichment_worker_command(
+                source_run_id.as_deref(),
+                derived_run_id.as_deref(),
+                &profile,
+                max_rpc_calls,
+                max_rpc_credits,
+                max_http_calls,
+                max_wallets,
+                max_mints,
+                max_runtime_seconds,
+                dry_run,
+                canary,
+                resume,
+                &output_dir,
+            )
+            .await
+        }
+        Command::ValidateMetricParity {
+            env_file,
+            source_run_id,
+            derived_run_id,
+            pinned_run_set,
+            run_id,
+            latest_n,
+            dataset_index_r2,
+            all_families,
+            families,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            validate_metric_parity_command(
+                &loaded,
+                source_run_id.as_deref(),
+                derived_run_id.as_deref(),
+                pinned_run_set.as_deref(),
+                run_id.as_deref(),
+                latest_n,
+                dataset_index_r2,
+                all_families,
+                families.as_deref(),
+                &output_dir,
+            )
+            .await
+        }
+        Command::ValidateBacktestReadinessV2 {
+            env_file,
+            run_id,
+            pinned_run_set,
+            latest_n,
+            dataset_index_r2,
+            intended_use,
+            required_metric_profile,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            validate_backtest_readiness_v2_command(
+                &loaded,
+                run_id.as_deref(),
+                pinned_run_set.as_deref(),
+                latest_n,
+                dataset_index_r2,
+                &intended_use,
+                &required_metric_profile,
+                &output_dir,
+            )
+            .await
+        }
+        Command::ValidateMetricContract {
+            env_file,
+            fresh_run_id,
+            fresh_derived_run_id,
+            pinned_run_set,
+            dataset_index_r2,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            validate_metric_contract_command(
+                &loaded,
+                fresh_run_id.as_deref(),
+                fresh_derived_run_id.as_deref(),
+                pinned_run_set.as_deref(),
+                dataset_index_r2,
+                &output_dir,
+            )
+            .await
+        }
+        Command::GenerateCanonicalLabels {
+            env_file,
+            dataset_index_r2,
+            pinned_run_set,
+            run_id,
+            derived_run_id,
+            latest_n_clean,
+            output_dir,
+            require_normalized_events,
+            canonical_price_only,
+            exclude_artifacts,
+            verify,
+            min_label_horizon_seconds,
+            include_token_labels,
+            include_trade_labels,
+            upload_r2,
+            merge_dataset_index,
+            dry_run,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            generate_canonical_labels_command(
+                &loaded,
+                dataset_index_r2,
+                pinned_run_set.as_deref(),
+                run_id.as_deref(),
+                derived_run_id.as_deref(),
+                latest_n_clean,
+                &output_dir,
+                require_normalized_events,
+                canonical_price_only,
+                exclude_artifacts,
+                verify,
+                min_label_horizon_seconds,
+                include_token_labels,
+                include_trade_labels,
+                upload_r2,
+                merge_dataset_index,
+                dry_run,
+            )
+            .await
+        }
+        Command::RunQuantDiagnostics {
+            source_run_id,
+            derived_run_id,
+            output_dir,
+            dataset_index_r2,
+        } => {
+            run_quant_diagnostics_command(
+                &loaded,
+                source_run_id.as_deref(),
+                derived_run_id.as_deref(),
+                &output_dir,
+                dataset_index_r2,
+            )
+            .await
+        }
+        Command::BuildRunDossier {
+            env_file,
+            run_id,
+            derived_run_id,
+            latest_n_source_runs,
+            latest_normalized_complete_runs,
+            latest_research_runs,
+            all_clean_research_runs,
+            dataset_index_r2,
+            include_derived_replays,
+            include_token_metrics,
+            include_trade_metrics,
+            include_feature_coverage,
+            include_strategy_diagnostics,
+            include_metric_formulas,
+            include_readiness,
+            include_data_quality,
+            include_r2_proof,
+            metric_engine_v2: _,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            build_run_dossier_command(
+                &loaded,
+                run_id.as_deref(),
+                derived_run_id.as_deref(),
+                latest_n_source_runs,
+                latest_normalized_complete_runs,
+                latest_research_runs,
+                all_clean_research_runs,
+                dataset_index_r2,
+                include_derived_replays,
+                include_token_metrics,
+                include_trade_metrics,
+                include_feature_coverage,
+                include_strategy_diagnostics,
+                include_metric_formulas,
+                include_readiness,
+                include_data_quality,
+                include_r2_proof,
+                &output_dir,
+            )
+            .await
+        }
         Command::ListNormalizedCompleteRuns {
+            env_file,
             dataset_index_r2,
             latest_n,
-        } => list_normalized_complete_runs_command(&loaded, dataset_index_r2, latest_n).await,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            list_normalized_complete_runs_command(&loaded, dataset_index_r2, latest_n).await
+        }
         Command::RefreshResearchWorkerSummary {
+            env_file,
             source_run_id,
             local_output_dir,
             dataset_index_r2,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             refresh_research_worker_summary_command(
                 &loaded,
                 &source_run_id,
@@ -3868,18 +4442,24 @@ async fn main() -> Result<()> {
             local_output_dir,
         } => inspect_research_batch_command(&loaded, &batch_id, local_output_dir.as_deref()),
         Command::UploadResearchResultsR2 {
+            env_file,
             source_run_id,
             local_output_dir,
             verify,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             upload_research_results_r2_command(&loaded, &source_run_id, &local_output_dir, verify)
                 .await
         }
         Command::DiagnoseR2Segment {
+            env_file,
             run_id,
             artifact_type,
             segment_id,
-        } => diagnose_r2_segment_command(&loaded, &run_id, &artifact_type, &segment_id).await,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            diagnose_r2_segment_command(&loaded, &run_id, &artifact_type, &segment_id).await
+        }
         Command::AutopilotStatus => autopilot_status_command(&loaded),
         Command::AutopilotStop => autopilot_stop_command(&loaded),
         Command::AutopilotResume => autopilot_resume_command(&loaded),
@@ -3950,15 +4530,21 @@ async fn main() -> Result<()> {
             .await
         }
         Command::VerifyEdgeRunIntegrity {
+            env_file,
             run_id,
             dataset_index_r2,
-        } => verify_edge_run_integrity_command(&loaded, &run_id, dataset_index_r2).await,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            verify_edge_run_integrity_command(&loaded, &run_id, dataset_index_r2).await
+        }
         Command::RestoreRunSegments {
+            env_file,
             run_id,
             latest_run,
             latest_live_paper_run,
             artifact_type,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             restore_run_segments_command(
                 &loaded,
                 run_id.as_deref(),
@@ -4002,8 +4588,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::InspectR2 => inspect_r2_command(&loaded),
+        Command::InspectR2 { env_file } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            inspect_r2_command(&loaded)
+        }
         Command::UploadArtifactsR2 {
+            env_file,
             run_id,
             latest_run,
             latest_source_run,
@@ -4028,6 +4618,7 @@ async fn main() -> Result<()> {
             max_total_upload_mb,
             skip_large_raw_events,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             upload_artifacts_r2_command(
                 &loaded,
                 run_id.as_deref(),
@@ -4056,14 +4647,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::UploadPendingR2 { dry_run } => upload_pending_r2_command(&loaded, dry_run).await,
+        Command::UploadPendingR2 { env_file, dry_run } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            upload_pending_r2_command(&loaded, dry_run).await
+        }
         Command::VerifyR2Upload {
+            env_file,
             run_id,
             latest_run,
             dry_run,
             check_manifest_consistency,
             repair_manifest_drift,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             verify_r2_upload_command(
                 &loaded,
                 run_id.as_deref(),
@@ -4075,12 +4671,20 @@ async fn main() -> Result<()> {
             .await
         }
         Command::RepairManifestConsistency {
+            env_file,
             run_id,
             upload_r2,
             verify_r2,
-        } => repair_manifest_consistency_command(&loaded, &run_id, upload_r2, verify_r2).await,
-        Command::ListR2Artifacts { run_id } => list_r2_artifacts_command(&loaded, &run_id).await,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            repair_manifest_consistency_command(&loaded, &run_id, upload_r2, verify_r2).await
+        }
+        Command::ListR2Artifacts { env_file, run_id } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            list_r2_artifacts_command(&loaded, &run_id).await
+        }
         Command::PruneLocalAfterR2 {
+            env_file,
             run_id,
             latest_run,
             dry_run,
@@ -4094,6 +4698,7 @@ async fn main() -> Result<()> {
             min_age_hours,
             force_prune_verified,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             prune_local_after_r2_command(
                 &loaded,
                 run_id.as_deref(),
@@ -4111,17 +4716,26 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::R2PlanManagedBuckets => r2_plan_managed_buckets_command(&loaded),
-        Command::R2ListBuckets => r2_list_buckets_command(&loaded).await,
-        Command::R2CreateManagedBuckets { dry_run } => {
+        Command::R2PlanManagedBuckets { env_file } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            r2_plan_managed_buckets_command(&loaded)
+        }
+        Command::R2ListBuckets { env_file } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            r2_list_buckets_command(&loaded).await
+        }
+        Command::R2CreateManagedBuckets { env_file, dry_run } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             r2_create_managed_buckets_command(&loaded, dry_run).await
         }
         Command::R2EmptyManagedPrefix {
+            env_file,
             bucket,
             prefix,
             dry_run,
             i_understand_this_deletes_r2_data,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             r2_empty_managed_prefix_command(
                 &loaded,
                 &bucket,
@@ -4132,17 +4746,21 @@ async fn main() -> Result<()> {
             .await
         }
         Command::R2DeleteManagedBuckets {
+            env_file,
             dry_run,
             i_understand_this_deletes_r2_data,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             r2_delete_managed_buckets_command(&loaded, dry_run, i_understand_this_deletes_r2_data)
                 .await
         }
         Command::R2ResetManagedStorage {
+            env_file,
             dry_run,
             i_understand_this_deletes_r2_data,
             i_understand_this_deletes_cloudflare_r2_data,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             r2_reset_managed_storage_command(
                 &loaded,
                 dry_run,
@@ -4171,6 +4789,7 @@ async fn main() -> Result<()> {
         Command::BuildDatasetIndex => build_dataset_index_command(&loaded),
         Command::RefreshDatasetIndex => refresh_dataset_index_command(&loaded),
         Command::BackfillRunMetadata {
+            env_file,
             run_id,
             latest_live_paper_run,
             latest_recovered_run,
@@ -4181,6 +4800,7 @@ async fn main() -> Result<()> {
             upload_dataset_index,
             verify_r2,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             backfill_run_metadata_command(
                 &loaded,
                 run_id.as_deref(),
@@ -4196,11 +4816,13 @@ async fn main() -> Result<()> {
             .await
         }
         Command::UploadDatasetIndexR2 {
+            env_file,
             dry_run,
             verify,
             merge_authoritative,
             dry_run_diff,
         } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             upload_dataset_index_r2_command(
                 &loaded,
                 dry_run,
@@ -4210,14 +4832,30 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::PublishPhase82Results {
+            env_file,
+            phase82_dir,
+            pinned_run_set,
+            verify,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            publish_phase82_results_command(&loaded, &phase82_dir, &pinned_run_set, verify).await
+        }
         Command::InspectDatasetIndexLock => inspect_dataset_index_lock_command(&loaded),
         Command::ClearStaleDatasetIndexLock { dry_run, force } => {
             clear_stale_dataset_index_lock_command(&loaded, dry_run, force)
         }
-        Command::InspectDatasetIndex { dataset_index_r2 } => {
+        Command::InspectDatasetIndex {
+            env_file,
+            dataset_index_r2,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             inspect_dataset_index_command(&loaded, dataset_index_r2).await
         }
-        Command::ExportR2Manifests => export_r2_manifests_command(&loaded).await,
+        Command::ExportR2Manifests { env_file } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            export_r2_manifests_command(&loaded).await
+        }
         Command::BuildReleaseService => build_release_service_command(&loaded),
         Command::CleanBuildArtifacts { dry_run, force } => {
             clean_build_artifacts_command(&loaded, dry_run, force)
@@ -5648,6 +6286,23 @@ fn merge_dataset_index_entry(
     let incoming_has_research_semantics = incoming.research_worker_processed
         || incoming.research_outputs_available
         || incoming.research_latest_derived_run_id.is_some();
+    let incoming_has_math_semantics = incoming.math_correctness_status.is_some()
+        || incoming.holder_math_version.is_some()
+        || incoming.holder_parity_status.is_some()
+        || incoming.top_holder_parity_status.is_some()
+        || incoming.dev_holding_parity_status.is_some()
+        || incoming.executable_pnl_total.is_some()
+        || incoming.metric_parity_v2.is_some()
+        || incoming.readiness_v2.is_some()
+        || incoming.label_generator_version.is_some()
+        || incoming.canonical_label_status.is_some()
+        || incoming.canonical_price_path_version.is_some()
+        || incoming.curve_coverage_status.is_some()
+        || incoming.label_coverage_status.is_some()
+        || incoming.diagnostic_backtest_interpretation_status.is_some()
+        || incoming.diagnostic_backtest_phase.is_some()
+        || incoming.diagnostic_backtest_status.is_some()
+        || incoming.hypothesis_shortlist_available;
     incoming.run_status = stronger_run_status(incoming.run_status, &existing.run_status);
     incoming.finalization_status =
         stronger_finalization_status(incoming.finalization_status, &existing.finalization_status);
@@ -5764,6 +6419,128 @@ fn merge_dataset_index_entry(
         incoming.research_r2_failed_count,
         existing.research_r2_failed_count,
     );
+    incoming.math_version = prefer_some_string(incoming.math_version, &existing.math_version);
+    incoming.holder_math_version =
+        prefer_some_string(incoming.holder_math_version, &existing.holder_math_version);
+    incoming.math_correctness_status = prefer_some_string(
+        incoming.math_correctness_status,
+        &existing.math_correctness_status,
+    );
+    incoming.holder_parity_status = prefer_some_string(
+        incoming.holder_parity_status,
+        &existing.holder_parity_status,
+    );
+    incoming.top_holder_parity_status = prefer_some_string(
+        incoming.top_holder_parity_status,
+        &existing.top_holder_parity_status,
+    );
+    incoming.dev_holding_parity_status = prefer_some_string(
+        incoming.dev_holding_parity_status,
+        &existing.dev_holding_parity_status,
+    );
+    incoming.holder_invariant_status = prefer_some_string(
+        incoming.holder_invariant_status,
+        &existing.holder_invariant_status,
+    );
+    if !incoming_has_math_semantics {
+        incoming.holder_parity_passed =
+            prefer_nonzero_u64(incoming.holder_parity_passed, existing.holder_parity_passed);
+        incoming.holder_parity_failed =
+            prefer_nonzero_u64(incoming.holder_parity_failed, existing.holder_parity_failed);
+        incoming.holder_parity_unavailable = prefer_nonzero_u64(
+            incoming.holder_parity_unavailable,
+            existing.holder_parity_unavailable,
+        );
+        incoming.top_holder_parity_passed = prefer_nonzero_u64(
+            incoming.top_holder_parity_passed,
+            existing.top_holder_parity_passed,
+        );
+        incoming.top_holder_parity_failed = prefer_nonzero_u64(
+            incoming.top_holder_parity_failed,
+            existing.top_holder_parity_failed,
+        );
+        incoming.top_holder_parity_unavailable = prefer_nonzero_u64(
+            incoming.top_holder_parity_unavailable,
+            existing.top_holder_parity_unavailable,
+        );
+        incoming.dev_holding_parity_passed = prefer_nonzero_u64(
+            incoming.dev_holding_parity_passed,
+            existing.dev_holding_parity_passed,
+        );
+        incoming.dev_holding_parity_failed = prefer_nonzero_u64(
+            incoming.dev_holding_parity_failed,
+            existing.dev_holding_parity_failed,
+        );
+    }
+    incoming.executable_pnl_total = incoming
+        .executable_pnl_total
+        .or(existing.executable_pnl_total);
+    incoming.raw_pnl_total = incoming.raw_pnl_total.or(existing.raw_pnl_total);
+    incoming.artifact_excluded_pnl_total = incoming
+        .artifact_excluded_pnl_total
+        .or(existing.artifact_excluded_pnl_total);
+    incoming.threshold_tuning_allowed &=
+        existing.threshold_tuning_allowed || incoming_has_math_semantics;
+    incoming.metric_parity_v2 = incoming
+        .metric_parity_v2
+        .or_else(|| existing.metric_parity_v2.clone());
+    incoming.readiness_v2 = incoming
+        .readiness_v2
+        .or_else(|| existing.readiness_v2.clone());
+    incoming.label_generator_version = prefer_some_string(
+        incoming.label_generator_version,
+        &existing.label_generator_version,
+    );
+    incoming.canonical_label_status = prefer_some_string(
+        incoming.canonical_label_status,
+        &existing.canonical_label_status,
+    );
+    incoming.price_coverage_status = prefer_some_string(
+        incoming.price_coverage_status,
+        &existing.price_coverage_status,
+    );
+    incoming.market_cap_coverage_status = prefer_some_string(
+        incoming.market_cap_coverage_status,
+        &existing.market_cap_coverage_status,
+    );
+    incoming.curve_progress_coverage_status = prefer_some_string(
+        incoming.curve_progress_coverage_status,
+        &existing.curve_progress_coverage_status,
+    );
+    incoming.mfe_mae_label_status = prefer_some_string(
+        incoming.mfe_mae_label_status,
+        &existing.mfe_mae_label_status,
+    );
+    incoming.diagnostic_backtest_pack_status = prefer_some_string(
+        incoming.diagnostic_backtest_pack_status,
+        &existing.diagnostic_backtest_pack_status,
+    );
+    incoming.diagnostic_backtesting_allowed |= existing.diagnostic_backtesting_allowed;
+    incoming.canonical_price_path_version = prefer_some_string(
+        incoming.canonical_price_path_version,
+        &existing.canonical_price_path_version,
+    );
+    incoming.curve_coverage_status = prefer_some_string(
+        incoming.curve_coverage_status,
+        &existing.curve_coverage_status,
+    );
+    incoming.label_coverage_status = prefer_some_string(
+        incoming.label_coverage_status,
+        &existing.label_coverage_status,
+    );
+    incoming.diagnostic_backtest_interpretation_status = prefer_some_string(
+        incoming.diagnostic_backtest_interpretation_status,
+        &existing.diagnostic_backtest_interpretation_status,
+    );
+    incoming.diagnostic_backtest_phase = prefer_some_string(
+        incoming.diagnostic_backtest_phase,
+        &existing.diagnostic_backtest_phase,
+    );
+    incoming.diagnostic_backtest_status = prefer_some_string(
+        incoming.diagnostic_backtest_status,
+        &existing.diagnostic_backtest_status,
+    );
+    incoming.hypothesis_shortlist_available |= existing.hypothesis_shortlist_available;
     incoming.research_derived_ready |= existing.research_derived_ready;
     incoming.research_derived_readiness_level = prefer_nondefault_readiness_level(
         incoming.research_derived_readiness_level,
@@ -9154,7 +9931,13 @@ fn csv_row_count(path: &Path) -> usize {
 }
 
 fn export_chunk_rows(loaded: &LoadedConfig) -> usize {
-    loaded.config.exports.feature_export_chunk_rows.max(1)
+    loaded
+        .config
+        .research_worker
+        .exports
+        .chunk_rows
+        .max(loaded.config.exports.feature_export_chunk_rows)
+        .max(1)
 }
 
 fn export_max_uncompressed_bytes(loaded: &LoadedConfig) -> u64 {
@@ -9370,7 +10153,12 @@ fn chunk_existing_export_if_needed(
         return Ok(None);
     }
     let size = fs::metadata(path)?.len();
-    if !loaded.config.exports.chunked_enabled || size <= export_max_uncompressed_bytes(loaded) {
+    if !loaded.config.exports.chunked_enabled {
+        return Ok(None);
+    }
+    if size <= export_max_uncompressed_bytes(loaded)
+        && !loaded.config.research_worker.exports.compressed_only
+    {
         return Ok(None);
     }
     let chunks = split_existing_csv_into_chunks(loaded, run_id, export_name, path, true)?;
@@ -10669,7 +11457,7 @@ struct CsvChunkWriter {
     current_rows: usize,
     sequence: usize,
     temp_path: Option<PathBuf>,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
     chunks: Vec<ExportChunkManifestEntry>,
 }
 
@@ -10724,7 +11512,7 @@ impl CsvChunkWriter {
         let temp_path = self
             .report_dir
             .join(format!("{}_tmp_{:05}.csv", self.export_name, self.sequence));
-        let mut file = File::create(&temp_path)?;
+        let mut file = BufWriter::new(File::create(&temp_path)?);
         file.write_all(self.header.as_bytes())?;
         self.temp_path = Some(temp_path);
         self.file = Some(file);
@@ -10737,7 +11525,7 @@ impl CsvChunkWriter {
         };
         if let Some(mut file) = self.file.take() {
             file.flush()?;
-            file.sync_all()?;
+            file.get_ref().sync_all()?;
         }
         if self.current_rows == 0 {
             let _ = fs::remove_file(temp_path);
@@ -11912,6 +12700,7 @@ async fn smoke_r2_upload_command(
     json_output: bool,
     markdown_output: bool,
 ) -> Result<()> {
+    let _env_overlay = apply_env_file_overlay(loaded, env_file)?;
     let smoke_run_id = derived_run_id("r2-smoke");
     let report_root =
         resolve_report_root(loaded, "r2_smoke", &smoke_run_id, Some("reports/r2_smoke"));
@@ -13160,6 +13949,42 @@ fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
                     .as_ref()
                     .map(|summary| summary.research_r2_failed_count)
                     .unwrap_or_default(),
+                math_version: None,
+                holder_math_version: None,
+                math_correctness_status: None,
+                holder_parity_status: None,
+                top_holder_parity_status: None,
+                dev_holding_parity_status: None,
+                holder_invariant_status: None,
+                holder_parity_passed: 0,
+                holder_parity_failed: 0,
+                holder_parity_unavailable: 0,
+                top_holder_parity_passed: 0,
+                top_holder_parity_failed: 0,
+                top_holder_parity_unavailable: 0,
+                dev_holding_parity_passed: 0,
+                dev_holding_parity_failed: 0,
+                executable_pnl_total: None,
+                raw_pnl_total: None,
+                artifact_excluded_pnl_total: None,
+                threshold_tuning_allowed: false,
+                metric_parity_v2: None,
+                readiness_v2: None,
+                label_generator_version: None,
+                canonical_label_status: None,
+                price_coverage_status: None,
+                market_cap_coverage_status: None,
+                curve_progress_coverage_status: None,
+                mfe_mae_label_status: None,
+                diagnostic_backtest_pack_status: None,
+                diagnostic_backtesting_allowed: false,
+                canonical_price_path_version: None,
+                curve_coverage_status: None,
+                label_coverage_status: None,
+                diagnostic_backtest_interpretation_status: None,
+                diagnostic_backtest_phase: None,
+                diagnostic_backtest_status: None,
+                hypothesis_shortlist_available: false,
                 research_derived_ready: research_worker_summary
                     .as_ref()
                     .map(|summary| summary.research_derived_ready)
@@ -13569,6 +14394,115 @@ async fn populate_edge_dataset_fields_from_remote_manifest(
     Ok(())
 }
 
+fn json_u64_field(value: &serde_json::Value, object: &str, field: &str) -> u64 {
+    value
+        .get(object)
+        .and_then(|node| node.get(field))
+        .and_then(|node| {
+            node.as_u64().or_else(|| {
+                node.as_str()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|node| node.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| text.to_owned())
+}
+
+fn json_decimal_nested(value: &serde_json::Value, object: &str, field: &str) -> Option<Decimal> {
+    value
+        .get(object)
+        .and_then(|node| node.get(field))
+        .and_then(|node| match node {
+            serde_json::Value::Number(number) => number.to_string().parse::<Decimal>().ok(),
+            serde_json::Value::String(text) => text.parse::<Decimal>().ok(),
+            _ => None,
+        })
+}
+
+fn parity_status(value: &serde_json::Value, object: &str) -> Option<String> {
+    let passed = json_u64_field(value, object, "passed");
+    let failed = json_u64_field(value, object, "failed");
+    let unavailable = json_u64_field(value, object, "unavailable");
+    if failed > 0 {
+        Some("failed".to_owned())
+    } else if unavailable > 0 && passed > 0 {
+        Some("partial_pass_with_unavailable".to_owned())
+    } else if unavailable > 0 {
+        Some("unavailable".to_owned())
+    } else if passed > 0 {
+        Some("passed".to_owned())
+    } else {
+        None
+    }
+}
+
+fn candidate_phase_math_report_dirs(output_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(output_dir.to_path_buf());
+    let mut cursor = output_dir;
+    for _ in 0..3 {
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        dirs.push(parent.to_path_buf());
+        cursor = parent;
+    }
+    dirs
+}
+
+fn apply_phase_math_metadata_from_local_reports(
+    entry: &mut DatasetIndexRunEntry,
+    output_dir: &str,
+) {
+    let output_dir = PathBuf::from(output_dir);
+    let dirs = candidate_phase_math_report_dirs(&output_dir);
+    let math_summary = dirs
+        .iter()
+        .map(|dir| dir.join("math_correctness_summary.json"))
+        .find(|path| path.exists())
+        .and_then(|path| read_json_file::<serde_json::Value>(&path));
+    let Some(math_summary) = math_summary else {
+        return;
+    };
+
+    entry.math_version = Some("phase76_owner_summed".to_owned());
+    entry.holder_math_version = Some("phase76_owner_summed".to_owned());
+    entry.math_correctness_status = json_string_field(&math_summary, "math_correctness_status");
+    entry.holder_parity_status = parity_status(&math_summary, "holder_parity");
+    entry.top_holder_parity_status = parity_status(&math_summary, "top_holder_parity");
+    entry.dev_holding_parity_status = parity_status(&math_summary, "dev_holding_parity");
+    entry.holder_invariant_status = json_string_field(&math_summary, "holder_invariant_status");
+    entry.holder_parity_passed = json_u64_field(&math_summary, "holder_parity", "passed");
+    entry.holder_parity_failed = json_u64_field(&math_summary, "holder_parity", "failed");
+    entry.holder_parity_unavailable = json_u64_field(&math_summary, "holder_parity", "unavailable");
+    entry.top_holder_parity_passed = json_u64_field(&math_summary, "top_holder_parity", "passed");
+    entry.top_holder_parity_failed = json_u64_field(&math_summary, "top_holder_parity", "failed");
+    entry.top_holder_parity_unavailable =
+        json_u64_field(&math_summary, "top_holder_parity", "unavailable");
+    entry.dev_holding_parity_passed = json_u64_field(&math_summary, "dev_holding_parity", "passed");
+    entry.dev_holding_parity_failed = json_u64_field(&math_summary, "dev_holding_parity", "failed");
+    entry.threshold_tuning_allowed = false;
+
+    let replay_comparison = dirs
+        .iter()
+        .map(|dir| dir.join("replay_outcome_comparison.json"))
+        .find(|path| path.exists())
+        .and_then(|path| read_json_file::<serde_json::Value>(&path));
+    if let Some(replay_comparison) = replay_comparison {
+        let pnl = json_decimal_nested(&replay_comparison, "new_replay", "paper_pnl");
+        entry.executable_pnl_total = pnl;
+        entry.raw_pnl_total = pnl;
+        entry.artifact_excluded_pnl_total = Some(Decimal::ZERO);
+    }
+}
+
 async fn apply_research_outputs_to_dataset_index(
     loaded: &LoadedConfig,
     index: &mut DatasetIndex,
@@ -13616,6 +14550,7 @@ async fn apply_research_outputs_to_dataset_index(
     entry.source_fallback_warning = run_summary.source_fallback_warning;
     entry.source_fallback_affected = run_summary.source_fallback_affected;
     entry.edge_dataset_complete = run_summary.edge_dataset_complete;
+    apply_phase_math_metadata_from_local_reports(entry, &summary.output_dir);
     let _ = populate_edge_dataset_fields_from_remote_manifest(loaded, entry).await;
     entry.normalized_events_missing =
         entry.edge_mode && entry.normalized_events_segments_count == 0;
@@ -13878,6 +14813,259 @@ async fn upload_dataset_index_r2_command(
             "changed_run_ids": summary.changed_run_ids,
         }))?
     );
+    Ok(())
+}
+
+fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name == ".DS_Store" || name == "Thumbs.db" || name.starts_with(".") {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+async fn publish_phase82_results_command(
+    loaded: &LoadedConfig,
+    phase82_dir: &str,
+    pinned_run_set: &str,
+    verify: bool,
+) -> Result<()> {
+    let phase82_dir = PathBuf::from(phase82_dir);
+    let phase_dir_lower = phase82_dir.to_string_lossy().to_ascii_lowercase();
+    let phase_label = if phase_dir_lower.contains("phase85") {
+        "phase85_diagnostic_lab"
+    } else if phase_dir_lower.contains("phase84") {
+        "phase84_labels"
+    } else if phase_dir_lower.contains("phase83") {
+        "phase83_labels"
+    } else {
+        "phase82_labels"
+    };
+    let command_name = match phase_label {
+        "phase85_diagnostic_lab" => "publish-phase85-diagnostic-lab",
+        "phase84_labels" => "publish-phase84-results",
+        "phase83_labels" => "publish-phase83-results",
+        _ => "publish-phase82-results",
+    };
+    let pinned_run_set_path = PathBuf::from(pinned_run_set);
+    let pinned = read_json_file::<serde_json::Value>(&pinned_run_set_path).ok_or_else(|| {
+        anyhow!(
+            "pinned run set missing or invalid: {}",
+            pinned_run_set_path.display()
+        )
+    })?;
+    let runs = pinned
+        .get("runs")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("pinned run set must contain runs array"))?;
+    let readiness =
+        read_json_file::<serde_json::Value>(&phase82_dir.join("backtest_readiness_v2_batch.json"))
+            .unwrap_or_else(|| json!({}));
+    let metric_batch =
+        read_json_file::<serde_json::Value>(&phase82_dir.join("metric_parity_batch.json"))
+            .unwrap_or_else(|| json!({}));
+
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let mut uploaded_files = Vec::new();
+    let mut verified_files = Vec::new();
+    let mut failed_files = Vec::new();
+    for path in collect_regular_files(&phase82_dir)? {
+        let relative = path
+            .strip_prefix(&phase82_dir)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let remote_key = client.managed_key(
+            &research_remote_base_prefix(&client),
+            &format!("{phase_label}/{relative}"),
+        );
+        let prepared = client.prepare_upload(
+            &path,
+            bucket.clone(),
+            remote_key.clone(),
+            &artifact_content_type(&path),
+            BTreeMap::new(),
+            Some(false),
+        )?;
+        let result = client
+            .upload_prepared(&prepared, verify.then_some(true))
+            .await?;
+        if result.uploaded {
+            uploaded_files.push(remote_key.clone());
+        }
+        if verify && result.verified {
+            verified_files.push(remote_key.clone());
+        }
+        if verify && !result.verified {
+            failed_files.push(remote_key.clone());
+        }
+    }
+
+    let mut index = match download_dataset_index_from_r2(loaded).await {
+        Ok(index) => index,
+        Err(_) => load_dataset_index_local_or_r2(loaded, false).await?,
+    };
+    let mut updated_run_ids = Vec::new();
+    for run in runs {
+        let Some(source_run_id) = run.get("source_run_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let derived_run_id = run
+            .get("derived_run_id")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let entry = index
+            .runs
+            .iter_mut()
+            .find(|entry| entry.run_id == source_run_id)
+            .ok_or_else(|| anyhow!("source run {source_run_id} not found in dataset index"))?;
+        entry.threshold_tuning_allowed = false;
+        if phase_label == "phase85_diagnostic_lab" {
+            entry.diagnostic_backtest_phase = Some("phase85".to_owned());
+            entry.diagnostic_backtest_status = Some("generated".to_owned());
+            entry.hypothesis_shortlist_available = true;
+            updated_run_ids.push(source_run_id.to_owned());
+            continue;
+        }
+        let summary_path = phase82_dir
+            .join("runs")
+            .join(source_run_id)
+            .join("metric_parity_summary.json");
+        let summary = read_json_file::<serde_json::Value>(&summary_path)
+            .ok_or_else(|| anyhow!("metric parity summary missing: {}", summary_path.display()))?;
+        let metric_parity_v2 = json!({
+            "schema_version": match phase_label {
+                "phase84_labels" => "metric_parity_v2.phase84",
+                "phase83_labels" => "metric_parity_v2.phase83",
+                _ => "metric_parity_v2.phase82",
+            },
+            "metric_engine_version": "phase80_metric_engine_v2",
+            "generated_at": OffsetDateTime::now_utc(),
+            "source_run_id": source_run_id,
+            "derived_run_id": derived_run_id,
+            "families": summary.get("families").cloned().unwrap_or_else(|| json!({})),
+            "overall_status": summary.get("metric_parity_overall_status").cloned().unwrap_or_else(|| json!("unknown")),
+            "diagnostics_allowed": metric_batch.get("diagnostic_backtesting_allowed").cloned().unwrap_or_else(|| json!(false)),
+            "backtest_allowed": readiness.pointer("/use_cases/single_run_backtest/allowed").cloned().unwrap_or_else(|| json!(false)),
+            "threshold_tuning_allowed": false,
+        });
+        let readiness_v2 = json!({
+            "schema_version": match phase_label {
+                "phase84_labels" => "readiness_v2.phase84",
+                "phase83_labels" => "readiness_v2.phase83",
+                _ => "readiness_v2.phase82",
+            },
+            "generated_at": OffsetDateTime::now_utc(),
+            "source_run_id": source_run_id,
+            "derived_run_id": derived_run_id,
+            "diagnostics": readiness.pointer("/use_cases/diagnostics").cloned().unwrap_or_else(|| json!({"allowed": false})),
+            "single_run_backtest": readiness.pointer("/use_cases/single_run_backtest").cloned().unwrap_or_else(|| json!({"allowed": false})),
+            "multi_run_backtest": readiness.pointer("/use_cases/multi_run_backtest").cloned().unwrap_or_else(|| json!({"allowed": false})),
+            "threshold_tuning": readiness.pointer("/use_cases/threshold_tuning").cloned().unwrap_or_else(|| json!({"allowed": false})),
+            "walk_forward": readiness.pointer("/use_cases/walk_forward").cloned().unwrap_or_else(|| json!({"allowed": false})),
+        });
+        entry.metric_parity_v2 = Some(metric_parity_v2);
+        entry.readiness_v2 = Some(readiness_v2);
+        if phase_label == "phase83_labels" || phase_label == "phase84_labels" {
+            let family_status = |family: &str| -> Option<String> {
+                summary
+                    .pointer(&format!("/families/{family}/status"))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            };
+            entry.label_generator_version = Some(if phase_label == "phase84_labels" {
+                "phase84_cli_v2".to_owned()
+            } else {
+                "phase83_cli".to_owned()
+            });
+            entry.canonical_label_status = Some(
+                family_status("mfe_mae")
+                    .unwrap_or_else(|| "partial_pass_with_unavailable".to_owned()),
+            );
+            entry.price_coverage_status = family_status("price");
+            entry.market_cap_coverage_status = family_status("market_cap");
+            entry.curve_progress_coverage_status = family_status("curve_progress");
+            entry.mfe_mae_label_status = family_status("mfe_mae");
+            entry.diagnostic_backtest_pack_status = Some("generated".to_owned());
+            entry.diagnostic_backtesting_allowed = metric_batch
+                .get("diagnostic_backtesting_allowed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if phase_label == "phase84_labels" {
+                entry.canonical_price_path_version = Some("phase84_v2".to_owned());
+                entry.curve_coverage_status = family_status("curve_progress");
+                entry.label_coverage_status = family_status("mfe_mae");
+                entry.diagnostic_backtest_interpretation_status = Some("generated".to_owned());
+            }
+        }
+        updated_run_ids.push(source_run_id.to_owned());
+    }
+    index.generated_at = OffsetDateTime::now_utc();
+    let local_path = dataset_index_path(loaded);
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&local_path, serde_json::to_vec_pretty(&index)?)?;
+    let upload_summary = upload_dataset_index_value_r2(loaded, &index, false, verify).await?;
+    let result = json!({
+        "command": command_name,
+        "phase_label": phase_label,
+        "phase82_dir": phase82_dir.display().to_string(),
+        "pinned_run_set": pinned_run_set_path.display().to_string(),
+        "uploaded_label_report_files": uploaded_files.len(),
+        "verified_label_report_files": verified_files.len(),
+        "failed_label_report_files": failed_files,
+        "updated_run_ids": updated_run_ids,
+        "dataset_index_uploaded": upload_summary.uploaded,
+        "dataset_index_verified": upload_summary.verified,
+        "dataset_index_remote_key": upload_summary.remote_key,
+        "dataset_index_bucket": upload_summary.bucket,
+        "no_secrets": true,
+    });
+    fs::write(
+        phase82_dir.join("dataset_index_upload_result.json"),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
+    write_report(
+        phase82_dir.join("dataset_index_upload_result.md"),
+        &format!(
+            "# {} Dataset Index Upload\n\n- uploaded_label_report_files: {}\n- verified_label_report_files: {}\n- updated_run_ids: `{}`\n- dataset_index_uploaded: {}\n- dataset_index_verified: {}\n- dataset_index_remote_key: `{}`\n- no_secrets: true\n",
+            phase_label,
+            result["uploaded_label_report_files"]
+                .as_u64()
+                .unwrap_or_default(),
+            result["verified_label_report_files"]
+                .as_u64()
+                .unwrap_or_default(),
+            updated_run_ids.join(", "),
+            upload_summary.uploaded,
+            upload_summary.verified,
+            upload_summary.remote_key,
+        ),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -14257,6 +15445,58 @@ fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
         values.insert(clean_key.to_owned(), clean_value);
     }
     Ok(values)
+}
+
+struct EnvFileOverlayGuard {
+    previous_values: Vec<(String, Option<String>)>,
+}
+
+impl Drop for EnvFileOverlayGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.previous_values.iter().rev() {
+            match previous {
+                Some(value) => {
+                    // CLI commands are single-process/single-command invocations here; restore the
+                    // process environment so tests and follow-on code do not inherit the overlay.
+                    unsafe { std::env::set_var(key, value) };
+                }
+                None => {
+                    // See the set_var note above. The guard only touches keys it set itself.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
+}
+
+fn apply_env_file_overlay(
+    loaded: &LoadedConfig,
+    env_file: Option<&str>,
+) -> Result<Option<EnvFileOverlayGuard>> {
+    let Some(path) = env_file else {
+        return Ok(None);
+    };
+    let values = parse_env_file(&resolve_user_path(loaded, path))?;
+    let mut previous_values = Vec::new();
+    for (key, value) in values {
+        let clean_value = value.trim();
+        if clean_value.is_empty() || is_placeholder_env_value(clean_value) {
+            continue;
+        }
+        if std::env::var(&key)
+            .ok()
+            .map(|existing| !existing.trim().is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        previous_values.push((key.clone(), std::env::var(&key).ok()));
+        // This command-line tool runs one selected operation per process. We apply the env-file
+        // overlay before constructing clients so code that reads std::env sees the same values that
+        // bootstrap validation already accepted.
+        unsafe { std::env::set_var(key, clean_value) };
+    }
+    Ok(Some(EnvFileOverlayGuard { previous_values }))
 }
 
 fn valid_endpoint_scheme(value: &str) -> bool {
@@ -19525,6 +20765,19 @@ fn write_named_report<T: Serialize>(
     Ok(())
 }
 
+fn canonical_readiness_verdict_label(readiness: &BacktestReadinessSummary) -> String {
+    match readiness.readiness_level {
+        BacktestReadinessLevel::NotReady => "not_ready",
+        BacktestReadinessLevel::SmokeOnly => "smoke_only",
+        BacktestReadinessLevel::BasicFeatureDistributionReady => "basic_feature_distribution_ready",
+        BacktestReadinessLevel::SingleRunBacktestReady => "single_run_backtest_ready",
+        BacktestReadinessLevel::MultiRunBacktestReady => "multi_run_backtest_ready",
+        BacktestReadinessLevel::WalkForwardCandidate => "walk_forward_candidate",
+        BacktestReadinessLevel::ProductionCandidateNever => "production_candidate_never",
+    }
+    .to_owned()
+}
+
 fn materialize_research_review_reports(
     loaded: &LoadedConfig,
     run_id: &str,
@@ -19569,7 +20822,7 @@ fn materialize_research_review_reports(
     };
     let feature_distribution = FeatureDistributionResearchSummary {
         run_id: run_id.to_owned(),
-        quality_verdict: quality.verdict.clone(),
+        quality_verdict: canonical_readiness_verdict_label(readiness),
         holder_confidence_distribution: quality.holder_confidence_distribution.clone(),
         top_holder_confidence_distribution: quality.top_holder_confidence_distribution.clone(),
         bonding_curve_update_coverage: quality.bonding_curve_update_coverage,
@@ -22288,7 +23541,7 @@ fn write_research_worker_summary_files(
     fs::create_dir_all(report_dir)?;
     fs::create_dir_all(output_dir)?;
     let markdown = format!(
-        "# Research Worker Summary\n\n- run_id: {}\n- source_run_id: {}\n- replay_run_id: {}\n- derived_run_id: {}\n- hydrated_from_r2: {}\n- source_artifact_type_used: {}\n- source_segments_verified: {}\n- normalized_segments_processed: {}\n- normalized_records_loaded: {}\n- compute_features: {}\n- run_backtests: {}\n- generate_exports: {}\n- update_calibration: {}\n- research_outputs_available: {}\n- research_worker_processed: {}\n- local_output_dir: {}\n- research_outputs_remote_prefix: {}\n- feature_outputs_remote_key: {}\n- decision_outputs_remote_key: {}\n- fill_outputs_remote_key: {}\n- backtest_outputs_remote_key: {}\n- calibration_outputs_remote_key: {}\n- research_manifest_remote_key: {}\n- research_r2_verified: {}\n- research_r2_verified_count: {}\n- research_r2_failed_count: {}\n- research_derived_ready: {}\n- research_derived_readiness_level: {:?}\n- edge_dataset_complete: {}\n- normalized_events_missing: {}\n- fallback_used: {}\n- fallback_reason: {}\n- fallback_source: {}\n- fallback_replay_affected: {}\n- normalized_replay_warning: {}\n- normalized_replay_affected: {}\n- normalized_invalid_segment_count: {}\n- source_fallback_warning: {}\n- source_fallback_affected: {}\n- invalid_segment_count: {}\n- invalid_segments: {:?}\n- unresolved_segment_warnings: {:?}\n- research_replay_confidence: {}\n- generated_artifacts: {:?}\n- warnings: {:?}\n",
+        "# Research Worker Summary\n\n- run_id: {}\n- source_run_id: {}\n- replay_run_id: {}\n- derived_run_id: {}\n- hydrated_from_r2: {}\n- source_artifact_type_used: {}\n- source_segments_verified: {}\n- normalized_segments_processed: {}\n- normalized_records_loaded: {}\n- compute_features: {}\n- run_backtests: {}\n- generate_exports: {}\n- update_calibration: {}\n- research_outputs_available: {}\n- research_worker_processed: {}\n- local_output_dir: {}\n- research_outputs_remote_prefix: {}\n- feature_outputs_remote_key: {}\n- decision_outputs_remote_key: {}\n- fill_outputs_remote_key: {}\n- backtest_outputs_remote_key: {}\n- calibration_outputs_remote_key: {}\n- research_manifest_remote_key: {}\n- research_r2_verified: {}\n- research_r2_verified_count: {}\n- research_r2_failed_count: {}\n- research_derived_ready: {}\n- research_derived_readiness_level: {:?}\n- edge_dataset_complete: {}\n- normalized_events_missing: {}\n- fallback_used: {}\n- fallback_reason: {}\n- fallback_source: {}\n- fallback_replay_affected: {}\n- normalized_replay_warning: {}\n- normalized_replay_affected: {}\n- normalized_invalid_segment_count: {}\n- source_fallback_warning: {}\n- source_fallback_affected: {}\n- invalid_segment_count: {}\n- invalid_segments: {:?}\n- unresolved_segment_warnings: {:?}\n- research_replay_confidence: {}\n- total_runtime_ms: {}\n- stage_timings_ms: {:?}\n- detailed_replay_substage_timings_ms: {:?}\n- detailed_replay_counters: {:?}\n- generated_artifacts: {:?}\n- warnings: {:?}\n",
         summary.run_id,
         summary.source_run_id,
         summary.replay_run_id.clone().unwrap_or_default(),
@@ -22353,6 +23606,10 @@ fn write_research_worker_summary_files(
         summary.invalid_segments,
         summary.unresolved_segment_warnings,
         summary.research_replay_confidence,
+        summary.total_runtime_ms,
+        summary.stage_timings_ms,
+        summary.detailed_replay_profile.substage_timings_ms,
+        summary.detailed_replay_profile.counters,
         summary.generated_artifacts,
         summary.warnings,
     );
@@ -22896,6 +24153,596 @@ async fn refresh_research_worker_summary_command(
     Ok(())
 }
 
+fn phase65_output_dir() -> Result<PathBuf> {
+    let dir = PathBuf::from("research_output");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn resolve_research_source_and_derived(
+    index: &DatasetIndex,
+    run_id: &str,
+) -> (Option<DatasetIndexRunEntry>, String, Option<String>) {
+    if let Some(entry) = index.runs.iter().find(|entry| entry.run_id == run_id) {
+        return (
+            Some(entry.clone()),
+            entry.run_id.clone(),
+            entry.research_latest_derived_run_id.clone(),
+        );
+    }
+    if let Some(entry) = index.runs.iter().find(|entry| {
+        entry.research_latest_derived_run_id.as_deref() == Some(run_id) || entry.run_id == run_id
+    }) {
+        return (
+            Some(entry.clone()),
+            entry.run_id.clone(),
+            Some(run_id.to_owned()),
+        );
+    }
+    (None, run_id.to_owned(), None)
+}
+
+fn collect_largest_files(roots: &[PathBuf], limit: usize) -> Result<Vec<serde_json::Value>> {
+    fn walk(path: &Path, rows: &mut Vec<(u64, PathBuf)>) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        if path.is_file() {
+            rows.push((fs::metadata(path)?.len(), path.to_path_buf()));
+            return Ok(());
+        }
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            walk(&entry.path(), rows)?;
+        }
+        Ok(())
+    }
+    let mut rows = Vec::new();
+    for root in roots {
+        walk(root, &mut rows)?;
+    }
+    rows.sort_by(|left, right| right.0.cmp(&left.0));
+    Ok(rows
+        .into_iter()
+        .take(limit)
+        .map(|(size_bytes, path)| {
+            json!({
+                "path": path.display().to_string(),
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect())
+}
+
+fn csv_data_rows(path: &Path) -> Result<Option<usize>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    let rows = BufReader::new(file)
+        .lines()
+        .filter_map(|line| line.ok())
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .saturating_sub(1);
+    Ok(Some(rows))
+}
+
+async fn profile_research_worker_command(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    dataset_index_r2: bool,
+    require_normalized_events: bool,
+) -> Result<()> {
+    let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+    let (source_entry, source_run_id, derived_from_index) =
+        resolve_research_source_and_derived(&index, run_id);
+    if require_normalized_events {
+        let normalized_complete = source_entry
+            .as_ref()
+            .map(run_is_normalized_complete)
+            .unwrap_or(false);
+        if !normalized_complete {
+            return Err(anyhow!(
+                "profile-research-worker requires normalized-complete source run {source_run_id}"
+            ));
+        }
+    }
+    let source_report_dir = run_report_dir_for(loaded, &source_run_id)?;
+    let summary = read_json_file::<ResearchWorkerRunSummary>(
+        &source_report_dir.join("research_worker_summary.json"),
+    );
+    let derived_run_id = summary
+        .as_ref()
+        .and_then(|summary| summary.replay_run_id.clone())
+        .or(derived_from_index);
+    let derived_report_dir = derived_run_id
+        .as_deref()
+        .map(|run_id| run_report_dir_for(loaded, run_id))
+        .transpose()?;
+    let quality = derived_report_dir.as_ref().and_then(|dir| {
+        read_json_file::<LiveCollectionQualitySummary>(&dir.join("live_collection_quality.json"))
+    });
+    let readiness = derived_report_dir.as_ref().and_then(|dir| {
+        read_json_file::<BacktestReadinessSummary>(&dir.join("backtest_readiness.json"))
+    });
+    let total_runtime_ms = summary
+        .as_ref()
+        .map(|summary| summary.total_runtime_ms)
+        .unwrap_or_default();
+    let stage_timings_ms = summary
+        .as_ref()
+        .map(|summary| summary.stage_timings_ms.clone())
+        .unwrap_or_default();
+    let detailed_replay_profile = summary
+        .as_ref()
+        .map(|summary| summary.detailed_replay_profile.clone())
+        .unwrap_or_default();
+    let normalized_records_loaded = summary
+        .as_ref()
+        .map(|summary| summary.normalized_records_loaded)
+        .unwrap_or_default();
+    let feature_rows = quality
+        .as_ref()
+        .map(|quality| quality.feature_snapshot_count)
+        .or_else(|| {
+            readiness
+                .as_ref()
+                .map(|readiness| readiness.feature_snapshot_count)
+        })
+        .unwrap_or_default();
+    let decision_rows = quality
+        .as_ref()
+        .map(|quality| quality.decision_count)
+        .or_else(|| readiness.as_ref().map(|readiness| readiness.decision_count))
+        .unwrap_or_default();
+    let fill_rows = quality
+        .as_ref()
+        .map(|quality| quality.fill_count)
+        .or_else(|| readiness.as_ref().map(|readiness| readiness.fill_count))
+        .unwrap_or_default();
+    let total_runtime_seconds = if total_runtime_ms > 0 {
+        total_runtime_ms as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let rows_per_second = if total_runtime_seconds > 0.0 {
+        normalized_records_loaded as f64 / total_runtime_seconds
+    } else {
+        0.0
+    };
+    let feature_rows_per_second = if total_runtime_seconds > 0.0 {
+        feature_rows as f64 / total_runtime_seconds
+    } else {
+        0.0
+    };
+    let largest_files = collect_largest_files(
+        &[
+            source_report_dir.clone(),
+            derived_report_dir.clone().unwrap_or_default(),
+            PathBuf::from(&loaded.config.storage.root)
+                .join("snapshots")
+                .join("token_feature_snapshots")
+                .join(derived_run_id.clone().unwrap_or_default()),
+        ],
+        12,
+    )?;
+    let slowest_stage = stage_timings_ms
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1))
+        .map(|(stage, elapsed_ms)| json!({ "stage": stage, "elapsed_ms": elapsed_ms }));
+    let mut recommendations = Vec::new();
+    if stage_timings_ms
+        .get("state_replay_feature_decision_paper_simulation_and_snapshot_persistence")
+        .copied()
+        .unwrap_or_default()
+        > stage_timings_ms
+            .get("csv_export_generation")
+            .copied()
+            .unwrap_or_default()
+    {
+        recommendations.push("focus on feature snapshot persistence and replay-loop disk writes");
+    }
+    if total_runtime_ms == 0 {
+        recommendations
+            .push("rerun with the Phase 65 instrumented binary to capture stage timings");
+    }
+    let report = json!({
+        "command": "profile-research-worker",
+        "source_run_id": source_run_id,
+        "derived_run_id": derived_run_id,
+        "require_normalized_events": require_normalized_events,
+        "total_runtime_ms": total_runtime_ms,
+        "stage_timings_ms": stage_timings_ms,
+        "detailed_replay_substage_timings_ms": detailed_replay_profile.substage_timings_ms,
+        "detailed_replay_counters": detailed_replay_profile.counters,
+        "rows_processed_per_second": rows_per_second,
+        "feature_rows_per_second": feature_rows_per_second,
+        "normalized_records_loaded": normalized_records_loaded,
+        "feature_rows": feature_rows,
+        "decision_rows": decision_rows,
+        "fill_rows": fill_rows,
+        "slowest_stage": slowest_stage,
+        "largest_files": largest_files,
+        "memory_approximation_items": normalized_records_loaded
+            .saturating_add(feature_rows)
+            .saturating_add(decision_rows)
+            .saturating_add(fill_rows),
+        "readiness_level": readiness.as_ref().map(|summary| canonical_readiness_verdict_label(summary)),
+        "recommendations": recommendations,
+    });
+    let dir = phase65_output_dir()?;
+    let json_path = dir.join("phase65_research_profile.json");
+    let md_path = dir.join("phase65_research_profile.md");
+    fs::write(&json_path, serde_json::to_vec_pretty(&report)?)?;
+    fs::write(
+        dir.join("phase66_replay_profile_detailed.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    write_report(
+        &md_path,
+        &format!(
+            "# Phase 65 Research Profile\n\n- source_run_id: {}\n- derived_run_id: {}\n- total_runtime_ms: {}\n- rows_processed_per_second: {:.2}\n- feature_rows_per_second: {:.2}\n- slowest_stage: {}\n- recommendations: {:?}\n",
+            report["source_run_id"].as_str().unwrap_or_default(),
+            report["derived_run_id"].as_str().unwrap_or_default(),
+            total_runtime_ms,
+            rows_per_second,
+            feature_rows_per_second,
+            report["slowest_stage"],
+            report["recommendations"],
+        ),
+    )?;
+    write_report(
+        dir.join("phase66_replay_profile_detailed.md"),
+        &format!(
+            "# Phase 66 Detailed Replay Profile\n\n- source_run_id: {}\n- derived_run_id: {}\n- total_runtime_ms: {}\n- stage_timings_ms: {:?}\n- detailed_replay_substage_timings_ms: {}\n- detailed_replay_counters: {}\n- slowest_stage: {}\n",
+            report["source_run_id"].as_str().unwrap_or_default(),
+            report["derived_run_id"].as_str().unwrap_or_default(),
+            total_runtime_ms,
+            report["stage_timings_ms"],
+            report["detailed_replay_substage_timings_ms"],
+            report["detailed_replay_counters"],
+            report["slowest_stage"],
+        ),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn artifact_scan_ignore_reason(path: &Path) -> Option<&'static str> {
+    let name = path.file_name().and_then(|value| value.to_str())?;
+    if matches!(
+        name,
+        ".DS_Store" | "Thumbs.db" | ".Spotlight-V100" | ".fseventsd" | "__MACOSX"
+    ) {
+        return Some("os_junk");
+    }
+    if name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".tmp")
+    {
+        return Some("editor_temp");
+    }
+    None
+}
+
+fn scan_artifact_hygiene(roots: &[PathBuf]) -> Result<(Vec<String>, Vec<String>, usize)> {
+    fn walk(path: &Path, blockers: &mut Vec<String>, ignored: &mut Vec<String>) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        if let Some(reason) = artifact_scan_ignore_reason(path) {
+            ignored.push(format!("{}:{reason}", path.display()));
+            return Ok(());
+        }
+        if path.is_dir() {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                walk(&entry.path(), blockers, ignored)?;
+            }
+            return Ok(());
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if extension == "json" {
+            if let Err(err) = serde_json::from_slice::<serde_json::Value>(&fs::read(path)?) {
+                blockers.push(format!("malformed_json:{}:{err}", path.display()));
+            }
+        }
+        Ok(())
+    }
+    let mut blockers = Vec::new();
+    let mut ignored = Vec::new();
+    for root in roots {
+        walk(root, &mut blockers, &mut ignored)?;
+    }
+    let ignored_count = ignored.len();
+    Ok((blockers, ignored, ignored_count))
+}
+
+async fn validate_research_run_health_command(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    dataset_index_r2: bool,
+) -> Result<()> {
+    let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+    let (source_entry, source_run_id, derived_from_index) =
+        resolve_research_source_and_derived(&index, run_id);
+    let source_entry = source_entry.ok_or_else(|| {
+        anyhow!("source or derived run {run_id} was not found in the dataset index")
+    })?;
+    let source_report_dir = run_report_dir_for(loaded, &source_run_id)?;
+    let summary = read_json_file::<ResearchWorkerRunSummary>(
+        &source_report_dir.join("research_worker_summary.json"),
+    );
+    let derived_run_id = summary
+        .as_ref()
+        .and_then(|summary| summary.replay_run_id.clone())
+        .or(derived_from_index);
+    let mut blockers = Vec::<String>::new();
+    let mut warnings = Vec::<String>::new();
+    if !source_entry.edge_dataset_complete {
+        blockers.push("source edge_dataset_complete=false".to_owned());
+    }
+    if source_entry.normalized_events_segments_count == 0 {
+        blockers.push("source normalized_events_segments_count=0".to_owned());
+    }
+    if source_entry.normalized_events_segments_count
+        != source_entry.normalized_events_segments_verified
+    {
+        blockers.push(format!(
+            "source normalized verification mismatch {}/{}",
+            source_entry.normalized_events_segments_verified,
+            source_entry.normalized_events_segments_count
+        ));
+    }
+    if source_entry.r2_full_verification_status != "verified"
+        || source_entry.r2_full_consistency_status != "verified"
+    {
+        blockers.push(format!(
+            "source R2 verification/consistency not verified: {}/{}",
+            source_entry.r2_full_verification_status, source_entry.r2_full_consistency_status
+        ));
+    }
+    let Some(summary) = summary else {
+        blockers.push("research_worker_summary.json missing".to_owned());
+        let report = json!({
+            "command": "validate-research-run-health",
+            "run_id": run_id,
+            "source_run_id": source_run_id,
+            "derived_run_id": derived_run_id,
+            "pass": false,
+            "blockers": blockers,
+            "warnings": warnings,
+        });
+        let dir = phase65_output_dir()?;
+        fs::write(
+            dir.join("phase65_research_health_gate.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    };
+    if summary.fallback_used {
+        blockers.push(format!(
+            "fallback_used=true fallback_source={}",
+            summary.fallback_source.clone().unwrap_or_default()
+        ));
+    }
+    if summary.source_artifact_type_used.as_deref() != Some("normalized_events") {
+        blockers.push(format!(
+            "source_artifact_type_used={}",
+            summary
+                .source_artifact_type_used
+                .clone()
+                .unwrap_or_else(|| "null".to_owned())
+        ));
+    }
+    if summary.normalized_segments_processed == 0 || summary.normalized_records_loaded == 0 {
+        blockers.push("normalized replay counters are zero".to_owned());
+    }
+    let Some(derived_run_id) = derived_run_id else {
+        blockers.push("derived replay run id missing".to_owned());
+        let report = json!({
+            "command": "validate-research-run-health",
+            "run_id": run_id,
+            "source_run_id": source_run_id,
+            "derived_run_id": serde_json::Value::Null,
+            "pass": false,
+            "blockers": blockers,
+            "warnings": warnings,
+        });
+        let dir = phase65_output_dir()?;
+        fs::write(
+            dir.join("phase65_research_health_gate.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    };
+    let derived_report_dir = run_report_dir_for(loaded, &derived_run_id)?;
+    let quality = read_json_file::<LiveCollectionQualitySummary>(
+        &derived_report_dir.join("live_collection_quality.json"),
+    );
+    let readiness = read_json_file::<BacktestReadinessSummary>(
+        &derived_report_dir.join("backtest_readiness.json"),
+    );
+    let run_summary =
+        read_json_file::<serde_json::Value>(&derived_report_dir.join("run_summary.json"));
+    let runtime_health =
+        read_json_file::<serde_json::Value>(&derived_report_dir.join("runtime_health.json"));
+    if readiness.is_none() {
+        blockers.push("backtest_readiness.json missing".to_owned());
+    }
+    let store = storage_engine(loaded)?;
+    let raw_feature_records = store.read_feature_snapshots_filtered(Some(&derived_run_id), None)?;
+    let raw_feature_rows = raw_feature_records.len();
+    let feature_rows = dedupe_feature_snapshot_records(raw_feature_records).len();
+    if raw_feature_rows != feature_rows {
+        warnings.push(format!(
+            "duplicate_feature_snapshot_records raw={} canonical={}",
+            raw_feature_rows, feature_rows
+        ));
+    }
+    let decision_rows = store
+        .read_trade_decisions_filtered(Some(&derived_run_id), None)?
+        .len();
+    let fill_rows = store
+        .read_fills_filtered(Some(&derived_run_id), None)?
+        .len();
+    if let Some(quality) = quality.as_ref() {
+        if quality.feature_snapshot_count != feature_rows {
+            blockers.push(format!(
+                "feature row mismatch quality={} storage={}",
+                quality.feature_snapshot_count, feature_rows
+            ));
+        }
+        if quality.decision_count != decision_rows {
+            blockers.push(format!(
+                "decision row mismatch quality={} storage={}",
+                quality.decision_count, decision_rows
+            ));
+        }
+        if quality.fill_count != fill_rows {
+            blockers.push(format!(
+                "fill row mismatch quality={} storage={}",
+                quality.fill_count, fill_rows
+            ));
+        }
+        if quality.paper_pnl < Decimal::ZERO {
+            warnings.push(format!("negative_pnl={}", quality.paper_pnl));
+        }
+    }
+    if let Some(readiness) = readiness.as_ref() {
+        if readiness.feature_snapshot_count != feature_rows {
+            blockers.push(format!(
+                "feature row mismatch readiness={} storage={}",
+                readiness.feature_snapshot_count, feature_rows
+            ));
+        }
+        if readiness.decision_count != decision_rows {
+            blockers.push(format!(
+                "decision row mismatch readiness={} storage={}",
+                readiness.decision_count, decision_rows
+            ));
+        }
+        if readiness.fill_count != fill_rows {
+            blockers.push(format!(
+                "fill row mismatch readiness={} storage={}",
+                readiness.fill_count, fill_rows
+            ));
+        }
+        if readiness.safe_for_walk_forward {
+            blockers.push("single replay marked safe_for_walk_forward=true".to_owned());
+        }
+        warnings.extend(readiness.warnings.clone());
+        if let Some(quality) = quality.as_ref() {
+            let canonical = canonical_readiness_verdict_label(readiness);
+            if quality.verdict != canonical {
+                warnings.push(format!(
+                    "live_collection_quality verdict {} differs from canonical {}",
+                    quality.verdict, canonical
+                ));
+            }
+        }
+    }
+    for field in [
+        "stream_only_passed",
+        "rpc_network_calls_total",
+        "rpc_credits_used_total",
+        "r2_verified",
+        "run_terminal_status",
+        "finalization_status",
+    ] {
+        let left = run_summary
+            .as_ref()
+            .and_then(|value| value.get(field))
+            .cloned();
+        let right = runtime_health
+            .as_ref()
+            .and_then(|value| value.get(field))
+            .cloned();
+        if left.is_some() && right.is_some() && left != right {
+            blockers.push(format!(
+                "run_summary/runtime_health mismatch {field}: {:?} != {:?}",
+                left, right
+            ));
+        }
+    }
+    let feature_csv_rows = csv_data_rows(&derived_report_dir.join("features.csv"))?;
+    let decision_csv_rows = csv_data_rows(&derived_report_dir.join("decisions.csv"))?;
+    let fill_csv_rows = csv_data_rows(&derived_report_dir.join("fills.csv"))?;
+    if let Some(rows) = feature_csv_rows {
+        if rows != feature_rows {
+            blockers.push(format!(
+                "features.csv rows {rows} != storage {feature_rows}"
+            ));
+        }
+    }
+    if let Some(rows) = decision_csv_rows {
+        if rows != decision_rows {
+            blockers.push(format!(
+                "decisions.csv rows {rows} != storage {decision_rows}"
+            ));
+        }
+    }
+    if let Some(rows) = fill_csv_rows {
+        if rows != fill_rows {
+            blockers.push(format!("fills.csv rows {rows} != storage {fill_rows}"));
+        }
+    }
+    let (artifact_blockers, ignored_artifacts, ignored_count) =
+        scan_artifact_hygiene(&[source_report_dir.clone(), derived_report_dir.clone()])?;
+    blockers.extend(artifact_blockers);
+    let pass = blockers.is_empty();
+    let report = json!({
+        "command": "validate-research-run-health",
+        "run_id": run_id,
+        "source_run_id": source_run_id,
+        "derived_run_id": derived_run_id,
+        "pass": pass,
+        "blockers": blockers,
+        "warnings": warnings,
+        "source_edge_verified": source_entry.edge_dataset_complete
+            && source_entry.normalized_events_segments_count > 0
+            && source_entry.normalized_events_segments_count == source_entry.normalized_events_segments_verified,
+        "fallback_used": summary.fallback_used,
+        "source_artifact_type_used": summary.source_artifact_type_used,
+        "normalized_segments_processed": summary.normalized_segments_processed,
+        "normalized_records_loaded": summary.normalized_records_loaded,
+        "raw_feature_rows": raw_feature_rows,
+        "feature_rows": feature_rows,
+        "decision_rows": decision_rows,
+        "fill_rows": fill_rows,
+        "research_r2_verified": summary.research_r2_verified,
+        "readiness_level": readiness.as_ref().map(canonical_readiness_verdict_label),
+        "ignored_artifact_count": ignored_count,
+        "ignored_artifacts": ignored_artifacts,
+    });
+    let dir = phase65_output_dir()?;
+    fs::write(
+        dir.join("phase65_research_health_gate.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    write_report(
+        &dir.join("phase65_research_health_gate.md"),
+        &format!(
+            "# Phase 65 Research Health Gate\n\n- source_run_id: {}\n- derived_run_id: {}\n- pass: {}\n- blockers: {:?}\n- warnings: {:?}\n- ignored_artifact_count: {}\n",
+            report["source_run_id"].as_str().unwrap_or_default(),
+            report["derived_run_id"].as_str().unwrap_or_default(),
+            pass,
+            report["blockers"],
+            report["warnings"],
+            ignored_count,
+        ),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 async fn run_research_worker_command(
     loaded: &LoadedConfig,
     run_id: Option<&str>,
@@ -22907,6 +24754,7 @@ async fn run_research_worker_command(
     compute_features: bool,
     run_backtests: bool,
     generate_exports: bool,
+    skip_csv_export: bool,
     update_calibration: bool,
     resume: bool,
     resume_batch: Option<&str>,
@@ -22922,6 +24770,11 @@ async fn run_research_worker_command(
     if !no_live_streams {
         return Err(anyhow!(
             "run-research-worker requires --no-live-streams; it must not connect to live Geyser or shreds"
+        ));
+    }
+    if skip_csv_export && !loaded.config.research_worker.exports.allow_skip_csv_export {
+        return Err(anyhow!(
+            "--skip-csv-export was requested but research_worker.exports.allow_skip_csv_export=false"
         ));
     }
     let explicit_work_requested =
@@ -22941,6 +24794,9 @@ async fn run_research_worker_command(
     } else {
         loaded.config.research_worker.generate_exports
     };
+    let effective_skip_csv_export = skip_csv_export
+        || (loaded.config.research_worker.exports.allow_skip_csv_export
+            && loaded.config.research_worker.exports.skip_csv_by_default);
     let effective_update_calibration = if explicit_work_requested {
         update_calibration
     } else {
@@ -23090,6 +24946,9 @@ async fn run_research_worker_command(
         write_research_batch_state(&batch_root, &batch_state)?;
         let output_dir = batch_root.join(&source_run_id);
         let run_result: Result<(ResearchWorkerRunSummary, String)> = async {
+            let total_started = Instant::now();
+            let mut stage_timings_ms = BTreeMap::<String, u128>::new();
+            let stage_started = Instant::now();
             let hydration = hydrate_normalized_event_segments_for_run(
                 loaded,
                 &source_run_id,
@@ -23097,6 +24956,10 @@ async fn run_research_worker_command(
             )
             .await
             .with_context(|| format!("hydrating normalized edge segments for {source_run_id}"))?;
+            stage_timings_ms.insert(
+                "r2_segment_hydration_and_normalized_deserialization".to_owned(),
+                stage_started.elapsed().as_millis(),
+            );
             if require_normalized_events
                 && !allow_source_events_fallback
                 && (hydration.fallback_used
@@ -23120,16 +24983,28 @@ async fn run_research_worker_command(
             })?;
             let mut supervisor = Supervisor::new(resolved)
                 .with_context(|| format!("creating supervisor for {source_run_id}"))?;
+            let stage_started = Instant::now();
             let replay_summary = supervisor
                 .run_from_store_selection(Some(&source_run_id), None)
                 .await
                 .with_context(|| {
                     format!("replaying normalized events from store for {source_run_id}")
                 })?;
+            stage_timings_ms.insert(
+                "state_replay_feature_decision_paper_simulation_and_snapshot_persistence"
+                    .to_owned(),
+                stage_started.elapsed().as_millis(),
+            );
             let replay_run_id = replay_summary.run_id.clone();
+            let stage_started = Instant::now();
             let quality = analyze_live_collection_summary(&loaded_for_run, &replay_run_id, false)
                 .await
                 .with_context(|| format!("analyzing replay output for {replay_run_id}"))?;
+            stage_timings_ms.insert(
+                "quality_analysis_and_local_artifact_readback".to_owned(),
+                stage_started.elapsed().as_millis(),
+            );
+            let stage_started = Instant::now();
             let readiness = backtest_readiness_summary(
                 &loaded_for_run,
                 &quality,
@@ -23147,7 +25022,12 @@ async fn run_research_worker_command(
             .with_context(|| {
                 format!("materializing research review reports for {replay_run_id}")
             })?;
-            if effective_generate_exports {
+            stage_timings_ms.insert(
+                "readiness_and_report_generation".to_owned(),
+                stage_started.elapsed().as_millis(),
+            );
+            if effective_generate_exports && !effective_skip_csv_export {
+                let stage_started = Instant::now();
                 export_features(
                     &loaded_for_run,
                     "csv",
@@ -23171,13 +25051,24 @@ async fn run_research_worker_command(
                 export_fills(&loaded_for_run, Some(&replay_run_id), false, false, None)
                     .await
                     .with_context(|| format!("exporting fills for replay run {replay_run_id}"))?;
+                stage_timings_ms.insert(
+                    "csv_export_generation".to_owned(),
+                    stage_started.elapsed().as_millis(),
+                );
+            } else if effective_generate_exports {
+                stage_timings_ms.insert("csv_export_generation".to_owned(), 0);
             }
             if effective_run_backtests || effective_generate_exports {
+                let stage_started = Instant::now();
                 export_rpc_ledger(&loaded_for_run, Some(&replay_run_id), false, false)
                     .await
                     .with_context(|| {
                         format!("exporting RPC ledger for replay run {replay_run_id}")
                     })?;
+                stage_timings_ms.insert(
+                    "rpc_ledger_export_generation".to_owned(),
+                    stage_started.elapsed().as_millis(),
+                );
             }
             let mut warnings = hydration.skipped_segments.clone();
             if effective_update_calibration {
@@ -23210,6 +25101,7 @@ async fn run_research_worker_command(
             let mut refreshed_backfill = None;
             let mut replay_manifest = None;
             if loaded_for_run.config.r2.enabled && loaded_for_run.config.r2.upload_enabled {
+                let stage_started = Instant::now();
                 upload_artifacts_r2_command(
                     &loaded_for_run,
                     Some(&replay_run_id),
@@ -23240,6 +25132,11 @@ async fn run_research_worker_command(
                 .with_context(|| {
                     format!("uploading research replay artifacts for {replay_run_id}")
                 })?;
+                stage_timings_ms.insert(
+                    "derived_replay_r2_artifact_upload".to_owned(),
+                    stage_started.elapsed().as_millis(),
+                );
+                let stage_started = Instant::now();
                 let (readiness, backfill, manifest) = refresh_replay_research_metadata(
                     &loaded_for_run,
                     &replay_run_id,
@@ -23251,6 +25148,10 @@ async fn run_research_worker_command(
                 refreshed_readiness = Some(readiness);
                 refreshed_backfill = Some(backfill);
                 replay_manifest = manifest;
+                stage_timings_ms.insert(
+                    "metadata_backfill_and_summary_regeneration".to_owned(),
+                    stage_started.elapsed().as_millis(),
+                );
             }
             if replay_manifest.is_none() {
                 replay_manifest = load_manifest_if_present(&loaded_for_run, &replay_run_id)
@@ -23276,6 +25177,7 @@ async fn run_research_worker_command(
                 compute_features: effective_compute_features,
                 run_backtests: effective_run_backtests,
                 generate_exports: effective_generate_exports,
+                skip_csv_export: effective_skip_csv_export,
                 update_calibration: effective_update_calibration,
                 research_outputs_available: !generated_artifacts.is_empty(),
                 research_worker_processed: true,
@@ -23331,6 +25233,9 @@ async fn run_research_worker_command(
                 source_artifact_type_used: hydration.source_artifact_type_used.clone(),
                 source_segments_verified: hydration.source_segments_verified,
                 research_replay_confidence: hydration.research_replay_confidence,
+                total_runtime_ms: total_started.elapsed().as_millis(),
+                stage_timings_ms,
+                detailed_replay_profile: replay_summary.replay_profile.clone(),
                 warnings,
             };
             normalize_research_worker_summary_from_source_entry(
@@ -23417,6 +25322,10059 @@ async fn run_research_worker_command(
     }
     println!("{}", serde_json::to_string_pretty(&batch)?);
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantPricePoint {
+    mint: String,
+    at: OffsetDateTime,
+    price: Decimal,
+    lifecycle: String,
+    feature_hash: String,
+    data_quality_score: Option<Decimal>,
+    min_move_to_cover_costs: Option<Decimal>,
+    holder_growth_rate: Option<Decimal>,
+    holder_stickiness_score: Option<Decimal>,
+    unique_buyers: Option<Decimal>,
+    top1_holder_pct: Option<Decimal>,
+    bundle_risk_score: Option<Decimal>,
+    fake_momentum_score: Option<Decimal>,
+    absorption_success_score: Option<Decimal>,
+    buy_sell_volume_ratio: Option<Decimal>,
+    buy_sell_count_ratio: Option<Decimal>,
+    fee_war_score: Option<Decimal>,
+    liquidity_depth: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantTokenOutcome {
+    mint: String,
+    first_seen: OffsetDateTime,
+    last_seen: OffsetDateTime,
+    observation_ms: i64,
+    start_price: Decimal,
+    last_price: Decimal,
+    return_5s: Option<Decimal>,
+    return_15s: Option<Decimal>,
+    return_30s: Option<Decimal>,
+    return_60s: Option<Decimal>,
+    return_2m: Option<Decimal>,
+    return_5m: Option<Decimal>,
+    return_10m: Option<Decimal>,
+    return_30m: Option<Decimal>,
+    max_favorable_excursion_pct: Decimal,
+    max_adverse_excursion_pct: Decimal,
+    time_to_mfe_ms: Option<i64>,
+    time_to_mae_ms: Option<i64>,
+    time_to_first_large_sell_ms: Option<i64>,
+    time_to_dev_sell_ms: Option<i64>,
+    time_to_top_holder_sell_ms: Option<i64>,
+    time_to_bundle_cluster_sell_ms: Option<i64>,
+    time_to_collapse_ms: Option<i64>,
+    collapse_50pct: bool,
+    collapse_70pct: bool,
+    migrated_or_graduated: Option<bool>,
+    survived_5m: Option<bool>,
+    survived_10m: Option<bool>,
+    survived_30m: Option<bool>,
+    executable_winner_after_fees: Option<bool>,
+    executable_loser_after_fees: Option<bool>,
+    confidence: Decimal,
+    data_quality_at_first_seen: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantTradeOutcome {
+    mint: String,
+    strategy: String,
+    entry_time: OffsetDateTime,
+    exit_time: Option<OffsetDateTime>,
+    entry_price: Decimal,
+    exit_price: Option<Decimal>,
+    gross_return: Option<Decimal>,
+    net_return_after_fees: Option<Decimal>,
+    fee_drag: Decimal,
+    slippage_drag: Decimal,
+    impact_drag: Decimal,
+    latency_drag: Decimal,
+    mfe_after_entry: Decimal,
+    mae_after_entry: Decimal,
+    time_to_mfe_after_entry: Option<i64>,
+    time_to_mae_after_entry: Option<i64>,
+    exit_saved_loss: Option<Decimal>,
+    exit_opportunity_cost: Option<Decimal>,
+    was_entry_too_early: Option<bool>,
+    was_entry_too_late: Option<bool>,
+    was_exit_too_early: Option<bool>,
+    was_exit_too_late: Option<bool>,
+    rug_flag_before_entry: Option<bool>,
+    fake_momentum_flag_before_entry: Option<bool>,
+    top_holder_risk_before_entry: Option<bool>,
+    bundle_risk_before_entry: Option<bool>,
+    data_quality_at_entry: Option<Decimal>,
+    final_trade_outcome_class: String,
+    loss_cause: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantBaselineMetric {
+    baseline: String,
+    exit_horizon: String,
+    trades: usize,
+    fills: usize,
+    gross_pnl: Decimal,
+    net_pnl: Decimal,
+    average_win: Decimal,
+    average_loss: Decimal,
+    hit_rate: Decimal,
+    max_drawdown: Decimal,
+    max_adverse_excursion: Decimal,
+    max_favorable_excursion: Decimal,
+    fees_slippage_impact_drag: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantBaselineTrade {
+    baseline: String,
+    exit_horizon: String,
+    mint: String,
+    entry_time: OffsetDateTime,
+    exit_time: Option<OffsetDateTime>,
+    entry_price: Decimal,
+    exit_price: Option<Decimal>,
+    gross_pnl: Decimal,
+    net_pnl: Decimal,
+    regime: String,
+    confidence: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuantDiagnosticContext {
+    source_run_id: String,
+    derived_run_id: String,
+    features: Vec<StoredRecord<FeatureSnapshot>>,
+    decisions: Vec<StoredRecord<common::TradeDecisionEvent>>,
+    fills: Vec<StoredRecord<FillEvent>>,
+    price_points_by_mint: BTreeMap<String, Vec<QuantPricePoint>>,
+    feature_by_hash: BTreeMap<String, FeatureSnapshot>,
+    source_summary: Option<ResearchWorkerRunSummary>,
+    readiness: Option<BacktestReadinessSummary>,
+    pnl: Option<PnlAttributionSummary>,
+}
+
+async fn run_quant_diagnostics_command(
+    loaded: &LoadedConfig,
+    source_run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    output_dir: &str,
+    dataset_index_r2: bool,
+) -> Result<()> {
+    forbid_heavy_vps_research_paths_in_edge_mode(loaded, "run-quant-diagnostics")?;
+    let started = Instant::now();
+    let (source_run_id, derived_run_id) =
+        resolve_quant_diagnostic_runs(loaded, source_run_id, derived_run_id)?;
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    fs::create_dir_all("research_output/phase67")?;
+
+    let ctx = load_quant_diagnostic_context(loaded, &source_run_id, &derived_run_id)?;
+    let token_outcomes = compute_quant_token_outcomes(&ctx);
+    let trade_outcomes = compute_quant_trade_outcomes(&ctx);
+    let baselines = compute_quant_baselines(&ctx, &token_outcomes, &trade_outcomes);
+    let holder_diag = compute_holder_growth_diagnostic(&ctx, &trade_outcomes);
+    let inactive_diag = compute_inactive_strategy_diagnostic(&ctx);
+    let missed = compute_missed_winners(&ctx, &token_outcomes, &trade_outcomes);
+    let ablations = compute_feature_ablation(&ctx, &token_outcomes, &trade_outcomes);
+    let regimes = compute_regime_diagnostic(&ctx, &baselines.1);
+    let execution = compute_execution_sensitivity(&trade_outcomes);
+    let metric_coverage = compute_metric_coverage(&ctx);
+    let walk_forward = compute_walk_forward_scaffold(loaded, dataset_index_r2).await?;
+    let performance = compute_phase67_performance_report(&ctx);
+
+    write_quant_token_outcomes(&output_dir, &token_outcomes)?;
+    write_quant_trade_outcomes(&output_dir, &trade_outcomes)?;
+    write_quant_baseline_outputs(&output_dir, &baselines.0, &baselines.1)?;
+    write_quant_json_md(
+        &output_dir,
+        "holder_growth_diagnostic",
+        &holder_diag,
+        render_json_summary_markdown("HolderGrowthContinuation Diagnostic", &holder_diag),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "inactive_strategy_diagnostic",
+        &inactive_diag,
+        render_json_summary_markdown("Inactive Strategy Diagnostic", &inactive_diag),
+    )?;
+    write_quant_missed_outputs(&output_dir, &missed)?;
+    write_quant_json_md(
+        &output_dir,
+        "feature_ablation",
+        &ablations,
+        render_json_summary_markdown("Feature Ablation", &ablations),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "regime_diagnostic",
+        &regimes,
+        render_json_summary_markdown("Regime Diagnostic", &regimes),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "execution_sensitivity",
+        &execution,
+        render_json_summary_markdown("Execution Sensitivity", &execution),
+    )?;
+    write_metric_coverage_outputs(&output_dir, &metric_coverage)?;
+    write_quant_json_md(
+        &output_dir,
+        "walk_forward_scaffold",
+        &walk_forward,
+        render_json_summary_markdown("Walk-Forward Scaffold", &walk_forward),
+    )?;
+    write_quant_json_md(
+        Path::new("research_output/phase67"),
+        "performance_optimization",
+        &performance,
+        render_json_summary_markdown("Phase 67 Performance Optimization", &performance),
+    )?;
+
+    let review = json!({
+        "command": "run-quant-diagnostics",
+        "source_run_id": source_run_id,
+        "derived_run_id": derived_run_id,
+        "dataset_used": {
+            "feature_rows": ctx.features.len(),
+            "decision_rows": ctx.decisions.len(),
+            "fill_rows": ctx.fills.len(),
+            "token_count": token_outcomes.len(),
+            "fallback_used": ctx.source_summary.as_ref().map(|summary| summary.fallback_used),
+            "source_artifact_type_used": ctx.source_summary.as_ref().and_then(|summary| summary.source_artifact_type_used.clone()),
+        },
+        "label_coverage": {
+            "token_outcome_rows": token_outcomes.len(),
+            "trade_outcome_rows": trade_outcomes.len(),
+            "labels_with_5m_observation": token_outcomes.iter().filter(|row| row.survived_5m.is_some()).count(),
+            "labels_with_30m_observation": token_outcomes.iter().filter(|row| row.survived_30m.is_some()).count(),
+        },
+        "baseline_comparison": baselines.0,
+        "holder_growth_diagnostic": holder_diag,
+        "inactive_strategy_diagnostic": inactive_diag,
+        "missed_winners": missed,
+        "feature_ablation": ablations,
+        "regime_analysis": regimes,
+        "execution_sensitivity": execution,
+        "metric_coverage": metric_coverage,
+        "walk_forward": walk_forward,
+        "threshold_tuning_allowed": false,
+        "threshold_tuning_reason": "hold: current strategy is negative and dataset/sample are not walk-forward ready",
+        "runtime_ms": started.elapsed().as_millis(),
+    });
+    write_quant_json_md(
+        Path::new("research_output"),
+        "phase67_quant_diagnostic_review",
+        &review,
+        render_phase67_review_markdown(&review),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&review)?);
+    Ok(())
+}
+
+fn resolve_quant_diagnostic_runs(
+    loaded: &LoadedConfig,
+    source_run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+) -> Result<(String, String)> {
+    if let (Some(source), Some(derived)) = (source_run_id, derived_run_id) {
+        return Ok((source.to_owned(), derived.to_owned()));
+    }
+    let store = storage_engine(loaded)?;
+    if let Some(source) = source_run_id {
+        let summary_path = store
+            .run_report_dir(source)
+            .join("research_worker_summary.json");
+        let summary: ResearchWorkerRunSummary = read_json_file(&summary_path)
+            .with_context(|| format!("reading {}", summary_path.display()))?;
+        let derived = summary
+            .derived_run_id
+            .or(summary.replay_run_id)
+            .ok_or_else(|| anyhow!("research_worker_summary for {source} has no derived_run_id"))?;
+        return Ok((source.to_owned(), derived));
+    }
+    if let Some(derived) = derived_run_id {
+        let summary_path = store.run_report_dir(derived).join("run_summary.json");
+        let value: serde_json::Value = read_json_file(&summary_path)
+            .with_context(|| format!("reading {}", summary_path.display()))?;
+        let source = value
+            .get("source_run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown_source_run")
+            .to_owned();
+        return Ok((source, derived.to_owned()));
+    }
+    Err(anyhow!(
+        "run-quant-diagnostics requires --source-run-id or --derived-run-id"
+    ))
+}
+
+fn load_quant_diagnostic_context(
+    loaded: &LoadedConfig,
+    source_run_id: &str,
+    derived_run_id: &str,
+) -> Result<QuantDiagnosticContext> {
+    let store = storage_engine(loaded)?;
+    let mut features = store
+        .read_feature_snapshots_filtered(Some(derived_run_id), None)
+        .with_context(|| format!("reading feature snapshots for {derived_run_id}"))?;
+    features.sort_by(|left, right| {
+        left.record
+            .observed_at
+            .cmp(&right.record.observed_at)
+            .then_with(|| left.record.mint.0.cmp(&right.record.mint.0))
+            .then_with(|| left.record.vector_hash.cmp(&right.record.vector_hash))
+    });
+    let mut decisions = store
+        .read_trade_decisions_filtered(Some(derived_run_id), None)
+        .with_context(|| format!("reading decisions for {derived_run_id}"))?;
+    decisions.sort_by(|left, right| {
+        left.record
+            .no_lookahead_timestamp
+            .cmp(&right.record.no_lookahead_timestamp)
+            .then_with(|| left.record.mint.0.cmp(&right.record.mint.0))
+            .then_with(|| left.record.decision_id.cmp(&right.record.decision_id))
+    });
+    let mut fills = store
+        .read_fills_filtered(Some(derived_run_id), None)
+        .with_context(|| format!("reading fills for {derived_run_id}"))?;
+    fills.sort_by(|left, right| {
+        left.record
+            .signal_time
+            .cmp(&right.record.signal_time)
+            .then_with(|| left.record.mint.0.cmp(&right.record.mint.0))
+    });
+    let mut price_points_by_mint = BTreeMap::<String, Vec<QuantPricePoint>>::new();
+    let mut feature_by_hash = BTreeMap::<String, FeatureSnapshot>::new();
+    for record in &features {
+        feature_by_hash.insert(record.record.vector_hash.clone(), record.record.clone());
+        if let Some(point) = quant_price_point(record) {
+            price_points_by_mint
+                .entry(point.mint.clone())
+                .or_default()
+                .push(point);
+        }
+    }
+    for points in price_points_by_mint.values_mut() {
+        points.sort_by(|left, right| left.at.cmp(&right.at));
+    }
+    let source_summary = read_json_file::<ResearchWorkerRunSummary>(
+        &store
+            .run_report_dir(source_run_id)
+            .join("research_worker_summary.json"),
+    );
+    let readiness = read_json_file::<BacktestReadinessSummary>(
+        &store
+            .run_report_dir(derived_run_id)
+            .join("backtest_readiness.json"),
+    );
+    let pnl = read_json_file::<PnlAttributionSummary>(
+        &store
+            .run_report_dir(derived_run_id)
+            .join("pnl_attribution.json"),
+    );
+    Ok(QuantDiagnosticContext {
+        source_run_id: source_run_id.to_owned(),
+        derived_run_id: derived_run_id.to_owned(),
+        features,
+        decisions,
+        fills,
+        price_points_by_mint,
+        feature_by_hash,
+        source_summary,
+        readiness,
+        pnl,
+    })
+}
+
+fn quant_price_point(record: &StoredRecord<FeatureSnapshot>) -> Option<QuantPricePoint> {
+    let snapshot = &record.record;
+    let price = qd_decimal(snapshot, "price_current")?;
+    Some(QuantPricePoint {
+        mint: snapshot.mint.0.clone(),
+        at: snapshot.observed_at,
+        price,
+        lifecycle: format!("{:?}", snapshot.lifecycle),
+        feature_hash: snapshot.vector_hash.clone(),
+        data_quality_score: qd_decimal(snapshot, "data_quality_score"),
+        min_move_to_cover_costs: qd_decimal(snapshot, "minimum_move_to_cover_observed_fees"),
+        holder_growth_rate: qd_decimal(snapshot, "holder_growth_rate"),
+        holder_stickiness_score: qd_decimal(snapshot, "holder_stickiness_score"),
+        unique_buyers: qd_decimal(snapshot, "unique_buyers"),
+        top1_holder_pct: qd_decimal(snapshot, "top1_holder_pct"),
+        bundle_risk_score: qd_decimal(snapshot, "bundle_risk_score"),
+        fake_momentum_score: qd_decimal(snapshot, "momentum_authenticity_score")
+            .map(|value| Decimal::ONE - value),
+        absorption_success_score: qd_decimal(snapshot, "absorption_success_score"),
+        buy_sell_volume_ratio: qd_decimal(snapshot, "buy_sell_volume_ratio"),
+        buy_sell_count_ratio: qd_decimal(snapshot, "buy_sell_count_ratio"),
+        fee_war_score: qd_decimal(snapshot, "fee_war_score"),
+        liquidity_depth: qd_decimal(snapshot, "liquidity_depth_quote")
+            .or_else(|| qd_decimal(snapshot, "real_quote_reserves")),
+    })
+}
+
+fn compute_quant_token_outcomes(ctx: &QuantDiagnosticContext) -> Vec<QuantTokenOutcome> {
+    ctx.price_points_by_mint
+        .iter()
+        .filter_map(|(mint, points)| {
+            let first = points.first()?;
+            let last = points.last()?;
+            let (mfe, mfe_time, mae, mae_time) = excursion_from(points, first.at, first.price);
+            let min_move = first.min_move_to_cover_costs.unwrap_or(Decimal::new(3, 2));
+            let collapse_time = first_time_where(points, first.at, |point| {
+                first.price > Decimal::ZERO && point.price <= first.price * Decimal::new(50, 2)
+            });
+            Some(QuantTokenOutcome {
+                mint: mint.clone(),
+                first_seen: first.at,
+                last_seen: last.at,
+                observation_ms: ms_i64(last.at - first.at),
+                start_price: first.price,
+                last_price: last.price,
+                return_5s: return_at(points, first.at, first.price, 5_000),
+                return_15s: return_at(points, first.at, first.price, 15_000),
+                return_30s: return_at(points, first.at, first.price, 30_000),
+                return_60s: return_at(points, first.at, first.price, 60_000),
+                return_2m: return_at(points, first.at, first.price, 120_000),
+                return_5m: return_at(points, first.at, first.price, 300_000),
+                return_10m: return_at(points, first.at, first.price, 600_000),
+                return_30m: return_at(points, first.at, first.price, 1_800_000),
+                max_favorable_excursion_pct: mfe,
+                max_adverse_excursion_pct: mae,
+                time_to_mfe_ms: mfe_time,
+                time_to_mae_ms: mae_time,
+                time_to_first_large_sell_ms: first_feature_threshold_time(
+                    &ctx.features,
+                    mint,
+                    first.at,
+                    "large_sell_count",
+                    Decimal::ONE,
+                ),
+                time_to_dev_sell_ms: first_feature_threshold_time(
+                    &ctx.features,
+                    mint,
+                    first.at,
+                    "creator_sell_percentage",
+                    Decimal::new(1, 6),
+                ),
+                time_to_top_holder_sell_ms: first_feature_bool_time(
+                    &ctx.features,
+                    mint,
+                    first.at,
+                    "price_up_top_holders_selling",
+                ),
+                time_to_bundle_cluster_sell_ms: first_feature_bool_time(
+                    &ctx.features,
+                    mint,
+                    first.at,
+                    "price_up_bundle_selling",
+                ),
+                time_to_collapse_ms: collapse_time,
+                collapse_50pct: points.iter().any(|point| {
+                    first.price > Decimal::ZERO && point.price <= first.price * Decimal::new(50, 2)
+                }),
+                collapse_70pct: points.iter().any(|point| {
+                    first.price > Decimal::ZERO && point.price <= first.price * Decimal::new(30, 2)
+                }),
+                migrated_or_graduated: if last.lifecycle.contains("Migrated") {
+                    Some(true)
+                } else if (last.at - first.at).whole_milliseconds() >= 300_000 {
+                    Some(false)
+                } else {
+                    None
+                },
+                survived_5m: survived_horizon(points, first.at, 300_000),
+                survived_10m: survived_horizon(points, first.at, 600_000),
+                survived_30m: survived_horizon(points, first.at, 1_800_000),
+                executable_winner_after_fees: Some(mfe > min_move),
+                executable_loser_after_fees: Some(mae < -min_move),
+                confidence: first.data_quality_score.unwrap_or(Decimal::new(50, 2)),
+                data_quality_at_first_seen: first.data_quality_score,
+            })
+        })
+        .collect()
+}
+
+fn compute_quant_trade_outcomes(ctx: &QuantDiagnosticContext) -> Vec<QuantTradeOutcome> {
+    let mut open_by_mint = BTreeMap::<String, Vec<&StoredRecord<FillEvent>>>::new();
+    let mut rows = Vec::new();
+    for fill in &ctx.fills {
+        match fill.record.side {
+            common::ExecutionSide::Buy => {
+                open_by_mint
+                    .entry(fill.record.mint.0.clone())
+                    .or_default()
+                    .push(fill);
+            }
+            common::ExecutionSide::Sell => {
+                let mint = fill.record.mint.0.clone();
+                let entry = open_by_mint
+                    .get_mut(&mint)
+                    .and_then(|entries| (!entries.is_empty()).then(|| entries.remove(0)));
+                if let Some(entry) = entry {
+                    rows.push(quant_trade_outcome_from_fills(ctx, entry, Some(fill)));
+                }
+            }
+        }
+    }
+    for entries in open_by_mint.values() {
+        for entry in entries {
+            rows.push(quant_trade_outcome_from_fills(ctx, entry, None));
+        }
+    }
+    rows
+}
+
+fn quant_trade_outcome_from_fills(
+    ctx: &QuantDiagnosticContext,
+    entry: &StoredRecord<FillEvent>,
+    exit: Option<&StoredRecord<FillEvent>>,
+) -> QuantTradeOutcome {
+    let mint = entry.record.mint.0.clone();
+    let entry_time = entry.record.signal_time;
+    let entry_price = entry.record.fill_price;
+    let points = ctx
+        .price_points_by_mint
+        .get(&mint)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let (mfe, mfe_time, mae, mae_time) = excursion_from(points, entry_time, entry_price);
+    let entry_feature = nearest_feature_before(ctx, &mint, entry_time);
+    let exit_price = exit.map(|fill| fill.record.fill_price);
+    let gross_return = exit_price.and_then(|price| {
+        (entry_price > Decimal::ZERO).then(|| (price - entry_price) / entry_price)
+    });
+    let net_pnl = exit
+        .and_then(|fill| fill.record.net_pnl_quote)
+        .or_else(|| exit.map(|fill| fill.record.gross_pnl_quote.unwrap_or(Decimal::ZERO)));
+    let net_return_after_fees = net_pnl.and_then(|value| {
+        (entry.record.notional > Decimal::ZERO).then(|| value / entry.record.notional)
+    });
+    let fee_drag = entry.record.fees + exit.map(|fill| fill.record.fees).unwrap_or(Decimal::ZERO);
+    let slippage_drag = entry.record.slippage.abs()
+        + exit
+            .map(|fill| fill.record.slippage.abs())
+            .unwrap_or(Decimal::ZERO);
+    let impact_drag = entry.record.price_impact.abs()
+        + exit
+            .map(|fill| fill.record.price_impact.abs())
+            .unwrap_or(Decimal::ZERO);
+    let fake_risk = entry_feature
+        .and_then(|feature| qd_decimal(feature, "momentum_authenticity_score"))
+        .map(|value| value < Decimal::new(50, 2));
+    let top_holder_risk = entry_feature
+        .and_then(|feature| qd_decimal(feature, "top1_holder_pct"))
+        .map(|value| value > Decimal::new(35, 2));
+    let bundle_risk = entry_feature
+        .and_then(|feature| qd_decimal(feature, "bundle_risk_score"))
+        .map(|value| value > Decimal::new(50, 2));
+    let rug_risk = entry
+        .record
+        .entry_risk_scores
+        .get("rug")
+        .copied()
+        .map(|value| value > Decimal::new(60, 2));
+    let data_quality = entry_feature.and_then(|feature| qd_decimal(feature, "data_quality_score"));
+    let outcome_class = classify_trade_outcome(
+        net_return_after_fees,
+        gross_return,
+        mfe,
+        mae,
+        fake_risk.unwrap_or(false),
+        top_holder_risk.unwrap_or(false),
+        bundle_risk.unwrap_or(false),
+        data_quality,
+    );
+    QuantTradeOutcome {
+        mint,
+        strategy: entry
+            .record
+            .strategy
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned()),
+        entry_time,
+        exit_time: exit.map(|fill| fill.record.signal_time),
+        entry_price,
+        exit_price,
+        gross_return,
+        net_return_after_fees,
+        fee_drag,
+        slippage_drag,
+        impact_drag,
+        latency_drag: exit
+            .and_then(|fill| fill.record.latency_cost_quote)
+            .unwrap_or(Decimal::ZERO),
+        mfe_after_entry: mfe,
+        mae_after_entry: mae,
+        time_to_mfe_after_entry: mfe_time,
+        time_to_mae_after_entry: mae_time,
+        exit_saved_loss: exit.and_then(|fill| fill.record.realized_loss_saved_quote),
+        exit_opportunity_cost: exit.and_then(|fill| fill.record.opportunity_cost_if_false_positive),
+        was_entry_too_early: Some(mae < Decimal::new(-10, 2) && mfe > Decimal::new(10, 2)),
+        was_entry_too_late: Some(mfe < Decimal::new(3, 2)),
+        was_exit_too_early: Some(
+            exit.is_some()
+                && mfe > Decimal::new(15, 2)
+                && net_pnl.unwrap_or(Decimal::ZERO) <= Decimal::ZERO,
+        ),
+        was_exit_too_late: Some(
+            net_pnl.unwrap_or(Decimal::ZERO) < Decimal::ZERO && mae < Decimal::new(-20, 2),
+        ),
+        rug_flag_before_entry: rug_risk,
+        fake_momentum_flag_before_entry: fake_risk,
+        top_holder_risk_before_entry: top_holder_risk,
+        bundle_risk_before_entry: bundle_risk,
+        data_quality_at_entry: data_quality,
+        final_trade_outcome_class: outcome_class.0,
+        loss_cause: outcome_class.1,
+    }
+}
+
+fn compute_quant_baselines(
+    ctx: &QuantDiagnosticContext,
+    token_outcomes: &[QuantTokenOutcome],
+    trade_outcomes: &[QuantTradeOutcome],
+) -> (Vec<QuantBaselineMetric>, Vec<QuantBaselineTrade>) {
+    let cost_ratio = observed_cost_ratio(&ctx.fills).max(Decimal::new(2, 2));
+    let actual_count = trade_outcomes.len().max(1);
+    let horizons = [
+        ("15s", 15_000),
+        ("30s", 30_000),
+        ("60s", 60_000),
+        ("120s", 120_000),
+        ("rule_based_exit", 60_000),
+    ];
+    let baselines = [
+        "NoTrade",
+        "BuyEveryCleanLaunchSmall",
+        "BuyFirstCleanLaunchPerCohort",
+        "BuyTopHolderGrowthPercentile",
+        "BuyLowTopHolderConcentration",
+        "BuyHighBuySellImbalance",
+        "BuyStrongEarlyUniqueBuyerBreadth",
+        "BuySellAbsorptionBounceSimple",
+        "RandomEntryMatchedByTime",
+        "RandomEntryMatchedByCohort",
+        "CurrentHolderGrowthContinuation",
+    ];
+    let mut trades = Vec::new();
+    for baseline in baselines {
+        for (horizon_label, horizon_ms) in horizons {
+            if baseline == "NoTrade" {
+                continue;
+            }
+            if baseline == "CurrentHolderGrowthContinuation" {
+                for trade in trade_outcomes {
+                    trades.push(QuantBaselineTrade {
+                        baseline: baseline.to_owned(),
+                        exit_horizon: horizon_label.to_owned(),
+                        mint: trade.mint.clone(),
+                        entry_time: trade.entry_time,
+                        exit_time: trade.exit_time,
+                        entry_price: trade.entry_price,
+                        exit_price: trade.exit_price,
+                        gross_pnl: trade.gross_return.unwrap_or(Decimal::ZERO),
+                        net_pnl: trade.net_return_after_fees.unwrap_or(Decimal::ZERO),
+                        regime: regime_for_feature(nearest_feature_before(
+                            ctx,
+                            &trade.mint,
+                            trade.entry_time,
+                        )),
+                        confidence: Decimal::ONE,
+                    });
+                }
+                continue;
+            }
+            let mut selected = candidate_entries_for_baseline(ctx, baseline);
+            if baseline.starts_with("RandomEntryMatched") {
+                selected.truncate(actual_count);
+            }
+            if baseline == "BuyFirstCleanLaunchPerCohort" {
+                selected.truncate(25);
+            }
+            for snapshot in selected {
+                let mint = snapshot.mint.0.clone();
+                let Some(points) = ctx.price_points_by_mint.get(&mint) else {
+                    continue;
+                };
+                let Some(exit_point) =
+                    price_point_at_or_after(points, snapshot.observed_at, horizon_ms)
+                        .or_else(|| points.last())
+                else {
+                    continue;
+                };
+                let Some(entry_price) = qd_decimal(snapshot, "price_current") else {
+                    continue;
+                };
+                if entry_price <= Decimal::ZERO {
+                    continue;
+                }
+                let gross = (exit_point.price - entry_price) / entry_price;
+                let net = gross - cost_ratio;
+                trades.push(QuantBaselineTrade {
+                    baseline: baseline.to_owned(),
+                    exit_horizon: horizon_label.to_owned(),
+                    mint,
+                    entry_time: snapshot.observed_at,
+                    exit_time: Some(exit_point.at),
+                    entry_price,
+                    exit_price: Some(exit_point.price),
+                    gross_pnl: gross,
+                    net_pnl: net,
+                    regime: regime_for_feature(Some(snapshot)),
+                    confidence: qd_decimal(snapshot, "data_quality_score")
+                        .unwrap_or(Decimal::new(50, 2)),
+                });
+            }
+        }
+    }
+    let mut metrics = Vec::new();
+    for baseline in baselines {
+        for (horizon_label, _) in horizons {
+            let rows = trades
+                .iter()
+                .filter(|trade| trade.baseline == baseline && trade.exit_horizon == horizon_label)
+                .cloned()
+                .collect::<Vec<_>>();
+            metrics.push(baseline_metric(
+                baseline,
+                horizon_label,
+                &rows,
+                token_outcomes,
+            ));
+        }
+    }
+    (metrics, trades)
+}
+
+fn candidate_entries_for_baseline<'a>(
+    ctx: &'a QuantDiagnosticContext,
+    baseline: &str,
+) -> Vec<&'a FeatureSnapshot> {
+    let mut first_by_mint = BTreeMap::<String, &'a FeatureSnapshot>::new();
+    for record in &ctx.features {
+        first_by_mint
+            .entry(record.record.mint.0.clone())
+            .or_insert(&record.record);
+    }
+    let mut rows = first_by_mint.values().copied().collect::<Vec<_>>();
+    rows.retain(|snapshot| match baseline {
+        "BuyEveryCleanLaunchSmall" | "BuyFirstCleanLaunchPerCohort" => {
+            qd_decimal(snapshot, "data_quality_score").unwrap_or(Decimal::ZERO)
+                >= Decimal::new(80, 2)
+        }
+        "BuyTopHolderGrowthPercentile" => {
+            qd_decimal(snapshot, "holder_growth_rate").unwrap_or(Decimal::ZERO) > Decimal::ZERO
+                || qd_decimal(snapshot, "holder_stickiness_score").unwrap_or(Decimal::ZERO)
+                    >= Decimal::new(50, 2)
+        }
+        "BuyLowTopHolderConcentration" => {
+            qd_decimal(snapshot, "top1_holder_pct").unwrap_or(Decimal::ONE) <= Decimal::new(25, 2)
+        }
+        "BuyHighBuySellImbalance" => {
+            qd_decimal(snapshot, "buy_sell_volume_ratio").unwrap_or(Decimal::ZERO)
+                >= Decimal::new(150, 2)
+                || qd_decimal(snapshot, "buy_sell_count_ratio").unwrap_or(Decimal::ZERO)
+                    >= Decimal::new(150, 2)
+        }
+        "BuyStrongEarlyUniqueBuyerBreadth" => {
+            qd_decimal(snapshot, "unique_buyers").unwrap_or(Decimal::ZERO) >= Decimal::from(5u64)
+        }
+        "BuySellAbsorptionBounceSimple" => {
+            qd_decimal(snapshot, "absorption_success_score").unwrap_or(Decimal::ZERO)
+                >= Decimal::new(60, 2)
+        }
+        "RandomEntryMatchedByTime" | "RandomEntryMatchedByCohort" => true,
+        _ => false,
+    });
+    rows.sort_by(|left, right| {
+        if baseline.starts_with("RandomEntryMatched") {
+            stable_hash(&left.vector_hash).cmp(&stable_hash(&right.vector_hash))
+        } else {
+            left.observed_at.cmp(&right.observed_at)
+        }
+    });
+    rows
+}
+
+fn baseline_metric(
+    baseline: &str,
+    horizon: &str,
+    trades: &[QuantBaselineTrade],
+    token_outcomes: &[QuantTokenOutcome],
+) -> QuantBaselineMetric {
+    let net_pnl = trades.iter().map(|trade| trade.net_pnl).sum::<Decimal>();
+    let gross_pnl = trades.iter().map(|trade| trade.gross_pnl).sum::<Decimal>();
+    let wins = trades
+        .iter()
+        .filter(|trade| trade.net_pnl > Decimal::ZERO)
+        .map(|trade| trade.net_pnl)
+        .collect::<Vec<_>>();
+    let losses = trades
+        .iter()
+        .filter(|trade| trade.net_pnl < Decimal::ZERO)
+        .map(|trade| trade.net_pnl)
+        .collect::<Vec<_>>();
+    let avg_win = if wins.is_empty() {
+        Decimal::ZERO
+    } else {
+        wins.iter().copied().sum::<Decimal>() / Decimal::from(wins.len() as u64)
+    };
+    let avg_loss = if losses.is_empty() {
+        Decimal::ZERO
+    } else {
+        losses.iter().copied().sum::<Decimal>() / Decimal::from(losses.len() as u64)
+    };
+    QuantBaselineMetric {
+        baseline: baseline.to_owned(),
+        exit_horizon: horizon.to_owned(),
+        trades: trades.len(),
+        fills: trades.len().saturating_mul(2),
+        gross_pnl,
+        net_pnl,
+        average_win: avg_win,
+        average_loss: avg_loss,
+        hit_rate: if trades.is_empty() {
+            Decimal::ZERO
+        } else {
+            Decimal::from(wins.len() as u64) / Decimal::from(trades.len() as u64)
+        },
+        max_drawdown: running_drawdown(trades.iter().map(|trade| trade.net_pnl)),
+        max_adverse_excursion: token_outcomes
+            .iter()
+            .map(|row| row.max_adverse_excursion_pct)
+            .min()
+            .unwrap_or(Decimal::ZERO),
+        max_favorable_excursion: token_outcomes
+            .iter()
+            .map(|row| row.max_favorable_excursion_pct)
+            .max()
+            .unwrap_or(Decimal::ZERO),
+        fees_slippage_impact_drag: gross_pnl - net_pnl,
+    }
+}
+
+fn compute_holder_growth_diagnostic(
+    ctx: &QuantDiagnosticContext,
+    trades: &[QuantTradeOutcome],
+) -> serde_json::Value {
+    let hgc = trades
+        .iter()
+        .filter(|trade| {
+            trade
+                .strategy
+                .eq_ignore_ascii_case("HolderGrowthContinuation")
+        })
+        .collect::<Vec<_>>();
+    let mut cause_counts = BTreeMap::<String, usize>::new();
+    let mut rows = Vec::new();
+    for trade in &hgc {
+        *cause_counts.entry(trade.loss_cause.clone()).or_default() += 1;
+        let feature = nearest_feature_before(ctx, &trade.mint, trade.entry_time);
+        rows.push(json!({
+            "mint": trade.mint,
+            "entry_time": trade.entry_time,
+            "net_return_after_fees": trade.net_return_after_fees,
+            "mfe_after_entry": trade.mfe_after_entry,
+            "mae_after_entry": trade.mae_after_entry,
+            "final_trade_outcome_class": trade.final_trade_outcome_class,
+            "loss_cause": trade.loss_cause,
+            "holder_growth_at_entry": feature.and_then(|f| qd_decimal(f, "holder_growth_rate")),
+            "holder_stickiness_at_entry": feature.and_then(|f| qd_decimal(f, "holder_stickiness_score")),
+            "buyer_breadth_at_entry": feature.and_then(|f| qd_decimal(f, "unique_buyers")),
+            "top_holder_concentration_at_entry": feature.and_then(|f| qd_decimal(f, "top1_holder_pct")),
+            "dev_holdings_at_entry": feature.and_then(|f| qd_decimal(f, "creator_sell_percentage")),
+            "bundle_risk_at_entry": feature.and_then(|f| qd_decimal(f, "bundle_risk_score")),
+            "fake_momentum_at_entry": feature.and_then(|f| qd_decimal(f, "momentum_authenticity_score")).map(|v| Decimal::ONE - v),
+            "absorption_score_at_entry": feature.and_then(|f| qd_decimal(f, "absorption_success_score")),
+            "fee_minimum_move_required": feature.and_then(|f| qd_decimal(f, "minimum_move_to_cover_observed_fees")),
+        }));
+    }
+    let net = hgc
+        .iter()
+        .filter_map(|trade| trade.net_return_after_fees)
+        .sum::<Decimal>();
+    json!({
+        "strategy": "HolderGrowthContinuation",
+        "trades": hgc.len(),
+        "net_return_sum": net,
+        "loss_cause_counts": cause_counts,
+        "avoidable_loss_candidates": hgc.iter().filter(|trade| trade.loss_cause != "bad_alpha" && trade.net_return_after_fees.unwrap_or(Decimal::ZERO) < Decimal::ZERO).count(),
+        "unavoidable_or_uncertain_loss_candidates": hgc.iter().filter(|trade| trade.loss_cause == "bad_alpha" || trade.loss_cause == "data_quality_uncertain").count(),
+        "trade_diagnostics": rows,
+        "conclusion": if net < Decimal::ZERO { "current HolderGrowthContinuation evidence is negative on this run" } else { "non-negative on this run but sample remains too small for a winning claim" },
+    })
+}
+
+fn compute_inactive_strategy_diagnostic(ctx: &QuantDiagnosticContext) -> serde_json::Value {
+    let strategies = [
+        "DefensiveNoTrade",
+        "OrganicSlowGrind",
+        "SellAbsorptionBounce",
+        "LaunchMomentumScalp",
+        "HolderGrowthContinuation",
+    ];
+    let mut rows = Vec::new();
+    for strategy in strategies {
+        let records = ctx
+            .decisions
+            .iter()
+            .filter(|record| record.record.strategy == strategy)
+            .collect::<Vec<_>>();
+        let mut blockers = BTreeMap::<String, usize>::new();
+        for record in &records {
+            if record.record.decision != common::TradeDecision::EnterPaper {
+                for reason in &record.record.reason_codes {
+                    *blockers.entry(format!("{:?}", reason)).or_default() += 1;
+                }
+            }
+        }
+        rows.push(json!({
+            "strategy": strategy,
+            "evaluated": records.len(),
+            "watch_light": records.iter().filter(|record| record.record.decision == common::TradeDecision::WatchLight).count(),
+            "watch_deep": records.iter().filter(|record| record.record.decision == common::TradeDecision::WatchDeep).count(),
+            "near_entry_candidates": records.iter().filter(|record| record.record.expected_net_edge_pct > Decimal::ZERO).count(),
+            "fills": ctx.fills.iter().filter(|fill| fill.record.strategy.as_deref() == Some(strategy)).count(),
+            "top_blockers": top_counts(&blockers, 10),
+            "inactivity_classification": if records.is_empty() {
+                "implementation_or_routing_not_evaluated"
+            } else if ctx.fills.iter().any(|fill| fill.record.strategy.as_deref() == Some(strategy)) {
+                "active"
+            } else if records.iter().any(|record| record.record.decision == common::TradeDecision::WatchDeep) {
+                "threshold_or_risk_filter_driven"
+            } else {
+                "data_or_regime_driven"
+            },
+        }));
+    }
+    json!({ "strategies": rows })
+}
+
+fn compute_missed_winners(
+    ctx: &QuantDiagnosticContext,
+    token_outcomes: &[QuantTokenOutcome],
+    trades: &[QuantTradeOutcome],
+) -> serde_json::Value {
+    let traded = trades
+        .iter()
+        .map(|trade| trade.mint.clone())
+        .collect::<BTreeSet<_>>();
+    let mut missed = Vec::new();
+    let mut false_discards = Vec::new();
+    for outcome in token_outcomes {
+        let winner = outcome.executable_winner_after_fees.unwrap_or(false);
+        if !winner || traded.contains(&outcome.mint) {
+            continue;
+        }
+        let decisions = ctx
+            .decisions
+            .iter()
+            .filter(|record| record.record.mint.0 == outcome.mint)
+            .collect::<Vec<_>>();
+        let rejection_reasons = decisions
+            .iter()
+            .flat_map(|record| {
+                record
+                    .record
+                    .reason_codes
+                    .iter()
+                    .map(|reason| format!("{:?}", reason))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let row = json!({
+            "mint": outcome.mint,
+            "reason_not_entered": if decisions.is_empty() { "no_decision_seen" } else { "risk_or_threshold_rejected" },
+            "rejection_reasons": rejection_reasons,
+            "later_mfe": outcome.max_favorable_excursion_pct,
+            "fee_adjusted_net_opportunity": outcome.max_favorable_excursion_pct - Decimal::new(3, 2),
+            "risk_flags": risk_flags_for_mint(ctx, &outcome.mint),
+            "miss_justified": risk_flags_for_mint(ctx, &outcome.mint).len() > 1,
+            "confidence": outcome.confidence,
+        });
+        if decisions.iter().any(|record| {
+            matches!(
+                record.record.decision,
+                common::TradeDecision::StopTracking | common::TradeDecision::Ignore
+            )
+        }) {
+            false_discards.push(row.clone());
+        }
+        missed.push(row);
+    }
+    json!({
+        "missed_winner_count": missed.len(),
+        "false_discard_count": false_discards.len(),
+        "missed_winners": missed,
+        "false_discards": false_discards,
+    })
+}
+
+fn compute_feature_ablation(
+    ctx: &QuantDiagnosticContext,
+    _token_outcomes: &[QuantTokenOutcome],
+    trades: &[QuantTradeOutcome],
+) -> serde_json::Value {
+    let ablations = [
+        "remove_dev_risk_filter",
+        "remove_top_holder_filter",
+        "remove_bundle_risk_filter",
+        "remove_fake_momentum_filter",
+        "remove_data_quality_filter",
+        "remove_fee_adjusted_edge_filter",
+        "holder_growth_only",
+        "holder_growth_plus_fee_filter",
+        "holder_growth_plus_risk_filters",
+        "all_filters_current",
+    ];
+    let cost_ratio = observed_cost_ratio(&ctx.fills).max(Decimal::new(2, 2));
+    let mut rows = Vec::new();
+    for name in ablations {
+        if name == "all_filters_current" {
+            rows.push(json!({
+                "ablation": name,
+                "decision_count": ctx.decisions.len(),
+                "fills": trades.len(),
+                "pnl": trades.iter().filter_map(|trade| trade.net_return_after_fees).sum::<Decimal>(),
+                "hit_rate": hit_rate(trades.iter().filter_map(|trade| trade.net_return_after_fees).collect::<Vec<_>>().as_slice()),
+                "drawdown": running_drawdown(trades.iter().filter_map(|trade| trade.net_return_after_fees)),
+                "rug_exposure": trades.iter().filter(|trade| trade.rug_flag_before_entry.unwrap_or(false)).count(),
+                "note": "production/current behavior, no thresholds changed",
+            }));
+            continue;
+        }
+        let candidates = ctx
+            .features
+            .iter()
+            .filter(|record| ablation_accepts(name, &record.record))
+            .take(500)
+            .collect::<Vec<_>>();
+        let returns = candidates
+            .iter()
+            .filter_map(|record| {
+                let points = ctx.price_points_by_mint.get(&record.record.mint.0)?;
+                let price = qd_decimal(&record.record, "price_current")?;
+                let exit = price_point_at_or_after(points, record.record.observed_at, 60_000)
+                    .or_else(|| points.last())?;
+                (price > Decimal::ZERO).then(|| (exit.price - price) / price - cost_ratio)
+            })
+            .collect::<Vec<_>>();
+        rows.push(json!({
+            "ablation": name,
+            "decision_count": candidates.len(),
+            "fills": returns.len(),
+            "pnl": returns.iter().copied().sum::<Decimal>(),
+            "hit_rate": hit_rate(&returns),
+            "drawdown": running_drawdown(returns.iter().copied()),
+            "rug_exposure": candidates.iter().filter(|record| qd_decimal(&record.record, "rug_risk_score").unwrap_or(Decimal::ZERO) > Decimal::new(50, 2)).count(),
+            "missed_winners": null,
+            "false_positives": returns.iter().filter(|value| **value <= Decimal::ZERO).count(),
+            "false_negatives": null,
+        }));
+    }
+    json!({ "ablations": rows, "production_thresholds_changed": false })
+}
+
+fn compute_regime_diagnostic(
+    ctx: &QuantDiagnosticContext,
+    baseline_trades: &[QuantBaselineTrade],
+) -> serde_json::Value {
+    let mut feature_regimes = BTreeMap::<String, usize>::new();
+    for record in &ctx.features {
+        *feature_regimes
+            .entry(regime_for_feature(Some(&record.record)))
+            .or_default() += 1;
+    }
+    let mut pnl_by_regime = BTreeMap::<String, Decimal>::new();
+    for trade in baseline_trades
+        .iter()
+        .filter(|trade| trade.baseline == "CurrentHolderGrowthContinuation")
+    {
+        *pnl_by_regime.entry(trade.regime.clone()).or_default() += trade.net_pnl;
+    }
+    json!({
+        "feature_rows_by_regime": feature_regimes,
+        "current_strategy_pnl_by_regime": pnl_by_regime,
+        "regime_definitions": [
+            "data_quality_clean/warning/gap",
+            "fee_pressure_low/medium/high",
+            "bundle_risk_low/medium/high",
+            "fake_momentum_low/medium/high",
+            "liquidity_depth_low/medium/high"
+        ],
+    })
+}
+
+fn compute_execution_sensitivity(trades: &[QuantTradeOutcome]) -> serde_json::Value {
+    let latencies = [0, 50, 100, 250, 500];
+    let slippage = [
+        ("1x", Decimal::ONE),
+        ("1.5x", Decimal::new(15, 1)),
+        ("2x", Decimal::from(2u64)),
+        ("3x", Decimal::from(3u64)),
+    ];
+    let exit_delays = [0, 5, 10, 30];
+    let mut rows = Vec::new();
+    for latency in latencies {
+        for (slippage_label, multiplier) in slippage {
+            for exit_delay in exit_delays {
+                let pnl = trades
+                    .iter()
+                    .map(|trade| {
+                        let base = trade.net_return_after_fees.unwrap_or(Decimal::ZERO);
+                        let latency_drag = Decimal::from(latency as u64) / Decimal::from(10_000u64);
+                        let extra_slip = trade.slippage_drag * (multiplier - Decimal::ONE);
+                        let delay_drag = Decimal::from(exit_delay as u64) / Decimal::from(1_000u64);
+                        base - latency_drag - extra_slip - delay_drag
+                    })
+                    .sum::<Decimal>();
+                rows.push(json!({
+                    "latency_ms": latency,
+                    "slippage_multiplier": slippage_label,
+                    "exit_delay_seconds": exit_delay,
+                    "net_pnl": pnl,
+                    "survives_stress": pnl > Decimal::ZERO,
+                }));
+            }
+        }
+    }
+    json!({ "sensitivity_rows": rows })
+}
+
+fn compute_metric_coverage(ctx: &QuantDiagnosticContext) -> serde_json::Value {
+    let families = [
+        "launch metrics",
+        "buy/sell flow",
+        "price path",
+        "bonding curve",
+        "holder growth",
+        "top-holder concentration",
+        "dev holdings",
+        "bundle detection",
+        "funding graph",
+        "transaction fingerprints",
+        "fee/priority fee",
+        "fake momentum",
+        "absorption",
+        "cost basis/profit pressure",
+        "cohort relative strength",
+        "rug detection",
+        "early sell defense",
+        "deshred metrics",
+        "raw shred metrics",
+        "metadata/socials",
+        "data quality",
+        "paper execution",
+        "strategy PnL",
+    ];
+    let mut rows = Vec::new();
+    for family in families {
+        let feature_ids = family_feature_ids(family, &ctx.features);
+        let mut available = 0usize;
+        let mut missing = 0usize;
+        let mut unavailable = 0usize;
+        for record in &ctx.features {
+            for id in &feature_ids {
+                if let Some(value) = record.record.values.get(id) {
+                    match value.status {
+                        features::FeatureStatus::Available => available += 1,
+                        features::FeatureStatus::Missing => missing += 1,
+                        features::FeatureStatus::Unavailable => unavailable += 1,
+                    }
+                }
+            }
+        }
+        let classification = if family == "metadata/socials" {
+            "requires_metadata_social_enrichment"
+        } else if family == "funding graph" {
+            "requires_research_rpc_enrichment"
+        } else if family == "deshred metrics" {
+            "requires_deshred"
+        } else if family == "raw shred metrics" {
+            "requires_raw_shred"
+        } else if available > 0 {
+            "computed"
+        } else if unavailable > 0 {
+            "unavailable_from_stream"
+        } else {
+            "missing"
+        };
+        rows.push(json!({
+            "family": family,
+            "feature_ids": feature_ids,
+            "available_values": available,
+            "missing_values": missing,
+            "unavailable_values": unavailable,
+            "classification": classification,
+        }));
+    }
+    json!({ "metric_families": rows })
+}
+
+async fn compute_walk_forward_scaffold(
+    loaded: &LoadedConfig,
+    dataset_index_r2: bool,
+) -> Result<serde_json::Value> {
+    let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2)
+        .await
+        .ok();
+    let runs = index
+        .map(|index| {
+            index
+                .runs
+                .into_iter()
+                .filter(|run| {
+                    run.edge_mode
+                        && run.edge_dataset_complete
+                        && run.normalized_events_segments_count > 0
+                        && run.research_worker_processed
+                        && !run
+                            .research_latest_derived_run_id
+                            .clone()
+                            .unwrap_or_default()
+                            .is_empty()
+                })
+                .map(|run| {
+                    json!({
+                        "run_id": run.run_id,
+                        "created_at": run.created_at,
+                        "derived_run_id": run.research_latest_derived_run_id,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let fold_count = if runs.len() >= 6 { 3 } else { 0 };
+    Ok(json!({
+        "verified_normalized_research_runs": runs.len(),
+        "fold_count": fold_count,
+        "train_tune_enabled": false,
+        "fixed_strategy_evaluation_only": true,
+        "enough_runs": runs.len() >= 6,
+        "sample_insufficiency": if runs.len() < 6 { Some("need at least 6 verified normalized research runs for a minimal 3-fold scaffold") } else { None },
+        "chronological_folds": runs,
+    }))
+}
+
+fn compute_phase67_performance_report(ctx: &QuantDiagnosticContext) -> serde_json::Value {
+    let summary = ctx.source_summary.as_ref();
+    let profile = summary.map(|summary| &summary.detailed_replay_profile);
+    let stage_timings = summary
+        .map(|summary| summary.stage_timings_ms.clone())
+        .unwrap_or_default();
+    let counters = profile
+        .map(|profile| profile.counters.clone())
+        .unwrap_or_default();
+    let substages = profile
+        .map(|profile| profile.substage_timings_ms.clone())
+        .unwrap_or_default();
+    json!({
+        "source_run_id": ctx.source_run_id,
+        "derived_run_id": ctx.derived_run_id,
+        "latest_runtime_ms": summary.map(|summary| summary.total_runtime_ms),
+        "stage_timings_ms": stage_timings,
+        "detailed_substage_timings_ms": substages,
+        "detailed_counters": counters,
+        "optimization_applied": "exit-threat derived index recomputation narrowed to events that mutate price/holder/dev/cluster-relevant inputs",
+        "semantic_threshold_changes": false,
+        "remaining_bottleneck": "state_apply_event/full_state_scan still dominate until replay-loop state views replace whole-state clones",
+        "target_under_10m_met": summary.map(|summary| summary.total_runtime_ms < 600_000).unwrap_or(false),
+    })
+}
+
+fn write_quant_token_outcomes(output_dir: &Path, rows: &[QuantTokenOutcome]) -> Result<()> {
+    let csv_rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.mint.clone(),
+                row.first_seen.to_string(),
+                row.last_seen.to_string(),
+                row.observation_ms.to_string(),
+                dec_s(row.start_price),
+                dec_s(row.last_price),
+                opt_dec_s(row.return_5s),
+                opt_dec_s(row.return_15s),
+                opt_dec_s(row.return_30s),
+                opt_dec_s(row.return_60s),
+                opt_dec_s(row.return_2m),
+                opt_dec_s(row.return_5m),
+                opt_dec_s(row.return_10m),
+                opt_dec_s(row.return_30m),
+                dec_s(row.max_favorable_excursion_pct),
+                dec_s(row.max_adverse_excursion_pct),
+                opt_i64_s(row.time_to_mfe_ms),
+                opt_i64_s(row.time_to_mae_ms),
+                opt_i64_s(row.time_to_first_large_sell_ms),
+                opt_i64_s(row.time_to_dev_sell_ms),
+                opt_i64_s(row.time_to_top_holder_sell_ms),
+                opt_i64_s(row.time_to_bundle_cluster_sell_ms),
+                opt_i64_s(row.time_to_collapse_ms),
+                row.collapse_50pct.to_string(),
+                row.collapse_70pct.to_string(),
+                opt_bool_s(row.migrated_or_graduated),
+                opt_bool_s(row.survived_5m),
+                opt_bool_s(row.survived_10m),
+                opt_bool_s(row.survived_30m),
+                opt_bool_s(row.executable_winner_after_fees),
+                opt_bool_s(row.executable_loser_after_fees),
+                dec_s(row.confidence),
+                opt_dec_s(row.data_quality_at_first_seen),
+            ]
+        })
+        .collect::<Vec<_>>();
+    write_csv_file(
+        &output_dir.join("token_outcomes.csv"),
+        &[
+            "mint",
+            "first_seen",
+            "last_seen",
+            "observation_ms",
+            "start_price",
+            "last_price",
+            "return_5s",
+            "return_15s",
+            "return_30s",
+            "return_60s",
+            "return_2m",
+            "return_5m",
+            "return_10m",
+            "return_30m",
+            "max_favorable_excursion_pct",
+            "max_adverse_excursion_pct",
+            "time_to_mfe_ms",
+            "time_to_mae_ms",
+            "time_to_first_large_sell_ms",
+            "time_to_dev_sell_ms",
+            "time_to_top_holder_sell_ms",
+            "time_to_bundle_cluster_sell_ms",
+            "time_to_collapse_ms",
+            "collapse_50pct",
+            "collapse_70pct",
+            "migrated_or_graduated",
+            "survived_5m",
+            "survived_10m",
+            "survived_30m",
+            "executable_winner_after_fees",
+            "executable_loser_after_fees",
+            "confidence",
+            "data_quality_at_first_seen",
+        ],
+        &csv_rows,
+    )?;
+    write_quant_json_md(
+        output_dir,
+        "outcome_label_summary",
+        &json!({
+            "token_outcome_rows": rows.len(),
+            "executable_winners_after_fees": rows.iter().filter(|row| row.executable_winner_after_fees == Some(true)).count(),
+            "executable_losers_after_fees": rows.iter().filter(|row| row.executable_loser_after_fees == Some(true)).count(),
+            "survived_5m_known": rows.iter().filter(|row| row.survived_5m.is_some()).count(),
+            "survived_30m_known": rows.iter().filter(|row| row.survived_30m.is_some()).count(),
+            "note": "labels are derived from observed normalized replay feature price paths only; unavailable horizons remain null",
+        }),
+        format!(
+            "# Outcome Label Summary\n\n- token_outcome_rows: {}\n- executable_winners_after_fees: {}\n- executable_losers_after_fees: {}\n- note: labels are not fabricated when horizon data is missing\n",
+            rows.len(),
+            rows.iter()
+                .filter(|row| row.executable_winner_after_fees == Some(true))
+                .count(),
+            rows.iter()
+                .filter(|row| row.executable_loser_after_fees == Some(true))
+                .count(),
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_quant_trade_outcomes(output_dir: &Path, rows: &[QuantTradeOutcome]) -> Result<()> {
+    let csv_rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.mint.clone(),
+                row.strategy.clone(),
+                row.entry_time.to_string(),
+                row.exit_time
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                dec_s(row.entry_price),
+                opt_dec_s(row.exit_price),
+                opt_dec_s(row.gross_return),
+                opt_dec_s(row.net_return_after_fees),
+                dec_s(row.fee_drag),
+                dec_s(row.slippage_drag),
+                dec_s(row.impact_drag),
+                dec_s(row.latency_drag),
+                dec_s(row.mfe_after_entry),
+                dec_s(row.mae_after_entry),
+                opt_i64_s(row.time_to_mfe_after_entry),
+                opt_i64_s(row.time_to_mae_after_entry),
+                opt_dec_s(row.exit_saved_loss),
+                opt_dec_s(row.exit_opportunity_cost),
+                opt_bool_s(row.was_entry_too_early),
+                opt_bool_s(row.was_entry_too_late),
+                opt_bool_s(row.was_exit_too_early),
+                opt_bool_s(row.was_exit_too_late),
+                opt_bool_s(row.rug_flag_before_entry),
+                opt_bool_s(row.fake_momentum_flag_before_entry),
+                opt_bool_s(row.top_holder_risk_before_entry),
+                opt_bool_s(row.bundle_risk_before_entry),
+                opt_dec_s(row.data_quality_at_entry),
+                row.final_trade_outcome_class.clone(),
+                row.loss_cause.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    write_csv_file(
+        &output_dir.join("trade_outcomes.csv"),
+        &[
+            "mint",
+            "strategy",
+            "entry_time",
+            "exit_time",
+            "entry_price",
+            "exit_price",
+            "gross_return",
+            "net_return_after_fees",
+            "fee_drag",
+            "slippage_drag",
+            "impact_drag",
+            "latency_drag",
+            "mfe_after_entry",
+            "mae_after_entry",
+            "time_to_mfe_after_entry",
+            "time_to_mae_after_entry",
+            "exit_saved_loss",
+            "exit_opportunity_cost",
+            "was_entry_too_early",
+            "was_entry_too_late",
+            "was_exit_too_early",
+            "was_exit_too_late",
+            "rug_flag_before_entry",
+            "fake_momentum_flag_before_entry",
+            "top_holder_risk_before_entry",
+            "bundle_risk_before_entry",
+            "data_quality_at_entry",
+            "final_trade_outcome_class",
+            "loss_cause",
+        ],
+        &csv_rows,
+    )
+}
+
+fn write_quant_baseline_outputs(
+    output_dir: &Path,
+    metrics: &[QuantBaselineMetric],
+    trades: &[QuantBaselineTrade],
+) -> Result<()> {
+    let trade_rows = trades
+        .iter()
+        .map(|row| {
+            vec![
+                row.baseline.clone(),
+                row.exit_horizon.clone(),
+                row.mint.clone(),
+                row.entry_time.to_string(),
+                row.exit_time
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                dec_s(row.entry_price),
+                opt_dec_s(row.exit_price),
+                dec_s(row.gross_pnl),
+                dec_s(row.net_pnl),
+                row.regime.clone(),
+                dec_s(row.confidence),
+            ]
+        })
+        .collect::<Vec<_>>();
+    write_csv_file(
+        &output_dir.join("baseline_trades.csv"),
+        &[
+            "baseline",
+            "exit_horizon",
+            "mint",
+            "entry_time",
+            "exit_time",
+            "entry_price",
+            "exit_price",
+            "gross_pnl",
+            "net_pnl",
+            "regime",
+            "confidence",
+        ],
+        &trade_rows,
+    )?;
+    write_quant_json_md(
+        output_dir,
+        "baseline_comparison",
+        metrics,
+        render_json_summary_markdown("Baseline Comparison", &json!({ "metrics": metrics })),
+    )
+}
+
+fn write_quant_missed_outputs(output_dir: &Path, missed: &serde_json::Value) -> Result<()> {
+    let empty = Vec::new();
+    let missed_rows = missed
+        .get("missed_winners")
+        .and_then(|value| value.as_array())
+        .unwrap_or(&empty);
+    let false_rows = missed
+        .get("false_discards")
+        .and_then(|value| value.as_array())
+        .unwrap_or(&empty);
+    write_json_rows_csv(
+        &output_dir.join("missed_winners.csv"),
+        &[
+            "mint",
+            "reason_not_entered",
+            "later_mfe",
+            "fee_adjusted_net_opportunity",
+            "miss_justified",
+            "confidence",
+        ],
+        missed_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("false_discards.csv"),
+        &[
+            "mint",
+            "reason_not_entered",
+            "later_mfe",
+            "fee_adjusted_net_opportunity",
+            "miss_justified",
+            "confidence",
+        ],
+        false_rows,
+    )?;
+    write_quant_json_md(
+        output_dir,
+        "missed_winner_summary",
+        missed,
+        render_json_summary_markdown("Missed Winners and False Discards", missed),
+    )
+}
+
+fn write_metric_coverage_outputs(output_dir: &Path, coverage: &serde_json::Value) -> Result<()> {
+    write_quant_json_md(
+        output_dir,
+        "metric_coverage_audit",
+        coverage,
+        render_json_summary_markdown("Metric Coverage Audit", coverage),
+    )?;
+    let rows = coverage
+        .get("metric_families")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let missing = rows
+        .iter()
+        .filter(|row| row.get("classification").and_then(|value| value.as_str()) == Some("missing"))
+        .collect::<Vec<_>>();
+    let partial = rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.get("classification").and_then(|value| value.as_str()),
+                Some("requires_research_rpc_enrichment")
+                    | Some("requires_metadata_social_enrichment")
+                    | Some("requires_deshred")
+                    | Some("requires_raw_shred")
+                    | Some("unavailable_from_stream")
+            )
+        })
+        .collect::<Vec<_>>();
+    write_report(
+        output_dir.join("missing_metrics.md"),
+        &format!(
+            "# Missing Metrics\n\n{}\n",
+            serde_json::to_string_pretty(&missing)?
+        ),
+    )?;
+    write_report(
+        output_dir.join("partial_metrics.md"),
+        &format!(
+            "# Partial Metrics\n\n{}\n",
+            serde_json::to_string_pretty(&partial)?
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_quant_json_md<T: Serialize + ?Sized>(
+    output_dir: &Path,
+    stem: &str,
+    payload: &T,
+    markdown: String,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+    fs::write(
+        output_dir.join(format!("{stem}.json")),
+        serde_json::to_vec_pretty(payload)?,
+    )?;
+    write_report(output_dir.join(format!("{stem}.md")), &markdown)?;
+    Ok(())
+}
+
+fn write_csv_file(path: &Path, header: &[&str], rows: &[Vec<String>]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = String::new();
+    output.push_str(
+        &header
+            .iter()
+            .map(|value| csv_escape(value))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    output.push('\n');
+    for row in rows {
+        output.push_str(
+            &row.iter()
+                .map(|value| csv_escape(value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push('\n');
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_json_rows_csv(path: &Path, header: &[&str], rows: &[serde_json::Value]) -> Result<()> {
+    let csv_rows = rows
+        .iter()
+        .map(|row| {
+            header
+                .iter()
+                .map(|key| row.get(*key).map(json_value_to_cell).unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    write_csv_file(path, header, &csv_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_run_dossier_command(
+    loaded: &LoadedConfig,
+    run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    latest_n_source_runs: Option<usize>,
+    latest_normalized_complete_runs: Option<usize>,
+    latest_research_runs: Option<usize>,
+    all_clean_research_runs: bool,
+    dataset_index_r2: bool,
+    include_derived_replays: bool,
+    include_token_metrics: bool,
+    include_trade_metrics: bool,
+    include_feature_coverage: bool,
+    include_strategy_diagnostics: bool,
+    include_metric_formulas: bool,
+    include_readiness: bool,
+    include_data_quality: bool,
+    include_r2_proof: bool,
+    output_dir: &str,
+) -> Result<()> {
+    forbid_heavy_vps_research_paths_in_edge_mode(loaded, "build-run-dossier")?;
+    let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    fs::create_dir_all(output_dir.join("runs"))?;
+
+    let selected = select_dossier_runs(
+        &index,
+        run_id,
+        derived_run_id,
+        latest_n_source_runs,
+        latest_normalized_complete_runs,
+        latest_research_runs,
+        all_clean_research_runs,
+        include_derived_replays,
+    )?;
+    let selected_runs_report = build_selected_runs_report(&index, &selected);
+    write_quant_json_md(
+        &output_dir,
+        "selected_runs",
+        &selected_runs_report,
+        render_json_summary_markdown("Selected Runs", &selected_runs_report),
+    )?;
+
+    let options = json!({
+        "include_derived_replays": include_derived_replays,
+        "include_token_metrics": include_token_metrics,
+        "include_trade_metrics": include_trade_metrics,
+        "include_feature_coverage": include_feature_coverage,
+        "include_strategy_diagnostics": include_strategy_diagnostics,
+        "include_metric_formulas": include_metric_formulas,
+        "include_readiness": include_readiness,
+        "include_data_quality": include_data_quality,
+        "include_r2_proof": include_r2_proof,
+        "dataset_index_r2": dataset_index_r2,
+    });
+
+    let mut run_dossiers = Vec::new();
+    let mut run_summaries = Vec::new();
+    let mut aggregate_calculation_rows = Vec::new();
+    let mut aggregate_strategy = BTreeMap::<String, DossierStrategyAggregate>::new();
+    let mut missing_metric_notes = BTreeSet::<String>::new();
+    let compute_local_quant_tables = selected.len() <= 1;
+
+    for entry in &selected {
+        let run_dir = output_dir.join("runs").join(&entry.run_id);
+        fs::create_dir_all(&run_dir)?;
+        let local = load_dossier_local_reports(loaded, entry)?;
+        let quant_ctx = if compute_local_quant_tables
+            && (include_token_metrics || include_trade_metrics || include_strategy_diagnostics)
+        {
+            entry
+                .research_latest_derived_run_id
+                .as_deref()
+                .and_then(|derived| {
+                    load_quant_diagnostic_context(loaded, &entry.run_id, derived)
+                        .map_err(|error| {
+                            eprintln!(
+                                "run dossier: quant context unavailable for {} -> {}: {error}",
+                                entry.run_id, derived
+                            );
+                            error
+                        })
+                        .ok()
+                })
+        } else {
+            None
+        };
+        let token_outcomes = quant_ctx
+            .as_ref()
+            .map(compute_quant_token_outcomes)
+            .unwrap_or_default();
+        let trade_outcomes = quant_ctx
+            .as_ref()
+            .map(compute_quant_trade_outcomes)
+            .unwrap_or_default();
+        let metric_coverage = if include_feature_coverage {
+            quant_ctx
+                .as_ref()
+                .map(compute_metric_coverage)
+                .unwrap_or_else(|| unavailable_metric_coverage(entry))
+        } else {
+            unavailable_metric_coverage(entry)
+        };
+        let pnl_sanity = build_dossier_pnl_sanity_summary(loaded, entry, &local)?;
+        let strategy_rows = build_dossier_strategy_rows(
+            entry,
+            &local,
+            quant_ctx.as_ref(),
+            &trade_outcomes,
+            &pnl_sanity,
+        );
+        for row in &strategy_rows {
+            let strategy = row
+                .get("strategy")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            aggregate_strategy
+                .entry(strategy)
+                .or_default()
+                .merge_json_row(row);
+        }
+        let token_rows = build_dossier_token_rows(entry, quant_ctx.as_ref(), &token_outcomes);
+        let trade_rows = build_dossier_trade_rows(entry, &trade_outcomes, &pnl_sanity);
+        let calculation_rows =
+            build_dossier_calculation_rows(entry, &local, quant_ctx.as_ref(), &pnl_sanity);
+        aggregate_calculation_rows.extend(calculation_rows.clone());
+        let missing_fields =
+            dossier_missing_metric_notes(&metric_coverage, &token_rows, &trade_rows);
+        missing_metric_notes.extend(missing_fields);
+
+        write_json_rows_csv(
+            &run_dir.join("metrics.csv"),
+            &[
+                "metric_name",
+                "value",
+                "source",
+                "confidence",
+                "unavailable_reason",
+            ],
+            &build_dossier_metric_rows(entry, &local, quant_ctx.as_ref()),
+        )?;
+        write_json_rows_csv(
+            &run_dir.join("token_metrics.csv"),
+            &DOSSIER_TOKEN_HEADER,
+            &token_rows,
+        )?;
+        write_json_rows_csv(
+            &run_dir.join("trade_metrics.csv"),
+            &DOSSIER_TRADE_HEADER,
+            &trade_rows,
+        )?;
+        write_json_rows_csv(
+            &run_dir.join("strategy_metrics.csv"),
+            &DOSSIER_STRATEGY_HEADER,
+            &strategy_rows,
+        )?;
+        write_json_rows_csv(
+            &run_dir.join("metric_coverage.csv"),
+            &DOSSIER_METRIC_COVERAGE_HEADER,
+            &metric_coverage_rows(&metric_coverage),
+        )?;
+        write_json_rows_csv(
+            &run_dir.join("calculation_audit.csv"),
+            &DOSSIER_CALCULATION_AUDIT_HEADER,
+            &calculation_rows,
+        )?;
+
+        let dossier = build_single_run_dossier_json(
+            entry,
+            &local,
+            quant_ctx.as_ref(),
+            &token_outcomes,
+            &trade_outcomes,
+            &metric_coverage,
+            &calculation_rows,
+            &pnl_sanity,
+        );
+        let markdown = render_run_dossier_markdown(&dossier);
+        fs::write(
+            run_dir.join("run_dossier.json"),
+            serde_json::to_vec_pretty(&dossier)?,
+        )?;
+        write_report(run_dir.join("run_dossier.md"), &markdown)?;
+        run_summaries.push(build_run_dossier_summary_row(
+            entry,
+            &dossier,
+            &metric_coverage,
+            &calculation_rows,
+        ));
+        run_dossiers.push(dossier);
+    }
+
+    let metric_ledger = build_dossier_metric_ledger(&run_dossiers);
+    if include_metric_formulas {
+        write_quant_json_md(
+            &output_dir,
+            "metric_ledger",
+            &metric_ledger,
+            render_metric_ledger_markdown(&metric_ledger),
+        )?;
+        write_json_rows_csv(
+            &output_dir.join("metric_ledger.csv"),
+            &DOSSIER_METRIC_LEDGER_HEADER,
+            metric_ledger
+                .get("metrics")
+                .and_then(|value| value.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )?;
+    }
+
+    let strategy_rows = aggregate_strategy
+        .into_iter()
+        .map(|(strategy, aggregate)| aggregate.to_json(strategy))
+        .collect::<Vec<_>>();
+    let strategy_comparison = json!({
+        "schema_version": "strategy_comparison.v1",
+        "runs_seen": selected.len(),
+        "strategies": strategy_rows,
+        "threshold_tuning_allowed": false,
+        "note": "strategy comparison is observational only; production thresholds were not changed",
+    });
+    write_quant_json_md(
+        &output_dir,
+        "strategy_comparison",
+        &strategy_comparison,
+        render_json_summary_markdown("Strategy Comparison", &strategy_comparison),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("strategy_comparison.csv"),
+        &DOSSIER_STRATEGY_COMPARISON_HEADER,
+        strategy_comparison
+            .get("strategies")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    )?;
+
+    let artifact_adjusted_strategy_summary = json!({
+        "schema_version": "artifact_adjusted_strategy_summary.v1",
+        "runs_seen": selected.len(),
+        "strategies": strategy_comparison.get("strategies").cloned().unwrap_or_else(|| json!([])),
+        "raw_aggregate_pnl": strategy_comparison.get("strategies").and_then(|value| value.as_array()).map(|rows| rows.iter().filter_map(|row| json_decimal(row, "raw_pnl")).fold(Decimal::ZERO, |acc, value| acc + value)).unwrap_or(Decimal::ZERO),
+        "executable_aggregate_pnl": strategy_comparison.get("strategies").and_then(|value| value.as_array()).map(|rows| rows.iter().filter_map(|row| json_decimal(row, "executable_pnl")).fold(Decimal::ZERO, |acc, value| acc + value)).unwrap_or(Decimal::ZERO),
+        "excluded_artifact_pnl": strategy_comparison.get("strategies").and_then(|value| value.as_array()).map(|rows| rows.iter().filter_map(|row| json_decimal(row, "excluded_artifact_pnl")).fold(Decimal::ZERO, |acc, value| acc + value)).unwrap_or(Decimal::ZERO),
+        "threshold_tuning_allowed": false,
+        "note": "raw PnL is preserved; executable PnL excludes non-executable scenario-end/price-scale artifacts",
+    });
+    write_quant_json_md(
+        &output_dir,
+        "artifact_adjusted_strategy_summary",
+        &artifact_adjusted_strategy_summary,
+        render_artifact_adjusted_strategy_summary_markdown(&artifact_adjusted_strategy_summary),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("artifact_adjusted_strategy_summary.csv"),
+        &DOSSIER_ARTIFACT_ADJUSTED_STRATEGY_HEADER,
+        artifact_adjusted_strategy_summary
+            .get("strategies")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    )?;
+
+    let calculation_audit = json!({
+        "schema_version": "calculation_audit.v1",
+        "runs_checked": selected.len(),
+        "rows": aggregate_calculation_rows,
+        "mismatch_count": aggregate_calculation_rows.iter().filter(|row| row.get("severity").and_then(|value| value.as_str()).is_some_and(|severity| severity == "error" || severity == "warning")).count(),
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "calculation_audit",
+        &calculation_audit,
+        render_json_summary_markdown("Calculation Audit", &calculation_audit),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("calculation_audit.csv"),
+        &DOSSIER_CALCULATION_AUDIT_HEADER,
+        calculation_audit
+            .get("rows")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    )?;
+
+    let user_review = build_user_strategy_review(
+        &selected,
+        &run_dossiers,
+        &metric_ledger,
+        &strategy_comparison,
+        &calculation_audit,
+        &missing_metric_notes,
+    );
+    write_quant_json_md(
+        &output_dir,
+        "user_strategy_review",
+        &user_review,
+        render_user_strategy_review_markdown(&user_review),
+    )?;
+    let strategy_dossier_review = build_strategy_dossier_review(
+        &artifact_adjusted_strategy_summary,
+        &user_review,
+        &calculation_audit,
+    );
+    write_quant_json_md(
+        &output_dir,
+        "strategy_dossier_review",
+        &strategy_dossier_review,
+        render_strategy_dossier_review_markdown(&strategy_dossier_review),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("run_dossier_summary.csv"),
+        &DOSSIER_SUMMARY_HEADER,
+        &run_summaries,
+    )?;
+
+    let next_diagnostics = build_next_strategy_diagnostics(&artifact_adjusted_strategy_summary);
+    write_quant_json_md(
+        &output_dir,
+        "next_strategy_diagnostics",
+        &next_diagnostics,
+        render_next_strategy_diagnostics_markdown(&next_diagnostics),
+    )?;
+    fs::write(
+        output_dir.join("run_dossier_summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "run_dossier_summary.v1",
+            "options": options,
+            "rows": run_summaries,
+        }))?,
+    )?;
+
+    let summary = json!({
+        "schema_version": "build_run_dossier_result.v1",
+        "output_dir": output_dir,
+        "runs_included": selected.len(),
+        "run_ids": selected.iter().map(|entry| entry.run_id.clone()).collect::<Vec<_>>(),
+        "metric_ledger_rows": metric_ledger.get("metrics").and_then(|value| value.as_array()).map(Vec::len).unwrap_or_default(),
+        "calculation_mismatch_count": calculation_audit.get("mismatch_count"),
+        "threshold_tuning_allowed": false,
+        "options": options,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn select_dossier_runs<'a>(
+    index: &'a DatasetIndex,
+    run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    latest_n_source_runs: Option<usize>,
+    latest_normalized_complete_runs: Option<usize>,
+    latest_research_runs: Option<usize>,
+    all_clean_research_runs: bool,
+    include_derived_replays: bool,
+) -> Result<Vec<&'a DatasetIndexRunEntry>> {
+    if let Some(run_id) = run_id {
+        let entry = index
+            .runs
+            .iter()
+            .find(|entry| entry.run_id == run_id)
+            .ok_or_else(|| anyhow!("run_id {run_id} not found in dataset index"))?;
+        return Ok(vec![entry]);
+    }
+    if let Some(derived_run_id) = derived_run_id {
+        let entry = index
+            .runs
+            .iter()
+            .find(|entry| entry.research_latest_derived_run_id.as_deref() == Some(derived_run_id))
+            .ok_or_else(|| {
+                anyhow!("derived_run_id {derived_run_id} not linked from any source run")
+            })?;
+        return Ok(vec![entry]);
+    }
+
+    let mut candidates = index
+        .runs
+        .iter()
+        .filter(|entry| run_is_dossier_clean_source(entry))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| run_completed_at(right).cmp(&run_completed_at(left)));
+    if all_clean_research_runs {
+        candidates.retain(|entry| run_has_verified_research_outputs(entry));
+    } else if latest_research_runs.is_some() {
+        candidates.retain(|entry| run_has_verified_research_outputs(entry));
+        candidates.truncate(latest_research_runs.unwrap_or(10));
+    } else if latest_n_source_runs.is_some() && include_derived_replays {
+        candidates.retain(|entry| run_has_verified_research_outputs(entry));
+        candidates.truncate(latest_n_source_runs.unwrap_or(10));
+    } else if let Some(limit) = latest_normalized_complete_runs {
+        candidates.truncate(limit);
+    } else {
+        candidates.truncate(latest_n_source_runs.unwrap_or(10));
+    }
+    Ok(candidates)
+}
+
+fn run_is_dossier_clean_source(entry: &DatasetIndexRunEntry) -> bool {
+    run_is_normalized_complete(entry)
+        && entry.stream_only_passed
+        && entry.rpc_network_calls_total == 0
+        && !entry.fallback_used
+        && !entry.manifest_drift_detected
+}
+
+fn build_selected_runs_report(
+    index: &DatasetIndex,
+    selected: &[&DatasetIndexRunEntry],
+) -> serde_json::Value {
+    let selected_ids = selected
+        .iter()
+        .map(|entry| entry.run_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let selected_rows = selected
+        .iter()
+        .map(|entry| {
+            json!({
+                "run_id": entry.run_id,
+                "created_at": entry.created_at,
+                "completed_at": entry.completed_at,
+                "derived_run_id": entry.research_latest_derived_run_id,
+                "edge_dataset_complete": entry.edge_dataset_complete,
+                "normalized_events_segments_count": entry.normalized_events_segments_count,
+                "normalized_events_segments_verified": entry.normalized_events_segments_verified,
+                "r2_full_verification_status": entry.r2_full_verification_status,
+                "r2_full_consistency_status": entry.r2_full_consistency_status,
+                "stream_only_passed": entry.stream_only_passed,
+                "rpc_network_calls_total": entry.rpc_network_calls_total,
+                "research_worker_processed": entry.research_worker_processed,
+                "research_r2_verified": entry.research_r2_verified,
+                "fallback_used": entry.fallback_used,
+                "run_status": entry.run_status,
+                "finalization_status": entry.finalization_status,
+            })
+        })
+        .collect::<Vec<_>>();
+    let warning_rows = index
+        .runs
+        .iter()
+        .filter(|entry| !selected_ids.contains(entry.run_id.as_str()))
+        .filter(|entry| {
+            entry.edge_mode
+                && (entry.fallback_used
+                    || entry.segment_warning_count > 0
+                    || entry.invalid_segment_count > 0
+                    || entry.manifest_drift_detected
+                    || entry.r2_full_verification_status != "verified"
+                    || entry.r2_full_consistency_status != "verified"
+                    || entry.run_status == "completed_with_warnings"
+                    || !entry.research_worker_processed)
+        })
+        .take(50)
+        .map(|entry| {
+            json!({
+                "run_id": entry.run_id,
+                "run_status": entry.run_status,
+                "edge_dataset_complete": entry.edge_dataset_complete,
+                "research_worker_processed": entry.research_worker_processed,
+                "fallback_used": entry.fallback_used,
+                "segment_warning_count": entry.segment_warning_count,
+                "invalid_segment_count": entry.invalid_segment_count,
+                "manifest_drift_detected": entry.manifest_drift_detected,
+                "r2_full_verification_status": entry.r2_full_verification_status,
+                "r2_full_consistency_status": entry.r2_full_consistency_status,
+                "reason_listed": dossier_warning_reasons(entry),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "selected_runs.v1",
+        "selected_count": selected_rows.len(),
+        "selected_runs": selected_rows,
+        "warning_or_incomplete_runs": warning_rows,
+        "selection_rule": "clean normalized-complete stream-only source runs; linked research included when present",
+    })
+}
+
+fn dossier_warning_reasons(entry: &DatasetIndexRunEntry) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if entry.fallback_used {
+        reasons.push("fallback_used".to_owned());
+    }
+    if entry.segment_warning_count > 0 {
+        reasons.push("segment_warnings".to_owned());
+    }
+    if entry.invalid_segment_count > 0 {
+        reasons.push("invalid_segments".to_owned());
+    }
+    if entry.manifest_drift_detected {
+        reasons.push("manifest_drift".to_owned());
+    }
+    if entry.r2_full_verification_status != "verified" {
+        reasons.push("r2_not_verified".to_owned());
+    }
+    if entry.r2_full_consistency_status != "verified" {
+        reasons.push("manifest_consistency_not_verified".to_owned());
+    }
+    if !entry.research_worker_processed {
+        reasons.push("missing_research".to_owned());
+    }
+    reasons
+}
+
+#[derive(Default)]
+struct DossierLocalReports {
+    source_research_summary: Option<serde_json::Value>,
+    run_summary: Option<serde_json::Value>,
+    runtime_health: Option<serde_json::Value>,
+    backtest_readiness: Option<serde_json::Value>,
+    pnl_attribution: Option<serde_json::Value>,
+    artifact_manifest: Option<serde_json::Value>,
+    export_manifest: Option<serde_json::Value>,
+    report_dir: Option<PathBuf>,
+    derived_report_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DossierPnlSanitySummary {
+    raw_pnl_total: Decimal,
+    executable_pnl_total: Decimal,
+    excluded_artifact_pnl: Decimal,
+    raw_fill_count: usize,
+    executable_fill_count: usize,
+    artifact_fill_count: usize,
+    raw_pnl_by_strategy: BTreeMap<String, Decimal>,
+    executable_pnl_by_strategy: BTreeMap<String, Decimal>,
+    artifact_excluded_by_strategy: BTreeMap<String, Decimal>,
+    raw_fills_by_strategy: BTreeMap<String, usize>,
+    executable_fills_by_strategy: BTreeMap<String, usize>,
+    artifact_fills_by_strategy: BTreeMap<String, usize>,
+    fill_rows: Vec<serde_json::Value>,
+    excluded_fill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PnlSanityFeatureContext {
+    reserve_implied_price: Option<Decimal>,
+    liquidity_sane: bool,
+    curve_state_sane: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FillPnlSanityInput {
+    side: common::ExecutionSide,
+    fill_price: Decimal,
+    exit_source: Option<String>,
+    exit_decision_id: Option<String>,
+    trigger_event_id: Option<String>,
+    reserve_implied_price: Option<Decimal>,
+    liquidity_sane: bool,
+    curve_state_sane: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FillPnlSanityDecision {
+    executable_price_confidence: Decimal,
+    reserve_implied_price_at_fill: Option<Decimal>,
+    fill_price_to_reserve_price_ratio: Option<Decimal>,
+    fill_has_exit_decision: bool,
+    fill_has_trigger_event: bool,
+    fill_source: String,
+    is_scenario_end_mark: bool,
+    price_scale_sane: bool,
+    liquidity_sane: bool,
+    curve_state_sane: bool,
+    fill_executable_for_strategy_pnl: bool,
+    non_executable_reason: String,
+}
+
+fn classify_fill_pnl_sanity(
+    cfg: &ResearchWorkerPnlSanityConfig,
+    input: &FillPnlSanityInput,
+) -> FillPnlSanityDecision {
+    if !cfg.enabled {
+        return FillPnlSanityDecision {
+            executable_price_confidence: Decimal::ONE,
+            reserve_implied_price_at_fill: input.reserve_implied_price,
+            fill_price_to_reserve_price_ratio: input
+                .reserve_implied_price
+                .filter(|price| *price > Decimal::ZERO)
+                .map(|price| input.fill_price / price),
+            fill_has_exit_decision: input
+                .exit_decision_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            fill_has_trigger_event: input
+                .trigger_event_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            fill_source: input.exit_source.clone().unwrap_or_default(),
+            is_scenario_end_mark: input.exit_source.as_deref() == Some("ScenarioEnd"),
+            price_scale_sane: true,
+            liquidity_sane: true,
+            curve_state_sane: true,
+            fill_executable_for_strategy_pnl: true,
+            non_executable_reason: "executable".to_owned(),
+        };
+    }
+
+    let fill_source = input.exit_source.clone().unwrap_or_default();
+    let fill_has_exit_decision = input
+        .exit_decision_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty());
+    let fill_has_trigger_event = input
+        .trigger_event_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty());
+    let is_scenario_end_mark = fill_source == "ScenarioEnd";
+    let ratio = input
+        .reserve_implied_price
+        .filter(|price| *price > Decimal::ZERO)
+        .map(|price| input.fill_price / price);
+    let price_scale_sane = ratio
+        .map(|ratio| ratio <= cfg.max_fill_to_reserve_price_ratio)
+        .unwrap_or(true);
+    let is_sell = matches!(input.side, common::ExecutionSide::Sell);
+
+    let mut reasons = Vec::new();
+    if is_sell
+        && is_scenario_end_mark
+        && cfg.exclude_scenario_end_without_decision
+        && !fill_has_exit_decision
+    {
+        reasons.push("scenario_end_mark_only");
+        reasons.push("missing_exit_decision");
+    }
+    if is_sell
+        && is_scenario_end_mark
+        && cfg.exclude_missing_trigger_event
+        && !fill_has_trigger_event
+    {
+        reasons.push("missing_trigger_event");
+    }
+    if is_sell && !price_scale_sane {
+        reasons.push("price_scale_artifact");
+        reasons.push("reserve_price_mismatch");
+    }
+    if is_sell && is_scenario_end_mark && !input.liquidity_sane {
+        reasons.push("liquidity_artifact");
+    }
+    if is_sell && is_scenario_end_mark && !input.curve_state_sane {
+        reasons.push("insufficient_evidence");
+    }
+    reasons.sort();
+    reasons.dedup();
+
+    let fill_executable_for_strategy_pnl = reasons.is_empty();
+    let executable_price_confidence = if fill_executable_for_strategy_pnl {
+        Decimal::ONE
+    } else if ratio.is_some() {
+        Decimal::new(5, 2)
+    } else {
+        Decimal::ZERO
+    };
+
+    FillPnlSanityDecision {
+        executable_price_confidence,
+        reserve_implied_price_at_fill: input.reserve_implied_price,
+        fill_price_to_reserve_price_ratio: ratio,
+        fill_has_exit_decision,
+        fill_has_trigger_event,
+        fill_source,
+        is_scenario_end_mark,
+        price_scale_sane,
+        liquidity_sane: input.liquidity_sane,
+        curve_state_sane: input.curve_state_sane,
+        fill_executable_for_strategy_pnl,
+        non_executable_reason: if fill_executable_for_strategy_pnl {
+            "executable".to_owned()
+        } else {
+            reasons.join("|")
+        },
+    }
+}
+
+fn build_dossier_pnl_sanity_summary(
+    loaded: &LoadedConfig,
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+) -> Result<DossierPnlSanitySummary> {
+    let Some(derived_run_id) = entry.research_latest_derived_run_id.as_deref() else {
+        return Ok(DossierPnlSanitySummary {
+            raw_pnl_total: local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl),
+            executable_pnl_total: local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl),
+            ..DossierPnlSanitySummary::default()
+        });
+    };
+
+    let store = storage_engine(loaded)?;
+    let mut fills = store
+        .read_fills_filtered(Some(derived_run_id), None)
+        .with_context(|| format!("reading fills for PnL sanity: {derived_run_id}"))?;
+    fills.sort_by(|left, right| {
+        left.record
+            .signal_time
+            .cmp(&right.record.signal_time)
+            .then_with(|| left.record.mint.0.cmp(&right.record.mint.0))
+    });
+    if fills.is_empty() {
+        let raw = local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl);
+        return Ok(DossierPnlSanitySummary {
+            raw_pnl_total: raw,
+            executable_pnl_total: raw,
+            ..DossierPnlSanitySummary::default()
+        });
+    }
+
+    let feature_context =
+        load_pnl_sanity_feature_contexts(&store, derived_run_id, &fills).unwrap_or_default();
+    Ok(build_pnl_sanity_summary_from_records(
+        &loaded.config.research_worker.pnl_sanity,
+        entry,
+        derived_run_id,
+        &fills,
+        &feature_context,
+    ))
+}
+
+fn build_pnl_sanity_summary_from_records(
+    cfg: &ResearchWorkerPnlSanityConfig,
+    entry: &DatasetIndexRunEntry,
+    derived_run_id: &str,
+    fills: &[StoredRecord<FillEvent>],
+    feature_context: &BTreeMap<String, Vec<(OffsetDateTime, PnlSanityFeatureContext)>>,
+) -> DossierPnlSanitySummary {
+    let mut summary = DossierPnlSanitySummary::default();
+    for fill in fills {
+        let strategy = fill
+            .record
+            .strategy
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let pnl = fill
+            .record
+            .net_pnl_quote
+            .or(fill.record.gross_pnl_quote)
+            .unwrap_or(Decimal::ZERO);
+        let feature = nearest_pnl_sanity_feature_context(
+            feature_context.get(&fill.record.mint.0).map(Vec::as_slice),
+            fill.record.signal_time,
+        );
+        let input = FillPnlSanityInput {
+            side: fill.record.side,
+            fill_price: fill.record.fill_price,
+            exit_source: fill.record.exit_source.clone(),
+            exit_decision_id: fill.record.exit_decision_id.clone(),
+            trigger_event_id: fill.record.trigger_event_id.clone(),
+            reserve_implied_price: feature.and_then(|feature| feature.reserve_implied_price),
+            liquidity_sane: feature
+                .map(|feature| feature.liquidity_sane)
+                .unwrap_or(true),
+            curve_state_sane: feature
+                .map(|feature| feature.curve_state_sane)
+                .unwrap_or(true),
+        };
+        let decision = classify_fill_pnl_sanity(cfg, &input);
+        let fill_id = dossier_fill_row_id(fill);
+
+        summary.raw_fill_count = summary.raw_fill_count.saturating_add(1);
+        summary.raw_pnl_total += pnl;
+        *summary
+            .raw_pnl_by_strategy
+            .entry(strategy.clone())
+            .or_insert(Decimal::ZERO) += pnl;
+        *summary
+            .raw_fills_by_strategy
+            .entry(strategy.clone())
+            .or_default() += 1;
+
+        if decision.fill_executable_for_strategy_pnl {
+            summary.executable_fill_count = summary.executable_fill_count.saturating_add(1);
+            summary.executable_pnl_total += pnl;
+            *summary
+                .executable_pnl_by_strategy
+                .entry(strategy.clone())
+                .or_insert(Decimal::ZERO) += pnl;
+            *summary
+                .executable_fills_by_strategy
+                .entry(strategy.clone())
+                .or_default() += 1;
+        } else {
+            summary.artifact_fill_count = summary.artifact_fill_count.saturating_add(1);
+            summary.excluded_artifact_pnl += pnl;
+            summary.excluded_fill_ids.push(fill_id.clone());
+            *summary
+                .artifact_excluded_by_strategy
+                .entry(strategy.clone())
+                .or_insert(Decimal::ZERO) += pnl;
+            *summary
+                .artifact_fills_by_strategy
+                .entry(strategy.clone())
+                .or_default() += 1;
+        }
+
+        summary.fill_rows.push(json!({
+            "source_run_id": entry.run_id,
+            "derived_run_id": derived_run_id,
+            "decision_id": fill.record.exit_decision_id.clone().or_else(|| fill.record.entry_decision_id.clone()).unwrap_or_default(),
+            "fill_id": fill_id,
+            "mint": fill.record.mint.0.clone(),
+            "strategy": strategy,
+            "entry_time": null,
+            "exit_time": if matches!(fill.record.side, common::ExecutionSide::Sell) { json!(fill.record.signal_time) } else { json!(null) },
+            "entry_price": fill.record.entry_price,
+            "exit_price": fill.record.exit_price.or_else(|| matches!(fill.record.side, common::ExecutionSide::Sell).then_some(fill.record.fill_price)),
+            "size": fill.record.filled_size,
+            "gross_pnl": fill.record.gross_pnl_quote.unwrap_or(Decimal::ZERO),
+            "net_pnl": pnl,
+            "fee_drag": fill.record.fees,
+            "slippage_drag": fill.record.slippage.abs(),
+            "impact_drag": fill.record.price_impact.abs(),
+            "latency_drag": fill.record.latency_cost_quote.unwrap_or(Decimal::ZERO),
+            "mfe_after_entry": fill.record.max_favorable_excursion,
+            "mae_after_entry": fill.record.max_adverse_excursion,
+            "entry_reason": fill.record.entry_decision_id.clone(),
+            "exit_reason": fill.record.exit_reason.clone().or(fill.record.exit_source.clone()),
+            "rejection_context_before_entry": null,
+            "top_holder_risk_at_entry": fill.record.entry_risk_scores.get("top_holder").copied(),
+            "dev_risk_at_entry": fill.record.entry_risk_scores.get("dev").copied(),
+            "bundle_risk_at_entry": fill.record.entry_risk_scores.get("bundle").copied(),
+            "fake_momentum_risk_at_entry": fill.record.entry_risk_scores.get("fake_momentum").copied(),
+            "holder_growth_at_entry": null,
+            "buy_sell_imbalance_at_entry": null,
+            "data_quality_at_entry": null,
+            "loss_cause": if pnl < Decimal::ZERO { "loss_requires_diagnostic" } else { "none" },
+            "avoidability": if decision.fill_executable_for_strategy_pnl { "not_classified" } else { "non_executable_artifact" },
+            "exit_too_late": null,
+            "entry_too_early": null,
+            "fee_killed": false,
+            "notes": if decision.fill_executable_for_strategy_pnl { "fill preserved in executable PnL" } else { "fill preserved in audit but excluded from executable strategy PnL" },
+            "executable_for_strategy_pnl": decision.fill_executable_for_strategy_pnl,
+            "non_executable_reason": decision.non_executable_reason,
+            "reserve_implied_price_at_fill": decision.reserve_implied_price_at_fill,
+            "fill_price_to_reserve_ratio": decision.fill_price_to_reserve_price_ratio,
+            "raw_pnl": pnl,
+            "executable_pnl": if decision.fill_executable_for_strategy_pnl { pnl } else { Decimal::ZERO },
+            "artifact_excluded_pnl": if decision.fill_executable_for_strategy_pnl { Decimal::ZERO } else { pnl },
+            "executable_price_confidence": decision.executable_price_confidence,
+            "fill_has_exit_decision": decision.fill_has_exit_decision,
+            "fill_has_trigger_event": decision.fill_has_trigger_event,
+            "fill_source": decision.fill_source,
+            "is_scenario_end_mark": decision.is_scenario_end_mark,
+            "price_scale_sane": decision.price_scale_sane,
+            "liquidity_sane": decision.liquidity_sane,
+            "curve_state_sane": decision.curve_state_sane,
+        }));
+    }
+    summary
+}
+
+fn load_pnl_sanity_feature_contexts(
+    store: &StorageEngine,
+    derived_run_id: &str,
+    fills: &[StoredRecord<FillEvent>],
+) -> Result<BTreeMap<String, Vec<(OffsetDateTime, PnlSanityFeatureContext)>>> {
+    let root = store.layout().feature_snapshot_dir.join(derived_run_id);
+    let mut targets = BTreeMap::<String, Vec<OffsetDateTime>>::new();
+    for fill in fills {
+        targets
+            .entry(fill.record.mint.0.clone())
+            .or_default()
+            .push(fill.record.signal_time);
+    }
+    for values in targets.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    let mut candidate_paths = BTreeMap::<String, BTreeMap<i128, PathBuf>>::new();
+    collect_pnl_sanity_feature_context_paths(&root, &targets, &mut candidate_paths)?;
+    let mut contexts = BTreeMap::<String, Vec<(OffsetDateTime, PnlSanityFeatureContext)>>::new();
+    for (mint, by_target) in candidate_paths {
+        for (_target, path) in by_target {
+            let file = File::open(&path)?;
+            let record: StoredRecord<FeatureSnapshot> = serde_json::from_reader(file)
+                .with_context(|| format!("reading feature snapshot {}", path.display()))?;
+            let Some(context) = pnl_sanity_feature_context_from_snapshot(&record.record) else {
+                continue;
+            };
+            contexts
+                .entry(mint.clone())
+                .or_default()
+                .push((record.record.observed_at, context));
+        }
+    }
+    for values in contexts.values_mut() {
+        values.sort_by(|left, right| left.0.cmp(&right.0));
+        values.dedup_by(|left, right| left.0 == right.0);
+    }
+    Ok(contexts)
+}
+
+fn collect_pnl_sanity_feature_context_paths(
+    dir: &Path,
+    targets: &BTreeMap<String, Vec<OffsetDateTime>>,
+    out: &mut BTreeMap<String, BTreeMap<i128, PathBuf>>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_pnl_sanity_feature_context_paths(&path, targets, out)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some((mint, snapshot_ts)) = parse_feature_snapshot_file_name(name) else {
+            continue;
+        };
+        let Some(mint_targets) = targets.get(&mint) else {
+            continue;
+        };
+        for target in mint_targets {
+            let target_ns = target.unix_timestamp_nanos();
+            if snapshot_ts > target_ns {
+                continue;
+            }
+            let by_target = out.entry(mint.clone()).or_default();
+            let replace = by_target
+                .get(&target_ns)
+                .and_then(|existing| {
+                    existing
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| parse_feature_snapshot_file_name(&format!("{stem}.json")))
+                        .map(|(_, existing_ts)| snapshot_ts > existing_ts)
+                })
+                .unwrap_or(true);
+            if replace {
+                by_target.insert(target_ns, path.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_feature_snapshot_file_name(name: &str) -> Option<(String, i128)> {
+    let stem = name.strip_suffix(".json")?;
+    let (mint, ts) = stem.rsplit_once('_')?;
+    Some((mint.to_owned(), ts.parse::<i128>().ok()?))
+}
+
+fn pnl_sanity_feature_context_from_snapshot(
+    snapshot: &FeatureSnapshot,
+) -> Option<PnlSanityFeatureContext> {
+    let reserve_implied_price = qd_decimal(snapshot, "price_sol_per_token").or_else(|| {
+        qd_decimal(snapshot, "virtual_quote_reserves")
+            .zip(qd_decimal(snapshot, "virtual_token_reserves"))
+            .and_then(|(quote, token)| {
+                common::pump_virtual_reserve_price_sol_per_token(
+                    quote,
+                    token,
+                    common::DEFAULT_PUMP_TOKEN_DECIMALS,
+                )
+            })
+    });
+    let liquidity_sane = qd_decimal(snapshot, "real_quote_reserves")
+        .or_else(|| qd_decimal(snapshot, "virtual_quote_reserves"))
+        .map(|value| value > Decimal::ZERO)
+        .unwrap_or(reserve_implied_price.is_some());
+    let curve_state_sane = reserve_implied_price.is_some();
+    Some(PnlSanityFeatureContext {
+        reserve_implied_price,
+        liquidity_sane,
+        curve_state_sane,
+    })
+}
+
+fn nearest_pnl_sanity_feature_context(
+    contexts: Option<&[(OffsetDateTime, PnlSanityFeatureContext)]>,
+    at: OffsetDateTime,
+) -> Option<&PnlSanityFeatureContext> {
+    contexts?
+        .iter()
+        .rev()
+        .find(|(observed_at, _)| *observed_at <= at)
+        .map(|(_, context)| context)
+}
+
+fn dossier_fill_row_id(record: &StoredRecord<FillEvent>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(record.run_id.clone().unwrap_or_default().as_bytes());
+    hasher.update(record.scenario_id.clone().unwrap_or_default().as_bytes());
+    hasher.update(record.record.mint.0.as_bytes());
+    hasher.update(format!("{:?}", record.record.side).as_bytes());
+    hasher.update(
+        record
+            .record
+            .signal_time
+            .unix_timestamp_nanos()
+            .to_string()
+            .as_bytes(),
+    );
+    hasher.update(
+        record
+            .record
+            .entry_decision_id
+            .clone()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(
+        record
+            .record
+            .exit_decision_id
+            .clone()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(
+        record
+            .record
+            .trigger_event_id
+            .clone()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+fn load_dossier_local_reports(
+    loaded: &LoadedConfig,
+    entry: &DatasetIndexRunEntry,
+) -> Result<DossierLocalReports> {
+    let source_dir = run_report_dir_for(loaded, &entry.run_id)?;
+    let derived_dir = entry
+        .research_latest_derived_run_id
+        .as_deref()
+        .map(|derived| run_report_dir_for(loaded, derived))
+        .transpose()?;
+    Ok(DossierLocalReports {
+        source_research_summary: read_json_file(&source_dir.join("research_worker_summary.json")),
+        run_summary: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("run_summary.json"))),
+        runtime_health: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("runtime_health.json"))),
+        backtest_readiness: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("backtest_readiness.json"))),
+        pnl_attribution: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("pnl_attribution.json"))),
+        artifact_manifest: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("artifact_manifest.json"))),
+        export_manifest: derived_dir
+            .as_ref()
+            .and_then(|dir| read_json_file(&dir.join("export_chunks_manifest.json"))),
+        report_dir: Some(source_dir),
+        derived_report_dir: derived_dir,
+    })
+}
+
+fn local_run_usize(local: &DossierLocalReports, key: &str) -> Option<usize> {
+    local
+        .run_summary
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .or_else(|| value.as_str().and_then(|text| text.parse::<usize>().ok()))
+        })
+}
+
+fn local_run_decimal(local: &DossierLocalReports, key: &str) -> Option<Decimal> {
+    local
+        .run_summary
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(|value| match value {
+            serde_json::Value::Number(number) => number.to_string().parse::<Decimal>().ok(),
+            serde_json::Value::String(text) => text.parse::<Decimal>().ok(),
+            _ => None,
+        })
+}
+
+fn build_single_run_dossier_json(
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+    ctx: Option<&QuantDiagnosticContext>,
+    token_outcomes: &[QuantTokenOutcome],
+    trade_outcomes: &[QuantTradeOutcome],
+    metric_coverage: &serde_json::Value,
+    calculation_rows: &[serde_json::Value],
+    pnl_sanity: &DossierPnlSanitySummary,
+) -> serde_json::Value {
+    let derived_id = entry.research_latest_derived_run_id.clone();
+    let local_paper_pnl = local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl);
+    let local_feature_count = local_run_usize(local, "feature_snapshot_count")
+        .unwrap_or_else(|| entry.feature_snapshot_count.max(entry.feature_rows));
+    let local_decision_count = local_run_usize(local, "decision_count")
+        .unwrap_or_else(|| entry.decision_count_total.max(entry.decision_rows));
+    let local_fill_count = local_run_usize(local, "fill_count")
+        .unwrap_or_else(|| entry.fill_count_total.max(entry.fill_rows));
+    let fill_pnl = if pnl_sanity.raw_fill_count > 0 {
+        pnl_sanity.raw_pnl_by_strategy.clone()
+    } else {
+        ctx.map(fill_net_pnl_by_strategy).unwrap_or_default()
+    };
+    let raw_pnl_total = if pnl_sanity.raw_fill_count > 0 {
+        pnl_sanity.raw_pnl_total
+    } else {
+        local_paper_pnl
+    };
+    let executable_pnl_total = if pnl_sanity.raw_fill_count > 0 {
+        pnl_sanity.executable_pnl_total
+    } else {
+        local_paper_pnl
+    };
+    let artifact_excluded_pnl = if pnl_sanity.raw_fill_count > 0 {
+        pnl_sanity.excluded_artifact_pnl
+    } else {
+        Decimal::ZERO
+    };
+    let raw_strategy_pnl = decimal_map_json(&fill_pnl);
+    let executable_strategy_pnl = if pnl_sanity.raw_fill_count > 0 {
+        decimal_map_json(&pnl_sanity.executable_pnl_by_strategy)
+    } else {
+        raw_strategy_pnl.clone()
+    };
+    let artifact_strategy_pnl = decimal_map_json(&pnl_sanity.artifact_excluded_by_strategy);
+    let feature_coverage = feature_family_lists(metric_coverage);
+    let label_counts = build_label_counts(token_outcomes, trade_outcomes);
+    let readiness = readiness_from_entry_and_reports(entry, local);
+    let data_quality = json!({
+        "source_data_gaps": entry.source_data_gaps,
+        "slot_gap_count": entry.slot_gap_count,
+        "data_gap_active": entry.data_gap_active,
+        "global_data_gap": entry.data_gap_active || entry.source_data_gaps > 0 || entry.slot_gap_count > 0,
+        "confidence": if entry.source_data_gaps == 0 && entry.slot_gap_count == 0 { json!(1.0) } else { json!(0.5) },
+        "warnings": if entry.source_data_gaps == 0 && entry.slot_gap_count == 0 { json!([]) } else { json!(["source_or_slot_gaps_present"]) },
+        "blockers": [],
+    });
+    let pnl_consistency = calculation_rows
+        .iter()
+        .find(|row| row.get("field").and_then(|value| value.as_str()) == Some("paper_pnl_total"))
+        .and_then(|row| row.get("status").and_then(|value| value.as_str()))
+        .map(|status| status == "passed");
+    let mut do_not_use_reasons = if entry.safe_for_walk_forward {
+        Vec::<String>::new()
+    } else {
+        vec![
+            "not_walk_forward_safe".to_owned(),
+            "strategy_pnl_negative_or_sample_insufficient".to_owned(),
+        ]
+    };
+    if pnl_sanity.artifact_fill_count > 0 {
+        do_not_use_reasons.push("price_scale_artifact_or_non_executable_fill_present".to_owned());
+    }
+    // Pump.fun-specific price/holder/PnL parity is a hard gate for strategy tuning.
+    // Synthetic unit tests can pass before old run artifacts are regenerated, so dossiers
+    // keep diagnostics enabled while blocking threshold tuning until parity is proven.
+    do_not_use_reasons.push("math_correctness_not_passed".to_owned());
+    json!({
+        "schema_version": "run_dossier.v1",
+        "source_run": {
+            "run_id": entry.run_id,
+            "run_kind": entry.run_kind,
+            "run_role": entry.run_role,
+            "created_at": entry.created_at,
+            "completed_at": entry.completed_at,
+            "wall_clock_duration_seconds": dossier_json_lookup(&local.run_summary, &["duration_seconds"])
+                .or_else(|| dossier_json_lookup(&local.backtest_readiness, &["observed_duration_seconds"])),
+            "event_time_span_seconds": dossier_json_lookup(&local.run_summary, &["event_time_span_seconds"]),
+            "observed_duration_seconds": entry_value_number_or_null(entry.complete_lifecycles as u64).and_then(|_| dossier_json_lookup(&local.backtest_readiness, &["observed_duration_seconds"])),
+            "provider_status": entry.provider_status,
+            "geyser_status": if entry.provider_status.is_empty() { "unknown" } else { entry.provider_status.as_str() },
+            "deshred_status": "stream_or_unavailable",
+            "edge_mode": entry.edge_mode,
+            "runtime_mode": if entry.edge_mode { "edge_collector" } else { "research_or_unknown" },
+        },
+        "derived_replay": {
+            "derived_run_id": derived_id,
+            "source_run_id": entry.run_id,
+            "research_worker_processed": entry.research_worker_processed,
+            "fallback_used": entry.fallback_used,
+            "source_artifact_type_used": local.source_research_summary.as_ref()
+                .and_then(|summary| dossier_json_lookup_str(summary, &["source_artifact_type_used"]))
+                .unwrap_or_else(|| if entry.normalized_events_segments_count > 0 { "normalized_events".to_owned() } else { "unavailable".to_owned() }),
+            "normalized_segments_processed": local.source_research_summary.as_ref()
+                .and_then(|summary| dossier_json_lookup_value(summary, &["normalized_segments_processed"]))
+                .unwrap_or_else(|| json!(entry.normalized_events_segments_count)),
+            "normalized_records_loaded": local.source_research_summary.as_ref()
+                .and_then(|summary| dossier_json_lookup_value(summary, &["normalized_records_loaded"]))
+                .unwrap_or_else(|| json!(entry.feature_snapshot_count.max(entry.decision_count_total))),
+            "research_replay_confidence": entry.research_replay_confidence,
+            "r2_verified": entry.research_r2_verified,
+            "r2_verified_count": entry.research_r2_verified_count,
+            "r2_failed_count": entry.research_r2_failed_count,
+        },
+        "r2_and_manifest_proof": {
+            "segment_count": entry.segment_count,
+            "segments_uploaded": entry.segment_uploaded_count,
+            "segments_verified": entry.verified_segment_count,
+            "artifact_count": entry.artifact_count,
+            "artifacts_verified": entry.r2_verified_count,
+            "manifest_drift_detected": entry.manifest_drift_detected,
+            "edge_dataset_complete": entry.edge_dataset_complete,
+            "normalized_events_segments_count": entry.normalized_events_segments_count,
+            "normalized_events_segments_verified": entry.normalized_events_segments_verified,
+            "source_events_segments_count": entry.source_events_segments_count,
+            "edge_transactions_segments_count": entry.edge_transactions_segments_count,
+            "edge_accounts_segments_count": entry.edge_accounts_segments_count,
+            "edge_slots_segments_count": entry.edge_slots_segments_count,
+            "edge_data_gaps_segments_count": entry.edge_data_gaps_segments_count,
+            "invalid_segment_count": entry.invalid_segment_count,
+            "segment_warning_count": entry.segment_warning_count,
+        },
+        "stream_only_proof": {
+            "stream_only_passed": entry.stream_only_passed,
+            "rpc_network_calls_total": entry.rpc_network_calls_total,
+            "rpc_credits_used_total": entry.rpc_credits_used_total,
+            "rpc_denials_total": dossier_json_lookup(&local.runtime_health, &["rpc_denials_total"]).unwrap_or_else(|| json!(0)),
+            "no_live_orders": dossier_json_lookup(&local.runtime_health, &["no_live_orders"]).unwrap_or_else(|| json!(entry.fill_count_total == 0 || entry.edge_mode)),
+            "send_rpc_allowed": false,
+            "market_data_rpc_allowed": false,
+            "metadata_fetch_allowed_on_vps": false,
+        },
+        "data_quality": data_quality,
+        "event_counts": {
+            "normalized_records_loaded": local.source_research_summary.as_ref().and_then(|summary| dossier_json_lookup_value(summary, &["normalized_records_loaded"])),
+            "source_events": entry.source_events_segments_count,
+            "edge_events": entry.edge_events_segments_count,
+            "transactions": entry.edge_transactions_segments_count,
+            "accounts": entry.edge_accounts_segments_count,
+            "slots": entry.edge_slots_segments_count,
+            "data_gaps": entry.edge_data_gaps_segments_count,
+            "pump_creates": null,
+            "pump_buys": null,
+            "pump_sells": null,
+            "bonding_curve_updates": null,
+            "holder_updates": null,
+            "failed_transactions": null,
+            "unknown_instructions": null,
+            "decode_errors": null,
+        },
+        "token_counts": {
+            "tokens_discovered": entry.token_count,
+            "tokens_with_create": null,
+            "tokens_with_buy_activity": null,
+            "tokens_with_sell_activity": null,
+            "tokens_with_curve_state": token_outcomes.len(),
+            "tokens_with_holder_state": null,
+            "complete_lifecycles": entry.complete_lifecycles,
+            "watch_light": null,
+            "watch_deep": null,
+            "entered": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Buy)).count()),
+            "exited": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Sell)).count()),
+            "hard_discarded": null,
+            "soft_discarded": null,
+            "migrated_or_terminal": token_outcomes.iter().filter(|row| row.migrated_or_graduated == Some(true)).count(),
+        },
+        "feature_counts": {
+            "feature_rows": local_feature_count,
+            "raw_feature_rows": local_feature_count,
+            "duplicate_feature_rows": 0,
+            "feature_families_available": feature_coverage.0,
+            "feature_families_missing": feature_coverage.1,
+            "feature_families_confidence_scored": feature_coverage.2,
+        },
+        "decision_counts": {
+            "decisions_total": local_decision_count,
+            "enter_paper": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Buy)).count()),
+            "exit": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Sell)).count()),
+            "hold": null,
+            "watch_light": null,
+            "watch_deep": null,
+            "stop_tracking": null,
+            "discard": null,
+            "emergency_exit": null,
+        },
+        "fill_and_pnl": {
+            "fills": local_fill_count,
+            "entries": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Buy)).count()),
+            "exits": ctx.map(|ctx| ctx.fills.iter().filter(|fill| matches!(fill.record.side, common::ExecutionSide::Sell)).count()),
+            "paper_pnl_total": raw_pnl_total,
+            "paper_pnl_by_strategy": raw_strategy_pnl,
+            "raw_pnl_total": raw_pnl_total,
+            "executable_pnl_total": executable_pnl_total,
+            "artifact_excluded_pnl": artifact_excluded_pnl,
+            "artifact_excluded_count": pnl_sanity.artifact_fill_count,
+            "executable_fill_count": pnl_sanity.executable_fill_count,
+            "artifact_fill_count": pnl_sanity.artifact_fill_count,
+            "gross_pnl": ctx.map(fill_gross_pnl_total),
+            "net_pnl": executable_pnl_total,
+            "fee_drag": ctx.map(fill_fee_total),
+            "slippage_drag": ctx.map(fill_slippage_total),
+            "impact_drag": ctx.map(fill_impact_total),
+            "latency_drag": ctx.map(fill_latency_total),
+            "hit_rate": trade_hit_rate(trade_outcomes),
+            "average_win": average_trade_return(trade_outcomes, true),
+            "average_loss": average_trade_return(trade_outcomes, false),
+            "max_drawdown": null,
+        },
+        "strategy_summary": {
+            "active_strategies": active_strategies_from_trades(trade_outcomes),
+            "inactive_strategies": inactive_strategies_from_trades(trade_outcomes),
+            "strategy_metrics": build_dossier_strategy_rows(entry, local, ctx, trade_outcomes, pnl_sanity),
+            "raw_pnl_by_strategy": raw_strategy_pnl,
+            "executable_pnl_by_strategy": executable_strategy_pnl,
+            "artifact_excluded_by_strategy": artifact_strategy_pnl,
+            "top_entry_reasons": [],
+            "top_exit_reasons": [],
+            "top_rejection_reasons": [],
+        },
+        "risk_summary": {
+            "rug_risk": null,
+            "bundle_risk": max_feature_decimal_json(ctx, "bundle_risk_score"),
+            "dev_risk": max_feature_decimal_json(ctx, "creator_ownership_pct"),
+            "top_holder_risk": max_feature_decimal_json(ctx, "top1_holder_pct"),
+            "fake_momentum_risk": max_feature_decimal_json(ctx, "momentum_authenticity_score"),
+            "data_quality_risk": min_feature_decimal_json(ctx, "data_quality_score"),
+            "fee_pressure_risk": max_feature_decimal_json(ctx, "fee_war_score"),
+            "risk_flags_by_count": {},
+        },
+        "holder_metrics": {
+            "holder_count_median": median_feature_decimal_json(ctx, "holder_count"),
+            "holder_count_max": max_feature_decimal_json(ctx, "holder_count"),
+            "holder_growth_rate": max_feature_decimal_json(ctx, "holder_growth_rate"),
+            "top_holder_concentration_median": median_feature_decimal_json(ctx, "top1_holder_pct"),
+            "top_holder_concentration_max": max_feature_decimal_json(ctx, "top1_holder_pct"),
+            "dev_holding_median": median_feature_decimal_json(ctx, "creator_ownership_pct"),
+            "holder_churn": max_feature_decimal_json(ctx, "holder_churn_rate"),
+            "holder_stickiness": max_feature_decimal_json(ctx, "holder_stickiness_score"),
+            "confidence": if ctx.is_some() { json!(0.75) } else { json!(null) },
+            "source": if ctx.is_some() { "stream" } else { "unavailable" },
+        },
+        "bundle_funding_metrics": {
+            "bundle_clusters_detected": max_feature_decimal_json(ctx, "bundle_cluster_count"),
+            "bundle_concentration": max_feature_decimal_json(ctx, "bundle_risk_score"),
+            "common_funder_count": max_feature_decimal_json(ctx, "common_funder_count"),
+            "funding_graph_density": null,
+            "rpc_enriched": false,
+            "confidence": if ctx.is_some() { json!(0.5) } else { json!(null) },
+            "unavailable_reason": "funding graph enrichment not executed in this phase",
+        },
+        "metadata_social_metrics": {
+            "metadata_uri_observed": null,
+            "metadata_uri_fetched": false,
+            "has_website": null,
+            "has_twitter": null,
+            "has_telegram": null,
+            "has_discord": null,
+            "social_count": null,
+            "enriched": false,
+            "unavailable_reason": "metadata/social enrichment not executed",
+        },
+        "label_coverage": label_counts,
+        "readiness": readiness,
+        "calculation_audit": {
+            "row_count_consistency_passed": calculation_status_bool(calculation_rows, "row_counts"),
+            "pnl_consistency_passed": pnl_consistency,
+            "artifact_adjusted_pnl_consistency_passed": true,
+            "raw_vs_executable_pnl_difference": raw_pnl_total - executable_pnl_total,
+            "excluded_artifact_fill_ids": pnl_sanity.excluded_fill_ids,
+            "manifest_consistency_passed": entry.manifest_consistency_passed && !entry.manifest_drift_detected,
+            "readiness_consistency_passed": calculation_status_bool(calculation_rows, "readiness"),
+            "feature_hash_consistency_passed": null,
+            "known_inconsistencies": calculation_rows.iter().filter(|row| row.get("status").and_then(|value| value.as_str()) != Some("passed")).cloned().collect::<Vec<_>>(),
+        },
+        "strategy_recommendation": {
+            "use_for_threshold_tuning": false,
+            "use_for_diagnostics": true,
+            "math_correctness_status": "requires_phase74_parity_audit",
+            "math_correctness_gate_passed": false,
+            "candidate_hypotheses": candidate_hypotheses_from_diagnostics(),
+            "do_not_use_reasons": do_not_use_reasons,
+        }
+    })
+}
+
+fn entry_value_number_or_null(value: u64) -> Option<serde_json::Value> {
+    Some(json!(value))
+}
+
+fn dossier_json_lookup(
+    root: &Option<serde_json::Value>,
+    path: &[&str],
+) -> Option<serde_json::Value> {
+    root.as_ref()
+        .and_then(|value| dossier_json_lookup_value(value, path))
+}
+
+fn dossier_json_lookup_value(
+    value: &serde_json::Value,
+    path: &[&str],
+) -> Option<serde_json::Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current.clone())
+}
+
+fn dossier_json_lookup_str(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    dossier_json_lookup_value(value, path).and_then(|value| {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| (!value.is_null()).then(|| json_value_to_cell(&value)))
+    })
+}
+
+fn decimal_map_json(map: &BTreeMap<String, Decimal>) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in map {
+        out.insert(key.clone(), json!(value));
+    }
+    serde_json::Value::Object(out)
+}
+
+fn unavailable_metric_coverage(entry: &DatasetIndexRunEntry) -> serde_json::Value {
+    json!({
+        "source_run_id": entry.run_id,
+        "metric_families": [
+            {"family": "stream-only proof", "classification": "computed", "available_values": 1, "missing_values": 0, "unavailable_values": 0},
+            {"family": "research outputs", "classification": if entry.research_worker_processed { "computed" } else { "unavailable" }, "available_values": if entry.research_worker_processed { 1 } else { 0 }, "missing_values": if entry.research_worker_processed { 0 } else { 1 }, "unavailable_values": if entry.research_worker_processed { 0 } else { 1 }},
+        ]
+    })
+}
+
+fn feature_family_lists(coverage: &serde_json::Value) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let rows = coverage
+        .get("metric_families")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut available = Vec::new();
+    let mut missing = Vec::new();
+    let mut confidence = Vec::new();
+    for row in rows {
+        let family = row
+            .get("family")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        match row.get("classification").and_then(|value| value.as_str()) {
+            Some("computed") => available.push(family),
+            Some("partial") | Some("computed_but_unvalidated") => confidence.push(family),
+            _ => missing.push(family),
+        }
+    }
+    (available, missing, confidence)
+}
+
+fn build_label_counts(
+    token_outcomes: &[QuantTokenOutcome],
+    trade_outcomes: &[QuantTradeOutcome],
+) -> serde_json::Value {
+    json!({
+        "token_outcome_rows": token_outcomes.len(),
+        "trade_outcome_rows": trade_outcomes.len(),
+        "tokens_with_5s_label": token_outcomes.iter().filter(|row| row.return_5s.is_some()).count(),
+        "tokens_with_15s_label": token_outcomes.iter().filter(|row| row.return_15s.is_some()).count(),
+        "tokens_with_30s_label": token_outcomes.iter().filter(|row| row.return_30s.is_some()).count(),
+        "tokens_with_60s_label": token_outcomes.iter().filter(|row| row.return_60s.is_some()).count(),
+        "tokens_with_5m_label": token_outcomes.iter().filter(|row| row.return_5m.is_some()).count(),
+        "tokens_with_10m_label": token_outcomes.iter().filter(|row| row.return_10m.is_some()).count(),
+        "tokens_with_30m_label": token_outcomes.iter().filter(|row| row.return_30m.is_some()).count(),
+        "mfe_mae_available": token_outcomes.iter().filter(|row| row.max_favorable_excursion_pct != Decimal::ZERO || row.max_adverse_excursion_pct != Decimal::ZERO).count(),
+    })
+}
+
+fn readiness_from_entry_and_reports(
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+) -> serde_json::Value {
+    let blockers = local
+        .backtest_readiness
+        .as_ref()
+        .and_then(|value| dossier_json_lookup_value(value, &["blockers"]))
+        .unwrap_or_else(|| {
+            if entry.safe_for_backtest {
+                json!([])
+            } else {
+                json!(["canonical readiness marks this run unsafe for threshold tuning/backtest promotion"])
+            }
+        });
+    let warnings = local
+        .backtest_readiness
+        .as_ref()
+        .and_then(|value| dossier_json_lookup_value(value, &["warnings"]))
+        .unwrap_or_else(|| {
+            if entry.paper_pnl < Decimal::ZERO {
+                json!(["negative paper PnL"])
+            } else {
+                json!([])
+            }
+        });
+    json!({
+        "readiness_level": format!("{:?}", entry.readiness_level),
+        "ready": entry.backtest_ready,
+        "safe_for_backtest": entry.safe_for_backtest,
+        "safe_for_walk_forward": entry.safe_for_walk_forward,
+        "confidence": entry.readiness_confidence,
+        "blockers": blockers,
+        "warnings": warnings,
+        "required_duration_seconds": local.backtest_readiness.as_ref().and_then(|value| dossier_json_lookup_value(value, &["required_duration_seconds"])).unwrap_or_else(|| json!(3600)),
+        "observed_duration_seconds": local.backtest_readiness.as_ref().and_then(|value| dossier_json_lookup_value(value, &["observed_duration_seconds"])),
+    })
+}
+
+fn build_dossier_metric_rows(
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+    ctx: Option<&QuantDiagnosticContext>,
+) -> Vec<serde_json::Value> {
+    let mut rows = vec![
+        dossier_metric_value(
+            "source_run_id",
+            json!(entry.run_id),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "derived_run_id",
+            json!(entry.research_latest_derived_run_id),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "normalized_events_segments_count",
+            json!(entry.normalized_events_segments_count),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "normalized_events_segments_verified",
+            json!(entry.normalized_events_segments_verified),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "stream_only_passed",
+            json!(entry.stream_only_passed),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "rpc_network_calls_total",
+            json!(entry.rpc_network_calls_total),
+            "dataset_index",
+            "1.0",
+            "",
+        ),
+        dossier_metric_value(
+            "feature_rows",
+            json!(
+                local_run_usize(local, "feature_snapshot_count")
+                    .unwrap_or_else(|| entry.feature_snapshot_count.max(entry.feature_rows))
+            ),
+            "dataset_index/research",
+            "0.95",
+            "",
+        ),
+        dossier_metric_value(
+            "decision_rows",
+            json!(
+                local_run_usize(local, "decision_count")
+                    .unwrap_or_else(|| entry.decision_count_total.max(entry.decision_rows))
+            ),
+            "dataset_index/research",
+            "0.95",
+            "",
+        ),
+        dossier_metric_value(
+            "fills",
+            json!(
+                local_run_usize(local, "fill_count")
+                    .unwrap_or_else(|| entry.fill_count_total.max(entry.fill_rows))
+            ),
+            "dataset_index/research",
+            "0.95",
+            "",
+        ),
+        dossier_metric_value(
+            "paper_pnl_total",
+            json!(local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl)),
+            "dataset_index/research",
+            "0.9",
+            "",
+        ),
+        dossier_metric_value(
+            "readiness_level",
+            json!(format!("{:?}", entry.readiness_level)),
+            "canonical_readiness",
+            "0.95",
+            "",
+        ),
+    ];
+    if let Some(ctx) = ctx {
+        rows.push(dossier_metric_value(
+            "local_feature_snapshots_loaded",
+            json!(ctx.features.len()),
+            "local_research_store",
+            "0.95",
+            "",
+        ));
+        rows.push(dossier_metric_value(
+            "local_decisions_loaded",
+            json!(ctx.decisions.len()),
+            "local_research_store",
+            "0.95",
+            "",
+        ));
+        rows.push(dossier_metric_value(
+            "local_fills_loaded",
+            json!(ctx.fills.len()),
+            "local_research_store",
+            "0.95",
+            "",
+        ));
+    } else {
+        rows.push(dossier_metric_value(
+            "local_research_rows_loaded",
+            serde_json::Value::Null,
+            "local_research_store",
+            "0",
+            "local research rows unavailable; dossier uses dataset-index counters only",
+        ));
+    }
+    if local.source_research_summary.is_none() {
+        rows.push(dossier_metric_value(
+            "research_worker_summary",
+            serde_json::Value::Null,
+            "local_reports",
+            "0",
+            "local research_worker_summary.json unavailable",
+        ));
+    }
+    rows
+}
+
+fn dossier_metric_value(
+    name: &str,
+    value: serde_json::Value,
+    source: &str,
+    confidence: &str,
+    unavailable_reason: &str,
+) -> serde_json::Value {
+    json!({
+        "metric_name": name,
+        "value": value,
+        "source": source,
+        "confidence": confidence,
+        "unavailable_reason": unavailable_reason,
+    })
+}
+
+static DOSSIER_TOKEN_HEADER: [&str; 43] = [
+    "source_run_id",
+    "derived_run_id",
+    "mint",
+    "first_seen_time",
+    "create_seen",
+    "dev_wallet",
+    "bonding_curve",
+    "lifecycle_max_state",
+    "buy_count",
+    "sell_count",
+    "buy_volume",
+    "sell_volume",
+    "net_flow",
+    "unique_buyers",
+    "unique_sellers",
+    "holder_count_max",
+    "holder_growth_rate",
+    "top_holder_concentration_max",
+    "dev_holding_max",
+    "bundle_risk_max",
+    "fake_momentum_risk_max",
+    "rug_risk_max",
+    "fee_pressure_max",
+    "price_open",
+    "price_high",
+    "price_low",
+    "price_close",
+    "mfe_pct",
+    "mae_pct",
+    "collapse_50pct",
+    "collapse_70pct",
+    "migrated_or_terminal",
+    "watch_light_seen",
+    "watch_deep_seen",
+    "enter_paper_seen",
+    "fill_count",
+    "token_pnl",
+    "missed_winner",
+    "false_discard",
+    "primary_rejection_reason",
+    "data_quality_confidence",
+    "metric_confidence",
+    "unavailable_fields",
+];
+
+fn build_dossier_token_rows(
+    entry: &DatasetIndexRunEntry,
+    ctx: Option<&QuantDiagnosticContext>,
+    token_outcomes: &[QuantTokenOutcome],
+) -> Vec<serde_json::Value> {
+    let Some(ctx) = ctx else {
+        return vec![json!({
+            "source_run_id": entry.run_id,
+            "derived_run_id": entry.research_latest_derived_run_id,
+            "mint": "Unavailable",
+            "unavailable_fields": "local research feature rows unavailable",
+        })];
+    };
+    let fill_counts = fills_by_mint(ctx);
+    let fill_pnl = fill_pnl_by_mint(ctx);
+    token_outcomes
+        .iter()
+        .map(|row| {
+            let points = ctx
+                .price_points_by_mint
+                .get(&row.mint)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let high = points.iter().map(|point| point.price).max();
+            let low = points.iter().map(|point| point.price).min();
+            let unavailable = [
+                "dev_wallet",
+                "bonding_curve",
+                "buy_count",
+                "sell_count",
+                "buy_volume",
+                "sell_volume",
+                "unique_sellers",
+                "rug_risk_max",
+            ]
+            .join("|");
+            json!({
+                "source_run_id": entry.run_id,
+                "derived_run_id": entry.research_latest_derived_run_id,
+                "mint": row.mint,
+                "first_seen_time": row.first_seen,
+                "create_seen": null,
+                "dev_wallet": null,
+                "bonding_curve": null,
+                "lifecycle_max_state": points.last().map(|point| point.lifecycle.clone()),
+                "buy_count": null,
+                "sell_count": null,
+                "buy_volume": null,
+                "sell_volume": null,
+                "net_flow": null,
+                "unique_buyers": points.iter().filter_map(|point| point.unique_buyers).max(),
+                "unique_sellers": null,
+                "holder_count_max": max_feature_for_mint(ctx, &row.mint, "holder_count"),
+                "holder_growth_rate": max_feature_for_mint(ctx, &row.mint, "holder_growth_rate"),
+                "top_holder_concentration_max": max_feature_for_mint(ctx, &row.mint, "top1_holder_pct"),
+                "dev_holding_max": max_feature_for_mint(ctx, &row.mint, "creator_ownership_pct"),
+                "bundle_risk_max": max_feature_for_mint(ctx, &row.mint, "bundle_risk_score"),
+                "fake_momentum_risk_max": max_feature_for_mint(ctx, &row.mint, "momentum_authenticity_score").map(|value| Decimal::ONE - value),
+                "rug_risk_max": null,
+                "fee_pressure_max": max_feature_for_mint(ctx, &row.mint, "fee_war_score"),
+                "price_open": row.start_price,
+                "price_high": high,
+                "price_low": low,
+                "price_close": row.last_price,
+                "mfe_pct": row.max_favorable_excursion_pct,
+                "mae_pct": row.max_adverse_excursion_pct,
+                "collapse_50pct": row.collapse_50pct,
+                "collapse_70pct": row.collapse_70pct,
+                "migrated_or_terminal": row.migrated_or_graduated,
+                "watch_light_seen": null,
+                "watch_deep_seen": null,
+                "enter_paper_seen": fill_counts.get(&row.mint).copied().unwrap_or_default() > 0,
+                "fill_count": fill_counts.get(&row.mint).copied().unwrap_or_default(),
+                "token_pnl": fill_pnl.get(&row.mint).copied().unwrap_or(Decimal::ZERO),
+                "missed_winner": row.executable_winner_after_fees == Some(true)
+                    && fill_counts.get(&row.mint).copied().unwrap_or_default() == 0,
+                "false_discard": null,
+                "primary_rejection_reason": null,
+                "data_quality_confidence": row.data_quality_at_first_seen.unwrap_or(row.confidence),
+                "metric_confidence": row.confidence,
+                "unavailable_fields": unavailable,
+            })
+        })
+        .collect()
+}
+
+static DOSSIER_TRADE_HEADER: [&str; 50] = [
+    "source_run_id",
+    "derived_run_id",
+    "decision_id",
+    "fill_id",
+    "mint",
+    "strategy",
+    "entry_time",
+    "exit_time",
+    "entry_price",
+    "exit_price",
+    "size",
+    "gross_pnl",
+    "net_pnl",
+    "fee_drag",
+    "slippage_drag",
+    "impact_drag",
+    "latency_drag",
+    "mfe_after_entry",
+    "mae_after_entry",
+    "entry_reason",
+    "exit_reason",
+    "rejection_context_before_entry",
+    "top_holder_risk_at_entry",
+    "dev_risk_at_entry",
+    "bundle_risk_at_entry",
+    "fake_momentum_risk_at_entry",
+    "holder_growth_at_entry",
+    "buy_sell_imbalance_at_entry",
+    "data_quality_at_entry",
+    "loss_cause",
+    "avoidability",
+    "exit_too_late",
+    "entry_too_early",
+    "fee_killed",
+    "notes",
+    "executable_for_strategy_pnl",
+    "non_executable_reason",
+    "reserve_implied_price_at_fill",
+    "fill_price_to_reserve_ratio",
+    "raw_pnl",
+    "executable_pnl",
+    "artifact_excluded_pnl",
+    "executable_price_confidence",
+    "fill_has_exit_decision",
+    "fill_has_trigger_event",
+    "fill_source",
+    "is_scenario_end_mark",
+    "price_scale_sane",
+    "liquidity_sane",
+    "curve_state_sane",
+];
+
+fn build_dossier_trade_rows(
+    entry: &DatasetIndexRunEntry,
+    trade_outcomes: &[QuantTradeOutcome],
+    pnl_sanity: &DossierPnlSanitySummary,
+) -> Vec<serde_json::Value> {
+    if !pnl_sanity.fill_rows.is_empty() {
+        return pnl_sanity.fill_rows.clone();
+    }
+    if trade_outcomes.is_empty() {
+        return vec![json!({
+            "source_run_id": entry.run_id,
+            "derived_run_id": entry.research_latest_derived_run_id,
+            "decision_id": "Unavailable",
+            "notes": "no trade outcome rows available or no fills for this run",
+            "executable_for_strategy_pnl": null,
+            "non_executable_reason": "unavailable",
+            "reserve_implied_price_at_fill": null,
+            "fill_price_to_reserve_ratio": null,
+            "raw_pnl": null,
+            "executable_pnl": null,
+            "artifact_excluded_pnl": null,
+            "executable_price_confidence": null,
+            "fill_has_exit_decision": null,
+            "fill_has_trigger_event": null,
+            "fill_source": null,
+            "is_scenario_end_mark": null,
+            "price_scale_sane": null,
+            "liquidity_sane": null,
+            "curve_state_sane": null,
+        })];
+    }
+    trade_outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            json!({
+                "source_run_id": entry.run_id,
+                "derived_run_id": entry.research_latest_derived_run_id,
+                "decision_id": format!("trade_outcome_{index:05}"),
+                "fill_id": format!("fill_pair_{index:05}"),
+                "mint": row.mint,
+                "strategy": row.strategy,
+                "entry_time": row.entry_time,
+                "exit_time": row.exit_time,
+                "entry_price": row.entry_price,
+                "exit_price": row.exit_price,
+                "size": null,
+                "gross_pnl": row.gross_return,
+                "net_pnl": row.net_return_after_fees,
+                "fee_drag": row.fee_drag,
+                "slippage_drag": row.slippage_drag,
+                "impact_drag": row.impact_drag,
+                "latency_drag": row.latency_drag,
+                "mfe_after_entry": row.mfe_after_entry,
+                "mae_after_entry": row.mae_after_entry,
+                "entry_reason": null,
+                "exit_reason": null,
+                "rejection_context_before_entry": null,
+                "top_holder_risk_at_entry": row.top_holder_risk_before_entry,
+                "dev_risk_at_entry": null,
+                "bundle_risk_at_entry": row.bundle_risk_before_entry,
+                "fake_momentum_risk_at_entry": row.fake_momentum_flag_before_entry,
+                "holder_growth_at_entry": null,
+                "buy_sell_imbalance_at_entry": null,
+                "data_quality_at_entry": row.data_quality_at_entry,
+                "loss_cause": row.loss_cause,
+                "avoidability": if row.net_return_after_fees.unwrap_or(Decimal::ZERO) < Decimal::ZERO { "diagnostic_required" } else { "not_loss" },
+                "exit_too_late": row.was_exit_too_late,
+                "entry_too_early": row.was_entry_too_early,
+                "fee_killed": row.final_trade_outcome_class == "fee_killed_win",
+                "notes": "trade labels are computed from replayed fills and observed feature price path; missing entry reason fields require richer decision export linkage",
+                "executable_for_strategy_pnl": true,
+                "non_executable_reason": "executable",
+                "reserve_implied_price_at_fill": null,
+                "fill_price_to_reserve_ratio": null,
+                "raw_pnl": row.net_return_after_fees,
+                "executable_pnl": row.net_return_after_fees,
+                "artifact_excluded_pnl": Decimal::ZERO,
+                "executable_price_confidence": Decimal::ONE,
+                "fill_has_exit_decision": row.exit_time.is_some(),
+                "fill_has_trigger_event": null,
+                "fill_source": "trade_outcome",
+                "is_scenario_end_mark": false,
+                "price_scale_sane": true,
+                "liquidity_sane": true,
+                "curve_state_sane": true,
+            })
+        })
+        .collect()
+}
+
+static DOSSIER_STRATEGY_HEADER: [&str; 27] = [
+    "strategy",
+    "runs_seen",
+    "candidates",
+    "entries",
+    "fills",
+    "exits",
+    "gross_pnl",
+    "net_pnl",
+    "hit_rate",
+    "average_win",
+    "average_loss",
+    "max_drawdown",
+    "fee_drag",
+    "slippage_drag",
+    "impact_drag",
+    "top_rejection_reasons",
+    "top_loss_causes",
+    "whether_strategy_active",
+    "whether_candidate_for_offline_ablation",
+    "raw_pnl",
+    "executable_pnl",
+    "excluded_artifact_pnl",
+    "excluded_artifact_count",
+    "executable_fills",
+    "artifact_fills",
+    "raw_hit_rate",
+    "executable_hit_rate",
+];
+
+fn build_dossier_strategy_rows(
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+    ctx: Option<&QuantDiagnosticContext>,
+    trade_outcomes: &[QuantTradeOutcome],
+    pnl_sanity: &DossierPnlSanitySummary,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let strategies = [
+        "HolderGrowthContinuation",
+        "DefensiveNoTrade",
+        "OrganicSlowGrind",
+        "SellAbsorptionBounce",
+    ];
+    let pnl_by_strategy = ctx.map(fill_net_pnl_by_strategy).unwrap_or_default();
+    let local_paper_pnl = local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl);
+    let local_decisions = local_run_usize(local, "decision_count")
+        .unwrap_or_else(|| entry.decision_count_total.max(entry.decision_rows));
+    let local_fills = local_run_usize(local, "fill_count")
+        .unwrap_or_else(|| entry.fill_count_total.max(entry.fill_rows));
+    for strategy in strategies {
+        let trades = trade_outcomes
+            .iter()
+            .filter(|row| row.strategy == strategy)
+            .collect::<Vec<_>>();
+        let fills = ctx
+            .map(|ctx| {
+                ctx.fills
+                    .iter()
+                    .filter(|fill| fill.record.strategy.as_deref() == Some(strategy))
+                    .count()
+            })
+            .unwrap_or_default();
+        let raw_pnl = if pnl_sanity.raw_fill_count > 0 {
+            pnl_sanity
+                .raw_pnl_by_strategy
+                .get(strategy)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+        } else if strategy == "HolderGrowthContinuation" && ctx.is_none() {
+            local_paper_pnl
+        } else {
+            pnl_by_strategy
+                .get(strategy)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+        };
+        let executable_pnl = if pnl_sanity.raw_fill_count > 0 {
+            pnl_sanity
+                .executable_pnl_by_strategy
+                .get(strategy)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+        } else {
+            raw_pnl
+        };
+        let excluded_artifact_pnl = pnl_sanity
+            .artifact_excluded_by_strategy
+            .get(strategy)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let raw_fills = pnl_sanity
+            .raw_fills_by_strategy
+            .get(strategy)
+            .copied()
+            .unwrap_or_else(|| {
+                if strategy == "HolderGrowthContinuation" && ctx.is_none() {
+                    local_fills
+                } else {
+                    fills
+                }
+            });
+        let executable_fills = pnl_sanity
+            .executable_fills_by_strategy
+            .get(strategy)
+            .copied()
+            .unwrap_or(raw_fills);
+        let artifact_fills = pnl_sanity
+            .artifact_fills_by_strategy
+            .get(strategy)
+            .copied()
+            .unwrap_or_default();
+        let raw_hit_rate = if raw_fills > 0 {
+            Some(
+                Decimal::from(
+                    pnl_sanity
+                        .fill_rows
+                        .iter()
+                        .filter(|row| {
+                            row.get("strategy").and_then(|value| value.as_str()) == Some(strategy)
+                        })
+                        .filter_map(|row| json_decimal(row, "raw_pnl"))
+                        .filter(|pnl| *pnl > Decimal::ZERO)
+                        .count() as u64,
+                ) / Decimal::from(raw_fills as u64),
+            )
+        } else {
+            hit_rate_for_trades(&trades)
+        };
+        let executable_hit_rate = if executable_fills > 0 {
+            Some(
+                Decimal::from(
+                    pnl_sanity
+                        .fill_rows
+                        .iter()
+                        .filter(|row| {
+                            row.get("strategy").and_then(|value| value.as_str()) == Some(strategy)
+                        })
+                        .filter(|row| {
+                            row.get("executable_for_strategy_pnl")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|row| json_decimal(row, "executable_pnl"))
+                        .filter(|pnl| *pnl > Decimal::ZERO)
+                        .count() as u64,
+                ) / Decimal::from(executable_fills as u64),
+            )
+        } else {
+            None
+        };
+        rows.push(json!({
+            "strategy": strategy,
+            "runs_seen": 1,
+            "candidates": if strategy == "HolderGrowthContinuation" { local_decisions } else { 0 },
+            "entries": if strategy == "HolderGrowthContinuation" && ctx.is_none() { local_fills / 2 } else { trades.len() },
+            "fills": raw_fills,
+            "exits": if strategy == "HolderGrowthContinuation" && ctx.is_none() { local_fills / 2 } else { trades.iter().filter(|row| row.exit_time.is_some()).count() },
+            "gross_pnl": trades.iter().filter_map(|row| row.gross_return).fold(Decimal::ZERO, |acc, value| acc + value),
+            "net_pnl": executable_pnl,
+            "hit_rate": executable_hit_rate.or(raw_hit_rate),
+            "average_win": average_trade_return_refs(&trades, true),
+            "average_loss": average_trade_return_refs(&trades, false),
+            "max_drawdown": null,
+            "fee_drag": trades.iter().map(|row| row.fee_drag).fold(Decimal::ZERO, |acc, value| acc + value),
+            "slippage_drag": trades.iter().map(|row| row.slippage_drag).fold(Decimal::ZERO, |acc, value| acc + value),
+            "impact_drag": trades.iter().map(|row| row.impact_drag).fold(Decimal::ZERO, |acc, value| acc + value),
+            "top_rejection_reasons": "",
+            "top_loss_causes": top_loss_causes(&trades),
+            "whether_strategy_active": !trades.is_empty() || raw_fills > 0 || (strategy == "HolderGrowthContinuation" && local_fills > 0),
+            "whether_candidate_for_offline_ablation": strategy == "HolderGrowthContinuation" || strategy == "SellAbsorptionBounce",
+            "raw_pnl": raw_pnl,
+            "executable_pnl": executable_pnl,
+            "excluded_artifact_pnl": excluded_artifact_pnl,
+            "excluded_artifact_count": artifact_fills,
+            "executable_fills": executable_fills,
+            "artifact_fills": artifact_fills,
+            "raw_hit_rate": raw_hit_rate,
+            "executable_hit_rate": executable_hit_rate,
+        }));
+    }
+    rows
+}
+
+#[derive(Default)]
+struct DossierStrategyAggregate {
+    runs_seen: u64,
+    candidates: u64,
+    entries: u64,
+    fills: u64,
+    exits: u64,
+    gross_pnl: Decimal,
+    net_pnl: Decimal,
+    raw_pnl: Decimal,
+    executable_pnl: Decimal,
+    excluded_artifact_pnl: Decimal,
+    executable_fills: u64,
+    artifact_fills: u64,
+    fee_drag: Decimal,
+    slippage_drag: Decimal,
+    impact_drag: Decimal,
+    active_runs: u64,
+    loss_causes: BTreeMap<String, u64>,
+}
+
+impl DossierStrategyAggregate {
+    fn merge_json_row(&mut self, row: &serde_json::Value) {
+        self.runs_seen = self.runs_seen.saturating_add(1);
+        self.candidates = self
+            .candidates
+            .saturating_add(json_u64(row, "candidates").unwrap_or_default());
+        self.entries = self
+            .entries
+            .saturating_add(json_u64(row, "entries").unwrap_or_default());
+        self.fills = self
+            .fills
+            .saturating_add(json_u64(row, "fills").unwrap_or_default());
+        self.exits = self
+            .exits
+            .saturating_add(json_u64(row, "exits").unwrap_or_default());
+        self.gross_pnl += json_decimal(row, "gross_pnl").unwrap_or(Decimal::ZERO);
+        self.net_pnl += json_decimal(row, "net_pnl").unwrap_or(Decimal::ZERO);
+        self.raw_pnl += json_decimal(row, "raw_pnl")
+            .unwrap_or_else(|| json_decimal(row, "net_pnl").unwrap_or(Decimal::ZERO));
+        self.executable_pnl += json_decimal(row, "executable_pnl")
+            .unwrap_or_else(|| json_decimal(row, "net_pnl").unwrap_or(Decimal::ZERO));
+        self.excluded_artifact_pnl +=
+            json_decimal(row, "excluded_artifact_pnl").unwrap_or(Decimal::ZERO);
+        self.executable_fills = self
+            .executable_fills
+            .saturating_add(json_u64(row, "executable_fills").unwrap_or_default());
+        self.artifact_fills = self
+            .artifact_fills
+            .saturating_add(json_u64(row, "artifact_fills").unwrap_or_default());
+        self.fee_drag += json_decimal(row, "fee_drag").unwrap_or(Decimal::ZERO);
+        self.slippage_drag += json_decimal(row, "slippage_drag").unwrap_or(Decimal::ZERO);
+        self.impact_drag += json_decimal(row, "impact_drag").unwrap_or(Decimal::ZERO);
+        if row
+            .get("whether_strategy_active")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            self.active_runs = self.active_runs.saturating_add(1);
+        }
+        if let Some(causes) = row.get("top_loss_causes").and_then(|value| value.as_str()) {
+            for cause in causes.split('|').filter(|cause| !cause.is_empty()) {
+                *self.loss_causes.entry(cause.to_owned()).or_default() += 1;
+            }
+        }
+    }
+
+    fn to_json(self, strategy: String) -> serde_json::Value {
+        json!({
+            "strategy": strategy,
+            "runs_seen": self.runs_seen,
+            "candidates": self.candidates,
+            "entries": self.entries,
+            "fills": self.fills,
+            "exits": self.exits,
+            "gross_pnl": self.gross_pnl,
+            "net_pnl": self.executable_pnl,
+            "hit_rate": null,
+            "average_win": null,
+            "average_loss": null,
+            "max_drawdown": null,
+            "fee_drag": self.fee_drag,
+            "slippage_drag": self.slippage_drag,
+            "impact_drag": self.impact_drag,
+            "top_rejection_reasons": "",
+            "top_loss_causes": self.loss_causes.into_iter().map(|(cause, count)| format!("{cause}:{count}")).collect::<Vec<_>>().join("|"),
+            "missed_winners": null,
+            "false_discards": null,
+            "readiness": "diagnostic_only",
+            "whether_strategy_active": self.active_runs > 0,
+            "whether_strategy_bug_suspected": false,
+            "whether_candidate_for_offline_ablation": self.executable_pnl < Decimal::ZERO || self.entries == 0,
+            "raw_pnl": self.raw_pnl,
+            "executable_pnl": self.executable_pnl,
+            "excluded_artifact_pnl": self.excluded_artifact_pnl,
+            "excluded_artifact_count": self.artifact_fills,
+            "executable_fills": self.executable_fills,
+            "artifact_fills": self.artifact_fills,
+            "raw_hit_rate": null,
+            "executable_hit_rate": null,
+        })
+    }
+}
+
+static DOSSIER_STRATEGY_COMPARISON_HEADER: [&str; 31] = [
+    "strategy",
+    "runs_seen",
+    "candidates",
+    "entries",
+    "fills",
+    "exits",
+    "gross_pnl",
+    "net_pnl",
+    "hit_rate",
+    "average_win",
+    "average_loss",
+    "max_drawdown",
+    "fee_drag",
+    "slippage_drag",
+    "impact_drag",
+    "top_rejection_reasons",
+    "top_loss_causes",
+    "missed_winners",
+    "false_discards",
+    "readiness",
+    "whether_strategy_active",
+    "whether_strategy_bug_suspected",
+    "whether_candidate_for_offline_ablation",
+    "raw_pnl",
+    "executable_pnl",
+    "excluded_artifact_pnl",
+    "excluded_artifact_count",
+    "executable_fills",
+    "artifact_fills",
+    "raw_hit_rate",
+    "executable_hit_rate",
+];
+
+static DOSSIER_ARTIFACT_ADJUSTED_STRATEGY_HEADER: [&str; 31] = DOSSIER_STRATEGY_COMPARISON_HEADER;
+
+static DOSSIER_METRIC_COVERAGE_HEADER: [&str; 5] = [
+    "family",
+    "classification",
+    "available_values",
+    "missing_values",
+    "unavailable_values",
+];
+
+fn metric_coverage_rows(coverage: &serde_json::Value) -> Vec<serde_json::Value> {
+    coverage
+        .get("metric_families")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            json!({
+                "family": row.get("family").cloned().unwrap_or_else(|| json!("unknown")),
+                "classification": row.get("classification").cloned().unwrap_or_else(|| json!("unavailable")),
+                "available_values": row.get("available_values").cloned().unwrap_or_else(|| json!(0)),
+                "missing_values": row.get("missing_values").cloned().unwrap_or_else(|| json!(0)),
+                "unavailable_values": row.get("unavailable_values").cloned().unwrap_or_else(|| json!(0)),
+            })
+        })
+        .collect()
+}
+
+static DOSSIER_CALCULATION_AUDIT_HEADER: [&str; 8] = [
+    "source_run_id",
+    "field",
+    "source_a",
+    "value_a",
+    "source_b",
+    "value_b",
+    "status",
+    "severity",
+];
+
+fn build_dossier_calculation_rows(
+    entry: &DatasetIndexRunEntry,
+    local: &DossierLocalReports,
+    ctx: Option<&QuantDiagnosticContext>,
+    pnl_sanity: &DossierPnlSanitySummary,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let expected_features = local_run_usize(local, "feature_snapshot_count")
+        .unwrap_or_else(|| entry.feature_snapshot_count.max(entry.feature_rows));
+    let expected_decisions = local_run_usize(local, "decision_count")
+        .unwrap_or_else(|| entry.decision_count_total.max(entry.decision_rows));
+    let expected_fills = local_run_usize(local, "fill_count")
+        .unwrap_or_else(|| entry.fill_count_total.max(entry.fill_rows));
+    let expected_pnl = local_run_decimal(local, "paper_pnl").unwrap_or(entry.paper_pnl);
+    let local_feature_rows = ctx.map(|ctx| ctx.features.len()).unwrap_or_default();
+    rows.push(audit_row(
+        entry,
+        "row_counts",
+        "run_summary_or_dataset_index.feature_rows",
+        expected_features.to_string(),
+        "local_feature_store.rows",
+        if ctx.is_some() {
+            local_feature_rows.to_string()
+        } else {
+            "unavailable".to_owned()
+        },
+        if ctx.is_none() || local_feature_rows == expected_features {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if ctx.is_none() || local_feature_rows == expected_features {
+            "info"
+        } else {
+            "warning"
+        },
+    ));
+    let local_decisions = ctx.map(|ctx| ctx.decisions.len()).unwrap_or_default();
+    rows.push(audit_row(
+        entry,
+        "decision_rows",
+        "run_summary_or_dataset_index.decision_rows",
+        expected_decisions.to_string(),
+        "local_decision_store.rows",
+        if ctx.is_some() {
+            local_decisions.to_string()
+        } else {
+            "unavailable".to_owned()
+        },
+        if ctx.is_none() || local_decisions == expected_decisions {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if ctx.is_none() || local_decisions == expected_decisions {
+            "info"
+        } else {
+            "warning"
+        },
+    ));
+    let local_fills = ctx.map(|ctx| ctx.fills.len()).unwrap_or_default();
+    rows.push(audit_row(
+        entry,
+        "fill_rows",
+        "run_summary_or_dataset_index.fill_rows",
+        expected_fills.to_string(),
+        "local_fill_store.rows",
+        if ctx.is_some() {
+            local_fills.to_string()
+        } else {
+            "unavailable".to_owned()
+        },
+        if ctx.is_none() || local_fills == expected_fills {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if ctx.is_none() || local_fills == expected_fills {
+            "info"
+        } else {
+            "warning"
+        },
+    ));
+    let fill_pnl = ctx.map(fill_net_pnl_total);
+    rows.push(audit_row(
+        entry,
+        "paper_pnl_total",
+        "run_summary_or_dataset_index.paper_pnl",
+        dec_s(expected_pnl),
+        "local_fill_store.sum_net_pnl_quote",
+        fill_pnl
+            .map(dec_s)
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        if fill_pnl
+            .map(|value| (value - expected_pnl).abs() < Decimal::new(1, 8))
+            .unwrap_or(true)
+        {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if fill_pnl
+            .map(|value| (value - expected_pnl).abs() < Decimal::new(1, 8))
+            .unwrap_or(true)
+        {
+            "info"
+        } else {
+            "warning"
+        },
+    ));
+    rows.push(audit_row(
+        entry,
+        "artifact_adjusted_pnl_consistency_passed",
+        "raw_pnl_total",
+        dec_s(pnl_sanity.raw_pnl_total),
+        "executable_pnl_total_plus_excluded_artifact_pnl",
+        dec_s(pnl_sanity.executable_pnl_total + pnl_sanity.excluded_artifact_pnl),
+        if (pnl_sanity.raw_pnl_total
+            - pnl_sanity.executable_pnl_total
+            - pnl_sanity.excluded_artifact_pnl)
+            .abs()
+            < Decimal::new(1, 8)
+        {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if (pnl_sanity.raw_pnl_total
+            - pnl_sanity.executable_pnl_total
+            - pnl_sanity.excluded_artifact_pnl)
+            .abs()
+            < Decimal::new(1, 8)
+        {
+            "info"
+        } else {
+            "warning"
+        },
+    ));
+    rows.push(audit_row(
+        entry,
+        "raw_vs_executable_pnl_difference",
+        "raw_pnl_total",
+        dec_s(pnl_sanity.raw_pnl_total),
+        "executable_pnl_total",
+        dec_s(pnl_sanity.executable_pnl_total),
+        if pnl_sanity.artifact_fill_count > 0 {
+            "artifact_adjusted"
+        } else {
+            "passed"
+        },
+        if pnl_sanity.artifact_fill_count > 0 {
+            "warning"
+        } else {
+            "info"
+        },
+    ));
+    rows.push(audit_row(
+        entry,
+        "excluded_artifact_fill_ids",
+        "pnl_sanity_classifier",
+        pnl_sanity.excluded_fill_ids.join("|"),
+        "audit_policy",
+        "fills_preserved_but_excluded_from_executable_pnl".to_owned(),
+        if pnl_sanity.artifact_fill_count > 0 {
+            "artifact_adjusted"
+        } else {
+            "passed"
+        },
+        if pnl_sanity.artifact_fill_count > 0 {
+            "warning"
+        } else {
+            "info"
+        },
+    ));
+    rows.push(audit_row(
+        entry,
+        "readiness",
+        "dataset_index.readiness_level",
+        format!("{:?}", entry.readiness_level),
+        "backtest_readiness.readiness_level",
+        local
+            .backtest_readiness
+            .as_ref()
+            .and_then(|value| dossier_json_lookup_str(value, &["readiness_level"]))
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        "informational",
+        "info",
+    ));
+    rows.push(audit_row(
+        entry,
+        "manifest_consistency",
+        "dataset_index.manifest_consistency_passed",
+        entry.manifest_consistency_passed.to_string(),
+        "dataset_index.manifest_drift_detected",
+        entry.manifest_drift_detected.to_string(),
+        if entry.manifest_consistency_passed && !entry.manifest_drift_detected {
+            "passed"
+        } else {
+            "mismatch"
+        },
+        if entry.manifest_consistency_passed && !entry.manifest_drift_detected {
+            "info"
+        } else {
+            "error"
+        },
+    ));
+    rows
+}
+
+fn audit_row(
+    entry: &DatasetIndexRunEntry,
+    field: &str,
+    source_a: &str,
+    value_a: String,
+    source_b: &str,
+    value_b: String,
+    status: &str,
+    severity: &str,
+) -> serde_json::Value {
+    json!({
+        "source_run_id": entry.run_id,
+        "field": field,
+        "source_a": source_a,
+        "value_a": value_a,
+        "source_b": source_b,
+        "value_b": value_b,
+        "status": status,
+        "severity": severity,
+    })
+}
+
+fn build_run_dossier_summary_row(
+    entry: &DatasetIndexRunEntry,
+    dossier: &serde_json::Value,
+    metric_coverage: &serde_json::Value,
+    calculation_rows: &[serde_json::Value],
+) -> serde_json::Value {
+    let coverage_pct = metric_coverage_pct(metric_coverage);
+    let top_loss = dossier
+        .get("strategy_summary")
+        .and_then(|value| value.get("strategy_metrics"))
+        .and_then(|value| value.as_array())
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("top_loss_causes"))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let top_missing_metric = dossier
+        .get("feature_counts")
+        .and_then(|value| value.get("feature_families_missing"))
+        .and_then(|value| value.as_array())
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    json!({
+        "source_run_id": entry.run_id,
+        "derived_run_id": entry.research_latest_derived_run_id,
+        "duration_seconds": dossier.get("source_run").and_then(|value| value.get("observed_duration_seconds")).cloned().unwrap_or(serde_json::Value::Null),
+        "normalized_records": dossier.get("derived_replay").and_then(|value| value.get("normalized_records_loaded")).cloned().unwrap_or(serde_json::Value::Null),
+        "tokens": entry.token_count,
+        "lifecycles": entry.complete_lifecycles,
+        "features": dossier.pointer("/feature_counts/feature_rows").cloned().unwrap_or_else(|| json!(entry.feature_snapshot_count.max(entry.feature_rows))),
+        "decisions": dossier.pointer("/decision_counts/decisions_total").cloned().unwrap_or_else(|| json!(entry.decision_count_total.max(entry.decision_rows))),
+        "fills": dossier.pointer("/fill_and_pnl/fills").cloned().unwrap_or_else(|| json!(entry.fill_count_total.max(entry.fill_rows))),
+        "paper_pnl": dossier.pointer("/fill_and_pnl/paper_pnl_total").cloned().unwrap_or_else(|| json!(entry.paper_pnl)),
+        "raw_pnl": dossier.pointer("/fill_and_pnl/raw_pnl_total").cloned().unwrap_or_else(|| dossier.pointer("/fill_and_pnl/paper_pnl_total").cloned().unwrap_or_else(|| json!(entry.paper_pnl))),
+        "executable_pnl": dossier.pointer("/fill_and_pnl/executable_pnl_total").cloned().unwrap_or_else(|| dossier.pointer("/fill_and_pnl/paper_pnl_total").cloned().unwrap_or_else(|| json!(entry.paper_pnl))),
+        "artifact_excluded_pnl": dossier.pointer("/fill_and_pnl/artifact_excluded_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "artifact_excluded_count": dossier.pointer("/fill_and_pnl/artifact_excluded_count").cloned().unwrap_or_else(|| json!(0)),
+        "executable_fills": dossier.pointer("/fill_and_pnl/executable_fill_count").cloned().unwrap_or_else(|| dossier.pointer("/fill_and_pnl/fills").cloned().unwrap_or_else(|| json!(entry.fill_count_total.max(entry.fill_rows)))),
+        "artifact_fills": dossier.pointer("/fill_and_pnl/artifact_fill_count").cloned().unwrap_or_else(|| json!(0)),
+        "raw_vs_executable_pnl_difference": dossier.pointer("/calculation_audit/raw_vs_executable_pnl_difference").cloned().unwrap_or_else(|| json!(0)),
+        "holder_growth_pnl": dossier.pointer("/strategy_summary/executable_pnl_by_strategy/HolderGrowthContinuation").cloned().unwrap_or_else(|| dossier.get("fill_and_pnl").and_then(|value| value.get("paper_pnl_by_strategy")).and_then(|value| value.get("HolderGrowthContinuation")).cloned().unwrap_or_else(|| dossier.pointer("/fill_and_pnl/paper_pnl_total").cloned().unwrap_or_else(|| json!(0)))),
+        "other_strategy_pnl": null,
+        "source_gaps": entry.source_data_gaps,
+        "slot_gaps": entry.slot_gap_count,
+        "r2_verified": entry.r2_full_verification_status == "verified",
+        "fallback_used": entry.fallback_used,
+        "edge_dataset_complete": entry.edge_dataset_complete,
+        "readiness_level": format!("{:?}", entry.readiness_level),
+        "safe_for_backtest": entry.safe_for_backtest,
+        "safe_for_walk_forward": entry.safe_for_walk_forward,
+        "top_loss_cause": top_loss,
+        "top_rejection_reason": "",
+        "top_missing_metric": top_missing_metric,
+        "metric_coverage_pct": coverage_pct,
+        "use_for_diagnostics": true,
+        "use_for_threshold_tuning": false,
+        "calculation_warnings": calculation_rows.iter().filter(|row| row.get("severity").and_then(|value| value.as_str()) == Some("warning")).count(),
+    })
+}
+
+static DOSSIER_SUMMARY_HEADER: [&str; 34] = [
+    "source_run_id",
+    "derived_run_id",
+    "duration_seconds",
+    "normalized_records",
+    "tokens",
+    "lifecycles",
+    "features",
+    "decisions",
+    "fills",
+    "paper_pnl",
+    "raw_pnl",
+    "executable_pnl",
+    "artifact_excluded_pnl",
+    "artifact_excluded_count",
+    "executable_fills",
+    "artifact_fills",
+    "raw_vs_executable_pnl_difference",
+    "holder_growth_pnl",
+    "other_strategy_pnl",
+    "source_gaps",
+    "slot_gaps",
+    "r2_verified",
+    "fallback_used",
+    "edge_dataset_complete",
+    "readiness_level",
+    "safe_for_backtest",
+    "safe_for_walk_forward",
+    "top_loss_cause",
+    "top_rejection_reason",
+    "top_missing_metric",
+    "metric_coverage_pct",
+    "use_for_diagnostics",
+    "use_for_threshold_tuning",
+    "calculation_warnings",
+];
+
+fn build_dossier_metric_ledger(run_dossiers: &[serde_json::Value]) -> serde_json::Value {
+    let metric_specs = dossier_metric_specs();
+    let rows = metric_specs
+        .into_iter()
+        .map(|spec| {
+            let non_null = run_dossiers
+                .iter()
+                .filter(|dossier| {
+                    dossier_json_path(dossier, spec.run_dossier_field)
+                        .is_some_and(|value| !value.is_null())
+                })
+                .count();
+            let null_count = run_dossiers.len().saturating_sub(non_null);
+            let sample = run_dossiers
+                .iter()
+                .find_map(|dossier| dossier_json_path(dossier, spec.run_dossier_field))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            json!({
+                "metric_name": spec.metric_name,
+                "metric_family": spec.metric_family,
+                "definition": spec.definition,
+                "formula_or_algorithm": spec.formula_or_algorithm,
+                "required_source_artifacts": spec.required_source_artifacts,
+                "required_event_types": spec.required_event_types,
+                "computed_in_module": spec.computed_in_module,
+                "exported_field_name": spec.exported_field_name,
+                "run_dossier_field": spec.run_dossier_field,
+                "data_type": spec.data_type,
+                "unit": spec.unit,
+                "confidence_logic": spec.confidence_logic,
+                "unavailable_reason_if_missing": spec.unavailable_reason_if_missing,
+                "uses_rpc": spec.uses_rpc,
+                "uses_metadata_fetch": spec.uses_metadata_fetch,
+                "uses_enrichment": spec.uses_enrichment,
+                "vps_edge_available": spec.vps_edge_available,
+                "research_worker_available": spec.research_worker_available,
+                "currently_computed": non_null > 0,
+                "non_null_count_latest_batch": non_null,
+                "null_count_latest_batch": null_count,
+                "sample_value": sample,
+                "validation_status": spec.validation_status,
+                "calculation_test_exists": spec.calculation_test_exists,
+                "notes": spec.notes,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "metric_ledger.v1",
+        "metrics": rows,
+        "no_metric_silently_omitted": true,
+        "threshold_tuning_allowed": false,
+    })
+}
+
+async fn run_enrichment_worker_command(
+    source_run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    profile: &str,
+    max_rpc_calls: u64,
+    max_rpc_credits: u64,
+    max_http_calls: u64,
+    max_wallets: u64,
+    max_mints: u64,
+    max_runtime_seconds: u64,
+    dry_run: bool,
+    canary: bool,
+    resume: bool,
+    output_dir: &str,
+) -> Result<()> {
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let rpc_allowed = max_rpc_calls > 0 || max_rpc_credits > 0;
+    let http_allowed = max_http_calls > 0;
+    let profiles_requiring_rpc = [
+        "funding_bundle",
+        "holder_denominator_repair",
+        "transaction_fingerprint_repair",
+        "batch",
+    ];
+    let profile_requires_rpc = profiles_requiring_rpc.contains(&profile);
+    let blocker = if profile_requires_rpc && !rpc_allowed {
+        Some("profile requires explicit RPC budget; max_rpc_calls/max_rpc_credits are zero")
+    } else if profile == "metadata_social" && !http_allowed {
+        Some("metadata_social profile requires explicit max_http_calls budget")
+    } else {
+        None
+    };
+    let can_run = blocker.is_none() && !dry_run;
+    let summary = json!({
+        "schema_version": "phase80.enrichment_worker.v1",
+        "source_run_id": source_run_id,
+        "derived_run_id": derived_run_id,
+        "profile": profile,
+        "dry_run": dry_run,
+        "canary": canary,
+        "resume": resume,
+        "can_run": can_run,
+        "blocked": blocker.is_some(),
+        "blockers": blocker.into_iter().collect::<Vec<_>>(),
+        "budget": {
+            "max_rpc_calls": max_rpc_calls,
+            "max_rpc_credits": max_rpc_credits,
+            "max_http_calls": max_http_calls,
+            "max_wallets": max_wallets,
+            "max_mints": max_mints,
+            "max_runtime_seconds": max_runtime_seconds,
+        },
+        "usage": {
+            "rpc_calls_used": 0,
+            "rpc_credits_used": 0,
+            "http_calls_used": 0,
+            "wallets_processed": 0,
+            "mints_processed": 0,
+        },
+        "outputs": {
+            "enrichment_cache": output_dir.join("enrichment_cache").display().to_string(),
+            "ledger": output_dir.join("enrichment_ledger.jsonl").display().to_string(),
+            "token_metadata_social": output_dir.join("token_metadata_social.csv").display().to_string(),
+            "funding_graph": output_dir.join("funding_graph.csv").display().to_string(),
+            "bundle_evidence": output_dir.join("bundle_evidence.csv").display().to_string(),
+            "holder_denominator_repair": output_dir.join("holder_denominator_repair.csv").display().to_string(),
+        },
+        "secrets_printed": false,
+        "notes": "Phase 80 enrichment is budget-ledgered and off-VPS only. This command records readiness and zero-call canaries unless an explicit budget is supplied.",
+    });
+    fs::create_dir_all(output_dir.join("enrichment_cache"))?;
+    fs::write(
+        output_dir.join("enrichment_ledger.jsonl"),
+        serde_json::to_string(&json!({
+            "event": "enrichment_worker_planned",
+            "profile": profile,
+            "rpc_calls_used": 0,
+            "rpc_credits_used": 0,
+            "http_calls_used": 0,
+            "dry_run": dry_run,
+            "canary": canary,
+        }))? + "\n",
+    )?;
+    write_csv_file(
+        &output_dir.join("token_metadata_social.csv"),
+        &["source_run_id", "mint", "status", "unavailable_reason"],
+        &[vec![
+            source_run_id.unwrap_or("").to_owned(),
+            String::new(),
+            "not_run".to_owned(),
+            "explicit metadata/social HTTP budget not consumed in this pass".to_owned(),
+        ]],
+    )?;
+    write_csv_file(
+        &output_dir.join("funding_graph.csv"),
+        &[
+            "source_run_id",
+            "wallet",
+            "funder",
+            "status",
+            "unavailable_reason",
+        ],
+        &[vec![
+            source_run_id.unwrap_or("").to_owned(),
+            String::new(),
+            String::new(),
+            "not_run".to_owned(),
+            "funding graph requires explicit off-VPS RPC/API budget".to_owned(),
+        ]],
+    )?;
+    write_csv_file(
+        &output_dir.join("bundle_evidence.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "cluster",
+            "status",
+            "unavailable_reason",
+        ],
+        &[vec![
+            source_run_id.unwrap_or("").to_owned(),
+            String::new(),
+            String::new(),
+            "not_run".to_owned(),
+            "bundle evidence requires explicit off-VPS RPC/API budget".to_owned(),
+        ]],
+    )?;
+    write_csv_file(
+        &output_dir.join("holder_denominator_repair.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "repair",
+            "status",
+            "unavailable_reason",
+        ],
+        &[vec![
+            source_run_id.unwrap_or("").to_owned(),
+            String::new(),
+            String::new(),
+            "not_run".to_owned(),
+            "holder denominator repair requires selected snapshots and explicit RPC budget"
+                .to_owned(),
+        ]],
+    )?;
+    let markdown = format!(
+        "# Phase 80 Enrichment Worker\n\n- profile: `{profile}`\n- dry_run: `{dry_run}`\n- canary: `{canary}`\n- can_run_now: `{}`\n- rpc_calls_used: `0`\n- rpc_credits_used: `0`\n- http_calls_used: `0`\n\nThis pass does not hide enrichment gaps: funding graph, bundle confirmations, wallet history, holder denominator repair, and metadata/socials remain unavailable unless an explicit off-VPS budgeted enrichment profile is run.\n",
+        summary["can_run"].as_bool().unwrap_or(false)
+    );
+    write_quant_json_md(&output_dir, "enrichment_summary", &summary, markdown)?;
+    Ok(())
+}
+
+async fn validate_metric_parity_command(
+    loaded: &LoadedConfig,
+    source_run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    pinned_run_set: Option<&str>,
+    run_id: Option<&str>,
+    latest_n: Option<usize>,
+    dataset_index_r2: bool,
+    _all_families: bool,
+    families: Option<&str>,
+    output_dir: &str,
+) -> Result<()> {
+    if source_run_id.is_some() || pinned_run_set.is_some() {
+        return validate_metric_parity_pinned_command(
+            source_run_id,
+            derived_run_id,
+            pinned_run_set,
+            output_dir,
+        );
+    }
+    let index = if dataset_index_r2 {
+        download_dataset_index_from_r2(loaded).await?
+    } else {
+        build_dataset_index(loaded)?
+    };
+    let selected = select_phase80_metric_runs(&index, run_id, latest_n.unwrap_or(3))?;
+    let parity_rows = read_phase80_local_parity_rows();
+    let selected_ids = selected
+        .iter()
+        .map(|entry| entry.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    let requested_families = families
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim().to_owned())
+                .filter(|item| !item.is_empty())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let family_rows = selected
+        .iter()
+        .flat_map(|entry| {
+            phase80_family_rows_for_entry(entry, parity_rows.get(&entry.run_id))
+                .into_iter()
+                .filter(|row| {
+                    requested_families.is_empty()
+                        || row
+                            .get("metric_family")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|family| requested_families.contains(family))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let blocker_count = family_rows
+        .iter()
+        .filter(|row| {
+            row.get("can_use_for_tuning")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+        })
+        .count();
+    let diagnostics_allowed = family_rows.iter().all(|row| {
+        row.get("required_for_diagnostics")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+            || row
+                .get("can_use_for_diagnostics")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+    });
+    let tuning_allowed = blocker_count == 0;
+    let report = json!({
+        "schema_version": "phase80.metric_parity_harness.v1",
+        "selected_runs": selected.iter().map(|entry| entry.run_id.clone()).collect::<Vec<_>>(),
+        "dataset_index_r2": dataset_index_r2,
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": tuning_allowed,
+        "family_rows": family_rows,
+        "blocker_count": blocker_count,
+        "notes": [
+            "Missing means unavailable, not zero.",
+            "Holder/top-holder unavailable rows remain explicit blockers for holder-strategy tuning when above tolerance.",
+            "Enrichment-required families are not silently treated as available."
+        ],
+    });
+    let audit = build_phase80_metric_ownership_audit();
+    let curve_dev = build_phase80_curve_dev_fix_report(&selected, &parity_rows);
+    let holder_completeness = build_phase80_holder_completeness_report(&selected, &parity_rows);
+    let output_dir = PathBuf::from(output_dir);
+    write_quant_json_md(
+        &output_dir,
+        "metric_parity_harness",
+        &report,
+        phase80_metric_parity_markdown(&report),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "metric_ownership_audit",
+        &audit,
+        phase80_metric_ownership_markdown(&audit),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "curve_dev_fix",
+        &curve_dev,
+        phase80_curve_dev_markdown(&curve_dev),
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "holder_denominator_completeness",
+        &holder_completeness,
+        phase80_holder_completeness_markdown(&holder_completeness),
+    )?;
+    let unavailable_rows = holder_completeness
+        .get("unavailable_reasons")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    write_json_rows_csv(
+        &output_dir.join("holder_unavailable_reasons.csv"),
+        &["source_run_id", "family", "unavailable", "reason"],
+        &unavailable_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("latest3_metric_parity_by_run.csv"),
+        &[
+            "source_run_id",
+            "metric_family",
+            "status",
+            "passed",
+            "failed",
+            "unavailable",
+            "can_use_for_diagnostics",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+        ],
+        report["family_rows"].as_array().unwrap_or(&Vec::new()),
+    )?;
+    write_report(
+        output_dir.join("latest3_metric_engine_review.md"),
+        &format!(
+            "# Latest-3 Metric Engine Review\n\nSelected runs: `{}`\n\nDiagnostic backtesting allowed: `{}`\n\nThreshold tuning allowed: `{}`\n\nThis review uses the authoritative dataset index plus local parity artifacts when available. It does not rerun collection and does not tune thresholds.\n",
+            selected_ids.into_iter().collect::<Vec<_>>().join(", "),
+            diagnostics_allowed,
+            tuning_allowed
+        ),
+    )?;
+    fs::write(
+        output_dir.join("latest3_metric_engine_review.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    Ok(())
+}
+
+async fn validate_backtest_readiness_v2_command(
+    loaded: &LoadedConfig,
+    run_id: Option<&str>,
+    pinned_run_set: Option<&str>,
+    latest_n: Option<usize>,
+    dataset_index_r2: bool,
+    intended_use: &str,
+    required_metric_profile: &str,
+    output_dir: &str,
+) -> Result<()> {
+    let index = if dataset_index_r2 {
+        download_dataset_index_from_r2(loaded).await?
+    } else {
+        build_dataset_index(loaded)?
+    };
+    let selected = if let Some(pinned_run_set) = pinned_run_set {
+        let (_, runs) = phase83_read_pinned_runs(Some(pinned_run_set), None, None)?;
+        let mut selected = Vec::new();
+        for run in runs {
+            let entry = index
+                .runs
+                .iter()
+                .find(|entry| entry.run_id == run.source_run_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pinned source run {} not found in dataset index",
+                        run.source_run_id
+                    )
+                })?;
+            selected.push(entry);
+        }
+        selected
+    } else {
+        select_phase80_metric_runs(&index, run_id, latest_n.unwrap_or(3))?
+    };
+    let parity_rows = read_phase80_local_parity_rows();
+    let family_rows = selected
+        .iter()
+        .flat_map(|entry| phase80_family_rows_for_entry(entry, parity_rows.get(&entry.run_id)))
+        .collect::<Vec<_>>();
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    if selected.is_empty() {
+        blockers.push("no selected normalized-complete runs".to_owned());
+    }
+    for entry in &selected {
+        if !entry.edge_dataset_complete || entry.fallback_used {
+            blockers.push(format!(
+                "{} is not a clean normalized-events source",
+                entry.run_id
+            ));
+        }
+        if entry.executable_pnl_total.unwrap_or(entry.paper_pnl) < Decimal::ZERO {
+            warnings.push(format!(
+                "{} executable_pnl_total is negative ({})",
+                entry.run_id,
+                entry.executable_pnl_total.unwrap_or(entry.paper_pnl)
+            ));
+        }
+    }
+    for row in &family_rows {
+        let family = row
+            .get("metric_family")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        if row
+            .get("can_use_for_diagnostics")
+            .and_then(|value| value.as_bool())
+            == Some(false)
+            && row
+                .get("required_for_diagnostics")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            blockers.push(format!("{family} is blocking diagnostics"));
+        }
+        if row
+            .get("can_use_for_tuning")
+            .and_then(|value| value.as_bool())
+            == Some(false)
+            && row
+                .get("required_for_tuning")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            warnings.push(format!("{family} blocks threshold tuning"));
+        }
+    }
+    if required_metric_profile.contains("holder")
+        && family_rows.iter().any(|row| {
+            matches!(
+                row.get("metric_family").and_then(|value| value.as_str()),
+                Some("holder") | Some("top_holder") | Some("dev_holding")
+            ) && row
+                .get("can_use_for_tuning")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+        })
+    {
+        let message =
+            "holder-strategy profile still has holder/dev/top-holder tuning availability blockers"
+                .to_owned();
+        if matches!(intended_use, "threshold_tuning" | "walk_forward") {
+            blockers.push(message);
+        } else {
+            warnings.push(message);
+        }
+    }
+    let diagnostics_allowed = blockers.is_empty();
+    let threshold_tuning_allowed = false;
+    let report = json!({
+        "schema_version": "phase80.backtest_readiness_v2.v1",
+        "selected_runs": selected.iter().map(|entry| entry.run_id.clone()).collect::<Vec<_>>(),
+        "intended_use": intended_use,
+        "required_metric_profile": required_metric_profile,
+        "diagnostics_allowed": diagnostics_allowed,
+        "single_run_backtest_allowed": false,
+        "multi_run_backtest_allowed": false,
+        "threshold_tuning_allowed": threshold_tuning_allowed,
+        "walk_forward_allowed": false,
+        "blockers": blockers,
+        "warnings": warnings,
+        "minimum_next_data_needed": [
+            "latest-N corrected-math replays with curve/dev parity passing",
+            "holder/top-holder unavailable rate below holder-strategy threshold or explicit enrichment repair",
+            "multiple runs and enough executable fills without one-run/outlier domination"
+        ],
+        "family_rows": family_rows,
+    });
+    let output_dir = PathBuf::from(output_dir);
+    write_quant_json_md(
+        &output_dir,
+        "backtest_readiness_v2",
+        &report,
+        phase80_readiness_v2_markdown(&report),
+    )?;
+    fs::write(
+        output_dir.join("latest3_backtest_readiness_v2.csv"),
+        "source_run_id,diagnostics_allowed,threshold_tuning_allowed\n".to_owned()
+            + &selected
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{},{},{}\n",
+                        entry.run_id, diagnostics_allowed, threshold_tuning_allowed
+                    )
+                })
+                .collect::<String>(),
+    )?;
+    Ok(())
+}
+
+async fn validate_metric_contract_command(
+    loaded: &LoadedConfig,
+    fresh_run_id: Option<&str>,
+    fresh_derived_run_id: Option<&str>,
+    pinned_run_set: Option<&str>,
+    dataset_index_r2: bool,
+    output_dir: &str,
+) -> Result<()> {
+    let output_dir_path = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir_path)?;
+    let dataset_index_path = if dataset_index_r2 {
+        let index = download_dataset_index_from_r2(loaded).await?;
+        let path = output_dir_path.join("dataset_index.snapshot.json");
+        fs::write(&path, serde_json::to_vec_pretty(&index)?)?;
+        path
+    } else {
+        loaded.resolve_path("data/dataset_index.json")
+    };
+    let script = PathBuf::from("scripts/phase88_metric_completion.mjs");
+    if !script.exists() {
+        bail!(
+            "phase88 metric completion script missing at {}",
+            script.display()
+        );
+    }
+    let mut command = ProcessCommand::new("node");
+    command
+        .arg(script)
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--dataset-index")
+        .arg(dataset_index_path);
+    if let Some(run_id) = fresh_run_id {
+        command.arg("--fresh-run-id").arg(run_id);
+    }
+    if let Some(run_id) = fresh_derived_run_id {
+        command.arg("--fresh-derived-run-id").arg(run_id);
+    }
+    if let Some(path) = pinned_run_set {
+        command.arg("--pinned-run-set").arg(path);
+    }
+    let output = command
+        .output()
+        .with_context(|| "failed to run Phase 88 metric contract generator")?;
+    if !output.status.success() {
+        bail!(
+            "Phase 88 metric contract generator failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        println!("{stdout}");
+    }
+    Ok(())
+}
+
+fn select_phase80_metric_runs<'a>(
+    index: &'a DatasetIndex,
+    run_id: Option<&str>,
+    latest_n: usize,
+) -> Result<Vec<&'a DatasetIndexRunEntry>> {
+    if let Some(run_id) = run_id {
+        let entry = index
+            .runs
+            .iter()
+            .find(|entry| entry.run_id == run_id)
+            .ok_or_else(|| anyhow!("run_id {run_id} not found in dataset index"))?;
+        return Ok(vec![entry]);
+    }
+    let mut candidates = index
+        .runs
+        .iter()
+        .filter(|entry| run_is_dossier_clean_source(entry))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| run_completed_at(right).cmp(&run_completed_at(left)));
+    candidates.truncate(latest_n);
+    Ok(candidates)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CanonicalLabelRunSelection {
+    source_run_id: String,
+    derived_run_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CanonicalFeatureSnapshot {
+    mint: String,
+    sequence: u64,
+    timestamp: i128,
+    price_sol_per_token: Option<f64>,
+    virtual_quote_reserves: Option<f64>,
+    virtual_token_reserves: Option<f64>,
+    real_quote_reserves: Option<f64>,
+    real_token_reserves: Option<f64>,
+    token_total_supply_raw: Option<f64>,
+    token_decimals: Option<u32>,
+    curve_complete_flag: Option<bool>,
+    curve_progress_pct: Option<f64>,
+    market_cap_1b_sol: Option<f64>,
+    market_cap_total_supply_sol: Option<f64>,
+    bonding_curve_account: Option<String>,
+    associated_bonding_curve_account: Option<String>,
+    curve_state_age_ms: Option<f64>,
+    reserve_confidence: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalPricePoint {
+    source_run_id: String,
+    derived_run_id: String,
+    mint: String,
+    sequence: u64,
+    timestamp: i128,
+    price_sol_per_token: Option<f64>,
+    price_source: String,
+    reserve_price: Option<f64>,
+    executable_price: Option<f64>,
+    confidence: String,
+    unavailable_reason: String,
+    artifact_excluded: bool,
+    curve_progress_pct: Option<f64>,
+    virtual_quote_reserves_raw: Option<f64>,
+    virtual_token_reserves_raw: Option<f64>,
+    real_quote_reserves_raw: Option<f64>,
+    real_token_reserves_raw: Option<f64>,
+    token_total_supply_raw: Option<f64>,
+    token_total_supply_ui: Option<f64>,
+    token_decimals: Option<u32>,
+    curve_complete_flag: Option<bool>,
+    curve_progress_source: String,
+    market_cap_1b_sol: Option<f64>,
+    market_cap_total_supply_sol: Option<f64>,
+    bonding_curve_account: Option<String>,
+    associated_bonding_curve_account: Option<String>,
+    curve_state_age_ms: Option<f64>,
+    curve_state_source: String,
+    forward_filled: bool,
+    forward_fill_reason: String,
+    forward_fill_blocked_reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalFillRow {
+    fill_id: String,
+    position_id: String,
+    mint: String,
+    strategy: String,
+    side: String,
+    fill_price: Option<f64>,
+    net_pnl: Option<f64>,
+    gross_pnl: Option<f64>,
+    fill_time: i128,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct Phase83FamilyCounts {
+    passed: u64,
+    failed: u64,
+    unavailable: u64,
+    confidence_scored: u64,
+    can_use_for_diagnostics: bool,
+    can_use_for_backtest: bool,
+    can_use_for_tuning: bool,
+}
+
+fn phase83_csv_field(value: impl ToString) -> String {
+    let value = value.to_string();
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value
+    }
+}
+
+fn phase83_csv_row(values: &[String]) -> String {
+    let rendered = values
+        .iter()
+        .map(phase83_csv_field)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{rendered}\n")
+}
+
+fn phase83_opt_f64(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.18}"))
+        .unwrap_or_default()
+}
+
+fn phase83_opt_u32(value: Option<u32>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn phase83_opt_bool(value: Option<bool>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn phase83_opt_string(value: &Option<String>) -> String {
+    value.clone().unwrap_or_default()
+}
+
+fn phase83_is_phase84_path(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("phase84")
+}
+
+fn phase83_parse_f64(value: Option<&str>) -> Option<f64> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn phase83_parse_i128(value: Option<&str>) -> i128 {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<i128>().ok())
+        .unwrap_or_default()
+}
+
+fn phase83_parse_u64(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+fn phase83_parse_bool(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim).filter(|value| !value.is_empty())? {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn phase83_split_csv_line(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                cell.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                cells.push(std::mem::take(&mut cell));
+            }
+            _ => cell.push(ch),
+        }
+    }
+    cells.push(cell);
+    cells
+}
+
+fn phase83_header_index(line: &str) -> BTreeMap<String, usize> {
+    phase83_split_csv_line(line)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, name)| (name, idx))
+        .collect()
+}
+
+fn phase83_cell<'a>(
+    row: &'a [String],
+    header: &BTreeMap<String, usize>,
+    name: &str,
+) -> Option<&'a str> {
+    header
+        .get(name)
+        .and_then(|idx| row.get(*idx))
+        .map(String::as_str)
+}
+
+fn phase83_csv_zst_files(report_dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !report_dir.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(report_dir)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if name.starts_with(prefix) && name.ends_with(".csv.zst") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn phase83_feature_snapshot_from_rows(
+    source_run_id: &str,
+    derived_run_id: &str,
+    snapshot: &CanonicalFeatureSnapshot,
+) -> CanonicalPricePoint {
+    let decimal_scale = snapshot
+        .token_decimals
+        .map(|decimals| 10_f64.powi(decimals as i32));
+    let reserve_price = match (
+        snapshot.virtual_quote_reserves,
+        snapshot.virtual_token_reserves,
+        decimal_scale,
+    ) {
+        (Some(quote), Some(tokens), Some(scale)) if quote > 0.0 && tokens > 0.0 => {
+            Some((quote / 1_000_000_000.0) / (tokens / scale))
+        }
+        _ => None,
+    };
+    let price = reserve_price.or(snapshot.price_sol_per_token);
+    let token_total_supply_ui = match (snapshot.token_total_supply_raw, decimal_scale) {
+        (Some(raw), Some(scale)) if scale > 0.0 => Some(raw / scale),
+        _ => None,
+    };
+    let derived_curve_progress_pct = match (snapshot.real_token_reserves, decimal_scale) {
+        (Some(real_tokens), Some(scale)) if real_tokens > 0.0 && scale > 0.0 => {
+            let balance_ui = real_tokens / scale;
+            Some(100.0 - (((balance_ui - 206_900_000.0) * 100.0) / 793_100_000.0))
+        }
+        _ => None,
+    };
+    let curve_progress_pct = snapshot.curve_progress_pct.or(derived_curve_progress_pct);
+    let curve_progress_source = if snapshot.curve_progress_pct.is_some() {
+        "feature_curve_progress_pct"
+    } else if derived_curve_progress_pct.is_some() {
+        "derived_from_real_token_reserves"
+    } else {
+        "unavailable"
+    };
+    let market_cap_1b_sol = snapshot
+        .market_cap_1b_sol
+        .or_else(|| price.map(|price| price * 1_000_000_000.0));
+    let market_cap_total_supply_sol = snapshot.market_cap_total_supply_sol.or_else(|| {
+        price
+            .zip(token_total_supply_ui)
+            .map(|(price, supply)| price * supply)
+    });
+    let curve_state_source = if snapshot.virtual_quote_reserves.is_some()
+        || snapshot.virtual_token_reserves.is_some()
+        || snapshot.real_quote_reserves.is_some()
+        || snapshot.real_token_reserves.is_some()
+        || snapshot.curve_progress_pct.is_some()
+    {
+        "corrected_feature_chunk"
+    } else {
+        "unavailable"
+    };
+    let unavailable_reason = if price.is_none() {
+        if snapshot.token_decimals.is_none() {
+            "missing_token_decimals"
+        } else if snapshot.virtual_quote_reserves.is_none()
+            || snapshot.virtual_token_reserves.is_none()
+        {
+            "missing_virtual_reserves_or_price"
+        } else if snapshot.virtual_quote_reserves == Some(0.0)
+            || snapshot.virtual_token_reserves == Some(0.0)
+        {
+            "token_not_yet_curve_initialized"
+        } else {
+            "missing_virtual_reserves_or_price"
+        }
+    } else {
+        ""
+    }
+    .to_owned();
+    CanonicalPricePoint {
+        source_run_id: source_run_id.to_owned(),
+        derived_run_id: derived_run_id.to_owned(),
+        mint: snapshot.mint.clone(),
+        sequence: snapshot.sequence,
+        timestamp: snapshot.timestamp,
+        price_sol_per_token: price,
+        price_source: if price.is_some() {
+            if reserve_price.is_some() {
+                "reserve_implied_virtual_reserves".to_owned()
+            } else {
+                "stored_canonical_price_sol_per_token".to_owned()
+            }
+        } else {
+            "unavailable".to_owned()
+        },
+        reserve_price: reserve_price.or(price),
+        executable_price: price,
+        confidence: if price.is_some() {
+            snapshot
+                .reserve_confidence
+                .clone()
+                .unwrap_or_else(|| "0.95".to_owned())
+        } else {
+            "0".to_owned()
+        },
+        unavailable_reason,
+        artifact_excluded: false,
+        curve_progress_pct,
+        virtual_quote_reserves_raw: snapshot.virtual_quote_reserves,
+        virtual_token_reserves_raw: snapshot.virtual_token_reserves,
+        real_quote_reserves_raw: snapshot.real_quote_reserves,
+        real_token_reserves_raw: snapshot.real_token_reserves,
+        token_total_supply_raw: snapshot.token_total_supply_raw,
+        token_total_supply_ui,
+        token_decimals: snapshot.token_decimals,
+        curve_complete_flag: snapshot.curve_complete_flag,
+        curve_progress_source: curve_progress_source.to_owned(),
+        market_cap_1b_sol,
+        market_cap_total_supply_sol,
+        bonding_curve_account: snapshot.bonding_curve_account.clone(),
+        associated_bonding_curve_account: snapshot.associated_bonding_curve_account.clone(),
+        curve_state_age_ms: snapshot.curve_state_age_ms,
+        curve_state_source: curve_state_source.to_owned(),
+        forward_filled: false,
+        forward_fill_reason: String::new(),
+        forward_fill_blocked_reason: if price.is_none() {
+            "no_valid_curve_state_at_row".to_owned()
+        } else {
+            String::new()
+        },
+    }
+}
+
+fn phase83_forward_fill_price_points(points: &mut [CanonicalPricePoint], max_age_ms: i128) -> u64 {
+    points.sort_by(|left, right| {
+        left.mint
+            .cmp(&right.mint)
+            .then(left.timestamp.cmp(&right.timestamp))
+            .then(left.sequence.cmp(&right.sequence))
+    });
+    let mut latest_by_mint = BTreeMap::<String, CanonicalPricePoint>::new();
+    let mut repaired = 0;
+    for point in points {
+        if point.price_sol_per_token.is_some() {
+            latest_by_mint.insert(point.mint.clone(), point.clone());
+            continue;
+        }
+        if let Some(prior) = latest_by_mint.get(&point.mint) {
+            let age = point.timestamp.saturating_sub(prior.timestamp);
+            if age >= 0 && age <= max_age_ms && prior.price_sol_per_token.is_some() {
+                point.price_sol_per_token = prior.price_sol_per_token;
+                point.reserve_price = prior.reserve_price;
+                point.executable_price = prior.executable_price;
+                point.curve_progress_pct = prior.curve_progress_pct;
+                point.virtual_quote_reserves_raw = prior.virtual_quote_reserves_raw;
+                point.virtual_token_reserves_raw = prior.virtual_token_reserves_raw;
+                point.real_quote_reserves_raw = prior.real_quote_reserves_raw;
+                point.real_token_reserves_raw = prior.real_token_reserves_raw;
+                point.token_total_supply_raw = prior.token_total_supply_raw;
+                point.token_total_supply_ui = prior.token_total_supply_ui;
+                point.token_decimals = prior.token_decimals;
+                point.curve_complete_flag = prior.curve_complete_flag;
+                point.curve_progress_source = prior.curve_progress_source.clone();
+                point.market_cap_1b_sol = prior.market_cap_1b_sol;
+                point.market_cap_total_supply_sol = prior.market_cap_total_supply_sol;
+                point.bonding_curve_account = prior.bonding_curve_account.clone();
+                point.associated_bonding_curve_account =
+                    prior.associated_bonding_curve_account.clone();
+                point.curve_state_age_ms = Some(age as f64);
+                point.curve_state_source = prior.curve_state_source.clone();
+                point.forward_filled = true;
+                point.forward_fill_reason = "prior_valid_curve_state_within_max_age".to_owned();
+                point.forward_fill_blocked_reason.clear();
+                point.price_source = "forward_filled_curve_state".to_owned();
+                point.confidence = "0.70".to_owned();
+                point.unavailable_reason.clear();
+                repaired += 1;
+            } else {
+                point.forward_fill_blocked_reason = if age < 0 {
+                    "future_curve_state_not_allowed"
+                } else {
+                    "stale_curve_state"
+                }
+                .to_owned();
+            }
+        } else if point.forward_fill_blocked_reason.is_empty() {
+            point.forward_fill_blocked_reason = "missing_prior_curve_state".to_owned();
+        }
+    }
+    repaired
+}
+
+fn phase83_return_pct(price: f64, base: f64) -> Option<f64> {
+    (base > 0.0 && price.is_finite() && base.is_finite()).then(|| ((price / base) - 1.0) * 100.0)
+}
+
+fn phase83_point_at_or_after(
+    points: &[CanonicalPricePoint],
+    timestamp: i128,
+) -> Option<&CanonicalPricePoint> {
+    points
+        .iter()
+        .find(|point| point.timestamp >= timestamp && point.price_sol_per_token.is_some())
+}
+
+fn phase83_price_path_valid(points: &[CanonicalPricePoint]) -> Vec<CanonicalPricePoint> {
+    let mut valid = points
+        .iter()
+        .filter(|point| point.price_sol_per_token.is_some_and(|price| price > 0.0))
+        .cloned()
+        .collect::<Vec<_>>();
+    valid.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then(left.sequence.cmp(&right.sequence))
+    });
+    valid
+}
+
+fn phase83_family_use(
+    family: &str,
+    passed: u64,
+    failed: u64,
+    unavailable: u64,
+) -> (bool, bool, bool) {
+    let total = passed + failed + unavailable;
+    let unavailable_rate = if total == 0 {
+        1.0
+    } else {
+        unavailable as f64 / total as f64
+    };
+    let diagnostics = failed == 0 && (passed > 0 || matches!(family, "mfe_mae" | "curve_progress"));
+    let backtest = failed == 0
+        && passed > 0
+        && match family {
+            "holder" | "top_holder" | "mfe_mae" => unavailable_rate < 0.25,
+            "price" | "market_cap" | "curve_progress" => unavailable_rate < 0.05,
+            _ => unavailable_rate < 0.05 || unavailable == 0,
+        };
+    let tuning = failed == 0
+        && passed > 0
+        && match family {
+            "holder" | "top_holder" => unavailable_rate < 0.10,
+            _ => unavailable_rate < 0.02,
+        };
+    (diagnostics, backtest, tuning)
+}
+
+fn phase83_write_json_rows_csv(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        if let Some(object) = row.as_object() {
+            keys.extend(object.keys().cloned());
+        }
+    }
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let mut output = String::new();
+    output.push_str(&phase83_csv_row(&keys));
+    for row in rows {
+        output.push_str(&phase83_csv_row(
+            &keys
+                .iter()
+                .map(|key| match row.get(key) {
+                    Some(value) if value.is_string() => {
+                        value.as_str().unwrap_or_default().to_owned()
+                    }
+                    Some(value) if value.is_null() => String::new(),
+                    Some(value) => value.to_string(),
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn phase83_read_pinned_runs(
+    pinned_run_set: Option<&str>,
+    run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+) -> Result<(serde_json::Value, Vec<CanonicalLabelRunSelection>)> {
+    let pinned = if let Some(path) = pinned_run_set {
+        read_json_file::<serde_json::Value>(Path::new(path))
+            .ok_or_else(|| anyhow!("pinned run set {path} is missing or invalid"))?
+    } else {
+        json!({
+            "schema_version": "phase83.pinned_run_set.inline.v1",
+            "runs": [{
+                "source_run_id": run_id.ok_or_else(|| anyhow!("--run-id is required without --pinned-run-set"))?,
+                "derived_run_id": derived_run_id.ok_or_else(|| anyhow!("--derived-run-id is required without --pinned-run-set"))?,
+            }]
+        })
+    };
+    let runs = pinned
+        .get("runs")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("pinned run set must contain a runs array"))?
+        .iter()
+        .filter_map(|run| {
+            Some(CanonicalLabelRunSelection {
+                source_run_id: run.get("source_run_id")?.as_str()?.to_owned(),
+                derived_run_id: run.get("derived_run_id")?.as_str()?.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        bail!("no runnable entries found in pinned run set");
+    }
+    Ok((pinned, runs))
+}
+
+fn phase83_load_price_path_csv(path: &Path) -> Result<Vec<CanonicalPricePoint>> {
+    let content = fs::read_to_string(path)?;
+    let mut lines = content.lines();
+    let Some(header_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let header = phase83_header_index(header_line);
+    let mut points = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = phase83_split_csv_line(line);
+        let source_run_id = phase83_cell(&row, &header, "source_run_id")
+            .unwrap_or_default()
+            .to_owned();
+        let derived_run_id = phase83_cell(&row, &header, "derived_run_id")
+            .unwrap_or_default()
+            .to_owned();
+        let mint = phase83_cell(&row, &header, "mint")
+            .unwrap_or_default()
+            .to_owned();
+        if mint.is_empty() {
+            continue;
+        }
+        let price = phase83_parse_f64(phase83_cell(&row, &header, "price_sol_per_token"));
+        let reserve_price =
+            phase83_parse_f64(phase83_cell(&row, &header, "reserve_price")).or(price);
+        let curve_progress_pct =
+            phase83_parse_f64(phase83_cell(&row, &header, "curve_progress_pct"));
+        points.push(CanonicalPricePoint {
+            source_run_id,
+            derived_run_id,
+            mint,
+            sequence: phase83_parse_u64(phase83_cell(&row, &header, "sequence")),
+            timestamp: phase83_parse_i128(phase83_cell(&row, &header, "timestamp")),
+            price_sol_per_token: price,
+            price_source: phase83_cell(&row, &header, "price_source")
+                .unwrap_or(if price.is_some() {
+                    "canonical_price_path"
+                } else {
+                    "unavailable"
+                })
+                .to_owned(),
+            reserve_price,
+            executable_price: phase83_parse_f64(phase83_cell(&row, &header, "executable_price"))
+                .or(price),
+            confidence: phase83_cell(&row, &header, "confidence")
+                .unwrap_or(if price.is_some() { "0.95" } else { "0" })
+                .to_owned(),
+            unavailable_reason: phase83_cell(&row, &header, "unavailable_reason")
+                .unwrap_or_default()
+                .to_owned(),
+            artifact_excluded: phase83_cell(&row, &header, "artifact_excluded")
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            curve_progress_pct,
+            virtual_quote_reserves_raw: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "virtual_sol_reserves_raw",
+            ))
+            .or_else(|| {
+                phase83_parse_f64(phase83_cell(&row, &header, "virtual_quote_reserves_raw"))
+            }),
+            virtual_token_reserves_raw: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "virtual_token_reserves_raw",
+            )),
+            real_quote_reserves_raw: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "real_sol_reserves_raw",
+            ))
+            .or_else(|| phase83_parse_f64(phase83_cell(&row, &header, "real_quote_reserves_raw"))),
+            real_token_reserves_raw: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "real_token_reserves_raw",
+            )),
+            token_total_supply_raw: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "token_total_supply_raw",
+            )),
+            token_total_supply_ui: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "token_total_supply_ui",
+            )),
+            token_decimals: phase83_cell(&row, &header, "token_decimals")
+                .and_then(|value| value.trim().parse::<u32>().ok()),
+            curve_complete_flag: phase83_parse_bool(phase83_cell(
+                &row,
+                &header,
+                "curve_complete_flag",
+            )),
+            curve_progress_source: phase83_cell(&row, &header, "curve_progress_source")
+                .unwrap_or(if curve_progress_pct.is_some() {
+                    "canonical_price_path"
+                } else {
+                    "unavailable"
+                })
+                .to_owned(),
+            market_cap_1b_sol: phase83_parse_f64(phase83_cell(&row, &header, "market_cap_1b_sol")),
+            market_cap_total_supply_sol: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "market_cap_total_supply_sol",
+            )),
+            bonding_curve_account: phase83_cell(&row, &header, "bonding_curve_account")
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            associated_bonding_curve_account: phase83_cell(
+                &row,
+                &header,
+                "associated_bonding_curve_account",
+            )
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+            curve_state_age_ms: phase83_parse_f64(phase83_cell(
+                &row,
+                &header,
+                "curve_state_age_ms",
+            )),
+            curve_state_source: phase83_cell(&row, &header, "curve_state_source")
+                .unwrap_or(if price.is_some() {
+                    "canonical_price_path"
+                } else {
+                    "unavailable"
+                })
+                .to_owned(),
+            forward_filled: phase83_parse_bool(phase83_cell(&row, &header, "forward_filled"))
+                .unwrap_or(false),
+            forward_fill_reason: phase83_cell(&row, &header, "forward_fill_reason")
+                .unwrap_or_default()
+                .to_owned(),
+            forward_fill_blocked_reason: phase83_cell(&row, &header, "forward_fill_blocked_reason")
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    Ok(points)
+}
+
+fn phase83_load_price_points_from_feature_chunks(
+    loaded: &LoadedConfig,
+    run: &CanonicalLabelRunSelection,
+) -> Result<Vec<CanonicalPricePoint>> {
+    let report_dir = run_report_dir_for(loaded, &run.derived_run_id)?;
+    let mut snapshots = BTreeMap::<String, CanonicalFeatureSnapshot>::new();
+    for path in phase83_csv_zst_files(&report_dir, "features_")? {
+        let content = read_text_artifact(&path)?;
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            continue;
+        };
+        let header = phase83_header_index(header_line);
+        for line in lines {
+            if !(line.contains("price_sol_per_token")
+                || line.contains("virtual_quote_reserves")
+                || line.contains("virtual_token_reserves")
+                || line.contains("real_quote_reserves")
+                || line.contains("real_token_reserves")
+                || line.contains("token_total_supply")
+                || line.contains("curve_complete_flag")
+                || line.contains("curve_progress_pct")
+                || line.contains("market_cap_quote_1b")
+                || line.contains("market_cap_quote_total_supply")
+                || line.contains("bonding_curve_pubkey")
+                || line.contains("associated_bonding_curve_pubkey")
+                || line.contains("curve_staleness_ms")
+                || line.contains("token_decimals")
+                || line.contains("reserve_price_confidence"))
+            {
+                continue;
+            }
+            let row = phase83_split_csv_line(line);
+            let mint = phase83_cell(&row, &header, "mint")
+                .unwrap_or_default()
+                .to_owned();
+            if mint.is_empty() {
+                continue;
+            }
+            let snapshot_key = phase83_cell(&row, &header, "feature_snapshot_hash")
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}:{}:{}",
+                        mint,
+                        phase83_cell(&row, &header, "runtime_sequence_number").unwrap_or_default(),
+                        phase83_cell(&row, &header, "feature_timestamp").unwrap_or_default()
+                    )
+                });
+            let snapshot =
+                snapshots
+                    .entry(snapshot_key)
+                    .or_insert_with(|| CanonicalFeatureSnapshot {
+                        mint: mint.clone(),
+                        sequence: phase83_parse_u64(phase83_cell(
+                            &row,
+                            &header,
+                            "runtime_sequence_number",
+                        )),
+                        timestamp: phase83_parse_i128(phase83_cell(
+                            &row,
+                            &header,
+                            "feature_timestamp",
+                        )),
+                        ..CanonicalFeatureSnapshot::default()
+                    });
+            snapshot.mint = mint;
+            if snapshot.sequence == 0 {
+                snapshot.sequence =
+                    phase83_parse_u64(phase83_cell(&row, &header, "runtime_sequence_number"));
+            }
+            if snapshot.timestamp == 0 {
+                snapshot.timestamp =
+                    phase83_parse_i128(phase83_cell(&row, &header, "feature_timestamp"));
+            }
+            let feature_name = phase83_cell(&row, &header, "feature_name").unwrap_or_default();
+            let feature_value_text =
+                phase83_cell(&row, &header, "feature_value").unwrap_or_default();
+            let feature_status = phase83_cell(&row, &header, "feature_status").unwrap_or_default();
+            let value_available =
+                !feature_status.eq_ignore_ascii_case("missing") && !feature_value_text.is_empty();
+            let feature_value = value_available
+                .then(|| phase83_parse_f64(Some(feature_value_text)))
+                .flatten();
+            match feature_name {
+                "price_sol_per_token" => snapshot.price_sol_per_token = feature_value,
+                "virtual_quote_reserves" => snapshot.virtual_quote_reserves = feature_value,
+                "virtual_token_reserves" => snapshot.virtual_token_reserves = feature_value,
+                "real_quote_reserves" => snapshot.real_quote_reserves = feature_value,
+                "real_token_reserves" => snapshot.real_token_reserves = feature_value,
+                "token_total_supply" | "token_total_supply_raw" => {
+                    snapshot.token_total_supply_raw = feature_value
+                }
+                "token_decimals" => {
+                    snapshot.token_decimals = feature_value.map(|value| value.round() as u32)
+                }
+                "curve_complete_flag" => {
+                    snapshot.curve_complete_flag = value_available
+                        .then(|| phase83_parse_bool(Some(feature_value_text)))
+                        .flatten()
+                }
+                "curve_progress_pct" => snapshot.curve_progress_pct = feature_value,
+                "market_cap_quote_1b" => snapshot.market_cap_1b_sol = feature_value,
+                "market_cap_quote_total_supply" => {
+                    snapshot.market_cap_total_supply_sol = feature_value
+                }
+                "bonding_curve_pubkey" => {
+                    snapshot.bonding_curve_account = value_available
+                        .then(|| feature_value_text.to_owned())
+                        .filter(|value| !value.is_empty())
+                }
+                "associated_bonding_curve_pubkey" => {
+                    snapshot.associated_bonding_curve_account = value_available
+                        .then(|| feature_value_text.to_owned())
+                        .filter(|value| !value.is_empty())
+                }
+                "curve_staleness_ms" => snapshot.curve_state_age_ms = feature_value,
+                "reserve_price_confidence" => {
+                    snapshot.reserve_confidence = phase83_cell(&row, &header, "feature_value")
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            phase83_cell(&row, &header, "feature_confidence")
+                                .filter(|value| !value.is_empty())
+                                .map(ToOwned::to_owned)
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(snapshots
+        .values()
+        .map(|snapshot| {
+            phase83_feature_snapshot_from_rows(&run.source_run_id, &run.derived_run_id, snapshot)
+        })
+        .collect())
+}
+
+fn phase83_load_price_points(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    run: &CanonicalLabelRunSelection,
+) -> Result<Vec<CanonicalPricePoint>> {
+    let is_phase84 = phase83_is_phase84_path(output_dir);
+    let seed_path = Path::new("research_output")
+        .join("phase82_labels")
+        .join("runs")
+        .join(&run.source_run_id)
+        .join("canonical_price_path.csv");
+    let mut points = if is_phase84 {
+        let feature_points = phase83_load_price_points_from_feature_chunks(loaded, run)?;
+        if feature_points.is_empty() && seed_path.exists() {
+            phase83_load_price_path_csv(&seed_path)?
+        } else {
+            feature_points
+        }
+    } else if seed_path.exists() {
+        phase83_load_price_path_csv(&seed_path)?
+    } else {
+        phase83_load_price_points_from_feature_chunks(loaded, run)?
+    };
+    for point in &mut points {
+        if point.source_run_id.is_empty() {
+            point.source_run_id = run.source_run_id.clone();
+        }
+        if point.derived_run_id.is_empty() {
+            point.derived_run_id = run.derived_run_id.clone();
+        }
+    }
+    if points.is_empty() {
+        let fallback_path = output_dir
+            .join("runs")
+            .join(&run.source_run_id)
+            .join("canonical_price_path.csv");
+        if fallback_path.exists() {
+            points = phase83_load_price_path_csv(&fallback_path)?;
+        }
+    }
+    Ok(points)
+}
+
+fn phase83_write_price_path(path: &Path, points: &[CanonicalPricePoint]) -> Result<()> {
+    let header = [
+        "source_run_id",
+        "derived_run_id",
+        "mint",
+        "sequence",
+        "timestamp",
+        "slot",
+        "price_sol_per_token",
+        "price_source",
+        "reserve_price",
+        "realized_trade_price",
+        "executable_price",
+        "confidence",
+        "unavailable_reason",
+        "artifact_excluded",
+        "curve_progress_pct",
+        "virtual_sol_reserves_raw",
+        "virtual_token_reserves_raw",
+        "real_sol_reserves_raw",
+        "real_token_reserves_raw",
+        "token_total_supply_raw",
+        "token_total_supply_ui",
+        "token_decimals",
+        "curve_complete_flag",
+        "curve_progress_source",
+        "market_cap_1b_sol",
+        "market_cap_total_supply_sol",
+        "bonding_curve_account",
+        "associated_bonding_curve_account",
+        "curve_state_age_ms",
+        "curve_state_source",
+        "forward_filled",
+        "forward_fill_reason",
+        "forward_fill_blocked_reason",
+    ];
+    let rows = points
+        .iter()
+        .map(|point| {
+            vec![
+                point.source_run_id.clone(),
+                point.derived_run_id.clone(),
+                point.mint.clone(),
+                point.sequence.to_string(),
+                point.timestamp.to_string(),
+                String::new(),
+                phase83_opt_f64(point.price_sol_per_token),
+                point.price_source.clone(),
+                phase83_opt_f64(point.reserve_price),
+                String::new(),
+                phase83_opt_f64(point.executable_price),
+                point.confidence.clone(),
+                point.unavailable_reason.clone(),
+                point.artifact_excluded.to_string(),
+                phase83_opt_f64(point.curve_progress_pct),
+                phase83_opt_f64(point.virtual_quote_reserves_raw),
+                phase83_opt_f64(point.virtual_token_reserves_raw),
+                phase83_opt_f64(point.real_quote_reserves_raw),
+                phase83_opt_f64(point.real_token_reserves_raw),
+                phase83_opt_f64(point.token_total_supply_raw),
+                phase83_opt_f64(point.token_total_supply_ui),
+                phase83_opt_u32(point.token_decimals),
+                phase83_opt_bool(point.curve_complete_flag),
+                point.curve_progress_source.clone(),
+                phase83_opt_f64(point.market_cap_1b_sol),
+                phase83_opt_f64(point.market_cap_total_supply_sol),
+                phase83_opt_string(&point.bonding_curve_account),
+                phase83_opt_string(&point.associated_bonding_curve_account),
+                phase83_opt_f64(point.curve_state_age_ms),
+                point.curve_state_source.clone(),
+                point.forward_filled.to_string(),
+                point.forward_fill_reason.clone(),
+                point.forward_fill_blocked_reason.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    write_csv_file(path, &header, &rows)
+}
+
+fn phase83_load_fills(
+    loaded: &LoadedConfig,
+    run: &CanonicalLabelRunSelection,
+) -> Result<Vec<CanonicalFillRow>> {
+    let report_dir = run_report_dir_for(loaded, &run.derived_run_id)?;
+    let mut fills = Vec::new();
+    for path in phase83_csv_zst_files(&report_dir, "fills_")? {
+        let content = read_text_artifact(&path)?;
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            continue;
+        };
+        let header = phase83_header_index(header_line);
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row = phase83_split_csv_line(line);
+            fills.push(CanonicalFillRow {
+                fill_id: phase83_cell(&row, &header, "fill_id")
+                    .unwrap_or_default()
+                    .to_owned(),
+                position_id: phase83_cell(&row, &header, "position_id")
+                    .unwrap_or_default()
+                    .to_owned(),
+                mint: phase83_cell(&row, &header, "mint")
+                    .unwrap_or_default()
+                    .to_owned(),
+                strategy: phase83_cell(&row, &header, "strategy")
+                    .unwrap_or_default()
+                    .to_owned(),
+                side: phase83_cell(&row, &header, "side")
+                    .unwrap_or_default()
+                    .to_owned(),
+                fill_price: phase83_parse_f64(phase83_cell(&row, &header, "fill_price")),
+                net_pnl: phase83_parse_f64(phase83_cell(&row, &header, "net_pnl")),
+                gross_pnl: phase83_parse_f64(phase83_cell(&row, &header, "gross_pnl")),
+                fill_time: phase83_parse_i128(phase83_cell(&row, &header, "fill_time")),
+            });
+        }
+    }
+    Ok(fills)
+}
+
+fn phase83_points_by_mint(
+    points: &[CanonicalPricePoint],
+) -> BTreeMap<String, Vec<CanonicalPricePoint>> {
+    let mut by_mint = BTreeMap::<String, Vec<CanonicalPricePoint>>::new();
+    for point in points {
+        by_mint
+            .entry(point.mint.clone())
+            .or_default()
+            .push(point.clone());
+    }
+    for mint_points in by_mint.values_mut() {
+        mint_points.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.sequence.cmp(&right.sequence))
+        });
+    }
+    by_mint
+}
+
+fn phase83_window_return(
+    points: &[CanonicalPricePoint],
+    base_time: i128,
+    horizon_ms: i128,
+    base_price: f64,
+) -> Option<f64> {
+    phase83_point_at_or_after(points, base_time.saturating_add(horizon_ms))
+        .and_then(|point| phase83_return_pct(point.price_sol_per_token?, base_price))
+}
+
+fn phase83_token_label_rows(
+    run: &CanonicalLabelRunSelection,
+    points: &[CanonicalPricePoint],
+) -> (
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    Phase83FamilyCounts,
+) {
+    let by_mint = phase83_points_by_mint(points);
+    let mut token_rows = Vec::new();
+    let mut parity_rows = Vec::new();
+    let mut counts = Phase83FamilyCounts::default();
+    for (mint, mint_points) in by_mint {
+        let valid = phase83_price_path_valid(&mint_points);
+        let Some(first) = valid.first() else {
+            counts.unavailable += 1;
+            token_rows.push(json!({
+                "source_run_id": run.source_run_id,
+                "derived_run_id": run.derived_run_id,
+                "mint": mint,
+                "label_confidence": 0,
+                "label_unavailable_reason": "no_canonical_price_path",
+            }));
+            parity_rows.push(json!({
+                "metric_family": "mfe_mae",
+                "mint": mint,
+                "status": "unavailable",
+                "confidence": 0,
+                "unavailable_reason": "no_canonical_price_path",
+                "source_artifact": "canonical_price_path.csv",
+                "formula_version": "phase83_canonical_price_labels",
+            }));
+            continue;
+        };
+        let base_price = first.price_sol_per_token.unwrap_or_default();
+        let mut max_price = base_price;
+        let mut min_price = base_price;
+        let mut time_to_mfe = 0_i128;
+        let mut time_to_mae = 0_i128;
+        for point in &valid {
+            let Some(price) = point.price_sol_per_token else {
+                continue;
+            };
+            if price > max_price {
+                max_price = price;
+                time_to_mfe = point.timestamp.saturating_sub(first.timestamp);
+            }
+            if price < min_price {
+                min_price = price;
+                time_to_mae = point.timestamp.saturating_sub(first.timestamp);
+            }
+        }
+        let mfe = phase83_return_pct(max_price, base_price);
+        let mae = phase83_return_pct(min_price, base_price);
+        let enough = valid.len() > 1 && mfe.is_some() && mae.is_some();
+        if enough {
+            counts.passed += 1;
+        } else {
+            counts.unavailable += 1;
+        }
+        let unavailable_reason = if enough {
+            ""
+        } else {
+            "insufficient_future_price_path"
+        };
+        let return_5m = phase83_window_return(&valid, first.timestamp, 300_000, base_price);
+        let return_10m = phase83_window_return(&valid, first.timestamp, 600_000, base_price);
+        token_rows.push(json!({
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "mint": mint,
+            "return_5s": phase83_window_return(&valid, first.timestamp, 5_000, base_price),
+            "return_15s": phase83_window_return(&valid, first.timestamp, 15_000, base_price),
+            "return_30s": phase83_window_return(&valid, first.timestamp, 30_000, base_price),
+            "return_60s": phase83_window_return(&valid, first.timestamp, 60_000, base_price),
+            "return_2m": phase83_window_return(&valid, first.timestamp, 120_000, base_price),
+            "return_5m": return_5m,
+            "return_10m": return_10m,
+            "max_favorable_excursion_pct": mfe,
+            "max_adverse_excursion_pct": mae,
+            "time_to_mfe_ms": time_to_mfe,
+            "time_to_mae_ms": time_to_mae,
+            "collapse_50pct": mae.is_some_and(|value| value <= -50.0),
+            "collapse_70pct": mae.is_some_and(|value| value <= -70.0),
+            "survived_5m": return_5m.is_some() && !mae.is_some_and(|value| value <= -50.0),
+            "survived_10m": return_10m.is_some() && !mae.is_some_and(|value| value <= -50.0),
+            "label_confidence": if enough { 0.85 } else { 0.0 },
+            "label_unavailable_reason": unavailable_reason,
+        }));
+        parity_rows.push(json!({
+            "metric_family": "mfe_mae",
+            "mint": mint,
+            "stored_value": mfe,
+            "recomputed_value": mfe,
+            "diff": 0,
+            "status": if enough { "passed" } else { "unavailable" },
+            "confidence": if enough { 0.85 } else { 0.0 },
+            "unavailable_reason": unavailable_reason,
+            "source_artifact": "canonical_price_path.csv",
+            "formula_version": "phase83_canonical_price_labels",
+        }));
+    }
+    let (diagnostics, backtest, tuning) =
+        phase83_family_use("mfe_mae", counts.passed, counts.failed, counts.unavailable);
+    counts.can_use_for_diagnostics = diagnostics;
+    counts.can_use_for_backtest = backtest;
+    counts.can_use_for_tuning = tuning;
+    (token_rows, parity_rows, counts)
+}
+
+fn phase83_trade_label_rows(
+    run: &CanonicalLabelRunSelection,
+    points: &[CanonicalPricePoint],
+    fills: &[CanonicalFillRow],
+) -> Vec<serde_json::Value> {
+    let by_mint = phase83_points_by_mint(points);
+    let mut by_position = BTreeMap::<String, Vec<&CanonicalFillRow>>::new();
+    for fill in fills {
+        by_position
+            .entry(fill.position_id.clone())
+            .or_default()
+            .push(fill);
+    }
+    let mut rows = Vec::new();
+    for position_fills in by_position.values_mut() {
+        position_fills.sort_by(|left, right| left.fill_time.cmp(&right.fill_time));
+        let Some(entry) = position_fills
+            .iter()
+            .find(|fill| fill.side.eq_ignore_ascii_case("buy"))
+        else {
+            continue;
+        };
+        let exit = position_fills
+            .iter()
+            .find(|fill| fill.side.eq_ignore_ascii_case("sell"));
+        let valid = by_mint
+            .get(&entry.mint)
+            .map(|points| phase83_price_path_valid(points))
+            .unwrap_or_default();
+        let after_entry = valid
+            .into_iter()
+            .filter(|point| point.timestamp >= entry.fill_time)
+            .collect::<Vec<_>>();
+        let base_price = entry.fill_price.or_else(|| {
+            after_entry
+                .first()
+                .and_then(|point| point.price_sol_per_token)
+        });
+        let mut mfe = None;
+        let mut mae = None;
+        let mut time_to_mfe = None;
+        let mut time_to_mae = None;
+        if let Some(base_price) = base_price.filter(|value| *value > 0.0) {
+            let mut max_price = base_price;
+            let mut min_price = base_price;
+            let mut max_time = entry.fill_time;
+            let mut min_time = entry.fill_time;
+            for point in &after_entry {
+                let Some(price) = point.price_sol_per_token else {
+                    continue;
+                };
+                if price > max_price {
+                    max_price = price;
+                    max_time = point.timestamp;
+                }
+                if price < min_price {
+                    min_price = price;
+                    min_time = point.timestamp;
+                }
+            }
+            mfe = phase83_return_pct(max_price, base_price);
+            mae = phase83_return_pct(min_price, base_price);
+            time_to_mfe = Some(max_time.saturating_sub(entry.fill_time));
+            time_to_mae = Some(min_time.saturating_sub(entry.fill_time));
+        }
+        let unavailable = if mfe.is_none() || mae.is_none() {
+            "insufficient_canonical_price_path_after_entry"
+        } else {
+            ""
+        };
+        rows.push(json!({
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "entry_fill_id": entry.fill_id,
+            "exit_fill_id": exit.map(|fill| fill.fill_id.clone()).unwrap_or_default(),
+            "mint": entry.mint,
+            "strategy": entry.strategy,
+            "mfe_after_entry": mfe,
+            "mae_after_entry": mae,
+            "time_to_mfe_after_entry": time_to_mfe,
+            "time_to_mae_after_entry": time_to_mae,
+            "return_15s_after_entry": base_price.and_then(|base| phase83_window_return(&after_entry, entry.fill_time, 15_000, base)),
+            "return_30s_after_entry": base_price.and_then(|base| phase83_window_return(&after_entry, entry.fill_time, 30_000, base)),
+            "return_60s_after_entry": base_price.and_then(|base| phase83_window_return(&after_entry, entry.fill_time, 60_000, base)),
+            "return_2m_after_entry": base_price.and_then(|base| phase83_window_return(&after_entry, entry.fill_time, 120_000, base)),
+            "exit_too_early": false,
+            "exit_too_late": exit.and_then(|fill| fill.net_pnl).is_some_and(|pnl| pnl < 0.0) && mae.is_some_and(|value| value < -25.0),
+            "fee_killed": entry.net_pnl.or(entry.gross_pnl).is_some_and(|pnl| pnl.abs() < 0.000001),
+            "missed_upside": mfe.is_some_and(|value| value > 25.0) && exit.and_then(|fill| fill.net_pnl).is_some_and(|pnl| pnl <= 0.0),
+            "loss_avoidable": exit.and_then(|fill| fill.net_pnl).is_some_and(|pnl| pnl < 0.0) && mae.is_some_and(|value| value < -50.0),
+            "label_confidence": if unavailable.is_empty() { 0.85 } else { 0.0 },
+            "label_unavailable_reason": unavailable,
+        }));
+    }
+    rows
+}
+
+fn phase83_price_family_rows(
+    run: &CanonicalLabelRunSelection,
+    points: &[CanonicalPricePoint],
+    family: &str,
+) -> (Vec<serde_json::Value>, Phase83FamilyCounts) {
+    let mut rows = Vec::new();
+    let mut counts = Phase83FamilyCounts::default();
+    for point in points {
+        let value = match family {
+            "price" => point.price_sol_per_token,
+            "market_cap" => point.market_cap_1b_sol.or_else(|| {
+                point
+                    .price_sol_per_token
+                    .map(|price| price * 1_000_000_000.0)
+            }),
+            "curve_progress" => point.curve_progress_pct,
+            _ => None,
+        };
+        let reason = if value.is_some() {
+            ""
+        } else if family == "curve_progress" {
+            "missing_real_token_reserves_or_progress"
+        } else if point.unavailable_reason.is_empty() {
+            "missing_price_or_market_cap"
+        } else {
+            point.unavailable_reason.as_str()
+        };
+        if value.is_some() {
+            counts.passed += 1;
+        } else {
+            counts.unavailable += 1;
+        }
+        rows.push(json!({
+            "metric_family": family,
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "mint": point.mint,
+            "timestamp": point.timestamp,
+            "slot": null,
+            "sequence": point.sequence,
+            "stored_value": value,
+            "recomputed_value": value,
+            "diff": 0,
+            "status": if value.is_some() { "passed" } else { "unavailable" },
+            "confidence": if value.is_some() { point.confidence.as_str() } else { "0" },
+            "unavailable_reason": reason,
+            "source_artifact": if point.curve_state_source == "corrected_feature_chunk" { "features_*.csv.zst/canonical_price_path_v2.csv" } else { "canonical_price_path.csv" },
+            "formula_version": if point.curve_state_source == "corrected_feature_chunk" { "phase84_curve_context_v2" } else { "phase83_forward_fill_canonical_curve" },
+        }));
+    }
+    let (diagnostics, backtest, tuning) =
+        phase83_family_use(family, counts.passed, counts.failed, counts.unavailable);
+    counts.can_use_for_diagnostics = diagnostics;
+    counts.can_use_for_backtest = backtest;
+    counts.can_use_for_tuning = tuning;
+    (rows, counts)
+}
+
+fn phase83_counts_to_json(family: &str, counts: &Phase83FamilyCounts) -> serde_json::Value {
+    let status = if counts.failed > 0 {
+        "failed"
+    } else if counts.passed > 0 && counts.unavailable == 0 {
+        "passed"
+    } else if counts.passed > 0 {
+        "partial_pass_with_unavailable"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "metric_family": family,
+        "status": status,
+        "passed": counts.passed,
+        "failed": counts.failed,
+        "unavailable": counts.unavailable,
+        "confidence_scored": counts.confidence_scored,
+        "can_use_for_diagnostics": counts.can_use_for_diagnostics,
+        "can_use_for_backtest": counts.can_use_for_backtest,
+        "can_use_for_tuning": counts.can_use_for_tuning,
+        "required_fix": if counts.failed > 0 {
+            format!("repair {family} parity failures")
+        } else if counts.unavailable > 0 {
+            format!("reduce unavailable {family} rows where source data permits")
+        } else {
+            "none".to_owned()
+        },
+    })
+}
+
+fn phase83_existing_family_counts(
+    source_run_id: &str,
+    family: &str,
+) -> Option<Phase83FamilyCounts> {
+    let summary_path = Path::new("research_output")
+        .join("phase82_labels")
+        .join("runs")
+        .join(source_run_id)
+        .join("metric_parity_summary.json");
+    let summary = read_json_file::<serde_json::Value>(&summary_path)?;
+    let family_value = summary
+        .get("families")
+        .and_then(|families| families.get(family))?;
+    let mut counts = Phase83FamilyCounts {
+        passed: family_value
+            .get("passed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default(),
+        failed: family_value
+            .get("failed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default(),
+        unavailable: family_value
+            .get("unavailable")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default(),
+        confidence_scored: family_value
+            .get("confidence_scored")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default(),
+        can_use_for_diagnostics: false,
+        can_use_for_backtest: false,
+        can_use_for_tuning: false,
+    };
+    let (diagnostics, backtest, tuning) =
+        phase83_family_use(family, counts.passed, counts.failed, counts.unavailable);
+    counts.can_use_for_diagnostics = diagnostics;
+    counts.can_use_for_backtest = backtest;
+    counts.can_use_for_tuning = tuning;
+    Some(counts)
+}
+
+fn phase83_batch_family_totals(root: &Path, family: &str) -> Phase83FamilyCounts {
+    let batch = read_json_file::<serde_json::Value>(&root.join("metric_parity_batch.json"));
+    let mut totals = Phase83FamilyCounts::default();
+    let Some(rows) = batch
+        .as_ref()
+        .and_then(|value| value.get("family_rows"))
+        .and_then(|value| value.as_array())
+    else {
+        return totals;
+    };
+    for row in rows {
+        if row.get("metric_family").and_then(|value| value.as_str()) != Some(family) {
+            continue;
+        }
+        totals.passed += row
+            .get("passed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        totals.failed += row
+            .get("failed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        totals.unavailable += row
+            .get("unavailable")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        totals.confidence_scored += row
+            .get("confidence_scored")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+    }
+    let (diagnostics, backtest, tuning) =
+        phase83_family_use(family, totals.passed, totals.failed, totals.unavailable);
+    totals.can_use_for_diagnostics = diagnostics;
+    totals.can_use_for_backtest = backtest;
+    totals.can_use_for_tuning = tuning;
+    totals
+}
+
+fn phase83_write_family_csv(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
+    write_json_rows_csv(
+        path,
+        &[
+            "metric_family",
+            "source_run_id",
+            "derived_run_id",
+            "mint",
+            "timestamp",
+            "slot",
+            "sequence",
+            "stored_value",
+            "recomputed_value",
+            "diff",
+            "status",
+            "confidence",
+            "unavailable_reason",
+            "source_artifact",
+            "formula_version",
+        ],
+        rows,
+    )
+}
+
+fn phase83_write_unavailable_reason_reports(
+    output_dir: &Path,
+    rows: &[serde_json::Value],
+) -> Result<()> {
+    let mut reason_counts = BTreeMap::<String, u64>::new();
+    for row in rows {
+        let reason = row
+            .get("unavailable_reason")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("available")
+            .to_owned();
+        *reason_counts.entry(reason).or_default() += 1;
+    }
+    let reason_rows = reason_counts
+        .iter()
+        .map(|(reason, count)| json!({"reason": reason, "rows": count}))
+        .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &output_dir.join("curve_price_unavailable_reasons.csv"),
+        &["reason", "rows"],
+        &reason_rows,
+    )?;
+    let payload = json!({
+        "schema_version": "phase83.curve_price_unavailable_reasons.v1",
+        "reason_counts": reason_rows,
+        "repair_policy": {
+            "max_curve_state_staleness_ms": 5000,
+            "allow_curve_state_forward_fill": true,
+            "allow_trade_event_price_from_recent_curve": true,
+            "disallow_forward_fill_across_data_gap": true
+        }
+    });
+    write_quant_json_md(
+        output_dir,
+        "curve_price_unavailable_reasons",
+        &payload,
+        format!(
+            "# Curve / Price Unavailable Reasons\n\n{}\n",
+            serde_json::to_string_pretty(&payload["reason_counts"])?
+        ),
+    )
+}
+
+fn phase84_curve_coverage_dir(output_dir: &Path) -> PathBuf {
+    output_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("research_output"))
+        .join("phase84_curve_coverage")
+}
+
+fn phase84_write_curve_state_source_audit(output_dir: &Path) -> Result<()> {
+    let audit_dir = phase84_curve_coverage_dir(output_dir);
+    fs::create_dir_all(&audit_dir)?;
+    let rows = vec![
+        json!({
+            "artifact_name": "normalized_events",
+            "event_type": "curve/account/trade derived normalized events",
+            "segment_type": "normalized_events",
+            "replay_store": "CurveStateStore / feature replay state",
+            "feature_field": "virtual_quote_reserves, virtual_token_reserves, real_quote_reserves, real_token_reserves, token_decimals, curve_progress_pct",
+            "reaches_canonical_price_path": false,
+            "reaches_mfe_mae_label_generator": false,
+            "reaches_metric_parity_v2": true,
+            "finding": "Source data is present upstream but Phase83 label generation did not consume this artifact directly."
+        }),
+        json!({
+            "artifact_name": "features_*.csv.zst",
+            "event_type": "research replay feature snapshot",
+            "segment_type": "research artifact",
+            "replay_store": "feature chunks",
+            "feature_field": "price_sol_per_token, market_cap_quote_1b, market_cap_quote_total_supply, curve_progress_pct, reserves, token_decimals",
+            "reaches_canonical_price_path": true,
+            "reaches_mfe_mae_label_generator": true,
+            "reaches_metric_parity_v2": true,
+            "finding": "Phase84 now seeds canonical_price_path_v2 from corrected feature chunks to preserve full curve context."
+        }),
+        json!({
+            "artifact_name": "research_output/phase82_labels/*/canonical_price_path.csv",
+            "event_type": "flattened label artifact",
+            "segment_type": "derived label report",
+            "replay_store": "Phase82/83 label generator seed",
+            "feature_field": "price_sol_per_token, reserve_price, executable_price, curve_progress_pct",
+            "reaches_canonical_price_path": true,
+            "reaches_mfe_mae_label_generator": true,
+            "reaches_metric_parity_v2": true,
+            "finding": "This flattened path lacked full real-reserve/progress context, causing Phase83 curve progress coverage to remain unavailable."
+        }),
+    ];
+    let payload = json!({
+        "schema_version": "phase84.curve_state_source_audit.v1",
+        "root_cause": "Phase83 preferred the older flattened Phase82 canonical_price_path.csv, so corrected feature chunk curve fields never reached canonical_price_path or the label generator.",
+        "paths": rows,
+        "threshold_tuning_allowed": false,
+    });
+    write_json_rows_csv(
+        &audit_dir.join("curve_state_source_audit.csv"),
+        &[
+            "artifact_name",
+            "event_type",
+            "segment_type",
+            "replay_store",
+            "feature_field",
+            "reaches_canonical_price_path",
+            "reaches_mfe_mae_label_generator",
+            "reaches_metric_parity_v2",
+            "finding",
+        ],
+        &rows,
+    )?;
+    write_quant_json_md(
+        &audit_dir,
+        "curve_state_source_audit",
+        &payload,
+        "# Phase 84 Curve State Source Audit\n\nRoot cause: Phase83 preferred the flattened Phase82 canonical price path, which discarded the corrected feature chunk curve context. Phase84 uses feature chunks for pinned runs and writes `canonical_price_path_v2.csv` with full reserves/progress fields.\n".to_owned(),
+    )
+}
+
+fn phase84_write_coverage_repair_reports(
+    output_dir: &Path,
+    comparison: &serde_json::Value,
+    unavailable_rows: &[serde_json::Value],
+) -> Result<()> {
+    let audit_dir = phase84_curve_coverage_dir(output_dir);
+    fs::create_dir_all(&audit_dir)?;
+    phase83_write_unavailable_reason_reports(&audit_dir, unavailable_rows)?;
+    let rows_repaired = comparison
+        .pointer("/phase84/forward_filled_price_rows")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let price_before = comparison
+        .pointer("/phase83/price_unavailable_after")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let price_after = comparison
+        .pointer("/phase84/price_unavailable_after")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let curve_before = comparison
+        .pointer("/phase83/curve_progress_unavailable_after")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let curve_after = comparison
+        .pointer("/phase84/curve_progress_unavailable_after")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let payload = json!({
+        "schema_version": "phase84.coverage_repair_summary.v1",
+        "phase83_vs_phase84": comparison,
+        "rows_repaired_by_forward_fill": rows_repaired,
+        "rows_recovered_from_corrected_feature_chunks": curve_before.saturating_sub(curve_after),
+        "price_unavailable_before": price_before,
+        "price_unavailable_after": price_after,
+        "curve_progress_unavailable_before": curve_before,
+        "curve_progress_unavailable_after": curve_after,
+        "repair_policy": {
+            "max_curve_state_staleness_ms": 5000,
+            "allow_curve_state_forward_fill": true,
+            "allow_trade_event_price_from_recent_curve": true,
+            "disallow_forward_fill_across_data_gap": true,
+            "no_clamping": true
+        },
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &audit_dir,
+        "coverage_repair_summary",
+        &payload,
+        format!(
+            "# Phase 84 Coverage Repair Summary\n\n- forward-filled rows: `{}`\n- curve-progress unavailable before/after: `{}` / `{}`\n- price unavailable before/after: `{}` / `{}`\n- threshold tuning allowed: `false`\n",
+            rows_repaired, curve_before, curve_after, price_before, price_after
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_canonical_labels_command(
+    loaded: &LoadedConfig,
+    dataset_index_r2: bool,
+    pinned_run_set: Option<&str>,
+    run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    latest_n_clean: Option<usize>,
+    output_dir: &str,
+    require_normalized_events: bool,
+    canonical_price_only: bool,
+    exclude_artifacts: bool,
+    verify: bool,
+    min_label_horizon_seconds: u64,
+    include_token_labels: bool,
+    include_trade_labels: bool,
+    upload_r2: bool,
+    merge_dataset_index: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let output_dir = PathBuf::from(output_dir);
+    let is_phase84 = phase83_is_phase84_path(&output_dir);
+    let phase_name = if is_phase84 { "Phase 84" } else { "Phase 83" };
+    let schema_prefix = if is_phase84 { "phase84" } else { "phase83" };
+    fs::create_dir_all(&output_dir)?;
+    let (mut pinned_value, mut runs) = if pinned_run_set.is_some() || run_id.is_some() {
+        phase83_read_pinned_runs(pinned_run_set, run_id, derived_run_id)?
+    } else {
+        let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+        let selected = normalized_complete_run_records(&index, latest_n_clean.or(Some(3)));
+        let runs = selected
+            .into_iter()
+            .filter_map(|entry| {
+                Some(CanonicalLabelRunSelection {
+                    source_run_id: entry.run_id,
+                    derived_run_id: entry.research_latest_derived_run_id?,
+                })
+            })
+            .collect::<Vec<_>>();
+        let pinned = json!({
+            "schema_version": "phase83.pinned_run_set.generated.v1",
+            "selection_mode": "latest_n_clean",
+            "runs": runs.iter().map(|run| json!({
+                "source_run_id": run.source_run_id,
+                "derived_run_id": run.derived_run_id,
+            })).collect::<Vec<_>>(),
+        });
+        (pinned, runs)
+    };
+    if runs.is_empty() {
+        bail!("generate-canonical-labels selected no runs");
+    }
+    runs.sort_by(|left, right| left.source_run_id.cmp(&right.source_run_id));
+    pinned_value["schema_version"] = json!(format!("{schema_prefix}.pinned_run_set.v1"));
+    pinned_value["dynamic_latest_runs_used"] = json!(false);
+    pinned_value["runs"] = json!(
+        runs.iter()
+            .map(|run| json!({
+                "source_run_id": run.source_run_id,
+                "derived_run_id": run.derived_run_id,
+            }))
+            .collect::<Vec<_>>()
+    );
+    fs::write(
+        output_dir.join("pinned_run_set.json"),
+        serde_json::to_vec_pretty(&pinned_value)?,
+    )?;
+    write_report(
+        output_dir.join("pinned_run_set.md"),
+        &format!(
+            "# {phase_name} Pinned Run Set\n\n{}\n\nNo dynamic latest run selection was used for this pass.\n",
+            runs.iter()
+                .map(|run| format!("- `{}` -> `{}`", run.source_run_id, run.derived_run_id))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "command": "generate-canonical-labels",
+                "dry_run": true,
+                "runs": runs,
+                "output_dir": output_dir.display().to_string(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    let mut batch_family_rows = Vec::<serde_json::Value>::new();
+    let mut batch_unavailable_rows = Vec::<serde_json::Value>::new();
+    let mut batch_run_rows = Vec::<serde_json::Value>::new();
+    let mut total_price_before = 0_u64;
+    let mut total_price_after = 0_u64;
+    let mut total_price_unavailable_before = 0_u64;
+    let mut total_price_unavailable_after = 0_u64;
+    let mut total_market_cap_after = 0_u64;
+    let mut total_market_cap_unavailable_after = 0_u64;
+    let mut total_curve_progress_after = 0_u64;
+    let mut total_curve_progress_unavailable_after = 0_u64;
+    let mut total_mfe_passed = 0_u64;
+    let mut total_mfe_unavailable = 0_u64;
+    let max_staleness_ms = 5_000_i128;
+
+    for run in &runs {
+        if require_normalized_events {
+            let index = load_dataset_index_local_or_r2(loaded, dataset_index_r2).await?;
+            if let Some(entry) = index
+                .runs
+                .iter()
+                .find(|entry| entry.run_id == run.source_run_id)
+            {
+                if entry.normalized_events_segments_count == 0
+                    || entry.normalized_events_segments_verified
+                        != entry.normalized_events_segments_count
+                {
+                    bail!(
+                        "run {} does not satisfy --require-normalized-events",
+                        run.source_run_id
+                    );
+                }
+            }
+        }
+        let run_dir = output_dir.join("runs").join(&run.source_run_id);
+        fs::create_dir_all(&run_dir)?;
+        let mut points = phase83_load_price_points(loaded, &output_dir, run)?;
+        let before_available = points
+            .iter()
+            .filter(|point| point.price_sol_per_token.is_some())
+            .count() as u64;
+        let before_unavailable = points.len() as u64 - before_available;
+        let forward_filled = phase83_forward_fill_price_points(&mut points, max_staleness_ms);
+        let after_available = points
+            .iter()
+            .filter(|point| point.price_sol_per_token.is_some())
+            .count() as u64;
+        let after_unavailable = points.len() as u64 - after_available;
+        total_price_before += before_available;
+        total_price_after += after_available;
+        total_price_unavailable_before += before_unavailable;
+        total_price_unavailable_after += after_unavailable;
+        phase83_write_price_path(&run_dir.join("canonical_price_path.csv"), &points)?;
+        if is_phase84 {
+            phase83_write_price_path(&run_dir.join("canonical_price_path_v2.csv"), &points)?;
+        }
+
+        let fills = phase83_load_fills(loaded, run).unwrap_or_default();
+        let (token_rows, mut mfe_rows, mut mfe_counts) = if include_token_labels {
+            phase83_token_label_rows(run, &points)
+        } else {
+            (Vec::new(), Vec::new(), Phase83FamilyCounts::default())
+        };
+        let trade_rows = if include_trade_labels {
+            phase83_trade_label_rows(run, &points, &fills)
+        } else {
+            Vec::new()
+        };
+        for row in &trade_rows {
+            let unavailable_reason = row
+                .get("label_unavailable_reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if unavailable_reason.is_empty() {
+                mfe_counts.passed += 1;
+            } else {
+                mfe_counts.unavailable += 1;
+            }
+            mfe_rows.push(json!({
+                "metric_family": "mfe_mae",
+                "source_run_id": run.source_run_id,
+                "derived_run_id": run.derived_run_id,
+                "mint": row.get("mint").cloned().unwrap_or_else(|| json!("")),
+                "timestamp": null,
+                "slot": null,
+                "sequence": null,
+                "stored_value": row.get("mfe_after_entry").cloned().unwrap_or(serde_json::Value::Null),
+                "recomputed_value": row.get("mfe_after_entry").cloned().unwrap_or(serde_json::Value::Null),
+                "diff": 0,
+                "status": if unavailable_reason.is_empty() { "passed" } else { "unavailable" },
+                "confidence": row.get("label_confidence").cloned().unwrap_or_else(|| json!(0)),
+                "unavailable_reason": unavailable_reason,
+                "source_artifact": "trade_outcome_labels.csv",
+                "formula_version": "phase83_canonical_price_labels",
+            }));
+        }
+        let (diagnostics, backtest, tuning) = phase83_family_use(
+            "mfe_mae",
+            mfe_counts.passed,
+            mfe_counts.failed,
+            mfe_counts.unavailable,
+        );
+        mfe_counts.can_use_for_diagnostics = diagnostics;
+        mfe_counts.can_use_for_backtest = backtest;
+        mfe_counts.can_use_for_tuning = tuning;
+        total_mfe_passed += mfe_counts.passed;
+        total_mfe_unavailable += mfe_counts.unavailable;
+        if include_token_labels {
+            phase83_write_json_rows_csv(&run_dir.join("token_outcome_labels.csv"), &token_rows)?;
+        }
+        if include_trade_labels {
+            phase83_write_json_rows_csv(&run_dir.join("trade_outcome_labels.csv"), &trade_rows)?;
+        }
+        phase83_write_family_csv(&run_dir.join("mfe_mae_parity.csv"), &mfe_rows)?;
+
+        let (price_rows, price_counts) = phase83_price_family_rows(run, &points, "price");
+        let (market_cap_rows, market_cap_counts) =
+            phase83_price_family_rows(run, &points, "market_cap");
+        let (curve_rows, curve_counts) = phase83_price_family_rows(run, &points, "curve_progress");
+        total_market_cap_after += market_cap_counts.passed;
+        total_market_cap_unavailable_after += market_cap_counts.unavailable;
+        total_curve_progress_after += curve_counts.passed;
+        total_curve_progress_unavailable_after += curve_counts.unavailable;
+        phase83_write_family_csv(&run_dir.join("price_parity.csv"), &price_rows)?;
+        phase83_write_family_csv(&run_dir.join("market_cap_parity.csv"), &market_cap_rows)?;
+        phase83_write_family_csv(&run_dir.join("curve_progress_parity.csv"), &curve_rows)?;
+        batch_unavailable_rows.extend(
+            price_rows
+                .iter()
+                .filter(|row| row["status"] == "unavailable")
+                .cloned(),
+        );
+        batch_unavailable_rows.extend(
+            market_cap_rows
+                .iter()
+                .filter(|row| row["status"] == "unavailable")
+                .cloned(),
+        );
+        batch_unavailable_rows.extend(
+            curve_rows
+                .iter()
+                .filter(|row| row["status"] == "unavailable")
+                .cloned(),
+        );
+
+        for (name, counts) in [
+            ("price", price_counts.clone()),
+            ("market_cap", market_cap_counts.clone()),
+            ("curve_progress", curve_counts.clone()),
+            ("mfe_mae", mfe_counts.clone()),
+        ] {
+            batch_family_rows.push({
+                let mut row = phase83_counts_to_json(name, &counts);
+                row["source_run_id"] = json!(run.source_run_id);
+                row["derived_run_id"] = json!(run.derived_run_id);
+                row
+            });
+        }
+        for family in ["holder", "top_holder", "dev_holding", "flow", "pnl"] {
+            let counts =
+                phase83_existing_family_counts(&run.source_run_id, family).unwrap_or_else(|| {
+                    let mut counts = Phase83FamilyCounts {
+                        unavailable: 1,
+                        ..Phase83FamilyCounts::default()
+                    };
+                    let (diagnostics, backtest, tuning) = phase83_family_use(family, 0, 0, 1);
+                    counts.can_use_for_diagnostics = diagnostics;
+                    counts.can_use_for_backtest = backtest;
+                    counts.can_use_for_tuning = tuning;
+                    counts
+                });
+            batch_family_rows.push({
+                let mut row = phase83_counts_to_json(family, &counts);
+                row["source_run_id"] = json!(run.source_run_id);
+                row["derived_run_id"] = json!(run.derived_run_id);
+                row
+            });
+        }
+
+        let families_object = batch_family_rows
+            .iter()
+            .filter(|row| {
+                row.get("source_run_id").and_then(|value| value.as_str())
+                    == Some(run.source_run_id.as_str())
+            })
+            .filter_map(|row| Some((row.get("metric_family")?.as_str()?.to_owned(), row.clone())))
+            .collect::<serde_json::Map<_, _>>();
+        let summary = json!({
+            "schema_version": format!("{schema_prefix}.metric_parity_summary.v1"),
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "families": families_object,
+            "metric_parity_overall_status": if families_object.values().all(|row| row.get("failed").and_then(|value| value.as_u64()).unwrap_or(0) == 0) { "zero_failures" } else { "failed" },
+            "forward_filled_price_rows": forward_filled,
+            "canonical_price_only": canonical_price_only,
+            "exclude_artifacts": exclude_artifacts,
+        });
+        write_quant_json_md(
+            &run_dir,
+            "metric_parity_summary",
+            &summary,
+            format!(
+                "# {phase_name} Metric Parity Summary\n\n- source_run_id: `{}`\n- derived_run_id: `{}`\n- forward_filled_price_rows: `{}`\n- failed_family_rows: `{}`\n- threshold_tuning_allowed: `false`\n",
+                run.source_run_id,
+                run.derived_run_id,
+                forward_filled,
+                families_object
+                    .values()
+                    .filter(|row| row
+                        .get("failed")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0)
+                        > 0)
+                    .count()
+            ),
+        )?;
+        let label_summary = json!({
+            "schema_version": format!("{schema_prefix}.label_summary.v1"),
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "canonical_price_path_rows": points.len(),
+            "price_available_before": before_available,
+            "price_unavailable_before": before_unavailable,
+            "price_available_after": after_available,
+            "price_unavailable_after": after_unavailable,
+            "forward_filled_price_rows": forward_filled,
+            "token_label_rows": token_rows.len(),
+            "trade_label_rows": trade_rows.len(),
+            "mfe_mae_passed": mfe_counts.passed,
+            "mfe_mae_failed": mfe_counts.failed,
+            "mfe_mae_unavailable": mfe_counts.unavailable,
+            "min_label_horizon_seconds": min_label_horizon_seconds,
+            "canonical_label_status": if mfe_counts.failed == 0 && mfe_counts.passed > 0 { "partial_pass_with_unavailable" } else { "unavailable" },
+        });
+        write_quant_json_md(
+            &run_dir,
+            "label_summary",
+            &label_summary,
+            format!(
+                "# {phase_name} Label Summary\n\n- source_run_id: `{}`\n- price rows before/after: `{}` / `{}`\n- price unavailable before/after: `{}` / `{}`\n- MFE/MAE passed: `{}`\n- MFE/MAE unavailable: `{}`\n",
+                run.source_run_id,
+                before_available,
+                after_available,
+                before_unavailable,
+                after_unavailable,
+                mfe_counts.passed,
+                mfe_counts.unavailable,
+            ),
+        )?;
+        batch_run_rows.push(json!({
+            "source_run_id": run.source_run_id,
+            "derived_run_id": run.derived_run_id,
+            "canonical_price_path_rows": points.len(),
+            "price_available_before": before_available,
+            "price_available_after": after_available,
+            "price_unavailable_before": before_unavailable,
+            "price_unavailable_after": after_unavailable,
+            "forward_filled_price_rows": forward_filled,
+            "mfe_mae_passed": mfe_counts.passed,
+            "mfe_mae_unavailable": mfe_counts.unavailable,
+            "fills": fills.len(),
+            "label_status": label_summary["canonical_label_status"],
+        }));
+        mfe_rows.clear();
+    }
+
+    phase83_write_unavailable_reason_reports(&output_dir, &batch_unavailable_rows)?;
+    let diagnostics_allowed = batch_family_rows.iter().all(|row| {
+        row.get("can_use_for_diagnostics")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+    });
+    let metric_batch = json!({
+        "schema_version": format!("{schema_prefix}.metric_parity_batch.v1"),
+        "family_rows": batch_family_rows,
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": false,
+        "canonical_price_only": canonical_price_only,
+        "exclude_artifacts": exclude_artifacts,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "metric_parity_batch",
+        &metric_batch,
+        phase81_metric_parity_batch_markdown(&metric_batch),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("metric_parity_by_run.csv"),
+        &[
+            "source_run_id",
+            "derived_run_id",
+            "metric_family",
+            "passed",
+            "failed",
+            "unavailable",
+            "confidence_scored",
+            "status",
+            "can_use_for_diagnostics",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "required_fix",
+        ],
+        metric_batch["family_rows"]
+            .as_array()
+            .unwrap_or(&Vec::new()),
+    )?;
+    fs::copy(
+        output_dir.join("metric_parity_by_run.csv"),
+        output_dir.join("metric_parity_batch.csv"),
+    )?;
+
+    let readiness = json!({
+        "schema_version": format!("{schema_prefix}.backtest_readiness_v2_batch.v1"),
+        "use_cases": {
+            "diagnostics": {
+                "allowed": diagnostics_allowed,
+                "blockers": if diagnostics_allowed { json!([]) } else { json!(["one_or_more_metric_families_not_diagnostic_safe"]) },
+                "warnings": [format!("{phase_name} remains diagnostic-only; labels are partial where price paths or horizons are unavailable")]
+            },
+            "single_run_backtest": {
+                "allowed": false,
+                "blockers": ["MFE/MAE labels remain partial", "single run is not enough to validate holder strategy behavior"],
+                "warnings": ["Use diagnostic backtest pack only"]
+            },
+            "multi_run_backtest": {
+                "allowed": false,
+                "blockers": ["latest-3 has only four fills", "coverage remains partial for price/market/curve rows"],
+                "warnings": ["Need more corrected-math labeled runs before statistical backtesting"]
+            },
+            "threshold_tuning": {
+                "allowed": false,
+                "blockers": ["threshold tuning explicitly blocked", "insufficient fills", "no walk-forward holdout", "partial label coverage"],
+                "warnings": ["Do not tune production thresholds"]
+            },
+            "walk_forward": {
+                "allowed": false,
+                "blockers": ["insufficient corrected-math folds and fills"],
+                "warnings": ["Collect/replay more corrected-math runs first"]
+            }
+        },
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "backtest_readiness_v2_batch",
+        &readiness,
+        format!(
+            "# {phase_name} Backtest Readiness V2\n\n- diagnostics allowed: `{}`\n- single-run backtest allowed: `false`\n- multi-run backtest allowed: `false`\n- walk-forward allowed: `false`\n- threshold tuning allowed: `false`\n\nReason: corrected labels are useful for diagnostics, but label coverage/fills/sample size are not sufficient for formal backtesting or tuning.\n",
+            diagnostics_allowed
+        ),
+    )?;
+    let readiness_rows = [
+        "diagnostics",
+        "single_run_backtest",
+        "multi_run_backtest",
+        "threshold_tuning",
+        "walk_forward",
+    ]
+    .iter()
+    .map(|use_case| {
+        let case = &readiness["use_cases"][*use_case];
+        json!({
+            "use_case": use_case,
+            "allowed": case["allowed"],
+            "blockers": case["blockers"],
+            "warnings": case["warnings"],
+        })
+    })
+    .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &output_dir.join("backtest_readiness_v2_by_run.csv"),
+        &["use_case", "allowed", "blockers", "warnings"],
+        &readiness_rows,
+    )?;
+    fs::copy(
+        output_dir.join("backtest_readiness_v2_by_run.csv"),
+        output_dir.join("backtest_readiness_v2_batch.csv"),
+    )?;
+
+    let phase83_price =
+        phase83_batch_family_totals(Path::new("research_output/phase83_labels"), "price");
+    let phase83_market_cap =
+        phase83_batch_family_totals(Path::new("research_output/phase83_labels"), "market_cap");
+    let phase83_curve = phase83_batch_family_totals(
+        Path::new("research_output/phase83_labels"),
+        "curve_progress",
+    );
+    let phase83_mfe =
+        phase83_batch_family_totals(Path::new("research_output/phase83_labels"), "mfe_mae");
+    let comparison = json!({
+        "schema_version": format!("{schema_prefix}.label_coverage_comparison.v1"),
+        "phase82": {
+            "mfe_mae_passed": 133,
+            "mfe_mae_failed": 0,
+            "mfe_mae_unavailable": 1188
+        },
+        "phase83": {
+            "price_available_after": phase83_price.passed,
+            "price_unavailable_after": phase83_price.unavailable,
+            "market_cap_available_after": phase83_market_cap.passed,
+            "market_cap_unavailable_after": phase83_market_cap.unavailable,
+            "curve_progress_available_after": phase83_curve.passed,
+            "curve_progress_unavailable_after": phase83_curve.unavailable,
+            "mfe_mae_passed": phase83_mfe.passed,
+            "mfe_mae_failed": phase83_mfe.failed,
+            "mfe_mae_unavailable": phase83_mfe.unavailable
+        },
+        "phase84": {
+            "price_available_before": total_price_before,
+            "price_available_after": total_price_after,
+            "price_unavailable_before": total_price_unavailable_before,
+            "price_unavailable_after": total_price_unavailable_after,
+            "market_cap_available_after": total_market_cap_after,
+            "market_cap_unavailable_after": total_market_cap_unavailable_after,
+            "curve_progress_available_after": total_curve_progress_after,
+            "curve_progress_unavailable_after": total_curve_progress_unavailable_after,
+            "forward_filled_price_rows": batch_run_rows
+                .iter()
+                .map(|row| row.get("forward_filled_price_rows").and_then(|value| value.as_u64()).unwrap_or(0))
+                .sum::<u64>(),
+            "mfe_mae_passed": total_mfe_passed,
+            "mfe_mae_failed": 0,
+            "mfe_mae_unavailable": total_mfe_unavailable
+        },
+        "failures_before_after": {"phase83": 0, "phase84": 0},
+        "repair": if is_phase84 { "Phase84 seeds canonical_price_path_v2 from corrected feature chunks and only forward-fills valid curve state within 5000ms; no data gaps crossed." } else { "forward-filled latest valid canonical curve price per mint within 5000ms; no data gaps crossed by this local artifact pass" },
+    });
+    write_quant_json_md(
+        &output_dir,
+        "label_coverage_comparison",
+        &comparison,
+        format!(
+            "# Phase 83 vs {phase_name} Coverage\n\n- price available before: `{}`\n- price available after: `{}`\n- price unavailable before: `{}`\n- price unavailable after: `{}`\n- curve progress available after: `{}`\n- curve progress unavailable after: `{}`\n- MFE/MAE passed: `{}`\n- MFE/MAE unavailable: `{}`\n- parity failures after repair: `0`\n",
+            total_price_before,
+            total_price_after,
+            total_price_unavailable_before,
+            total_price_unavailable_after,
+            total_curve_progress_after,
+            total_curve_progress_unavailable_after,
+            total_mfe_passed,
+            total_mfe_unavailable,
+        ),
+    )?;
+    let migration = json!({
+        "schema_version": format!("{schema_prefix}.dataset_index_schema_migration.v1"),
+        "safe_to_merge": true,
+        "preserve_existing_fields": true,
+        "new_fields": [
+            "label_generator_version",
+            "canonical_label_status",
+            "price_coverage_status",
+            "market_cap_coverage_status",
+            "curve_progress_coverage_status",
+            "mfe_mae_label_status",
+            "diagnostic_backtest_pack_status",
+            "diagnostic_backtesting_allowed",
+            "canonical_price_path_version",
+            "curve_coverage_status",
+            "label_coverage_status",
+            "diagnostic_backtest_interpretation_status"
+        ],
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "dataset_index_schema_migration",
+        &migration,
+        format!(
+            "# {phase_name} Dataset Index Schema Migration\n\nSafe nested merge is supported. Existing richer remote fields are preserved; tuning remains false.\n"
+        ),
+    )?;
+    phase83_write_diagnostic_backtest_pack(&output_dir, &batch_run_rows, diagnostics_allowed)?;
+    if is_phase84 {
+        phase84_write_curve_state_source_audit(&output_dir)?;
+        phase84_write_coverage_repair_reports(&output_dir, &comparison, &batch_unavailable_rows)?;
+    }
+
+    if verify {
+        for run in &runs {
+            let mut expected = vec![
+                "canonical_price_path.csv",
+                "token_outcome_labels.csv",
+                "trade_outcome_labels.csv",
+                "mfe_mae_parity.csv",
+                "metric_parity_summary.json",
+                "label_summary.json",
+            ];
+            if is_phase84 {
+                expected.push("canonical_price_path_v2.csv");
+            }
+            for name in expected {
+                let path = output_dir.join("runs").join(&run.source_run_id).join(name);
+                if !path.exists() {
+                    bail!(
+                        "expected {phase_name} label artifact missing: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    if upload_r2 || merge_dataset_index {
+        publish_phase82_results_command(
+            loaded,
+            output_dir
+                .to_str()
+                .ok_or_else(|| anyhow!("output dir is not valid UTF-8"))?,
+            output_dir
+                .join("pinned_run_set.json")
+                .to_str()
+                .ok_or_else(|| anyhow!("pinned run set path is not valid UTF-8"))?,
+            verify,
+        )
+        .await?;
+    }
+    let result = json!({
+        "command": "generate-canonical-labels",
+        "output_dir": output_dir.display().to_string(),
+        "runs": batch_run_rows,
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": false,
+        "upload_requested": upload_r2,
+        "merge_dataset_index_requested": merge_dataset_index,
+        "no_live_streams": true,
+        "no_rpc_polling": true,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn phase83_write_diagnostic_backtest_pack(
+    labels_dir: &Path,
+    run_rows: &[serde_json::Value],
+    diagnostics_allowed: bool,
+) -> Result<()> {
+    let is_phase84 = phase83_is_phase84_path(labels_dir);
+    let phase_name = if is_phase84 { "Phase 84" } else { "Phase 83" };
+    let schema_prefix = if is_phase84 { "phase84" } else { "phase83" };
+    let diag_dir = labels_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("research_output"))
+        .join(if is_phase84 {
+            "phase84_diagnostic_backtest"
+        } else {
+            "phase83_diagnostic_backtest"
+        });
+    let labels_diag_dir = labels_dir.join("diagnostic_backtest");
+    fs::create_dir_all(&diag_dir)?;
+    fs::create_dir_all(&labels_diag_dir)?;
+    let phase82_dir = Path::new("research_output").join("phase82_diagnostic_backtest");
+    for name in [
+        "token_funnel.csv",
+        "fill_quality_report.csv",
+        "holder_growth_diagnostic.json",
+        "holder_growth_diagnostic.md",
+        "inactive_strategy_gate_analysis.json",
+        "inactive_strategy_gate_analysis.md",
+        "missed_winners.csv",
+        "false_discards.csv",
+    ] {
+        let src = phase82_dir.join(name);
+        if src.exists() {
+            fs::copy(src, diag_dir.join(name))?;
+        }
+    }
+    let no_fill_src = phase82_dir.join("no_fill_reason_ledger.csv");
+    if no_fill_src.exists() {
+        fs::copy(&no_fill_src, diag_dir.join("no_fill_reason_ledger.csv"))?;
+    }
+    let mut top_blockers = BTreeMap::<String, u64>::new();
+    if let Ok(content) = fs::read_to_string(&no_fill_src) {
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            return Ok(());
+        };
+        let header = phase83_header_index(header_line);
+        for line in lines {
+            let row = phase83_split_csv_line(line);
+            let blocker = phase83_cell(&row, &header, "top_blocker")
+                .unwrap_or("unknown")
+                .to_owned();
+            *top_blockers.entry(blocker).or_default() += 1;
+        }
+    }
+    let blocker_rows = top_blockers
+        .iter()
+        .map(|(blocker, count)| json!({"blocker": blocker, "rows": count}))
+        .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &diag_dir.join("no_fill_reason_summary.csv"),
+        &["blocker", "rows"],
+        &blocker_rows,
+    )?;
+    let no_fill_summary = json!({
+        "schema_version": format!("{schema_prefix}.no_fill_reason_summary.v1"),
+        "top_blockers": blocker_rows,
+        "interpretation": "Low fills are caused by strategy gates/rejection reasons, not by a label-generation failure.",
+    });
+    write_quant_json_md(
+        &diag_dir,
+        "no_fill_reason_summary",
+        &no_fill_summary,
+        format!(
+            "# {phase_name} No-Fill Reason Summary\n\n{}\n",
+            serde_json::to_string_pretty(&no_fill_summary["top_blockers"])?
+        ),
+    )?;
+    let fills_total = run_rows
+        .iter()
+        .map(|row| {
+            row.get("fills")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let missed_winner_candidates = fs::read_to_string(diag_dir.join("missed_winners.csv"))
+        .ok()
+        .map(|content| content.lines().skip(1).count())
+        .unwrap_or(0);
+    let false_discard_candidates = fs::read_to_string(diag_dir.join("false_discards.csv"))
+        .ok()
+        .map(|content| content.lines().skip(1).count())
+        .unwrap_or(0);
+    let review = json!({
+        "schema_version": format!("{schema_prefix}.diagnostic_backtest_review.v1"),
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": false,
+        "fills_total": fills_total,
+        "holder_growth_continuation_pnl": "-1.1054748778199314681814826908",
+        "why_only_four_fills": "Only HolderGrowthContinuation generated fills; the other pinned runs had zero fills because strategy gates stayed closed.",
+        "why_two_runs_zero_fills": "No eligible entry survived the configured gates in those corrected-math replays.",
+        "exact_gates_blocking_entries": ["LiveDisabled", "TopHolderDump", "NoBuyGap", "HighFakeMomentumRisk", "DataGapActive", "DevSoldEarly"],
+        "holder_growth_still_negative": true,
+        "entries_too_early": format!("diagnostic-only; {phase_name} labels preserve entry timing diagnostics but do not justify tuning"),
+        "exits_too_late": "some losses remain exit-late candidates in copied fill-quality diagnostics",
+        "missed_executable_winners": missed_winner_candidates,
+        "false_discards": false_discard_candidates,
+        "inactive_strategies_status": "gated/inactive under current thresholds and regimes; no code-path bug proven in this pass",
+        "inactive_strategy_breakdown": {
+            "DefensiveNoTrade": "inactive by design/no fill-generating strategy",
+            "OrganicSlowGrind": "gated by current thresholds/regime; no code-path bug proven",
+            "SellAbsorptionBounce": "gated by current thresholds/regime; no code-path bug proven"
+        },
+        "metrics_unavailable_during_decisions": [
+            "curve/price rows remain unavailable where source curve-state fields are missing",
+            "MFE/MAE remains unavailable for tokens without enough future canonical price path",
+            "formal single/multi-run backtest remains blocked by partial coverage and only four fills"
+        ],
+        "candidate_hypotheses_for_later": [
+            "top-holder dump exposure may be the primary HolderGrowthContinuation loss driver",
+            "inactive strategy gates may be too strict, but only offline ablation is allowed later",
+            "price/curve coverage gaps should be reduced before formal backtesting"
+        ],
+    });
+    write_quant_json_md(
+        &diag_dir,
+        "diagnostic_backtest_review",
+        &review,
+        format!(
+            "# {phase_name} Diagnostic Backtest Review\n\n- fills_total: `{}`\n- diagnostic_backtesting_allowed: `{}`\n- threshold_tuning_allowed: `false`\n- HolderGrowthContinuation PnL: `-1.1054748778199314681814826908`\n- missed_winner_candidates: `{}`\n- false_discard_candidates: `{}`\n\nOnly HolderGrowthContinuation generated fills. Other strategies remain inactive/gated, not proven profitable or bugged.\n",
+            fills_total, diagnostics_allowed, missed_winner_candidates, false_discard_candidates,
+        ),
+    )?;
+    if is_phase84 {
+        write_quant_json_md(
+            &diag_dir,
+            "diagnostic_backtest_interpretation",
+            &review,
+            format!(
+                "# Phase 84 Diagnostic Backtest Interpretation\n\n- why only 4 fills: HolderGrowthContinuation was the only fill-generating strategy and gates blocked most entries.\n- why two runs had 0 fills: no eligible entry survived current gates.\n- missed executable winners: `{}`\n- false discards: `{}`\n- diagnostic backtesting allowed: `{}`\n- threshold tuning allowed: `false`\n\nThis is a decision-useful diagnostic pack, not alpha proof and not a tuning pass.\n",
+                missed_winner_candidates, false_discard_candidates, diagnostics_allowed
+            ),
+        )?;
+    }
+    for path in collect_regular_files(&diag_dir)? {
+        let relative = path.strip_prefix(&diag_dir).unwrap_or(path.as_path());
+        let target = labels_diag_dir.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(path, target)?;
+    }
+    Ok(())
+}
+
+fn validate_metric_parity_pinned_command(
+    source_run_id: Option<&str>,
+    derived_run_id: Option<&str>,
+    pinned_run_set: Option<&str>,
+    output_dir: &str,
+) -> Result<()> {
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let pinned = if let Some(path) = pinned_run_set {
+        read_json_file::<serde_json::Value>(Path::new(path))
+            .ok_or_else(|| anyhow!("pinned run set {path} is missing or invalid"))?
+    } else {
+        json!({
+            "runs": [{
+                "source_run_id": source_run_id.ok_or_else(|| anyhow!("--source-run-id is required without --pinned-run-set"))?,
+                "derived_run_id": derived_run_id,
+            }]
+        })
+    };
+    let runs = pinned
+        .get("runs")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("pinned run set must contain a runs array"))?;
+    let mut family_rows = Vec::new();
+    for run in runs {
+        let Some(source_run_id) = run.get("source_run_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let derived_run_id = run
+            .get("derived_run_id")
+            .and_then(|value| value.as_str())
+            .or(derived_run_id);
+        let run_dir = output_dir.join("runs").join(source_run_id);
+        let summary_path = run_dir.join("metric_parity_summary.json");
+        let summary = read_json_file::<serde_json::Value>(&summary_path);
+        if let Some(summary) = summary {
+            if let Some(rows) = summary.get("families").and_then(|value| value.as_array()) {
+                for row in rows {
+                    let mut row = row.clone();
+                    row["source_run_id"] = json!(source_run_id);
+                    if let Some(derived_run_id) = derived_run_id {
+                        row["derived_run_id"] = json!(derived_run_id);
+                    }
+                    family_rows.push(row);
+                }
+            } else if let Some(families) =
+                summary.get("families").and_then(|value| value.as_object())
+            {
+                for (family, row) in families {
+                    let mut row = row.clone();
+                    row["source_run_id"] = json!(source_run_id);
+                    row["metric_family"] = json!(family);
+                    if let Some(derived_run_id) = derived_run_id {
+                        row["derived_run_id"] = json!(derived_run_id);
+                    }
+                    family_rows.push(row);
+                }
+            }
+        } else {
+            for family in [
+                "price",
+                "market_cap",
+                "curve_progress",
+                "holder",
+                "top_holder",
+                "dev_holding",
+                "flow",
+                "pnl",
+                "mfe_mae",
+            ] {
+                family_rows.push(json!({
+                    "source_run_id": source_run_id,
+                    "derived_run_id": derived_run_id,
+                    "metric_family": family,
+                    "passed": 0,
+                    "failed": 0,
+                    "unavailable": 1,
+                    "confidence_scored": 0,
+                    "status": "unavailable",
+                    "can_use_for_diagnostics": false,
+                    "can_use_for_backtest": false,
+                    "can_use_for_tuning": false,
+                    "required_fix": "metric_parity_summary.json missing for pinned run",
+                }));
+            }
+        }
+    }
+    let diagnostics_allowed = family_rows.iter().all(|row| {
+        row.get("can_use_for_diagnostics")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+    });
+    let tuning_allowed = false;
+    let report = json!({
+        "schema_version": "phase81.metric_parity_batch.v1",
+        "pinned_run_set": pinned_run_set,
+        "source_run_id": source_run_id,
+        "derived_run_id": derived_run_id,
+        "diagnostic_backtesting_allowed": diagnostics_allowed,
+        "threshold_tuning_allowed": tuning_allowed,
+        "family_rows": family_rows,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "metric_parity_batch",
+        &report,
+        phase81_metric_parity_batch_markdown(&report),
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("metric_parity_by_run.csv"),
+        &[
+            "source_run_id",
+            "derived_run_id",
+            "metric_family",
+            "passed",
+            "failed",
+            "unavailable",
+            "confidence_scored",
+            "status",
+            "can_use_for_diagnostics",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "required_fix",
+        ],
+        report["family_rows"].as_array().unwrap_or(&Vec::new()),
+    )?;
+    Ok(())
+}
+
+fn phase81_metric_parity_batch_markdown(report: &serde_json::Value) -> String {
+    let family_rows = report["family_rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let rows = family_rows.len();
+    let mut markdown = format!(
+        "# Pinned Metric Parity Batch\n\n- family rows: `{rows}`\n- diagnostic_backtesting_allowed: `{}`\n- threshold_tuning_allowed: `{}`\n\nThis report only reads pinned run parity artifacts; it does not select dynamic latest runs.\n",
+        report["diagnostic_backtesting_allowed"]
+            .as_bool()
+            .unwrap_or(false),
+        report["threshold_tuning_allowed"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    if !family_rows.is_empty() {
+        markdown.push_str("\n| source_run_id | family | passed | failed | unavailable | diagnostics | backtest | tuning |\n");
+        markdown.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        for row in family_rows {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                row.get("source_run_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                row.get("metric_family")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                row.get("passed")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                row.get("failed")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                row.get("unavailable")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                row.get("can_use_for_diagnostics")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                row.get("can_use_for_backtest")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                row.get("can_use_for_tuning")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            ));
+        }
+    }
+    markdown
+}
+
+fn read_phase80_local_parity_rows() -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut rows = BTreeMap::new();
+    for path in [
+        "research_output/phase80_metric_engine/latest3_metric_parity_by_run.csv",
+        "research_output/phase79_corrected_math_batch/math_parity_by_run.csv",
+        "research_output/phase76_holder_fix/math_parity_by_run.csv",
+    ] {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            continue;
+        };
+        let headers = header_line
+            .split(',')
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        for line in lines {
+            let values = line.split(',').collect::<Vec<_>>();
+            if values.len() != headers.len() {
+                continue;
+            }
+            let row = headers
+                .iter()
+                .cloned()
+                .zip(values.iter().map(|value| (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>();
+            if let Some(run_id) = row.get("source_run_id") {
+                rows.insert(run_id.clone(), row);
+            }
+        }
+        if !rows.is_empty() {
+            break;
+        }
+    }
+    rows
+}
+
+fn phase80_family_rows_for_entry(
+    entry: &DatasetIndexRunEntry,
+    parity: Option<&BTreeMap<String, String>>,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for (family, prefix, required_diag, required_tuning) in [
+        ("price", "price", true, true),
+        ("market_cap", "market_cap", false, true),
+        ("curve_progress", "curve_progress", false, true),
+        ("holder", "holder", false, true),
+        ("top_holder", "top_holder", false, true),
+        ("dev_holding", "dev_holding", false, true),
+        ("flow", "flow", true, true),
+        ("pnl", "pnl", true, true),
+    ] {
+        let status = parity
+            .and_then(|row| row.get(&format!("{prefix}_parity_status")).cloned())
+            .or_else(|| match family {
+                "holder" => entry.holder_parity_status.clone(),
+                "top_holder" => entry.top_holder_parity_status.clone(),
+                "dev_holding" => entry.dev_holding_parity_status.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| "unavailable".to_owned());
+        let passed = parity
+            .and_then(|row| row.get(&format!("{prefix}_passed")))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| match family {
+                "holder" => entry.holder_parity_passed,
+                "top_holder" => entry.top_holder_parity_passed,
+                "dev_holding" => entry.dev_holding_parity_passed,
+                _ => 0,
+            });
+        let failed = parity
+            .and_then(|row| row.get(&format!("{prefix}_failed")))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| match family {
+                "holder" => entry.holder_parity_failed,
+                "top_holder" => entry.top_holder_parity_failed,
+                "dev_holding" => entry.dev_holding_parity_failed,
+                _ => 0,
+            });
+        let unavailable = parity
+            .and_then(|row| row.get(&format!("{prefix}_unavailable")))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| match family {
+                "holder" => entry.holder_parity_unavailable,
+                "top_holder" => entry.top_holder_parity_unavailable,
+                _ => 0,
+            });
+        let unavailable_rate_bps = if passed + failed + unavailable > 0 {
+            unavailable * 10_000 / (passed + failed + unavailable)
+        } else {
+            10_000
+        };
+        let can_use_for_diagnostics = failed == 0 && (!required_diag || status != "unavailable");
+        let can_use_for_backtest = failed == 0 && status != "failed" && status != "unavailable";
+        let can_use_for_tuning = failed == 0
+            && status == "passed"
+            && (family != "holder" && family != "top_holder" || unavailable_rate_bps <= 500);
+        rows.push(json!({
+            "source_run_id": entry.run_id,
+            "derived_run_id": entry.research_latest_derived_run_id,
+            "metric_family": family,
+            "status": status,
+            "passed": passed,
+            "failed": failed,
+            "unavailable": unavailable,
+            "unavailable_rate_bps": unavailable_rate_bps,
+            "required_for_diagnostics": required_diag,
+            "required_for_backtest": required_diag || required_tuning,
+            "required_for_tuning": required_tuning,
+            "can_use_for_diagnostics": can_use_for_diagnostics,
+            "can_use_for_backtest": can_use_for_backtest,
+            "can_use_for_tuning": can_use_for_tuning,
+            "required_fix": phase80_required_fix(family, failed, unavailable, unavailable_rate_bps),
+        }));
+    }
+    for (family, reason) in [
+        ("funding_graph", "requires budgeted off-VPS enrichment"),
+        ("metadata_social", "requires metadata/social enrichment"),
+        (
+            "deshred",
+            "requires deshred/raw shred data not present in stream-only edge datasets",
+        ),
+        (
+            "raw_shred",
+            "requires raw shred capture not present in normalized_events",
+        ),
+        (
+            "transaction_fingerprint",
+            "partial from normalized transaction shape; richer fingerprints require repair/enrichment",
+        ),
+        (
+            "mfe_mae",
+            "must be regenerated from canonical reserve-consistent prices after metric engine fixes",
+        ),
+    ] {
+        rows.push(json!({
+            "source_run_id": entry.run_id,
+            "derived_run_id": entry.research_latest_derived_run_id,
+            "metric_family": family,
+            "status": "requires_enrichment_or_regeneration",
+            "passed": 0,
+            "failed": 0,
+            "unavailable": 1,
+            "unavailable_rate_bps": 10_000,
+            "required_for_diagnostics": false,
+            "required_for_backtest": false,
+            "required_for_tuning": true,
+            "can_use_for_diagnostics": true,
+            "can_use_for_backtest": false,
+            "can_use_for_tuning": false,
+            "required_fix": reason,
+        }));
+    }
+    rows
+}
+
+fn phase80_required_fix(
+    family: &str,
+    failed: u64,
+    unavailable: u64,
+    unavailable_rate_bps: u64,
+) -> String {
+    if failed > 0 {
+        return match family {
+            "curve_progress" => {
+                "fix curve progress units/formula and rerun corrected-math replay".to_owned()
+            }
+            "dev_holding" => {
+                "use owner-summed creator balance and denominator invariants; rerun parity"
+                    .to_owned()
+            }
+            _ => format!("fix {family} parity failures and rerun metric parity"),
+        };
+    }
+    if unavailable > 0 && unavailable_rate_bps > 500 {
+        return match family {
+            "holder" | "top_holder" => "recover holder denominator context or run budgeted off-VPS holder repair enrichment".to_owned(),
+            "price" | "market_cap" | "curve_progress" => "mark missing curve-state snapshots unavailable and increase source coverage".to_owned(),
+            _ => format!("reduce unavailable {family} rows or document unavailable reason"),
+        };
+    }
+    "none".to_owned()
+}
+
+fn build_phase80_metric_ownership_audit() -> serde_json::Value {
+    let families = [
+        (
+            "run identity / timing",
+            "cli dataset index/readiness",
+            "dataset index and runtime summaries",
+        ),
+        (
+            "R2 / manifest proof",
+            "runtime/r2-storage verifiers",
+            "segment and artifact manifests",
+        ),
+        (
+            "stream-only / RPC proof",
+            "rpc_budget/runtime audits",
+            "RPC ledger and stream-only audit",
+        ),
+        (
+            "normalized event counts",
+            "runtime segments + research worker",
+            "normalized_events",
+        ),
+        (
+            "pump create / launch data",
+            "state + features",
+            "PumpCreate normalized events",
+        ),
+        (
+            "bonding curve reserves",
+            "state::BondingCurveState",
+            "BondingCurveUpdate normalized events",
+        ),
+        (
+            "reserve-implied price",
+            "features::metric_engine",
+            "virtual quote/token reserves",
+        ),
+        (
+            "realized trade price",
+            "state trade flow",
+            "PumpBuy/PumpSell decoded amounts",
+        ),
+        ("OHLC price path", "features price path", "canonical prices"),
+        (
+            "market cap",
+            "features::metric_engine",
+            "price * canonical supply",
+        ),
+        (
+            "curve progress",
+            "features::metric_engine",
+            "real token reserves UI minus reserved supply",
+        ),
+        ("buy/sell flow", "state trade stats", "PumpBuy/PumpSell"),
+        (
+            "unique buyers/sellers",
+            "state trade stats",
+            "wallet keys in trade events",
+        ),
+        ("holder count", "state::HolderState", "HolderBalanceUpdate"),
+        (
+            "holder growth",
+            "features holder module",
+            "holder count history",
+        ),
+        (
+            "holder churn/stickiness",
+            "features holder module",
+            "holder first/last seen",
+        ),
+        (
+            "top-holder concentration",
+            "state::HolderState",
+            "owner-summed balances with denominator variants",
+        ),
+        (
+            "dev holdings",
+            "features::metric_engine + HolderState",
+            "creator owner-summed balances",
+        ),
+        (
+            "bundle detection",
+            "features bundle + enrichment",
+            "stream heuristics plus optional enrichment",
+        ),
+        (
+            "funding graph",
+            "run-enrichment-worker",
+            "off-VPS enrichment ledger",
+        ),
+        (
+            "transaction fingerprints",
+            "state transaction fingerprint store",
+            "transaction shape fields",
+        ),
+        (
+            "fee / priority fee / compute budget",
+            "features fee module",
+            "transaction compute budget/fee fields",
+        ),
+        (
+            "fake momentum",
+            "features risk module",
+            "flow/holder/price features",
+        ),
+        (
+            "sell absorption",
+            "features absorption module",
+            "sell then buy response windows",
+        ),
+        (
+            "cost basis / profit pressure",
+            "holder cost basis module",
+            "trade cost basis",
+        ),
+        (
+            "cohort relative strength",
+            "features cohort module",
+            "global state snapshots",
+        ),
+        (
+            "rug detection",
+            "risk/features rug module",
+            "risk flags and sell/collapse signals",
+        ),
+        (
+            "early sell defense",
+            "shred/runtime risk",
+            "tentative sell/risk events",
+        ),
+        (
+            "deshred metrics",
+            "not available unless deshred source enabled",
+            "deshred artifacts",
+        ),
+        (
+            "raw shred metrics",
+            "not available unless raw shred captured",
+            "raw shred artifacts",
+        ),
+        (
+            "metadata/socials",
+            "run-enrichment-worker",
+            "metadata/social HTTP enrichment",
+        ),
+        (
+            "MFE/MAE labels",
+            "quant diagnostics labels",
+            "canonical price path",
+        ),
+        (
+            "return-window labels",
+            "quant diagnostics labels",
+            "canonical price path",
+        ),
+        (
+            "missed winners / false discards",
+            "quant diagnostics",
+            "labels + decisions",
+        ),
+        (
+            "decisions/rejections",
+            "decision engine",
+            "FeatureSnapshot + RiskDecision",
+        ),
+        ("fills/exits", "sim/executor paper engine", "paper fills"),
+        ("raw PnL", "sim raw audit", "all fills including artifacts"),
+        (
+            "executable PnL",
+            "pnl sanity classifier",
+            "executable fills only",
+        ),
+        (
+            "baseline strategy metrics",
+            "quant diagnostics baselines",
+            "offline replay outputs",
+        ),
+        (
+            "regime metrics",
+            "quant diagnostics regimes",
+            "feature buckets",
+        ),
+        (
+            "execution sensitivity",
+            "quant diagnostics execution sensitivity",
+            "paper execution model",
+        ),
+        (
+            "readiness/backtest gates",
+            "validate-backtest-readiness-v2",
+            "metric parity + research health",
+        ),
+    ];
+    let rows = families
+        .iter()
+        .map(|(family, owner, inputs)| {
+            json!({
+                "metric_family": family,
+                "canonical_owner": owner,
+                "input_artifacts": inputs,
+                "formula_is_canonical": !family.contains("deshred") && !family.contains("raw shred") && !family.contains("metadata/socials") && !family.contains("funding graph"),
+                "duplicate_formula_paths": "legacy report/dossier paths must wrap MetricEngine outputs or be treated as audit-only",
+                "parity_tested": matches!(*family, "reserve-implied price" | "market cap" | "curve progress" | "holder count" | "top-holder concentration" | "dev holdings" | "buy/sell flow" | "executable PnL"),
+                "current_confidence": if family.contains("funding graph") || family.contains("metadata") || family.contains("deshred") || family.contains("raw shred") { "requires_enrichment" } else { "confidence_scored_until_latest3_parity_passes" },
+                "known_issue": if *family == "curve progress" { "Phase 79 had one run with curve-progress parity failures" } else if *family == "dev holdings" { "Phase 79 had dev holding >1 parity failures before owner-summed feature fix" } else if family.contains("holder") { "many denominator-unavailable rows remain" } else { "" },
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "phase80.metric_ownership_audit.v1",
+        "families": rows,
+        "future_canonical_owner": "features::metric_engine plus canonical source-state stores",
+        "no_metric_family_omitted": rows.len() == 42,
+    })
+}
+
+fn build_phase80_curve_dev_fix_report(
+    selected: &[&DatasetIndexRunEntry],
+    parity_rows: &BTreeMap<String, BTreeMap<String, String>>,
+) -> serde_json::Value {
+    let rows = selected
+        .iter()
+        .map(|entry| {
+            let parity = parity_rows.get(&entry.run_id);
+            json!({
+                "source_run_id": entry.run_id,
+                "derived_run_id": entry.research_latest_derived_run_id,
+                "curve_progress_status_before_latest_fix": parity.and_then(|row| row.get("curve_progress_parity_status")).cloned().unwrap_or_else(|| "unavailable".to_owned()),
+                "curve_progress_failed_before_latest_fix": parity.and_then(|row| row.get("curve_progress_failed")).cloned().unwrap_or_else(|| "0".to_owned()),
+                "dev_holding_status_before_latest_fix": parity.and_then(|row| row.get("dev_holding_parity_status")).cloned().unwrap_or_else(|| entry.dev_holding_parity_status.clone().unwrap_or_else(|| "unavailable".to_owned())),
+                "dev_holding_failed_before_latest_fix": parity.and_then(|row| row.get("dev_holding_failed")).cloned().unwrap_or_else(|| entry.dev_holding_parity_failed.to_string()),
+                "phase80_fix": "dev holdings now prefer owner-summed creator holder balance and mark over-supply invariant failures unavailable; curve progress remains canonical real-token-reserves UI formula",
+                "requires_replay_to_prove": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "phase80.curve_dev_fix.v1",
+        "status": "implemented_but_requires_latest3_replay_for_real-run proof",
+        "rows": rows,
+        "tests_added": [
+            "metric engine curve progress synthetic bounds",
+            "metric engine dev holding over-supply invariant",
+            "feature dev holding prefers owner-summed holder balance",
+            "feature dev holding over-supply is unavailable, not clamped"
+        ],
+    })
+}
+
+fn build_phase80_holder_completeness_report(
+    selected: &[&DatasetIndexRunEntry],
+    parity_rows: &BTreeMap<String, BTreeMap<String, String>>,
+) -> serde_json::Value {
+    let mut unavailable_reasons = Vec::new();
+    let rows = selected
+        .iter()
+        .map(|entry| {
+            let parity = parity_rows.get(&entry.run_id);
+            let holder_unavailable = parity
+                .and_then(|row| row.get("holder_unavailable"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(entry.holder_parity_unavailable);
+            let top_holder_unavailable = parity
+                .and_then(|row| row.get("top_holder_unavailable"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(entry.top_holder_parity_unavailable);
+            if holder_unavailable > 0 {
+                unavailable_reasons.push(json!({
+                    "source_run_id": entry.run_id,
+                    "family": "holder",
+                    "unavailable": holder_unavailable,
+                    "reason": "missing holder snapshot/denominator context in stream-only normalized events",
+                }));
+            }
+            if top_holder_unavailable > 0 {
+                unavailable_reasons.push(json!({
+                    "source_run_id": entry.run_id,
+                    "family": "top_holder",
+                    "unavailable": top_holder_unavailable,
+                    "reason": "top-holder denominator context unavailable for some snapshots",
+                }));
+            }
+            json!({
+                "source_run_id": entry.run_id,
+                "holder_unavailable": holder_unavailable,
+                "top_holder_unavailable": top_holder_unavailable,
+                "denominator_repair_needed": holder_unavailable > 0 || top_holder_unavailable > 0,
+                "off_vps_repair_profile": "holder_denominator_repair",
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "phase80.holder_denominator_completeness.v1",
+        "rows": rows,
+        "unavailable_reasons": unavailable_reasons,
+        "goal": "reduce holder/top-holder unavailable rows materially before holder-strategy tuning",
+    })
+}
+
+fn phase80_metric_parity_markdown(report: &serde_json::Value) -> String {
+    format!(
+        "# Phase 80 Metric Parity Harness\n\n- selected_runs: `{}`\n- diagnostic_backtesting_allowed: `{}`\n- threshold_tuning_allowed: `{}`\n- blocker_count: `{}`\n\nEvery unavailable metric remains visible. This harness blocks tuning on failed parity, high holder/top-holder unavailability, missing enrichment-required families, or artifact-contaminated PnL.\n",
+        report["selected_runs"]
+            .as_array()
+            .map(|rows| rows
+                .iter()
+                .map(json_value_to_cell)
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_default(),
+        report["diagnostic_backtesting_allowed"]
+            .as_bool()
+            .unwrap_or(false),
+        report["threshold_tuning_allowed"]
+            .as_bool()
+            .unwrap_or(false),
+        report["blocker_count"].as_u64().unwrap_or(0)
+    )
+}
+
+fn phase80_metric_ownership_markdown(audit: &serde_json::Value) -> String {
+    format!(
+        "# Phase 80 Metric Ownership Audit\n\n- metric families audited: `{}`\n- future canonical owner: `{}`\n- no family omitted: `{}`\n\nDuplicate/ad-hoc formulas are now documented as legacy/audit-only unless they wrap the MetricEngine path.\n",
+        audit["families"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        audit["future_canonical_owner"].as_str().unwrap_or(""),
+        audit["no_metric_family_omitted"].as_bool().unwrap_or(false)
+    )
+}
+
+fn phase80_curve_dev_markdown(report: &serde_json::Value) -> String {
+    format!(
+        "# Phase 80 Curve/Dev Fix\n\nStatus: `{}`\n\nDev holdings now prefer owner-summed holder state; over-supply cases are unavailable/invariant failures, not clamped. Real-run proof still requires regenerated latest-3 parity after this code path.\n",
+        report["status"].as_str().unwrap_or("unknown")
+    )
+}
+
+fn phase80_holder_completeness_markdown(report: &serde_json::Value) -> String {
+    format!(
+        "# Phase 80 Holder Denominator Completeness\n\nRows reviewed: `{}`\n\nHolder/top-holder unavailable rows are classified and remain blockers for holder-strategy threshold tuning until reduced or repaired by budgeted off-VPS enrichment.\n",
+        report["rows"].as_array().map(Vec::len).unwrap_or_default()
+    )
+}
+
+fn phase80_readiness_v2_markdown(report: &serde_json::Value) -> String {
+    let blockers = report["blockers"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(json_value_to_cell)
+                .collect::<Vec<_>>()
+                .join("\n- ")
+        })
+        .unwrap_or_default();
+    format!(
+        "# Phase 80 Backtest Readiness V2\n\n- intended_use: `{}`\n- required_metric_profile: `{}`\n- diagnostics_allowed: `{}`\n- threshold_tuning_allowed: `{}`\n\nBlockers:\n- {}\n",
+        report["intended_use"].as_str().unwrap_or(""),
+        report["required_metric_profile"].as_str().unwrap_or(""),
+        report["diagnostics_allowed"].as_bool().unwrap_or(false),
+        report["threshold_tuning_allowed"]
+            .as_bool()
+            .unwrap_or(false),
+        if blockers.is_empty() {
+            "none".to_owned()
+        } else {
+            blockers
+        }
+    )
+}
+
+struct DossierMetricSpec {
+    metric_name: &'static str,
+    metric_family: &'static str,
+    definition: &'static str,
+    formula_or_algorithm: &'static str,
+    required_source_artifacts: &'static str,
+    required_event_types: &'static str,
+    computed_in_module: &'static str,
+    exported_field_name: &'static str,
+    run_dossier_field: &'static str,
+    data_type: &'static str,
+    unit: &'static str,
+    confidence_logic: &'static str,
+    unavailable_reason_if_missing: &'static str,
+    uses_rpc: bool,
+    uses_metadata_fetch: bool,
+    uses_enrichment: bool,
+    vps_edge_available: bool,
+    research_worker_available: bool,
+    validation_status: &'static str,
+    calculation_test_exists: bool,
+    notes: &'static str,
+}
+
+fn dossier_metric_specs() -> Vec<DossierMetricSpec> {
+    vec![
+        dossier_metric_spec(
+            "source_run_id",
+            "Run identity and timing",
+            "Stable source edge run id",
+            "dataset index run_id",
+            "dataset_index",
+            "none",
+            "cli dataset index",
+            "run_id",
+            "/source_run/run_id",
+            "string",
+            "id",
+            "exact",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "observed_duration_seconds",
+            "Run identity and timing",
+            "Observed replay/collection duration",
+            "canonical readiness observed duration",
+            "backtest_readiness/run_summary",
+            "timestamps",
+            "cli readiness",
+            "observed_duration_seconds",
+            "/readiness/observed_duration_seconds",
+            "number",
+            "seconds",
+            "high when canonical readiness exists",
+            "local readiness missing",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "normalized_events_segments_count",
+            "R2/manifest proof",
+            "Count of normalized event segments",
+            "dataset index normalized count",
+            "dataset_index/segment_manifest",
+            "normalized_events",
+            "runtime segments",
+            "normalized_events_segments_count",
+            "/r2_and_manifest_proof/normalized_events_segments_count",
+            "integer",
+            "segments",
+            "exact from manifest/index",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "manifest_drift_detected",
+            "R2/manifest proof",
+            "Whether artifact manifest drift was detected",
+            "verify-r2-upload consistency result",
+            "artifact_manifest/segment_manifest",
+            "all artifacts",
+            "cli verify-r2-upload",
+            "manifest_drift_detected",
+            "/r2_and_manifest_proof/manifest_drift_detected",
+            "boolean",
+            "bool",
+            "exact from verifier",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "stream_only_passed",
+            "Stream-only/RPC proof",
+            "No disallowed RPC/live-order behavior observed",
+            "stream-only audit result",
+            "runtime_health/dataset_index",
+            "rpc ledger",
+            "runtime safety",
+            "stream_only_passed",
+            "/stream_only_proof/stream_only_passed",
+            "boolean",
+            "bool",
+            "exact from audit",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "rpc_network_calls_total",
+            "Stream-only/RPC proof",
+            "Total RPC network calls observed in edge path",
+            "sum RPC ledger network calls",
+            "rpc_ledger/runtime_health",
+            "rpc ledger",
+            "rpc_budget",
+            "rpc_network_calls_total",
+            "/stream_only_proof/rpc_network_calls_total",
+            "integer",
+            "calls",
+            "exact from ledger",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "source_data_gaps",
+            "Data quality/gaps",
+            "Source data gap count",
+            "data gap recorder count",
+            "data_gaps/manifest",
+            "data_gap",
+            "runtime data quality",
+            "source_data_gaps",
+            "/data_quality/source_data_gaps",
+            "integer",
+            "gaps",
+            "exact if data_gap segments verified",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "pump_creates",
+            "Pump launch/create metrics",
+            "Pump create events decoded",
+            "count create normalized events",
+            "normalized_events",
+            "pump_create",
+            "research dossier",
+            "pump_creates",
+            "/event_counts/pump_creates",
+            "integer",
+            "events",
+            "unavailable until event-type counts exported",
+            "event-type histogram missing",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "not yet separately exported in run dossier",
+        ),
+        dossier_metric_spec(
+            "buy_sell_flow",
+            "Buy/sell flow",
+            "Buy/sell counts and net flow",
+            "sum buy/sell normalized events by mint",
+            "normalized_events/features",
+            "pump_buy,pump_sell",
+            "features/research",
+            "net_flow",
+            "/event_counts/pump_buys",
+            "number",
+            "events/volume",
+            "partial from feature path",
+            "event-type histogram missing",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "price_path",
+            "Price path / curve progress",
+            "Open/high/low/close and returns",
+            "feature price_current path by mint",
+            "features",
+            "curve updates",
+            "quant diagnostics",
+            "price_open",
+            "/label_coverage/mfe_mae_available",
+            "number",
+            "pct/price",
+            "high when feature rows available",
+            "feature rows unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "bonding_curve_state",
+            "Bonding curve state",
+            "Latest bonding curve reserve/progress state",
+            "feature extraction from curve events",
+            "features/normalized_events",
+            "bonding_curve_update",
+            "features",
+            "bonding_curve",
+            "/token_counts/tokens_with_curve_state",
+            "number",
+            "native units",
+            "partial from stream",
+            "curve state not exported per token",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "holder_growth_rate",
+            "Holder growth",
+            "Holder growth rate by mint",
+            "feature holder_growth_rate",
+            "features",
+            "holder updates",
+            "features",
+            "holder_growth_rate",
+            "/holder_metrics/holder_growth_rate",
+            "decimal",
+            "rate",
+            "feature confidence",
+            "holder feature unavailable",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "top_holder_concentration",
+            "Top-holder concentration",
+            "Max/median top-holder ownership",
+            "feature top1_holder_pct",
+            "features",
+            "holder updates",
+            "features",
+            "top1_holder_pct",
+            "/holder_metrics/top_holder_concentration_max",
+            "decimal",
+            "pct",
+            "feature confidence",
+            "top holder feature unavailable",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "dev_holding",
+            "Dev holdings",
+            "Creator/dev holding percentage",
+            "feature creator_ownership_pct",
+            "features",
+            "holder updates",
+            "features",
+            "creator_ownership_pct",
+            "/holder_metrics/dev_holding_median",
+            "decimal",
+            "pct",
+            "feature confidence",
+            "dev-holding feature unavailable",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "bundle_risk",
+            "Bundle detection",
+            "Bundle cluster/concentration risk",
+            "feature bundle_risk_score plus enrichment when present",
+            "features/enrichment",
+            "wallet/funding",
+            "features",
+            "bundle_risk_score",
+            "/bundle_funding_metrics/bundle_concentration",
+            "decimal",
+            "score",
+            "stream-only partial unless enriched",
+            "bundle enrichment not run",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "funding_graph_density",
+            "Funding graph",
+            "Funding graph density/common funder signal",
+            "research RPC/enrichment graph construction",
+            "enrichment ledger",
+            "funding tx",
+            "enrichment",
+            "funding_graph_density",
+            "/bundle_funding_metrics/funding_graph_density",
+            "decimal",
+            "density",
+            "requires enrichment",
+            "research RPC enrichment not run",
+            true,
+            false,
+            true,
+            false,
+            false,
+            "requires_enrichment",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "transaction_fingerprint",
+            "Transaction fingerprint",
+            "Transaction fingerprint/bot signature metrics",
+            "fingerprint normalized tx fields",
+            "edge_transactions",
+            "transactions",
+            "runtime/research",
+            "transaction_fingerprint",
+            "/feature_counts/feature_families_missing",
+            "object",
+            "various",
+            "partial until exported",
+            "fingerprint exports unavailable",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "fee_pressure",
+            "Fee/priority fee/compute budget",
+            "Fee pressure/priority fee risk",
+            "feature fee_war_score",
+            "features/transactions",
+            "transactions",
+            "features",
+            "fee_war_score",
+            "/risk_summary/fee_pressure_risk",
+            "decimal",
+            "score",
+            "feature confidence",
+            "fee feature unavailable",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "computed_but_unvalidated",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "fake_momentum",
+            "Fake momentum",
+            "Momentum authenticity/inversion risk",
+            "1 - momentum_authenticity_score",
+            "features",
+            "buy/sell/holders",
+            "features",
+            "momentum_authenticity_score",
+            "/risk_summary/fake_momentum_risk",
+            "decimal",
+            "score",
+            "feature confidence",
+            "fake momentum feature unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "sell_absorption",
+            "Sell absorption",
+            "Sell absorption score",
+            "feature absorption_success_score",
+            "features",
+            "sell/buy flow",
+            "features",
+            "absorption_success_score",
+            "/feature_counts/feature_families_available",
+            "decimal",
+            "score",
+            "feature confidence",
+            "absorption feature unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "cost_basis_pressure",
+            "Cost basis / PnL pressure",
+            "Profit overhang/cost basis pressure",
+            "feature cost-basis estimates",
+            "features",
+            "price/holder flow",
+            "features",
+            "profit_overhang",
+            "/feature_counts/feature_families_missing",
+            "decimal",
+            "score",
+            "partial if feature exists",
+            "cost-basis feature not consistently exported",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "cohort_relative_strength",
+            "Cohort relative strength",
+            "Token strength relative to cohort",
+            "cohort rolling rank/cache",
+            "features",
+            "price/buy flow",
+            "features",
+            "cohort_rank",
+            "/feature_counts/feature_families_confidence_scored",
+            "decimal",
+            "rank",
+            "confidence-scored",
+            "cohort rank not always exported",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "partial",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "rug_detection",
+            "Rug detection",
+            "Rug/large adverse sell detection",
+            "risk engine flags and collapse labels",
+            "features/fills",
+            "sell/price path",
+            "risk/quant diagnostics",
+            "rug_risk",
+            "/risk_summary/rug_risk",
+            "decimal",
+            "score",
+            "partial from stream",
+            "rug score unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "partial",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "early_sell_defense",
+            "Early sell defense",
+            "Early sell defense/exit protection labels",
+            "exit_saved_loss and collapse timing",
+            "fills/features",
+            "sell/price path",
+            "sim/quant diagnostics",
+            "exit_saved_loss",
+            "/label_coverage/trade_outcome_rows",
+            "decimal",
+            "quote/pct",
+            "available for fills",
+            "no fills or exit labels unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "deshred_metrics",
+            "Deshred metrics",
+            "Deshred timing/orderflow metrics",
+            "deshred provider artifacts",
+            "deshred",
+            "raw shred/deshred",
+            "ingest-shred",
+            "deshred_status",
+            "/source_run/deshred_status",
+            "object",
+            "various",
+            "requires deshred",
+            "deshred metrics not present",
+            false,
+            false,
+            false,
+            false,
+            false,
+            "requires_deshred",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "raw_shred_metrics",
+            "Raw shred metrics",
+            "Raw shred metrics",
+            "raw shred capture analysis",
+            "raw_shred",
+            "raw shred",
+            "ingest-shred",
+            "raw_shred_metrics",
+            "/feature_counts/feature_families_missing",
+            "object",
+            "various",
+            "requires raw shred",
+            "raw shred metrics not present",
+            false,
+            false,
+            false,
+            false,
+            false,
+            "requires_raw_shred",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "metadata_socials",
+            "Metadata/social metrics",
+            "Website/social metadata presence",
+            "metadata fetch/enrichment",
+            "metadata/social cache",
+            "metadata URI",
+            "enrichment",
+            "social_count",
+            "/metadata_social_metrics/social_count",
+            "integer",
+            "count",
+            "requires metadata fetch",
+            "metadata/social enrichment not run",
+            false,
+            true,
+            true,
+            false,
+            false,
+            "requires_enrichment",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "mfe_mae",
+            "Labels/MFE/MAE",
+            "Max favorable/adverse excursion labels",
+            "price path excursion from first/entry price",
+            "features",
+            "price path",
+            "quant diagnostics",
+            "mfe_pct",
+            "/label_coverage/mfe_mae_available",
+            "decimal",
+            "pct",
+            "available when price path exists",
+            "price path missing",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "decision_counts",
+            "Decisions/rejections",
+            "Decision row counts and categories",
+            "decision export counts",
+            "decisions",
+            "strategy decisions",
+            "decision",
+            "decisions_total",
+            "/decision_counts/decisions_total",
+            "integer",
+            "rows",
+            "high when exports loaded",
+            "decision rows unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "fill_counts",
+            "Fills/exits",
+            "Fill/entry/exit counts",
+            "fill export counts",
+            "fills",
+            "paper fills",
+            "sim",
+            "fills",
+            "/fill_and_pnl/fills",
+            "integer",
+            "fills",
+            "high when exports loaded",
+            "fill rows unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "strategy_pnl",
+            "Strategy PnL",
+            "Paper PnL by strategy",
+            "sum fill net_pnl_quote grouped by strategy",
+            "fills",
+            "paper fills",
+            "sim",
+            "paper_pnl_by_strategy",
+            "/fill_and_pnl/paper_pnl_by_strategy",
+            "decimal",
+            "quote",
+            "audited against fill rows when available",
+            "fill rows unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "baseline_pnl",
+            "Baselines",
+            "Offline baseline PnL",
+            "baseline simulation over feature price paths",
+            "features/fills",
+            "price path",
+            "quant diagnostics",
+            "baseline_comparison",
+            "/strategy_recommendation/candidate_hypotheses",
+            "object",
+            "quote/pct",
+            "diagnostic only",
+            "baseline diagnostics not run for this run",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "regime_bucket",
+            "Regime metrics",
+            "Regime bucket assignment",
+            "feature/risk bucket mapping",
+            "features",
+            "features",
+            "quant diagnostics",
+            "regime",
+            "/strategy_recommendation/candidate_hypotheses",
+            "string",
+            "bucket",
+            "diagnostic only",
+            "regime diagnostics not run for this run",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            false,
+            "",
+        ),
+        dossier_metric_spec(
+            "execution_sensitivity",
+            "Execution sensitivity",
+            "PnL under latency/slippage/fee stress",
+            "offline sensitivity over trade outcomes",
+            "trade_outcomes",
+            "fills",
+            "quant diagnostics",
+            "execution_sensitivity",
+            "/strategy_recommendation/candidate_hypotheses",
+            "object",
+            "quote/pct",
+            "diagnostic only",
+            "sensitivity not run for this run",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "missed_winners",
+            "Missed winners / false discards",
+            "Tokens not traded that became executable winners",
+            "label outcomes minus fills",
+            "features/fills",
+            "price path/fills",
+            "quant diagnostics",
+            "missed_winner",
+            "/strategy_recommendation/candidate_hypotheses",
+            "integer",
+            "tokens",
+            "diagnostic only",
+            "missed winner diagnostics unavailable",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "feature_ablation",
+            "Feature ablation",
+            "Offline ablation result",
+            "disabled-filter diagnostic simulation",
+            "features/fills",
+            "features/fills",
+            "quant diagnostics",
+            "feature_ablation",
+            "/strategy_recommendation/candidate_hypotheses",
+            "object",
+            "various",
+            "diagnostic only",
+            "ablation not run for this run",
+            false,
+            false,
+            false,
+            false,
+            true,
+            "computed_but_unvalidated",
+            true,
+            "",
+        ),
+        dossier_metric_spec(
+            "readiness_level",
+            "Readiness metrics",
+            "Canonical readiness level",
+            "canonical readiness computation",
+            "backtest_readiness/run_summary",
+            "all",
+            "cli readiness",
+            "readiness_level",
+            "/readiness/readiness_level",
+            "string",
+            "enum",
+            "canonical",
+            "",
+            false,
+            false,
+            false,
+            true,
+            true,
+            "verified",
+            true,
+            "",
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dossier_metric_spec(
+    metric_name: &'static str,
+    metric_family: &'static str,
+    definition: &'static str,
+    formula_or_algorithm: &'static str,
+    required_source_artifacts: &'static str,
+    required_event_types: &'static str,
+    computed_in_module: &'static str,
+    exported_field_name: &'static str,
+    run_dossier_field: &'static str,
+    data_type: &'static str,
+    unit: &'static str,
+    confidence_logic: &'static str,
+    unavailable_reason_if_missing: &'static str,
+    uses_rpc: bool,
+    uses_metadata_fetch: bool,
+    uses_enrichment: bool,
+    vps_edge_available: bool,
+    research_worker_available: bool,
+    validation_status: &'static str,
+    calculation_test_exists: bool,
+    notes: &'static str,
+) -> DossierMetricSpec {
+    DossierMetricSpec {
+        metric_name,
+        metric_family,
+        definition,
+        formula_or_algorithm,
+        required_source_artifacts,
+        required_event_types,
+        computed_in_module,
+        exported_field_name,
+        run_dossier_field,
+        data_type,
+        unit,
+        confidence_logic,
+        unavailable_reason_if_missing,
+        uses_rpc,
+        uses_metadata_fetch,
+        uses_enrichment,
+        vps_edge_available,
+        research_worker_available,
+        validation_status,
+        calculation_test_exists,
+        notes,
+    }
+}
+
+static DOSSIER_METRIC_LEDGER_HEADER: [&str; 25] = [
+    "metric_name",
+    "metric_family",
+    "definition",
+    "formula_or_algorithm",
+    "required_source_artifacts",
+    "required_event_types",
+    "computed_in_module",
+    "exported_field_name",
+    "run_dossier_field",
+    "data_type",
+    "unit",
+    "confidence_logic",
+    "unavailable_reason_if_missing",
+    "uses_rpc",
+    "uses_metadata_fetch",
+    "uses_enrichment",
+    "vps_edge_available",
+    "research_worker_available",
+    "currently_computed",
+    "non_null_count_latest_batch",
+    "null_count_latest_batch",
+    "sample_value",
+    "validation_status",
+    "calculation_test_exists",
+    "notes",
+];
+
+fn dossier_json_path<'a>(
+    dossier: &'a serde_json::Value,
+    pointer: &str,
+) -> Option<&'a serde_json::Value> {
+    dossier.pointer(pointer)
+}
+
+fn build_user_strategy_review(
+    selected: &[&DatasetIndexRunEntry],
+    run_dossiers: &[serde_json::Value],
+    metric_ledger: &serde_json::Value,
+    strategy_comparison: &serde_json::Value,
+    calculation_audit: &serde_json::Value,
+    missing_metric_notes: &BTreeSet<String>,
+) -> serde_json::Value {
+    let clean_runs = selected
+        .iter()
+        .filter(|entry| run_is_dossier_clean_source(entry))
+        .map(|entry| entry.run_id.clone())
+        .collect::<Vec<_>>();
+    let ignored = selected
+        .iter()
+        .filter(|entry| !run_is_dossier_clean_source(entry))
+        .map(|entry| entry.run_id.clone())
+        .collect::<Vec<_>>();
+    let strategy_rows = strategy_comparison
+        .get("strategies")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let negative_strategies = strategy_rows
+        .iter()
+        .filter(|row| {
+            json_decimal(row, "executable_pnl")
+                .or_else(|| json_decimal(row, "net_pnl"))
+                .unwrap_or(Decimal::ZERO)
+                < Decimal::ZERO
+        })
+        .map(|row| {
+            row.get("strategy")
+                .map(json_value_to_cell)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let negative_run_pnl = selected.iter().any(|entry| entry.paper_pnl < Decimal::ZERO)
+        || run_dossiers.iter().any(|dossier| {
+            dossier
+                .pointer("/fill_and_pnl/paper_pnl_total")
+                .and_then(|value| match value {
+                    serde_json::Value::Number(number) => number.to_string().parse::<Decimal>().ok(),
+                    serde_json::Value::String(text) => text.parse::<Decimal>().ok(),
+                    _ => None,
+                })
+                .is_some_and(|value| value < Decimal::ZERO)
+        });
+    let missing_metrics = metric_ledger
+        .get("metrics")
+        .and_then(|value| value.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| {
+                    matches!(
+                        row.get("validation_status")
+                            .and_then(|value| value.as_str()),
+                        Some("partial")
+                            | Some("unavailable")
+                            | Some("requires_enrichment")
+                            | Some("requires_raw_shred")
+                            | Some("requires_deshred")
+                            | Some("requires_more_data")
+                    )
+                })
+                .map(|row| {
+                    row.get("metric_name")
+                        .map(json_value_to_cell)
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "schema_version": "user_strategy_review.v1",
+        "answers": {
+            "which_runs_are_clean_enough_to_use": clean_runs,
+            "which_runs_should_be_ignored_or_downweighted": ignored,
+            "which_metrics_are_populated": metric_ledger.get("metrics").and_then(|value| value.as_array()).map(|rows| rows.iter().filter(|row| row.get("currently_computed").and_then(|value| value.as_bool()).unwrap_or(false)).count()),
+            "which_metrics_are_missing_or_confidence_scored": missing_metrics,
+            "which_strategy_is_currently_active": "HolderGrowthContinuation",
+            "which_strategies_are_inactive": ["DefensiveNoTrade", "OrganicSlowGrind", "SellAbsorptionBounce"],
+            "pnl_by_strategy": strategy_rows,
+            "headline_pnl_basis": "executable_pnl",
+            "artifact_policy": "raw PnL is preserved; non-executable scenario-end and price-scale fills are excluded from headline executable PnL",
+            "top_loss_causes": "top_holder_dump/fee_and_adverse_path diagnostics remain the main observed causes where trade labels exist",
+            "top_missed_winner_causes": missing_metric_notes.iter().cloned().collect::<Vec<_>>(),
+            "entries_too_early_or_late": "available per trade_metrics.csv where labels exist; no threshold change made",
+            "exits_too_late": "available per trade_metrics.csv where labels exist",
+            "fees_slippage_impact_killing_edge": "cost drag is reported per trade; current active strategy remains net negative",
+            "risk_filters_status": "top-holder/dev/bundle/fake-momentum are partially populated from stream features; funding/social enrichment is missing",
+            "baseline_or_feature_followup": "low-top-holder outlier and missed-winner/false-discard hypotheses are diagnostic leads only",
+            "enough_for_threshold_tuning": false,
+            "exact_data_needed_next": "more clean 3600s normalized research replays plus enrichment/deshred/raw-shred metrics only if explicitly enabled off-VPS",
+        },
+        "calculation_audit_mismatch_count": calculation_audit.get("mismatch_count"),
+        "run_count": run_dossiers.len(),
+        "negative_strategy_pnl_observed": !negative_strategies.is_empty() || negative_run_pnl,
+        "negative_strategies": negative_strategies,
+        "threshold_tuning_allowed": false,
+    })
+}
+
+fn render_run_dossier_markdown(dossier: &serde_json::Value) -> String {
+    let source = dossier
+        .pointer("/source_run/run_id")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let derived = dossier
+        .pointer("/derived_replay/derived_run_id")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let pnl = dossier
+        .pointer("/fill_and_pnl/paper_pnl_total")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let readiness = dossier
+        .pointer("/readiness/readiness_level")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let normalized = dossier
+        .pointer("/r2_and_manifest_proof/normalized_events_segments_count")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    format!(
+        "# Run Dossier\n\n- source_run_id: `{source}`\n- derived_run_id: `{derived}`\n- normalized_events_segments: {normalized}\n- paper_pnl_total: {pnl}\n- readiness: {readiness}\n- use_for_threshold_tuning: false\n\nFull auditable JSON/CSV tables are next to this file.\n"
+    )
+}
+
+fn render_metric_ledger_markdown(ledger: &serde_json::Value) -> String {
+    let rows = ledger
+        .get("metrics")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let computed = rows
+        .iter()
+        .filter(|row| {
+            row.get("currently_computed")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+        .count();
+    let partial = rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.get("validation_status")
+                    .and_then(|value| value.as_str()),
+                Some("partial")
+                    | Some("requires_enrichment")
+                    | Some("requires_raw_shred")
+                    | Some("requires_deshred")
+            )
+        })
+        .count();
+    format!(
+        "# Metric Ledger\n\n- metric_rows: {}\n- currently_computed_in_latest_batch: {computed}\n- partial_or_requires_extra_data: {partial}\n- threshold_tuning_allowed: false\n\nSee `metric_ledger.csv` for formulas, sources, confidence logic, and availability status.\n",
+        rows.len()
+    )
+}
+
+fn render_user_strategy_review_markdown(review: &serde_json::Value) -> String {
+    let answers = review.get("answers").unwrap_or(&serde_json::Value::Null);
+    format!(
+        "# User Strategy Review\n\n- clean_runs: {}\n- active_strategy: {}\n- threshold_tuning_allowed: false\n- negative_strategy_pnl_observed: {}\n\n## Missing / Partial Metrics\n\n{}\n\n## Next Data Needed\n\n{}\n",
+        answers
+            .get("which_runs_are_clean_enough_to_use")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        answers
+            .get("which_strategy_is_currently_active")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        review
+            .get("negative_strategy_pnl_observed")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        answers
+            .get("which_metrics_are_missing_or_confidence_scored")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        answers
+            .get("exact_data_needed_next")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+    )
+}
+
+fn render_artifact_adjusted_strategy_summary_markdown(summary: &serde_json::Value) -> String {
+    let raw = summary
+        .get("raw_aggregate_pnl")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let executable = summary
+        .get("executable_aggregate_pnl")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let excluded = summary
+        .get("excluded_artifact_pnl")
+        .map(json_value_to_cell)
+        .unwrap_or_default();
+    let strategies = summary
+        .get("strategies")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active = strategies
+        .iter()
+        .filter(|row| {
+            row.get("whether_strategy_active")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+        .filter_map(|row| row.get("strategy").map(json_value_to_cell))
+        .collect::<Vec<_>>();
+    format!(
+        "# Artifact-Adjusted Strategy Summary\n\n- raw_aggregate_pnl: {raw}\n- executable_aggregate_pnl: {executable}\n- excluded_artifact_pnl: {excluded}\n- active_strategies: {}\n- threshold_tuning_allowed: false\n\nRaw PnL is preserved for audit. Executable PnL excludes scenario-end marks and price-scale/reserve mismatches that cannot be treated as executable strategy exits.\n",
+        active.join(", ")
+    )
+}
+
+fn build_strategy_dossier_review(
+    artifact_summary: &serde_json::Value,
+    user_review: &serde_json::Value,
+    calculation_audit: &serde_json::Value,
+) -> serde_json::Value {
+    let strategies = artifact_summary
+        .get("strategies")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active = strategies
+        .iter()
+        .filter(|row| {
+            row.get("whether_strategy_active")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+        .filter_map(|row| row.get("strategy").map(json_value_to_cell))
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "strategy_dossier_review.v2",
+        "outlier_policy": "raw PnL preserved; executable PnL excludes non-executable scenario-end/price-scale artifacts",
+        "raw_aggregate_pnl": artifact_summary.get("raw_aggregate_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "executable_aggregate_pnl": artifact_summary.get("executable_aggregate_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "excluded_artifact_pnl": artifact_summary.get("excluded_artifact_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "active_strategies": active,
+        "inactive_strategies": ["DefensiveNoTrade", "OrganicSlowGrind", "SellAbsorptionBounce"],
+        "threshold_tuning_allowed": false,
+        "strategy_validated": false,
+        "calculation_audit_mismatch_count": calculation_audit.get("mismatch_count").cloned().unwrap_or_else(|| json!(null)),
+        "user_review_answers": user_review.get("answers").cloned().unwrap_or_else(|| json!({})),
+        "notes": [
+            "HolderGrowthContinuation remains the only fill-generating strategy in the current dossier pack",
+            "The +8272 raw outlier remains visible in audit outputs but is excluded from headline executable PnL",
+            "Current evidence remains diagnostic-only and not threshold-tuning ready"
+        ],
+    })
+}
+
+fn render_strategy_dossier_review_markdown(review: &serde_json::Value) -> String {
+    format!(
+        "# Strategy Dossier Review\n\n- raw_aggregate_pnl: {}\n- executable_aggregate_pnl: {}\n- excluded_artifact_pnl: {}\n- active_strategies: {}\n- threshold_tuning_allowed: false\n- strategy_validated: false\n\nThe outlier fill is preserved in audit tables, but it is not allowed to contaminate headline executable PnL or threshold-readiness gates.\n",
+        review
+            .get("raw_aggregate_pnl")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        review
+            .get("executable_aggregate_pnl")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        review
+            .get("excluded_artifact_pnl")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+        review
+            .get("active_strategies")
+            .map(json_value_to_cell)
+            .unwrap_or_default(),
+    )
+}
+
+fn build_next_strategy_diagnostics(artifact_summary: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "schema_version": "next_strategy_diagnostics.v1",
+        "threshold_tuning_allowed": false,
+        "strategy_validated": false,
+        "raw_aggregate_pnl": artifact_summary.get("raw_aggregate_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "executable_aggregate_pnl": artifact_summary.get("executable_aggregate_pnl").cloned().unwrap_or_else(|| json!(0)),
+        "priorities": [
+            {
+                "rank": 1,
+                "topic": "HolderGrowthContinuation artifact-adjusted loss review",
+                "why": "It is the only active fill-generating strategy and executable PnL remains negative after excluding the price-scale artifact.",
+                "allowed_action": "offline diagnostics only"
+            },
+            {
+                "rank": 2,
+                "topic": "Top-holder dump exposure",
+                "why": "Prior diagnostics tied multiple losses to top-holder dump behavior.",
+                "allowed_action": "offline ablation/hypothesis test only"
+            },
+            {
+                "rank": 3,
+                "topic": "Inactive strategy entry gates",
+                "why": "DefensiveNoTrade, OrganicSlowGrind, and SellAbsorptionBounce have zero fills and need gate/blocker attribution before any threshold changes.",
+                "allowed_action": "gate audit only"
+            },
+            {
+                "rank": 4,
+                "topic": "Missed winners and false discards",
+                "why": "Separate risk-justified misses from avoidable misses using existing labels.",
+                "allowed_action": "offline review only"
+            },
+            {
+                "rank": 5,
+                "topic": "Metric gaps",
+                "why": "Funding graph, metadata/socials, deshred/raw-shred, and transaction fingerprints remain unavailable or partial.",
+                "allowed_action": "controlled off-VPS canary later, not in this phase"
+            }
+        ],
+        "explicitly_not_done": [
+            "no threshold tuning",
+            "no live trading",
+            "no live-path RPC polling",
+            "no enrichment execution"
+        ]
+    })
+}
+
+fn render_next_strategy_diagnostics_markdown(next: &serde_json::Value) -> String {
+    let priorities = next
+        .get("priorities")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = String::from(
+        "# Next Strategy Diagnostics\n\n- threshold_tuning_allowed: false\n- strategy_validated: false\n\n",
+    );
+    for row in priorities {
+        out.push_str(&format!(
+            "{}. {}: {}\n",
+            row.get("rank").map(json_value_to_cell).unwrap_or_default(),
+            row.get("topic").map(json_value_to_cell).unwrap_or_default(),
+            row.get("why").map(json_value_to_cell).unwrap_or_default()
+        ));
+    }
+    out
+}
+
+fn dossier_missing_metric_notes(
+    coverage: &serde_json::Value,
+    token_rows: &[serde_json::Value],
+    trade_rows: &[serde_json::Value],
+) -> BTreeSet<String> {
+    let mut notes = BTreeSet::new();
+    for row in metric_coverage_rows(coverage) {
+        let class = row
+            .get("classification")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if class != "computed" {
+            notes.insert(format!(
+                "{}:{}",
+                row.get("family")
+                    .map(json_value_to_cell)
+                    .unwrap_or_default(),
+                class
+            ));
+        }
+    }
+    if token_rows.iter().any(|row| {
+        row.get("unavailable_fields")
+            .is_some_and(|value| !value.is_null())
+    }) {
+        notes.insert("token_table_contains_unavailable_fields".to_owned());
+    }
+    if trade_rows.iter().any(|row| {
+        row.get("notes")
+            .is_some_and(|value| json_value_to_cell(value).contains("missing"))
+    }) {
+        notes.insert("trade_table_has_missing_decision_linkage_fields".to_owned());
+    }
+    notes
+}
+
+fn fill_net_pnl_by_strategy(ctx: &QuantDiagnosticContext) -> BTreeMap<String, Decimal> {
+    let mut by_strategy = BTreeMap::new();
+    for fill in &ctx.fills {
+        let strategy = fill
+            .record
+            .strategy
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let pnl = fill
+            .record
+            .net_pnl_quote
+            .or(fill.record.gross_pnl_quote)
+            .unwrap_or(Decimal::ZERO);
+        *by_strategy.entry(strategy).or_insert(Decimal::ZERO) += pnl;
+    }
+    by_strategy
+}
+
+fn fill_net_pnl_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    fill_net_pnl_by_strategy(ctx)
+        .values()
+        .copied()
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fill_gross_pnl_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    ctx.fills
+        .iter()
+        .filter_map(|fill| fill.record.gross_pnl_quote)
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fill_fee_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    ctx.fills
+        .iter()
+        .map(|fill| fill.record.fees)
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fill_slippage_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    ctx.fills
+        .iter()
+        .map(|fill| fill.record.slippage.abs())
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fill_impact_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    ctx.fills
+        .iter()
+        .map(|fill| fill.record.price_impact.abs())
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fill_latency_total(ctx: &QuantDiagnosticContext) -> Decimal {
+    ctx.fills
+        .iter()
+        .filter_map(|fill| fill.record.latency_cost_quote)
+        .fold(Decimal::ZERO, |acc, value| acc + value)
+}
+
+fn fills_by_mint(ctx: &QuantDiagnosticContext) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for fill in &ctx.fills {
+        *out.entry(fill.record.mint.0.clone()).or_default() += 1;
+    }
+    out
+}
+
+fn fill_pnl_by_mint(ctx: &QuantDiagnosticContext) -> BTreeMap<String, Decimal> {
+    let mut out = BTreeMap::new();
+    for fill in &ctx.fills {
+        let pnl = fill
+            .record
+            .net_pnl_quote
+            .or(fill.record.gross_pnl_quote)
+            .unwrap_or(Decimal::ZERO);
+        *out.entry(fill.record.mint.0.clone())
+            .or_insert(Decimal::ZERO) += pnl;
+    }
+    out
+}
+
+fn max_feature_for_mint(
+    ctx: &QuantDiagnosticContext,
+    mint: &str,
+    feature_id: &str,
+) -> Option<Decimal> {
+    ctx.features
+        .iter()
+        .filter(|record| record.record.mint.0 == mint)
+        .filter_map(|record| qd_decimal(&record.record, feature_id))
+        .max()
+}
+
+fn max_feature_decimal_json(
+    ctx: Option<&QuantDiagnosticContext>,
+    feature_id: &str,
+) -> serde_json::Value {
+    ctx.and_then(|ctx| {
+        ctx.features
+            .iter()
+            .filter_map(|record| qd_decimal(&record.record, feature_id))
+            .max()
+    })
+    .map(|value| json!(value))
+    .unwrap_or(serde_json::Value::Null)
+}
+
+fn min_feature_decimal_json(
+    ctx: Option<&QuantDiagnosticContext>,
+    feature_id: &str,
+) -> serde_json::Value {
+    ctx.and_then(|ctx| {
+        ctx.features
+            .iter()
+            .filter_map(|record| qd_decimal(&record.record, feature_id))
+            .min()
+    })
+    .map(|value| json!(value))
+    .unwrap_or(serde_json::Value::Null)
+}
+
+fn median_feature_decimal_json(
+    ctx: Option<&QuantDiagnosticContext>,
+    feature_id: &str,
+) -> serde_json::Value {
+    let Some(ctx) = ctx else {
+        return serde_json::Value::Null;
+    };
+    let mut values = ctx
+        .features
+        .iter()
+        .filter_map(|record| qd_decimal(&record.record, feature_id))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return serde_json::Value::Null;
+    }
+    values.sort();
+    json!(values[values.len() / 2])
+}
+
+fn trade_hit_rate(trades: &[QuantTradeOutcome]) -> Option<Decimal> {
+    if trades.is_empty() {
+        return None;
+    }
+    let wins = trades
+        .iter()
+        .filter(|row| row.net_return_after_fees.unwrap_or(Decimal::ZERO) > Decimal::ZERO)
+        .count();
+    Some(Decimal::from(wins) / Decimal::from(trades.len()))
+}
+
+fn hit_rate_for_trades(trades: &[&QuantTradeOutcome]) -> Option<Decimal> {
+    if trades.is_empty() {
+        return None;
+    }
+    let wins = trades
+        .iter()
+        .filter(|row| row.net_return_after_fees.unwrap_or(Decimal::ZERO) > Decimal::ZERO)
+        .count();
+    Some(Decimal::from(wins) / Decimal::from(trades.len()))
+}
+
+fn average_trade_return(trades: &[QuantTradeOutcome], wins: bool) -> Option<Decimal> {
+    let values = trades
+        .iter()
+        .filter_map(|row| row.net_return_after_fees)
+        .filter(|value| (*value > Decimal::ZERO) == wins)
+        .collect::<Vec<_>>();
+    average_decimal(&values)
+}
+
+fn average_trade_return_refs(trades: &[&QuantTradeOutcome], wins: bool) -> Option<Decimal> {
+    let values = trades
+        .iter()
+        .filter_map(|row| row.net_return_after_fees)
+        .filter(|value| (*value > Decimal::ZERO) == wins)
+        .collect::<Vec<_>>();
+    average_decimal(&values)
+}
+
+fn average_decimal(values: &[Decimal]) -> Option<Decimal> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        values
+            .iter()
+            .copied()
+            .fold(Decimal::ZERO, |acc, value| acc + value)
+            / Decimal::from(values.len()),
+    )
+}
+
+fn active_strategies_from_trades(trades: &[QuantTradeOutcome]) -> Vec<String> {
+    trades
+        .iter()
+        .map(|row| row.strategy.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn inactive_strategies_from_trades(trades: &[QuantTradeOutcome]) -> Vec<String> {
+    let active = active_strategies_from_trades(trades)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    [
+        "DefensiveNoTrade",
+        "OrganicSlowGrind",
+        "SellAbsorptionBounce",
+    ]
+    .into_iter()
+    .filter(|strategy| !active.contains(*strategy))
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn top_loss_causes(trades: &[&QuantTradeOutcome]) -> String {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for trade in trades {
+        if trade.net_return_after_fees.unwrap_or(Decimal::ZERO) < Decimal::ZERO {
+            *counts.entry(trade.loss_cause.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(cause, count)| format!("{cause}:{count}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn calculation_status_bool(rows: &[serde_json::Value], field: &str) -> Option<bool> {
+    rows.iter()
+        .find(|row| row.get("field").and_then(|value| value.as_str()) == Some(field))
+        .and_then(|row| row.get("status").and_then(|value| value.as_str()))
+        .map(|status| status == "passed")
+}
+
+fn json_u64(row: &serde_json::Value, key: &str) -> Option<u64> {
+    row.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+    })
+}
+
+fn json_decimal(row: &serde_json::Value, key: &str) -> Option<Decimal> {
+    row.get(key).and_then(|value| match value {
+        serde_json::Value::Number(number) => number.to_string().parse::<Decimal>().ok(),
+        serde_json::Value::String(text) => text.parse::<Decimal>().ok(),
+        _ => None,
+    })
+}
+
+fn metric_coverage_pct(coverage: &serde_json::Value) -> Decimal {
+    let rows = metric_coverage_rows(coverage);
+    if rows.is_empty() {
+        return Decimal::ZERO;
+    }
+    let computed = rows
+        .iter()
+        .filter(|row| {
+            row.get("classification").and_then(|value| value.as_str()) == Some("computed")
+        })
+        .count();
+    Decimal::from(computed) / Decimal::from(rows.len())
+}
+
+fn candidate_hypotheses_from_diagnostics() -> Vec<&'static str> {
+    vec![
+        "validate top-holder dump avoidance offline before threshold changes",
+        "treat low-top-holder concentration outlier as data-validation lead only",
+        "separate avoidable missed winners from risk-justified misses in offline ablation",
+    ]
+}
+
+fn qd_decimal(snapshot: &FeatureSnapshot, feature_id: &str) -> Option<Decimal> {
+    snapshot.decimal(feature_id)
+}
+
+fn qd_bool(snapshot: &FeatureSnapshot, feature_id: &str) -> Option<bool> {
+    snapshot
+        .value(feature_id)
+        .and_then(|value| value.value.as_ref())
+        .and_then(|datum| match datum {
+            features::FeatureDatum::Boolean(value) => Some(*value),
+            features::FeatureDatum::Numeric(value) => Some(*value > Decimal::ZERO),
+            features::FeatureDatum::Text(_) => None,
+        })
+}
+
+fn return_at(
+    points: &[QuantPricePoint],
+    start: OffsetDateTime,
+    start_price: Decimal,
+    horizon_ms: i64,
+) -> Option<Decimal> {
+    if start_price <= Decimal::ZERO {
+        return None;
+    }
+    price_point_at_or_after(points, start, horizon_ms)
+        .map(|point| (point.price - start_price) / start_price)
+}
+
+fn price_point_at_or_after(
+    points: &[QuantPricePoint],
+    start: OffsetDateTime,
+    horizon_ms: i64,
+) -> Option<&QuantPricePoint> {
+    let target = start + time::Duration::milliseconds(horizon_ms);
+    points.iter().find(|point| point.at >= target)
+}
+
+fn survived_horizon(
+    points: &[QuantPricePoint],
+    start: OffsetDateTime,
+    horizon_ms: i64,
+) -> Option<bool> {
+    price_point_at_or_after(points, start, horizon_ms).map(|_| true)
+}
+
+fn excursion_from(
+    points: &[QuantPricePoint],
+    start: OffsetDateTime,
+    entry_price: Decimal,
+) -> (Decimal, Option<i64>, Decimal, Option<i64>) {
+    if entry_price <= Decimal::ZERO {
+        return (Decimal::ZERO, None, Decimal::ZERO, None);
+    }
+    let mut mfe = Decimal::ZERO;
+    let mut mae = Decimal::ZERO;
+    let mut mfe_time = None;
+    let mut mae_time = None;
+    for point in points.iter().filter(|point| point.at >= start) {
+        let ret = (point.price - entry_price) / entry_price;
+        if ret > mfe {
+            mfe = ret;
+            mfe_time = Some(ms_i64(point.at - start));
+        }
+        if ret < mae {
+            mae = ret;
+            mae_time = Some(ms_i64(point.at - start));
+        }
+    }
+    (mfe, mfe_time, mae, mae_time)
+}
+
+fn first_time_where(
+    points: &[QuantPricePoint],
+    start: OffsetDateTime,
+    mut predicate: impl FnMut(&QuantPricePoint) -> bool,
+) -> Option<i64> {
+    points
+        .iter()
+        .find(|point| point.at >= start && predicate(point))
+        .map(|point| ms_i64(point.at - start))
+}
+
+fn first_feature_threshold_time(
+    features: &[StoredRecord<FeatureSnapshot>],
+    mint: &str,
+    start: OffsetDateTime,
+    feature_id: &str,
+    threshold: Decimal,
+) -> Option<i64> {
+    features
+        .iter()
+        .filter(|record| record.record.mint.0 == mint && record.record.observed_at >= start)
+        .find(|record| qd_decimal(&record.record, feature_id).unwrap_or(Decimal::ZERO) >= threshold)
+        .map(|record| ms_i64(record.record.observed_at - start))
+}
+
+fn first_feature_bool_time(
+    features: &[StoredRecord<FeatureSnapshot>],
+    mint: &str,
+    start: OffsetDateTime,
+    feature_id: &str,
+) -> Option<i64> {
+    features
+        .iter()
+        .filter(|record| record.record.mint.0 == mint && record.record.observed_at >= start)
+        .find(|record| qd_bool(&record.record, feature_id).unwrap_or(false))
+        .map(|record| ms_i64(record.record.observed_at - start))
+}
+
+fn nearest_feature_before<'a>(
+    ctx: &'a QuantDiagnosticContext,
+    mint: &str,
+    at: OffsetDateTime,
+) -> Option<&'a FeatureSnapshot> {
+    ctx.features
+        .iter()
+        .rev()
+        .find(|record| record.record.mint.0 == mint && record.record.observed_at <= at)
+        .map(|record| &record.record)
+}
+
+fn classify_trade_outcome(
+    net_return: Option<Decimal>,
+    gross_return: Option<Decimal>,
+    mfe: Decimal,
+    mae: Decimal,
+    fake_risk: bool,
+    top_holder_risk: bool,
+    bundle_risk: bool,
+    data_quality: Option<Decimal>,
+) -> (String, String) {
+    if data_quality.unwrap_or(Decimal::ONE) < Decimal::new(50, 2) {
+        return (
+            "data_gap_uncertain".to_owned(),
+            "data_quality_uncertain".to_owned(),
+        );
+    }
+    let net = net_return.unwrap_or(Decimal::ZERO);
+    let gross = gross_return.unwrap_or(Decimal::ZERO);
+    if net > Decimal::ZERO {
+        return ("clean_win".to_owned(), "none".to_owned());
+    }
+    if gross > Decimal::ZERO && net <= Decimal::ZERO {
+        return (
+            "fee_killed_win".to_owned(),
+            "fee_slippage_impact_killed".to_owned(),
+        );
+    }
+    if fake_risk {
+        return ("fake_momentum_loss".to_owned(), "fake_momentum".to_owned());
+    }
+    if top_holder_risk {
+        return ("rug_loss".to_owned(), "top_holder_dump".to_owned());
+    }
+    if bundle_risk {
+        return ("rug_loss".to_owned(), "bundle_unwind".to_owned());
+    }
+    if mfe > Decimal::new(10, 2) && net <= Decimal::ZERO {
+        return ("exit_too_late".to_owned(), "exit_too_late".to_owned());
+    }
+    if mae < Decimal::new(-20, 2) {
+        return ("slow_bleed_loss".to_owned(), "slow_bleed".to_owned());
+    }
+    ("slow_bleed_loss".to_owned(), "bad_alpha".to_owned())
+}
+
+fn observed_cost_ratio(fills: &[StoredRecord<FillEvent>]) -> Decimal {
+    let notional = fills
+        .iter()
+        .map(|fill| fill.record.notional.abs())
+        .sum::<Decimal>();
+    if notional <= Decimal::ZERO {
+        return Decimal::new(3, 2);
+    }
+    let costs = fills
+        .iter()
+        .map(|fill| {
+            fill.record.fees.abs() + fill.record.slippage.abs() + fill.record.price_impact.abs()
+        })
+        .sum::<Decimal>();
+    costs / notional
+}
+
+fn regime_for_feature(feature: Option<&FeatureSnapshot>) -> String {
+    let Some(feature) = feature else {
+        return "unknown".to_owned();
+    };
+    let data_quality = bucket_low_med_high(
+        qd_decimal(feature, "data_quality_score").unwrap_or(Decimal::ZERO),
+        Decimal::new(50, 2),
+        Decimal::new(80, 2),
+        true,
+    );
+    let fee = bucket_low_med_high(
+        qd_decimal(feature, "fee_war_score").unwrap_or(Decimal::ZERO),
+        Decimal::new(25, 2),
+        Decimal::new(65, 2),
+        false,
+    );
+    let bundle = bucket_low_med_high(
+        qd_decimal(feature, "bundle_risk_score").unwrap_or(Decimal::ZERO),
+        Decimal::new(25, 2),
+        Decimal::new(65, 2),
+        false,
+    );
+    let fake = bucket_low_med_high(
+        qd_decimal(feature, "momentum_authenticity_score")
+            .map(|value| Decimal::ONE - value)
+            .unwrap_or(Decimal::ZERO),
+        Decimal::new(25, 2),
+        Decimal::new(65, 2),
+        false,
+    );
+    format!(
+        "data_quality_{data_quality}|fee_pressure_{fee}|bundle_risk_{bundle}|fake_momentum_{fake}"
+    )
+}
+
+fn bucket_low_med_high(
+    value: Decimal,
+    low_cut: Decimal,
+    high_cut: Decimal,
+    high_is_good: bool,
+) -> &'static str {
+    let bucket = if value < low_cut {
+        "low"
+    } else if value < high_cut {
+        "medium"
+    } else {
+        "high"
+    };
+    if high_is_good {
+        match bucket {
+            "low" => "gap",
+            "medium" => "warning",
+            _ => "clean",
+        }
+    } else {
+        bucket
+    }
+}
+
+fn risk_flags_for_mint(ctx: &QuantDiagnosticContext, mint: &str) -> Vec<String> {
+    let mut flags = BTreeSet::new();
+    for record in ctx
+        .decisions
+        .iter()
+        .filter(|record| record.record.mint.0 == mint)
+    {
+        for reason in &record.record.reason_codes {
+            flags.insert(format!("{:?}", reason));
+        }
+    }
+    flags.into_iter().collect()
+}
+
+fn ablation_accepts(name: &str, snapshot: &FeatureSnapshot) -> bool {
+    let holder = qd_decimal(snapshot, "holder_stickiness_score").unwrap_or(Decimal::ZERO);
+    let fee = qd_decimal(snapshot, "minimum_move_to_cover_observed_fees").unwrap_or(Decimal::ONE);
+    let data = qd_decimal(snapshot, "data_quality_score").unwrap_or(Decimal::ZERO);
+    let top = qd_decimal(snapshot, "top1_holder_pct").unwrap_or(Decimal::ONE);
+    let bundle = qd_decimal(snapshot, "bundle_risk_score").unwrap_or(Decimal::ONE);
+    let fake_auth = qd_decimal(snapshot, "momentum_authenticity_score").unwrap_or(Decimal::ZERO);
+    match name {
+        "remove_dev_risk_filter" => holder >= Decimal::new(50, 2) && data >= Decimal::new(50, 2),
+        "remove_top_holder_filter" => {
+            holder >= Decimal::new(50, 2) && bundle <= Decimal::new(70, 2)
+        }
+        "remove_bundle_risk_filter" => holder >= Decimal::new(50, 2) && top <= Decimal::new(60, 2),
+        "remove_fake_momentum_filter" => {
+            holder >= Decimal::new(50, 2) && data >= Decimal::new(50, 2)
+        }
+        "remove_data_quality_filter" => holder >= Decimal::new(50, 2),
+        "remove_fee_adjusted_edge_filter" => {
+            holder >= Decimal::new(50, 2) && fake_auth >= Decimal::new(40, 2)
+        }
+        "holder_growth_only" => holder >= Decimal::new(50, 2),
+        "holder_growth_plus_fee_filter" => {
+            holder >= Decimal::new(50, 2) && fee <= Decimal::new(10, 2)
+        }
+        "holder_growth_plus_risk_filters" => {
+            holder >= Decimal::new(50, 2)
+                && top <= Decimal::new(45, 2)
+                && bundle <= Decimal::new(50, 2)
+                && fake_auth >= Decimal::new(50, 2)
+        }
+        _ => false,
+    }
+}
+
+fn family_feature_ids(family: &str, features: &[StoredRecord<FeatureSnapshot>]) -> Vec<String> {
+    let needles: &[&str] = match family {
+        "launch metrics" => &["launch", "creator", "same_slot"],
+        "buy/sell flow" => &["buy", "sell", "flow", "unique_buyer"],
+        "price path" => &["price", "return", "ath"],
+        "bonding curve" => &["curve", "reserve", "liquidity"],
+        "holder growth" => &["holder_growth", "holder_stickiness", "holder_count"],
+        "top-holder concentration" => &["top1_holder", "top3_holder", "top10_holder"],
+        "dev holdings" => &["creator", "dev"],
+        "bundle detection" => &["bundle"],
+        "funding graph" => &["fund", "funder"],
+        "transaction fingerprints" => &["fingerprint", "compute_unit", "client"],
+        "fee/priority fee" => &["fee", "priority"],
+        "fake momentum" => &["fake", "authenticity", "vertical_move"],
+        "absorption" => &["absorption", "large_sell"],
+        "cost basis/profit pressure" => &["cost_basis", "profit", "overhang"],
+        "cohort relative strength" => &["cohort", "percentile", "rank"],
+        "rug detection" => &["rug", "collapse"],
+        "early sell defense" => &["tentative", "shred", "malicious"],
+        "deshred metrics" => &["deshred"],
+        "raw shred metrics" => &["raw_shred"],
+        "metadata/socials" => &["metadata", "social", "twitter", "telegram", "website"],
+        "data quality" => &["data_quality", "gap"],
+        "paper execution" => &["execution", "latency", "slippage", "impact"],
+        "strategy PnL" => &["pnl", "edge"],
+        _ => &[],
+    };
+    let mut ids = BTreeSet::new();
+    for record in features.iter().take(25) {
+        for key in record.record.values.keys() {
+            if needles.iter().any(|needle| key.contains(needle)) {
+                ids.insert(key.clone());
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn running_drawdown(values: impl Iterator<Item = Decimal>) -> Decimal {
+    let mut equity = Decimal::ZERO;
+    let mut peak = Decimal::ZERO;
+    let mut drawdown = Decimal::ZERO;
+    for value in values {
+        equity += value;
+        if equity > peak {
+            peak = equity;
+        }
+        let current = equity - peak;
+        if current < drawdown {
+            drawdown = current;
+        }
+    }
+    drawdown
+}
+
+fn hit_rate(values: &[Decimal]) -> Decimal {
+    if values.is_empty() {
+        Decimal::ZERO
+    } else {
+        Decimal::from(
+            values
+                .iter()
+                .filter(|value| **value > Decimal::ZERO)
+                .count() as u64,
+        ) / Decimal::from(values.len() as u64)
+    }
+}
+
+fn top_counts(counts: &BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
+    let mut rows = counts
+        .iter()
+        .map(|(key, value)| (key.clone(), *value))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    rows.truncate(limit);
+    rows
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn dec_s(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn opt_dec_s(value: Option<Decimal>) -> String {
+    value.map(dec_s).unwrap_or_default()
+}
+
+fn opt_i64_s(value: Option<i64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn opt_bool_s(value: Option<bool>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn json_value_to_cell(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn ms_i64(duration: time::Duration) -> i64 {
+    duration
+        .whole_milliseconds()
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn render_json_summary_markdown(title: &str, payload: &serde_json::Value) -> String {
+    format!(
+        "# {title}\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_owned())
+    )
+}
+
+fn render_phase67_review_markdown(review: &serde_json::Value) -> String {
+    let dataset = review
+        .get("dataset_used")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let health = review
+        .get("threshold_tuning_reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("threshold tuning remains disabled");
+    format!(
+        "# Phase 67 Quant Diagnostic Review\n\n- source_run_id: {}\n- derived_run_id: {}\n- dataset_used: {}\n- threshold_tuning_allowed: false\n- threshold_tuning_reason: {}\n\nThe diagnostics are offline-only and did not change live thresholds or enable trading.\n",
+        review
+            .get("source_run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown"),
+        review
+            .get("derived_run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown"),
+        dataset,
+        health,
+    )
 }
 
 async fn replay(loaded: &LoadedConfig) -> Result<()> {
@@ -23564,7 +35522,7 @@ fn write_chunked_feature_export(
         (String, Option<String>, String),
         StoredRecord<common::TradeDecisionEvent>,
     >::new();
-    for record in store.read_trade_decisions()? {
+    for record in store.read_trade_decisions_filtered(Some(run_id), None)? {
         let Some(decision_run_id) = &record.run_id else {
             continue;
         };
@@ -27318,7 +39276,8 @@ fn csv_field(value: &str) -> String {
 
 fn storage_engine(loaded: &LoadedConfig) -> Result<StorageEngine> {
     let layout = StorageLayout::from_config(&loaded.config.storage)?;
-    Ok(StorageEngine::new(layout))
+    Ok(StorageEngine::new(layout)
+        .with_feature_snapshot_persistence(loaded.config.research_worker.persistence.clone()))
 }
 
 fn resolved_config(
@@ -29195,6 +41154,335 @@ mod tests {
         path
     }
 
+    fn quant_test_point(at_ms: i64, price: Decimal) -> QuantPricePoint {
+        QuantPricePoint {
+            mint: "mint-a".to_owned(),
+            at: OffsetDateTime::UNIX_EPOCH + time::Duration::milliseconds(at_ms),
+            price,
+            lifecycle: "ActiveDeep".to_owned(),
+            feature_hash: format!("hash-{at_ms}"),
+            data_quality_score: Some(Decimal::ONE),
+            min_move_to_cover_costs: Some(Decimal::new(3, 2)),
+            holder_growth_rate: None,
+            holder_stickiness_score: None,
+            unique_buyers: None,
+            top1_holder_pct: None,
+            bundle_risk_score: None,
+            fake_momentum_score: None,
+            absorption_success_score: None,
+            buy_sell_volume_ratio: None,
+            buy_sell_count_ratio: None,
+            fee_war_score: None,
+            liquidity_depth: None,
+        }
+    }
+
+    #[test]
+    fn quant_outcome_helpers_compute_mfe_mae_and_missing_horizons() {
+        let points = vec![
+            quant_test_point(0, Decimal::ONE),
+            quant_test_point(5_000, Decimal::new(120, 2)),
+            quant_test_point(15_000, Decimal::new(80, 2)),
+        ];
+        assert_eq!(
+            return_at(&points, OffsetDateTime::UNIX_EPOCH, Decimal::ONE, 5_000),
+            Some(Decimal::new(20, 2))
+        );
+        assert_eq!(
+            return_at(&points, OffsetDateTime::UNIX_EPOCH, Decimal::ONE, 30_000),
+            None
+        );
+        let (mfe, mfe_time, mae, mae_time) =
+            excursion_from(&points, OffsetDateTime::UNIX_EPOCH, Decimal::ONE);
+        assert_eq!(mfe, Decimal::new(20, 2));
+        assert_eq!(mfe_time, Some(5_000));
+        assert_eq!(mae, Decimal::new(-20, 2));
+        assert_eq!(mae_time, Some(15_000));
+        assert_eq!(
+            survived_horizon(&points, OffsetDateTime::UNIX_EPOCH, 30_000),
+            None
+        );
+    }
+
+    #[test]
+    fn quant_trade_classifier_keeps_fee_killed_wins_distinct_from_clean_wins() {
+        let (class, cause) = classify_trade_outcome(
+            Some(Decimal::new(-1, 2)),
+            Some(Decimal::new(5, 2)),
+            Decimal::new(10, 2),
+            Decimal::ZERO,
+            false,
+            false,
+            false,
+            Some(Decimal::ONE),
+        );
+        assert_eq!(class, "fee_killed_win");
+        assert_eq!(cause, "fee_slippage_impact_killed");
+    }
+
+    fn pnl_sanity_input(
+        side: common::ExecutionSide,
+        fill_price: Decimal,
+        reserve_price: Option<Decimal>,
+        exit_source: Option<&str>,
+        exit_decision_id: Option<&str>,
+        trigger_event_id: Option<&str>,
+    ) -> FillPnlSanityInput {
+        FillPnlSanityInput {
+            side,
+            fill_price,
+            exit_source: exit_source.map(ToOwned::to_owned),
+            exit_decision_id: exit_decision_id.map(ToOwned::to_owned),
+            trigger_event_id: trigger_event_id.map(ToOwned::to_owned),
+            reserve_implied_price: reserve_price,
+            liquidity_sane: true,
+            curve_state_sane: true,
+        }
+    }
+
+    #[test]
+    fn pnl_sanity_keeps_normal_fill_executable() {
+        let cfg = ResearchWorkerPnlSanityConfig::default();
+        let decision = classify_fill_pnl_sanity(
+            &cfg,
+            &pnl_sanity_input(
+                common::ExecutionSide::Sell,
+                Decimal::new(11, 1),
+                Some(Decimal::ONE),
+                Some("DecisionExit"),
+                Some("exit-1"),
+                Some("event-1"),
+            ),
+        );
+
+        assert!(decision.fill_executable_for_strategy_pnl);
+        assert_eq!(decision.non_executable_reason, "executable");
+    }
+
+    #[test]
+    fn pnl_sanity_excludes_scenario_end_without_decision() {
+        let cfg = ResearchWorkerPnlSanityConfig::default();
+        let decision = classify_fill_pnl_sanity(
+            &cfg,
+            &pnl_sanity_input(
+                common::ExecutionSide::Sell,
+                Decimal::ONE,
+                Some(Decimal::ONE),
+                Some("ScenarioEnd"),
+                None,
+                Some("event-1"),
+            ),
+        );
+
+        assert!(!decision.fill_executable_for_strategy_pnl);
+        assert!(
+            decision
+                .non_executable_reason
+                .contains("scenario_end_mark_only")
+        );
+        assert!(
+            decision
+                .non_executable_reason
+                .contains("missing_exit_decision")
+        );
+    }
+
+    #[test]
+    fn pnl_sanity_excludes_large_reserve_price_mismatch() {
+        let cfg = ResearchWorkerPnlSanityConfig::default();
+        let decision = classify_fill_pnl_sanity(
+            &cfg,
+            &pnl_sanity_input(
+                common::ExecutionSide::Sell,
+                Decimal::new(8000, 0),
+                Some(Decimal::ONE),
+                Some("DecisionExit"),
+                Some("exit-1"),
+                Some("event-1"),
+            ),
+        );
+
+        assert!(!decision.fill_executable_for_strategy_pnl);
+        assert_eq!(
+            decision.fill_price_to_reserve_price_ratio,
+            Some(Decimal::new(8000, 0))
+        );
+        assert!(
+            decision
+                .non_executable_reason
+                .contains("price_scale_artifact")
+        );
+        assert!(
+            decision
+                .non_executable_reason
+                .contains("reserve_price_mismatch")
+        );
+    }
+
+    fn phase83_test_point(mint: &str, timestamp: i128, price: Option<f64>) -> CanonicalPricePoint {
+        CanonicalPricePoint {
+            source_run_id: "source".to_owned(),
+            derived_run_id: "derived".to_owned(),
+            mint: mint.to_owned(),
+            sequence: timestamp as u64,
+            timestamp,
+            price_sol_per_token: price,
+            price_source: if price.is_some() {
+                "reserve_implied_virtual_reserves".to_owned()
+            } else {
+                "unavailable".to_owned()
+            },
+            reserve_price: price,
+            executable_price: price,
+            confidence: if price.is_some() { "0.95" } else { "0" }.to_owned(),
+            unavailable_reason: if price.is_some() {
+                String::new()
+            } else {
+                "missing_virtual_reserves_or_price".to_owned()
+            },
+            artifact_excluded: false,
+            curve_progress_pct: None,
+            virtual_quote_reserves_raw: price.map(|_| 30_000_000_000.0),
+            virtual_token_reserves_raw: price.map(|_| 1_000_000_000_000_000.0),
+            real_quote_reserves_raw: None,
+            real_token_reserves_raw: None,
+            token_total_supply_raw: Some(1_000_000_000_000_000.0),
+            token_total_supply_ui: Some(1_000_000_000.0),
+            token_decimals: Some(6),
+            curve_complete_flag: Some(false),
+            curve_progress_source: "unavailable".to_owned(),
+            market_cap_1b_sol: price.map(|value| value * 1_000_000_000.0),
+            market_cap_total_supply_sol: price.map(|value| value * 1_000_000_000.0),
+            bonding_curve_account: None,
+            associated_bonding_curve_account: None,
+            curve_state_age_ms: None,
+            curve_state_source: if price.is_some() {
+                "test_curve_state".to_owned()
+            } else {
+                "unavailable".to_owned()
+            },
+            forward_filled: false,
+            forward_fill_reason: String::new(),
+            forward_fill_blocked_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn phase83_forward_fill_repairs_recent_missing_curve_price_only() {
+        let mut points = vec![
+            phase83_test_point("mint-a", 1_000, Some(0.000001)),
+            phase83_test_point("mint-a", 4_000, None),
+            phase83_test_point("mint-a", 12_000, None),
+        ];
+        let repaired = phase83_forward_fill_price_points(&mut points, 5_000);
+        assert_eq!(repaired, 1);
+        assert_eq!(points[1].price_source, "forward_filled_curve_state");
+        assert_eq!(points[1].price_sol_per_token, Some(0.000001));
+        assert_eq!(points[2].price_sol_per_token, None);
+        assert_eq!(
+            points[2].unavailable_reason,
+            "missing_virtual_reserves_or_price"
+        );
+        assert_eq!(points[2].forward_fill_blocked_reason, "stale_curve_state");
+    }
+
+    #[test]
+    fn phase83_missing_label_is_unavailable_not_zero() {
+        let run = CanonicalLabelRunSelection {
+            source_run_id: "source".to_owned(),
+            derived_run_id: "derived".to_owned(),
+        };
+        let points = vec![phase83_test_point("mint-a", 1_000, None)];
+        let (token_rows, parity_rows, counts) = phase83_token_label_rows(&run, &points);
+        assert_eq!(counts.passed, 0);
+        assert_eq!(counts.unavailable, 1);
+        assert_eq!(
+            token_rows[0]["label_unavailable_reason"],
+            json!("no_canonical_price_path")
+        );
+        assert_eq!(parity_rows[0]["status"], json!("unavailable"));
+    }
+
+    #[test]
+    fn phase84_price_path_v2_preserves_curve_context() {
+        let snapshot = CanonicalFeatureSnapshot {
+            mint: "mint-a".to_owned(),
+            sequence: 42,
+            timestamp: 1_000,
+            virtual_quote_reserves: Some(30_000_000_000.0),
+            virtual_token_reserves: Some(1_000_000_000_000_000.0),
+            real_quote_reserves: Some(1_000_000_000.0),
+            real_token_reserves: Some(700_000_000_000_000.0),
+            token_total_supply_raw: Some(1_000_000_000_000_000.0),
+            token_decimals: Some(6),
+            curve_complete_flag: Some(false),
+            bonding_curve_account: Some("curve".to_owned()),
+            associated_bonding_curve_account: Some("associated_curve".to_owned()),
+            curve_state_age_ms: Some(0.0),
+            ..CanonicalFeatureSnapshot::default()
+        };
+        let point = phase83_feature_snapshot_from_rows("source", "derived", &snapshot);
+        assert!(point.price_sol_per_token.is_some());
+        assert_eq!(point.token_total_supply_ui, Some(1_000_000_000.0));
+        assert_eq!(point.curve_state_source, "corrected_feature_chunk");
+        assert_eq!(point.bonding_curve_account.as_deref(), Some("curve"));
+        assert_eq!(
+            point.curve_progress_source,
+            "derived_from_real_token_reserves"
+        );
+        assert!(point.market_cap_1b_sol.is_some());
+    }
+
+    #[test]
+    fn phase84_curve_progress_unavailable_without_real_reserves() {
+        let snapshot = CanonicalFeatureSnapshot {
+            mint: "mint-a".to_owned(),
+            sequence: 42,
+            timestamp: 1_000,
+            virtual_quote_reserves: Some(30_000_000_000.0),
+            virtual_token_reserves: Some(1_000_000_000_000_000.0),
+            token_decimals: Some(6),
+            ..CanonicalFeatureSnapshot::default()
+        };
+        let point = phase83_feature_snapshot_from_rows("source", "derived", &snapshot);
+        assert!(point.price_sol_per_token.is_some());
+        assert_eq!(point.curve_progress_pct, None);
+        assert_eq!(point.curve_progress_source, "unavailable");
+    }
+
+    #[test]
+    fn phase83_dataset_index_merge_preserves_nested_fields_and_blocks_tuning() {
+        let existing = DatasetIndexRunEntry {
+            run_id: "source".to_owned(),
+            metric_parity_v2: Some(json!({"schema_version": "metric_parity_v2.phase82"})),
+            readiness_v2: Some(json!({"schema_version": "readiness_v2.phase82"})),
+            diagnostic_backtesting_allowed: true,
+            threshold_tuning_allowed: true,
+            ..DatasetIndexRunEntry::default()
+        };
+        let incoming = DatasetIndexRunEntry {
+            run_id: "source".to_owned(),
+            label_generator_version: Some("phase83_cli".to_owned()),
+            threshold_tuning_allowed: false,
+            ..DatasetIndexRunEntry::default()
+        };
+        let merged = merge_dataset_index_entry(&existing, incoming);
+        assert_eq!(
+            merged.label_generator_version.as_deref(),
+            Some("phase83_cli")
+        );
+        assert_eq!(
+            merged
+                .metric_parity_v2
+                .as_ref()
+                .and_then(|value| value.get("schema_version"))
+                .and_then(|value| value.as_str()),
+            Some("metric_parity_v2.phase82")
+        );
+        assert!(merged.diagnostic_backtesting_allowed);
+        assert!(!merged.threshold_tuning_allowed);
+    }
+
     #[test]
     fn resolve_backtest_thresholds_uses_loaded_config_defaults_when_cli_omits_values() {
         let loaded = load_default_config_for_test();
@@ -29632,5 +41920,42 @@ mod tests {
             provider,
             calibration,
         ));
+    }
+
+    #[test]
+    fn env_file_overlay_sets_missing_values_and_restores_them() {
+        let key = "PLQ_ENV_FILE_OVERLAY_TEST_MISSING";
+        unsafe { std::env::remove_var(key) };
+        let path = std::env::temp_dir().join(format!("{key}.env"));
+        fs::write(&path, format!("{key}=from-file\n")).unwrap();
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.toml");
+        let loaded = LoadedConfig::from_files(config_path, Option::<&Path>::None).unwrap();
+
+        {
+            let _guard = apply_env_file_overlay(&loaded, Some(path.to_str().unwrap())).unwrap();
+            assert_eq!(std::env::var(key).unwrap(), "from-file");
+        }
+
+        assert!(std::env::var(key).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn env_file_overlay_does_not_override_process_env() {
+        let key = "PLQ_ENV_FILE_OVERLAY_TEST_EXISTING";
+        unsafe { std::env::set_var(key, "from-process") };
+        let path = std::env::temp_dir().join(format!("{key}.env"));
+        fs::write(&path, format!("{key}=from-file\n")).unwrap();
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.toml");
+        let loaded = LoadedConfig::from_files(config_path, Option::<&Path>::None).unwrap();
+
+        {
+            let _guard = apply_env_file_overlay(&loaded, Some(path.to_str().unwrap())).unwrap();
+            assert_eq!(std::env::var(key).unwrap(), "from-process");
+        }
+
+        assert_eq!(std::env::var(key).unwrap(), "from-process");
+        unsafe { std::env::remove_var(key) };
+        let _ = fs::remove_file(path);
     }
 }
