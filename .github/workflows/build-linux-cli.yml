@@ -303,6 +303,36 @@ jobs:
           SMOKE_DURATION_SECONDS="${SMOKE_DURATION_SECONDS:-120}"
           BIN="${APP_DIR}/target/release/cli"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+
+          if [[ -f "${ENV_FILE}" ]]; then
+            set -a
+            # The edge smoke run needs the same provider/R2 env as the systemd service.
+            # Do not print this file: GitHub masking is not a substitute for not logging secrets.
+            source "${ENV_FILE}"
+            set +a
+          else
+            echo "::error::VPS env file not found at ${ENV_FILE}"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          required = [
+              "GRPC_URL",
+              "R2_ACCESS_KEY_ID",
+              "R2_SECRET_ACCESS_KEY",
+              "R2_ENDPOINT",
+              "R2_DATASET_BUCKET",
+          ]
+          print(json.dumps({
+              "edge_smoke_env_loaded": True,
+              "env_file_path": "/home/ubuntu/pump-launch-quant.env",
+              "required_env_present": {name: bool(os.environ.get(name)) for name in required},
+          }, indent=2))
+          PY
 
           STATUS_BEFORE="$("${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}")"
           PREVIOUS_RUN_ID="$(printf '%s' "${STATUS_BEFORE}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("last_completed_run_id") or "")')"
@@ -315,21 +345,30 @@ jobs:
           if [[ -n "${LATEST_RUN_ID}" && "${LATEST_RUN_ID}" != "${PREVIOUS_RUN_ID}" ]]; then
             "${BIN}" verify-run-segments "${VALIDATE_CONFIG[@]}" --run-id "${LATEST_RUN_ID}"
             "${BIN}" verify-r2-upload "${VALIDATE_CONFIG[@]}" --run-id "${LATEST_RUN_ID}" --check-manifest-consistency
+          else
+            echo "::error::Smoke cycle did not produce a new completed run"
+            printf '%s\n' "${STATUS_AFTER}"
+            exit 1
           fi
 
-          "${BIN}" inspect-dataset-index "${VALIDATE_CONFIG[@]}"
+          DATASET_INDEX_AFTER_PATH="$(mktemp)"
+          "${BIN}" inspect-dataset-index "${VALIDATE_CONFIG[@]}" > "${DATASET_INDEX_AFTER_PATH}"
 
           export PREVIOUS_RUN_ID LATEST_RUN_ID
+          export DATASET_INDEX_AFTER_PATH
 
           python3 - <<'PY'
           import json
           import os
+          with open(os.environ["DATASET_INDEX_AFTER_PATH"], "r", encoding="utf-8") as fh:
+              data = json.load(fh)
           print(json.dumps({
               "smoke_run_attempted": True,
               "smoke_duration_seconds": int(os.environ.get("SMOKE_DURATION_SECONDS", "120")),
               "previous_last_completed_run_id": os.environ["PREVIOUS_RUN_ID"],
               "latest_last_completed_run_id": os.environ["LATEST_RUN_ID"],
               "new_run_detected": bool(os.environ["LATEST_RUN_ID"]) and os.environ["LATEST_RUN_ID"] != os.environ["PREVIOUS_RUN_ID"],
+              "dataset_index_run_count": data.get("run_count"),
           }, indent=2))
           PY
           EOF
