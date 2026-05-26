@@ -342,27 +342,7 @@ jobs:
 
           if [[ -f "${LOCK_PATH}" ]]; then
             export LOCK_PATH STATUS_BEFORE
-            python3 - <<'PY'
-            import json
-            import os
-            from pathlib import Path
-
-            lock_path = Path(os.environ["LOCK_PATH"])
-            lock = json.loads(lock_path.read_text(encoding="utf-8"))
-            status = json.loads(os.environ["STATUS_BEFORE"])
-            print(json.dumps({
-                "autopilot_lock_preflight": "blocked",
-                "lock_pid": lock.get("pid"),
-                "lock_cycle_id": lock.get("cycle_id"),
-                "lock_acquired_at": lock.get("acquired_at"),
-                "lock_heartbeat_at": lock.get("heartbeat_at"),
-                "status_state": status.get("state"),
-                "status_current_run_id": status.get("current_run_id"),
-                "status_last_completed_run_id": status.get("last_completed_run_id"),
-                "status_last_provider_status": status.get("provider_status"),
-                "status_next_scheduled_action": status.get("next_scheduled_action"),
-            }, indent=2))
-            PY
+            python3 -c 'import json, os; from pathlib import Path; lock=json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8")); status=json.loads(os.environ["STATUS_BEFORE"]); print(json.dumps({"autopilot_lock_preflight":"blocked","lock_pid":lock.get("pid"),"lock_cycle_id":lock.get("cycle_id"),"lock_acquired_at":lock.get("acquired_at"),"lock_heartbeat_at":lock.get("heartbeat_at"),"status_state":status.get("state"),"status_current_run_id":status.get("current_run_id"),"status_last_completed_run_id":status.get("last_completed_run_id"),"status_last_provider_status":status.get("provider_status"),"status_next_scheduled_action":status.get("next_scheduled_action")}, indent=2))'
             LOCK_PID="$(python3 -c 'import json, os; from pathlib import Path; print(json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8")).get("pid", ""))')"
             if [[ -n "${LOCK_PID}" ]]; then
               ps -fp "${LOCK_PID}" || true
