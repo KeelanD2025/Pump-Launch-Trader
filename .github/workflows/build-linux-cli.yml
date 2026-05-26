@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      smoke_duration_seconds:
+        description: Edge-only smoke/canary duration in seconds
+        required: false
+        default: "120"
+        type: string
 
 permissions:
   contents: read
@@ -285,21 +290,24 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          SMOKE_DURATION_SECONDS: ${{ github.event.inputs.smoke_duration_seconds }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          SMOKE_DURATION_SECONDS="${SMOKE_DURATION_SECONDS:-120}"
 
-          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" 'bash -se' <<'EOF'
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" SMOKE_DURATION_SECONDS="${SMOKE_DURATION_SECONDS}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
+          SMOKE_DURATION_SECONDS="${SMOKE_DURATION_SECONDS:-120}"
           BIN="${APP_DIR}/target/release/cli"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
 
           STATUS_BEFORE="$("${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}")"
           PREVIOUS_RUN_ID="$(printf '%s' "${STATUS_BEFORE}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("last_completed_run_id") or "")')"
 
-          "${BIN}" run-autopilot "${VALIDATE_CONFIG[@]}" --mode edge-collector --once --duration-seconds 120
+          "${BIN}" run-autopilot "${VALIDATE_CONFIG[@]}" --mode edge-collector --once --duration-seconds "${SMOKE_DURATION_SECONDS}"
 
           STATUS_AFTER="$("${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}")"
           LATEST_RUN_ID="$(printf '%s' "${STATUS_AFTER}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("last_completed_run_id") or "")')"
@@ -318,6 +326,7 @@ jobs:
           import os
           print(json.dumps({
               "smoke_run_attempted": True,
+              "smoke_duration_seconds": int(os.environ.get("SMOKE_DURATION_SECONDS", "120")),
               "previous_last_completed_run_id": os.environ["PREVIOUS_RUN_ID"],
               "latest_last_completed_run_id": os.environ["LATEST_RUN_ID"],
               "new_run_detected": bool(os.environ["LATEST_RUN_ID"]) and os.environ["LATEST_RUN_ID"] != os.environ["PREVIOUS_RUN_ID"],
