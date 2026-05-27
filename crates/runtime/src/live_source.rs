@@ -402,6 +402,18 @@ impl GeyserEventNormalizer {
                 ),
                 tx_fee_lamports: Some(Lamports(update.fee_lamports)),
                 compute_units_consumed: update.compute_units_consumed,
+                pre_sol_balances_lamports: update
+                    .pre_balances
+                    .iter()
+                    .copied()
+                    .map(Lamports)
+                    .collect(),
+                post_sol_balances_lamports: update
+                    .post_balances
+                    .iter()
+                    .copied()
+                    .map(Lamports)
+                    .collect(),
                 failed_transaction: !update.succeeded,
                 error_code: update.error_code.clone(),
                 bundle_like_evidence: bundle_like_evidence(&update, compute_budget),

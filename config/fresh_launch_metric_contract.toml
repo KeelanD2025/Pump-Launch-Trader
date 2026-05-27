@@ -1,4 +1,4 @@
-schema_version = "phase89.fresh_launch_metric_contract.v1"
+schema_version = "phase90.fresh_launch_metric_contract.v2"
 missing_value_policy = "unavailable_not_zero"
 stream_required_missing_policy = "fail_canary_and_stop_tracking"
 threshold_tuning_allowed = false
@@ -112,8 +112,26 @@ safe_for_threshold_tuning = false
 coverage_requirement_for_tuning = 1.0
 
 [[metric]]
-metric_id = "associated_bonding_curve_account"
-metric_name = "associated bonding curve account"
+metric_id = "associated_bonding_curve_account_observed"
+metric_name = "associated bonding curve account observed"
+metric_family = "bonding curve reserves"
+bucket = "stream_optional"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "token_created"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "associated_bonding_curve_account_derived"
+metric_name = "associated bonding curve account derived"
 metric_family = "bonding curve reserves"
 bucket = "stream_required"
 required_layer = "edge_collector"
@@ -148,13 +166,85 @@ safe_for_threshold_tuning = false
 coverage_requirement_for_tuning = 1.0
 
 [[metric]]
-metric_id = "token_total_supply"
-metric_name = "token total supply"
+metric_id = "token_total_supply_stream_observed"
+metric_name = "token total supply stream observed"
+metric_family = "market cap"
+bucket = "stream_optional"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "token_created"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "token_total_supply_bonding_curve_observed"
+metric_name = "token total supply bonding curve observed"
+metric_family = "market cap"
+bucket = "stream_optional"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "token_created|bonding_curve_update"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "token_total_supply_protocol_constant"
+metric_name = "token total supply protocol constant"
+metric_family = "market cap"
+bucket = "research_derived"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "token_created"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = true
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "token_total_supply_rpc_verified"
+metric_name = "token total supply rpc verified"
+metric_family = "market cap"
+bucket = "enrichment_required_rpc"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "token_created"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "token_total_supply_selected"
+metric_name = "token total supply selected"
 metric_family = "market cap"
 bucket = "stream_required"
 required_layer = "edge_collector"
 source_artifact = "normalized_events"
-required_event_types = "token_created"
+required_event_types = "token_created|bonding_curve_update"
 required_accounts = "fresh mint and related curve/token accounts"
 unit = "mixed"
 confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
@@ -382,8 +472,44 @@ safe_for_threshold_tuning = false
 coverage_requirement_for_tuning = 1.0
 
 [[metric]]
-metric_id = "pre_post_sol_balance"
-metric_name = "pre post sol balance"
+metric_id = "pre_sol_balance_stream_observed"
+metric_name = "pre sol balance stream observed"
+metric_family = "realized buy/sell trade price"
+bucket = "stream_optional"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "observed_transaction"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "post_sol_balance_stream_observed"
+metric_name = "post sol balance stream observed"
+metric_family = "realized buy/sell trade price"
+bucket = "stream_optional"
+required_layer = "edge_collector"
+source_artifact = "normalized_events"
+required_event_types = "observed_transaction"
+required_accounts = "fresh mint and related curve/token accounts"
+unit = "mixed"
+confidence_logic = "observed from normalized event source field; unavailable is never coerced to zero"
+unavailable_reason_if_missing = "classified by launch-metric-canary source-field coverage"
+implementation_status = "implemented_or_provider_unavailable"
+safe_for_diagnostics = true
+safe_for_backtest = false
+safe_for_threshold_tuning = false
+coverage_requirement_for_tuning = 1.0
+
+[[metric]]
+metric_id = "quote_amount_lamports_from_delta"
+metric_name = "quote amount lamports from delta"
 metric_family = "realized buy/sell trade price"
 bucket = "stream_required"
 required_layer = "edge_collector"

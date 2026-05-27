@@ -479,6 +479,10 @@ pub struct ObservedTransactionEvent {
     #[serde(default)]
     pub compute_units_consumed: Option<u64>,
     #[serde(default)]
+    pub pre_sol_balances_lamports: Vec<Lamports>,
+    #[serde(default)]
+    pub post_sol_balances_lamports: Vec<Lamports>,
+    #[serde(default)]
     pub failed_transaction: bool,
     #[serde(default)]
     pub error_code: Option<String>,

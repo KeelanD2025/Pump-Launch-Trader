@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sim = { path = "../sim" }
+solana-pubkey.workspace = true
 state = { path = "../state" }
 storage = { path = "../storage" }
 time.workspace = true

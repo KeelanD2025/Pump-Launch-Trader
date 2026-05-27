@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sim::{FeeModel, Simulator};
+use solana_pubkey::Pubkey;
 use state::{StateEngine, StateSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -41,6 +42,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::str::FromStr;
 use std::time::Instant;
 use storage::{
     ArtifactMetadata, ArtifactType, DatasetKind, RunKind, RunRole, StorageEngine, StorageLayout,
@@ -33050,7 +33052,17 @@ fn fresh_launch_stream_field_contract() -> Vec<FreshLaunchFieldSpec> {
             blocking_for_tuning: true,
         },
         FreshLaunchFieldSpec {
-            field_id: "associated_bonding_curve_account",
+            field_id: "associated_bonding_curve_account_observed",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_optional",
+            event_kinds: &["token_created"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "associated_bonding_curve_account_derived",
             metric_family: "bonding curve reserves",
             bucket: "stream_required",
             event_kinds: &["token_created"],
@@ -33070,10 +33082,50 @@ fn fresh_launch_stream_field_contract() -> Vec<FreshLaunchFieldSpec> {
             blocking_for_tuning: true,
         },
         FreshLaunchFieldSpec {
-            field_id: "token_total_supply",
+            field_id: "token_total_supply_stream_observed",
+            metric_family: "market cap",
+            bucket: "stream_optional",
+            event_kinds: &["token_created"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_total_supply_bonding_curve_observed",
+            metric_family: "market cap",
+            bucket: "stream_optional",
+            event_kinds: &["token_created", "bonding_curve_update"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_total_supply_protocol_constant",
+            metric_family: "market cap",
+            bucket: "research_derived",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_total_supply_rpc_verified",
+            metric_family: "market cap",
+            bucket: "enrichment_required_rpc",
+            event_kinds: &["token_created"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_total_supply_selected",
             metric_family: "market cap",
             bucket: "stream_required",
-            event_kinds: &["token_created"],
+            event_kinds: &["token_created", "bonding_curve_update"],
             required: true,
             blocking_for_research: true,
             blocking_for_backtest: true,
@@ -33205,7 +33257,27 @@ fn fresh_launch_stream_field_contract() -> Vec<FreshLaunchFieldSpec> {
             blocking_for_tuning: true,
         },
         FreshLaunchFieldSpec {
-            field_id: "pre_post_sol_balance",
+            field_id: "pre_sol_balance_stream_observed",
+            metric_family: "realized buy/sell trade price",
+            bucket: "stream_optional",
+            event_kinds: &["observed_transaction"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "post_sol_balance_stream_observed",
+            metric_family: "realized buy/sell trade price",
+            bucket: "stream_optional",
+            event_kinds: &["observed_transaction"],
+            required: false,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "quote_amount_lamports_from_delta",
             metric_family: "realized buy/sell trade price",
             bucket: "stream_required",
             event_kinds: &["pump_buy", "pump_sell"],
@@ -33463,10 +33535,15 @@ fn ensure_fresh_launch_metric_contract_files(output_dir: &Path) -> Result<()> {
         &rows,
     )?;
     let payload = json!({
-        "schema_version": "phase89.fresh_launch_metric_contract.v1",
+        "schema_version": "phase90.fresh_launch_metric_contract.v2",
         "missing_value_policy": "unavailable_not_zero",
         "stream_required_missing_policy": "fail_canary_and_stop_tracking",
         "rpc_enrichment_policy": "blocked_by_budget_not_stream_failure_when_no_rpc_mode",
+        "phase90_field_split": {
+            "associated_bonding_curve_account": "observed and deterministic ATA-derived fields are reported separately",
+            "token_total_supply": "stream, bonding-curve, protocol-constant, RPC-verified, and selected supply fields are reported separately",
+            "pre_post_sol_balance": "pre/post stream balances and quote lamport delta fallback are reported separately"
+        },
         "rows": rows,
         "threshold_tuning_allowed": false,
     });
@@ -33476,14 +33553,14 @@ fn ensure_fresh_launch_metric_contract_files(output_dir: &Path) -> Result<()> {
     )?;
     write_report(
         output_dir.join("fresh_launch_metric_contract.md"),
-        "# Phase 89 Fresh Launch Metric Contract\n\nStream-required fields fail the canary if they are missing due to decode/schema/serialization/replay code paths. Enrichment, raw-shred, deshred, and post-migration metrics are explicit external/provider gates and are not coerced to zero.\n",
+        "# Phase 90 Fresh Launch Metric Contract\n\nStream-required fields fail the canary if they are missing due to decode/schema/serialization/replay code paths. Phase 90 splits the remaining ambiguous fields into explicit observed, derived, selected, fallback, confidence, and unavailable-reason columns. Enrichment, raw-shred, deshred, and post-migration metrics are explicit external/provider gates and are not coerced to zero.\n",
     )?;
     write_report(
         Path::new("docs").join("FRESH_LAUNCH_METRIC_CANARY.md"),
-        "# Fresh Launch Metric Canary\n\nThe fresh-launch canary tracks one Pump.fun mint at a time and proves stream source-field coverage from normalized_events before any strategy research uses the token. Missing stream-required fields are reported as unavailable with an exact path classification, never as zero. RPC/enrichment metrics are budget-gated and are not called in `--no-rpc` mode.\n",
+        "# Fresh Launch Metric Canary\n\nThe fresh-launch canary tracks one Pump.fun mint at a time and proves stream source-field coverage from normalized_events before any strategy research uses the token. Missing stream-required fields are reported as unavailable with an exact path classification, never as zero. RPC/enrichment metrics are budget-gated and are not called in `--no-rpc` mode.\n\nPhase 90 makes the prior ambiguous gaps explicit: the associated bonding curve account is reported as observed and/or deterministic ATA-derived, token total supply is split into stream-observed, bonding-curve-observed, protocol-constant, RPC-verified, and selected supply, and SOL balance provenance is split into transaction-meta pre/post balances versus quote lamport delta fallback.\n",
     )?;
     let mut toml = String::from(
-        "schema_version = \"phase89.fresh_launch_metric_contract.v1\"\nmissing_value_policy = \"unavailable_not_zero\"\nstream_required_missing_policy = \"fail_canary_and_stop_tracking\"\nthreshold_tuning_allowed = false\n\n",
+        "schema_version = \"phase90.fresh_launch_metric_contract.v2\"\nmissing_value_policy = \"unavailable_not_zero\"\nstream_required_missing_policy = \"fail_canary_and_stop_tracking\"\nthreshold_tuning_allowed = false\n\n",
     );
     for row in payload["rows"].as_array().unwrap_or(&Vec::new()) {
         toml.push_str("[[metric]]\n");
@@ -33539,6 +33616,307 @@ fn event_kind(event: &NormalizedEvent) -> &'static str {
     }
 }
 
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+
+#[derive(Debug, Clone)]
+struct AssociatedCurveAnalysis {
+    observed: Option<String>,
+    derived: Option<String>,
+    token_program_id: Option<&'static str>,
+    source: &'static str,
+    confidence: &'static str,
+    matches_observed_account_list: Option<bool>,
+    observed_matches_derived: Option<bool>,
+    unavailable_reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct TokenSupplyAnalysis {
+    stream_observed_raw: Option<Decimal>,
+    bonding_curve_observed_raw: Option<Decimal>,
+    protocol_constant_raw: Option<Decimal>,
+    protocol_constant_ui: Option<Decimal>,
+    rpc_verified_raw: Option<Decimal>,
+    selected_raw: Option<Decimal>,
+    selected_ui: Option<Decimal>,
+    decimals: u8,
+    source: &'static str,
+    confidence: &'static str,
+    rpc_unavailable_reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct SolBalanceAnalysis {
+    pre_observed: bool,
+    post_observed: bool,
+    pre_balance_count: usize,
+    post_balance_count: usize,
+    sample_pre_lamports: Option<u64>,
+    sample_post_lamports: Option<u64>,
+    quote_amount_lamports_from_delta: Option<Decimal>,
+    quote_amount_sol_from_delta: Option<Decimal>,
+    tx_fee_lamports: Option<u64>,
+    priority_fee_lamports: Option<u64>,
+    trade_quote_source: &'static str,
+    trade_quote_source_confidence: &'static str,
+    unavailable_reason: &'static str,
+}
+
+fn derive_associated_token_account(
+    owner: &str,
+    mint: &str,
+    token_program_id: &'static str,
+) -> Option<String> {
+    let owner = Pubkey::from_str(owner).ok()?;
+    let mint = Pubkey::from_str(mint).ok()?;
+    let token_program = Pubkey::from_str(token_program_id).ok()?;
+    let associated_token_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).ok()?;
+    let (address, _) = Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &associated_token_program,
+    );
+    Some(address.to_string())
+}
+
+fn associated_curve_analysis(events: &[NormalizedEvent]) -> AssociatedCurveAnalysis {
+    let Some(payload) = events.iter().find_map(|event| match &event.payload {
+        EventPayload::TokenCreated(payload) => Some(payload),
+        _ => None,
+    }) else {
+        return AssociatedCurveAnalysis {
+            observed: None,
+            derived: None,
+            token_program_id: None,
+            source: "unavailable_provider_or_idl",
+            confidence: "unavailable",
+            matches_observed_account_list: None,
+            observed_matches_derived: None,
+            unavailable_reason: "missing_due_to_token_not_initialized",
+        };
+    };
+    let mint = payload.mint.to_string();
+    let curve = payload.bonding_curve_account.to_string();
+    let observed = payload
+        .associated_bonding_curve_account
+        .as_ref()
+        .map(ToString::to_string);
+    if mint.is_empty() || curve.is_empty() {
+        return AssociatedCurveAnalysis {
+            observed,
+            derived: None,
+            token_program_id: None,
+            source: "unavailable_provider_or_idl",
+            confidence: "unavailable",
+            matches_observed_account_list: None,
+            observed_matches_derived: None,
+            unavailable_reason: "missing_mint_or_bonding_curve_account",
+        };
+    }
+    let raw_accounts = payload
+        .raw_account_list
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let candidates = [
+        (
+            SPL_TOKEN_PROGRAM_ID,
+            derive_associated_token_account(&curve, &mint, SPL_TOKEN_PROGRAM_ID),
+        ),
+        (
+            TOKEN_2022_PROGRAM_ID,
+            derive_associated_token_account(&curve, &mint, TOKEN_2022_PROGRAM_ID),
+        ),
+    ];
+    let matched = candidates
+        .iter()
+        .find_map(|(program, candidate)| {
+            candidate
+                .as_ref()
+                .filter(|value| raw_accounts.contains(*value))
+                .map(|value| (*program, value.clone(), true))
+        })
+        .or_else(|| {
+            candidates.iter().find_map(|(program, candidate)| {
+                candidate.clone().map(|value| (*program, value, false))
+            })
+        });
+    let (token_program_id, derived, matches_observed_account_list) =
+        if let Some((program, derived, matches)) = matched {
+            (Some(program), Some(derived), Some(matches))
+        } else {
+            (None, None, None)
+        };
+    let observed_matches_derived = observed
+        .as_ref()
+        .zip(derived.as_ref())
+        .map(|(observed, derived)| observed == derived);
+    let source = if observed.is_some() {
+        "observed_instruction_account"
+    } else if derived.is_some() {
+        "deterministic_ata_derivation"
+    } else {
+        "unavailable_provider_or_idl"
+    };
+    let confidence = if observed.is_some() {
+        "observed"
+    } else if derived.is_some() {
+        "deterministic"
+    } else {
+        "unavailable"
+    };
+    AssociatedCurveAnalysis {
+        observed,
+        derived,
+        token_program_id,
+        source,
+        confidence,
+        matches_observed_account_list,
+        observed_matches_derived,
+        unavailable_reason: if confidence == "unavailable" {
+            "missing_mint_or_bonding_curve_account"
+        } else {
+            ""
+        },
+    }
+}
+
+fn token_supply_analysis(events: &[NormalizedEvent]) -> TokenSupplyAnalysis {
+    let has_create = events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::TokenCreated(_)));
+    let decimals = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::BondingCurveUpdate(payload) => payload.token_decimals,
+            EventPayload::HolderBalanceUpdate(payload) => payload.token_decimals,
+            _ => None,
+        })
+        .unwrap_or(common::DEFAULT_PUMP_TOKEN_DECIMALS);
+    let stream_observed_raw = events.iter().find_map(|event| match &event.payload {
+        EventPayload::TokenCreated(payload) => payload.initial_supply,
+        _ => None,
+    });
+    let protocol_constant_ui = Decimal::from(common::PUMP_TOTAL_SUPPLY_UI);
+    let protocol_constant_raw = common::ui_tokens_to_raw(protocol_constant_ui, decimals);
+    let selected_raw = stream_observed_raw.or_else(|| has_create.then_some(protocol_constant_raw));
+    let selected_ui = selected_raw.map(|raw| common::raw_tokens_to_ui(raw, decimals));
+    let (source, confidence) = if stream_observed_raw.is_some() {
+        ("stream_observed", "observed")
+    } else if has_create {
+        ("protocol_constant", "protocol_constant")
+    } else {
+        ("unavailable", "unavailable")
+    };
+    TokenSupplyAnalysis {
+        stream_observed_raw,
+        bonding_curve_observed_raw: None,
+        protocol_constant_raw: has_create.then_some(protocol_constant_raw),
+        protocol_constant_ui: has_create.then_some(protocol_constant_ui),
+        rpc_verified_raw: None,
+        selected_raw,
+        selected_ui,
+        decimals,
+        source,
+        confidence,
+        rpc_unavailable_reason: "unavailable_blocked_by_rpc_budget",
+    }
+}
+
+fn sol_balance_analysis(
+    events: &[NormalizedEvent],
+    related_signatures: &BTreeSet<String>,
+) -> SolBalanceAnalysis {
+    let related_observed = events
+        .iter()
+        .filter_map(|event| {
+            if let EventPayload::ObservedTransaction(payload) = &event.payload {
+                let related = payload
+                    .signature_hint
+                    .as_ref()
+                    .map(|sig| related_signatures.contains(sig))
+                    .unwrap_or(true);
+                related.then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let sample = related_observed.first();
+    let pre_observed = related_observed
+        .iter()
+        .any(|payload| !payload.pre_sol_balances_lamports.is_empty());
+    let post_observed = related_observed
+        .iter()
+        .any(|payload| !payload.post_sol_balances_lamports.is_empty());
+    let quote_amount_lamports_from_delta = events.iter().find_map(|event| match &event.payload {
+        EventPayload::PumpBuy(payload) if payload.quote_in > Decimal::ZERO => {
+            Some(payload.quote_in)
+        }
+        EventPayload::PumpSell(payload) if payload.quote_out > Decimal::ZERO => {
+            Some(payload.quote_out)
+        }
+        _ => None,
+    });
+    let quote_amount_sol_from_delta = quote_amount_lamports_from_delta.map(common::lamports_to_sol);
+    let tx_fee_lamports =
+        sample.and_then(|payload| payload.tx_fee_lamports.as_ref().map(|fee| fee.0));
+    let priority_fee_lamports = sample.and_then(|payload| {
+        payload
+            .estimated_priority_fee_lamports
+            .as_ref()
+            .map(|fee| fee.0)
+    });
+    let trade_quote_source = if pre_observed && post_observed {
+        "transaction_meta_pre_post_balance"
+    } else if quote_amount_lamports_from_delta.is_some() {
+        "wallet_lamport_delta"
+    } else {
+        "unavailable_provider_meta"
+    };
+    let trade_quote_source_confidence = if pre_observed && post_observed {
+        "observed"
+    } else if quote_amount_lamports_from_delta.is_some() {
+        "fallback"
+    } else {
+        "unavailable"
+    };
+    SolBalanceAnalysis {
+        pre_observed,
+        post_observed,
+        pre_balance_count: sample
+            .map(|payload| payload.pre_sol_balances_lamports.len())
+            .unwrap_or(0),
+        post_balance_count: sample
+            .map(|payload| payload.post_sol_balances_lamports.len())
+            .unwrap_or(0),
+        sample_pre_lamports: sample.and_then(|payload| {
+            payload
+                .pre_sol_balances_lamports
+                .first()
+                .map(|lamports| lamports.0)
+        }),
+        sample_post_lamports: sample.and_then(|payload| {
+            payload
+                .post_sol_balances_lamports
+                .first()
+                .map(|lamports| lamports.0)
+        }),
+        quote_amount_lamports_from_delta,
+        quote_amount_sol_from_delta,
+        tx_fee_lamports,
+        priority_fee_lamports,
+        trade_quote_source,
+        trade_quote_source_confidence,
+        unavailable_reason: if trade_quote_source == "unavailable_provider_meta" {
+            "unavailable_provider_meta"
+        } else {
+            ""
+        },
+    }
+}
+
 fn event_mint_string(event: &NormalizedEvent) -> Option<String> {
     event.mint().map(|mint| mint.to_string())
 }
@@ -33568,9 +33946,17 @@ fn fresh_field_present(
         "mint" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_)) && event_mint_string(e).is_some()),
         "creator_dev_wallet" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if !p.creator_wallet.to_string().is_empty())),
         "bonding_curve_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if !p.bonding_curve_account.to_string().is_empty())),
-        "associated_bonding_curve_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.associated_bonding_curve_account.is_some())),
+        "associated_bonding_curve_account_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.associated_bonding_curve_account.is_some())),
+        "associated_bonding_curve_account_derived" => {
+            let analysis = associated_curve_analysis(events);
+            analysis.derived.is_some() && analysis.observed_matches_derived != Some(false)
+        }
         "token_decimals" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.token_decimals.is_some()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.token_decimals.is_some())),
-        "token_total_supply" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_supply.is_some())),
+        "token_total_supply_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_supply.is_some())),
+        "token_total_supply_bonding_curve_observed" => false,
+        "token_total_supply_protocol_constant" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_))),
+        "token_total_supply_rpc_verified" => false,
+        "token_total_supply_selected" => token_supply_analysis(events).selected_raw.is_some(),
         "virtual_sol_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.virtual_quote_reserves > Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_virtual_quote_reserves.is_some())),
         "virtual_token_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.virtual_token_reserves > Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_virtual_token_reserves.is_some())),
         "real_sol_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.real_quote_reserves >= Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_real_quote_reserves.is_some())),
@@ -33583,7 +33969,9 @@ fn fresh_field_present(
         "signer_or_owner_wallet" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if !p.buyer.to_string().is_empty()) || matches!(&e.payload, EventPayload::PumpSell(p) if !p.seller.to_string().is_empty()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.owner_wallet.to_string().is_empty()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.signer.is_some())),
         "token_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.token_account.to_string().is_empty())),
         "pre_post_token_balance" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.old_balance.is_some() || p.new_balance >= Decimal::ZERO)),
-        "pre_post_sol_balance" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.reserves_before.is_some() && p.reserves_after.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.reserves_before.is_some() && p.reserves_after.is_some())),
+        "pre_sol_balance_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if !p.pre_sol_balances_lamports.is_empty() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
+        "post_sol_balance_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if !p.post_sol_balances_lamports.is_empty() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
+        "quote_amount_lamports_from_delta" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.quote_out > Decimal::ZERO)),
         "transaction_signature" => events.iter().any(|e| event_signature_string(e).is_some()),
         "instruction_type" => events.iter().any(|e| matches!(event_kind(e), "token_created" | "pump_buy" | "pump_sell" | "bonding_curve_update" | "holder_balance_update")),
         "instruction_shape_hash" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.instruction_shape_hash.is_some() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
@@ -33628,7 +34016,7 @@ fn fresh_field_unavailable_reason(
         "buy_sell_direction"
         | "token_amount_raw_or_ui"
         | "quote_amount_lamports_or_sol"
-        | "pre_post_sol_balance"
+        | "quote_amount_lamports_from_delta"
             if !has_trade =>
         {
             ("not_applicable_no_trade_observed_for_tracked_launch", false)
@@ -33651,20 +34039,45 @@ fn fresh_field_unavailable_reason(
         {
             ("not_applicable_no_trade_or_observed_transaction", false)
         }
-        "associated_bonding_curve_account" => {
-            ("not_decodable_from_current_provider_idl_account_map", false)
-        }
-        "token_total_supply" => (
-            "provider_did_not_emit_supply_for_create_or_curve_account; pumpfun_total_supply_constant_used_for_research_metrics",
+        "associated_bonding_curve_account_observed" => (
+            "provider_or_idl_unavailable; deterministic_ata_derivation_used_when_possible",
             false,
+        ),
+        "associated_bonding_curve_account_derived" => {
+            let analysis = associated_curve_analysis(token_events);
+            if analysis.observed_matches_derived == Some(false) {
+                ("associated_bonding_curve_derivation_mismatch", true)
+            } else {
+                (analysis.unavailable_reason, true)
+            }
+        }
+        "token_total_supply_stream_observed" => (
+            "provider_did_not_emit_supply_for_create_or_curve_account",
+            false,
+        ),
+        "token_total_supply_bonding_curve_observed" => (
+            "bonding_curve_account_state_does_not_emit_total_supply_in_current_stream_decode",
+            false,
+        ),
+        "token_total_supply_protocol_constant" => {
+            ("not_a_pumpfun_create_or_missing_mint_context", true)
+        }
+        "token_total_supply_rpc_verified" => ("unavailable_blocked_by_rpc_budget", false),
+        "token_total_supply_selected" => (
+            "no_stream_supply_and_no_protocol_constant_context_available",
+            true,
         ),
         "token_decimals" => (
             "decoded_but_not_serialized_or_provider_did_not_emit_decimals",
             true,
         ),
-        "pre_post_sol_balance" if has_trade => (
-            "raw_wallet_sol_pre_post_not_serialized; trade_quote_amount_from_lamport_delta_is_available",
+        "pre_sol_balance_stream_observed" | "post_sol_balance_stream_observed" => (
+            "provider_meta_unavailable_or_old_schema_without_serialized_pre_post_balances",
             false,
+        ),
+        "quote_amount_lamports_from_delta" if has_trade => (
+            "wallet_lamport_delta_or_instruction_amount_unavailable",
+            true,
         ),
         _ => ("decoded_but_not_serialized", true),
     }
@@ -34065,6 +34478,9 @@ async fn launch_metric_canary_command(
     let mut coverage_rows = Vec::<serde_json::Value>::new();
     let mut missing_rows = Vec::<serde_json::Value>::new();
     let mut blocking_failures = Vec::<serde_json::Value>::new();
+    let associated_curve = associated_curve_analysis(&scoped_events);
+    let token_supply = token_supply_analysis(&scoped_events);
+    let sol_balance = sol_balance_analysis(&scoped_events, &related_signatures);
     for spec in fresh_launch_stream_field_contract() {
         let present = fresh_field_present(spec.field_id, &scoped_events, &related_signatures);
         let (reason, blocking_failure) =
@@ -34102,6 +34518,37 @@ async fn launch_metric_canary_command(
             "blocking_for_backtest": spec.blocking_for_backtest && blocking_failure,
             "blocking_for_tuning": spec.blocking_for_tuning || blocking_failure,
             "missing_path_classification": if present { "" } else { reason },
+            "associated_bonding_curve_account_observed": associated_curve.observed.clone(),
+            "associated_bonding_curve_account_derived": associated_curve.derived.clone(),
+            "associated_bonding_curve_account_source": associated_curve.source,
+            "associated_bonding_curve_account_confidence": associated_curve.confidence,
+            "associated_bonding_curve_token_program_id": associated_curve.token_program_id,
+            "associated_bonding_curve_derivation_matches_observed_account_list": associated_curve.matches_observed_account_list,
+            "associated_bonding_curve_observed_matches_derived": associated_curve.observed_matches_derived,
+            "token_total_supply_stream_observed_raw": decimal_to_json(token_supply.stream_observed_raw),
+            "token_total_supply_bonding_curve_observed_raw": decimal_to_json(token_supply.bonding_curve_observed_raw),
+            "token_total_supply_protocol_constant_raw": decimal_to_json(token_supply.protocol_constant_raw),
+            "token_total_supply_protocol_constant_ui": decimal_to_json(token_supply.protocol_constant_ui),
+            "token_total_supply_rpc_verified_raw": decimal_to_json(token_supply.rpc_verified_raw),
+            "token_total_supply_rpc_verified_reason": token_supply.rpc_unavailable_reason,
+            "token_total_supply_selected_raw": decimal_to_json(token_supply.selected_raw),
+            "token_total_supply_selected_ui": decimal_to_json(token_supply.selected_ui),
+            "token_total_supply_source": token_supply.source,
+            "token_total_supply_confidence": token_supply.confidence,
+            "token_decimals_selected": token_supply.decimals,
+            "pre_sol_balance_stream_observed": sol_balance.pre_observed,
+            "post_sol_balance_stream_observed": sol_balance.post_observed,
+            "pre_sol_balance_count": sol_balance.pre_balance_count,
+            "post_sol_balance_count": sol_balance.post_balance_count,
+            "pre_sol_balance_lamports": sol_balance.sample_pre_lamports,
+            "post_sol_balance_lamports": sol_balance.sample_post_lamports,
+            "quote_amount_lamports_from_delta_value": decimal_to_json(sol_balance.quote_amount_lamports_from_delta),
+            "quote_amount_sol_from_delta": decimal_to_json(sol_balance.quote_amount_sol_from_delta),
+            "tx_fee_lamports": sol_balance.tx_fee_lamports,
+            "priority_fee_lamports": sol_balance.priority_fee_lamports,
+            "trade_quote_source": sol_balance.trade_quote_source,
+            "trade_quote_source_confidence": sol_balance.trade_quote_source_confidence,
+            "sol_balance_unavailable_reason": sol_balance.unavailable_reason,
         });
         if !present {
             missing_rows.push(row.clone());
@@ -34134,6 +34581,37 @@ async fn launch_metric_canary_command(
             "blocking_for_backtest",
             "blocking_for_tuning",
             "missing_path_classification",
+            "associated_bonding_curve_account_observed",
+            "associated_bonding_curve_account_derived",
+            "associated_bonding_curve_account_source",
+            "associated_bonding_curve_account_confidence",
+            "associated_bonding_curve_token_program_id",
+            "associated_bonding_curve_derivation_matches_observed_account_list",
+            "associated_bonding_curve_observed_matches_derived",
+            "token_total_supply_stream_observed_raw",
+            "token_total_supply_bonding_curve_observed_raw",
+            "token_total_supply_protocol_constant_raw",
+            "token_total_supply_protocol_constant_ui",
+            "token_total_supply_rpc_verified_raw",
+            "token_total_supply_rpc_verified_reason",
+            "token_total_supply_selected_raw",
+            "token_total_supply_selected_ui",
+            "token_total_supply_source",
+            "token_total_supply_confidence",
+            "token_decimals_selected",
+            "pre_sol_balance_stream_observed",
+            "post_sol_balance_stream_observed",
+            "pre_sol_balance_count",
+            "post_sol_balance_count",
+            "pre_sol_balance_lamports",
+            "post_sol_balance_lamports",
+            "quote_amount_lamports_from_delta_value",
+            "quote_amount_sol_from_delta",
+            "tx_fee_lamports",
+            "priority_fee_lamports",
+            "trade_quote_source",
+            "trade_quote_source_confidence",
+            "sol_balance_unavailable_reason",
         ],
         &coverage_rows,
     )?;
@@ -34152,13 +34630,46 @@ async fn launch_metric_canary_command(
         &missing_rows,
     )?;
     let coverage = json!({
-        "schema_version": "phase89.source_field_coverage.v1",
+        "schema_version": "phase90.source_field_coverage.v2",
         "source_run_id": run_id,
         "mint": mint,
         "stream_required_fields": fresh_launch_stream_field_contract().len(),
         "observed_fields": coverage_rows.iter().filter(|row| row["observed"].as_bool().unwrap_or(false)).count(),
         "missing_fields": missing_rows.len(),
         "blocking_failures": blocking_failures,
+        "associated_bonding_curve": {
+            "observed": associated_curve.observed,
+            "derived": associated_curve.derived,
+            "source": associated_curve.source,
+            "confidence": associated_curve.confidence,
+            "token_program_id": associated_curve.token_program_id,
+            "derivation_matches_observed_account_list": associated_curve.matches_observed_account_list,
+            "observed_matches_derived": associated_curve.observed_matches_derived
+        },
+        "token_total_supply": {
+            "stream_observed_raw": decimal_to_json(token_supply.stream_observed_raw),
+            "bonding_curve_observed_raw": decimal_to_json(token_supply.bonding_curve_observed_raw),
+            "protocol_constant_raw": decimal_to_json(token_supply.protocol_constant_raw),
+            "protocol_constant_ui": decimal_to_json(token_supply.protocol_constant_ui),
+            "rpc_verified_raw": decimal_to_json(token_supply.rpc_verified_raw),
+            "rpc_verified_reason": token_supply.rpc_unavailable_reason,
+            "selected_raw": decimal_to_json(token_supply.selected_raw),
+            "selected_ui": decimal_to_json(token_supply.selected_ui),
+            "source": token_supply.source,
+            "confidence": token_supply.confidence,
+            "decimals": token_supply.decimals
+        },
+        "sol_balance": {
+            "pre_sol_balance_stream_observed": sol_balance.pre_observed,
+            "post_sol_balance_stream_observed": sol_balance.post_observed,
+            "quote_amount_lamports_from_delta": decimal_to_json(sol_balance.quote_amount_lamports_from_delta),
+            "quote_amount_sol_from_delta": decimal_to_json(sol_balance.quote_amount_sol_from_delta),
+            "tx_fee_lamports": sol_balance.tx_fee_lamports,
+            "priority_fee_lamports": sol_balance.priority_fee_lamports,
+            "trade_quote_source": sol_balance.trade_quote_source,
+            "trade_quote_source_confidence": sol_balance.trade_quote_source_confidence,
+            "unavailable_reason": sol_balance.unavailable_reason
+        },
         "rows": coverage_rows,
     });
     fs::write(
@@ -34259,7 +34770,7 @@ async fn launch_metric_canary_command(
         let mut paths = Vec::<PathBuf>::new();
         collect_canary_files(&output_dir, &mut paths)?;
         paths.sort();
-        let remote_base = format!("phase89_fresh_launch_canary/{run_id}");
+        let remote_base = format!("phase90_field_gap_fix/{run_id}");
         for path in paths {
             if path.is_dir() {
                 continue;
@@ -34295,7 +34806,7 @@ async fn launch_metric_canary_command(
             }
         }
         let upload_summary = json!({
-            "schema_version": "phase89.canary_r2_upload.v1",
+        "schema_version": "phase90.canary_r2_upload.v1",
             "source_run_id": run_id,
             "mint": mint,
             "uploaded_files": canary_uploaded_files.clone(),
@@ -34308,7 +34819,7 @@ async fn launch_metric_canary_command(
             "canary_r2_upload_summary",
             &upload_summary,
             format!(
-                "# Phase 89 Canary R2 Upload\n\n- source run: `{run_id}`\n- uploaded files: `{}`\n- verified files: `{}`\n- failed files: `{}`\n",
+                "# Phase 90 Canary R2 Upload\n\n- source run: `{run_id}`\n- uploaded files: `{}`\n- verified files: `{}`\n- failed files: `{}`\n",
                 upload_summary["uploaded_files"]
                     .as_array()
                     .map(|v| v.len())
@@ -34330,7 +34841,7 @@ async fn launch_metric_canary_command(
         false
     };
     let success = json!({
-        "schema_version": "phase89.fresh_launch_canary_success.v1",
+        "schema_version": "phase90.fresh_launch_canary_success.v1",
         "source_run_id": run_id,
         "mint": mint,
         "launch_detected": true,
@@ -34355,7 +34866,7 @@ async fn launch_metric_canary_command(
         ),
     )?;
     let readiness = json!({
-        "schema_version": "phase89.final_metric_readiness.v1",
+        "schema_version": "phase90.final_metric_readiness.v1",
         "source_run_id": run_id,
         "mint": mint,
         "stream_required_metrics_working": contract_result["stream_required_passed"],
@@ -34373,7 +34884,7 @@ async fn launch_metric_canary_command(
         &output_dir,
         "final_metric_readiness",
         &readiness,
-        "# Phase 89 Final Metric Readiness\n\nDiagnostic work is allowed only if the stream-required canary passes. Formal backtesting and threshold tuning remain blocked by sample size and enrichment/provider coverage.\n".to_owned(),
+        "# Phase 90 Final Metric Readiness\n\nDiagnostic work is allowed only if the stream-required canary passes. Formal backtesting and threshold tuning remain blocked by sample size and enrichment/provider coverage.\n".to_owned(),
     )?;
     let result = json!({
         "command": "launch-metric-canary",
@@ -43452,5 +43963,193 @@ mod tests {
         assert_eq!(std::env::var(key).unwrap(), "from-process");
         unsafe { std::env::remove_var(key) };
         let _ = fs::remove_file(path);
+    }
+
+    fn phase90_token_created_event(
+        associated: Option<&str>,
+        initial_supply: Option<Decimal>,
+    ) -> NormalizedEvent {
+        let mut meta = common::EventMeta::new(
+            common::EventSource::GeyserProcessed,
+            common::Canonicality::Processed,
+            1,
+        );
+        meta.signature = Some("sig-phase90".to_owned());
+        NormalizedEvent {
+            meta,
+            payload: EventPayload::TokenCreated(common::TokenCreatedEvent {
+                mint: common::PubkeyValue(
+                    "7EpM2UKJmxPwj1guKXCRNoy5ZSj2qgxxsv6p2zeZpump".to_owned(),
+                ),
+                token_program: common::TokenProgramType::Token2022,
+                quote_mint: common::PubkeyValue("quote".to_owned()),
+                quote_asset_type: common::QuoteAssetType::Unknown,
+                creator_wallet: common::PubkeyValue(
+                    "8BG1poHiCBcumotQjusxijcSHPWRj1i5miftxp1mdqxP".to_owned(),
+                ),
+                payer: common::PubkeyValue(
+                    "8BG1poHiCBcumotQjusxijcSHPWRj1i5miftxp1mdqxP".to_owned(),
+                ),
+                bonding_curve_account: common::PubkeyValue(
+                    "AH1oNvhpg8VLxS5kVA88pPkY9bGj3m6zfa3jSnFsfLH7".to_owned(),
+                ),
+                associated_bonding_curve_account: associated
+                    .map(|value| common::PubkeyValue(value.to_owned())),
+                metadata_account: None,
+                name: "phase90".to_owned(),
+                symbol: "P90".to_owned(),
+                uri: String::new(),
+                create_instruction_variant: "create_v2".to_owned(),
+                initial_virtual_quote_reserves: None,
+                initial_virtual_token_reserves: None,
+                initial_real_quote_reserves: None,
+                initial_real_token_reserves: None,
+                initial_supply,
+                creator_initial_buy: None,
+                same_transaction_buys: 0,
+                same_slot_buys: 0,
+                fee_recipients: Vec::new(),
+                raw_account_list: vec![
+                    common::PubkeyValue("7EpM2UKJmxPwj1guKXCRNoy5ZSj2qgxxsv6p2zeZpump".to_owned()),
+                    common::PubkeyValue("AH1oNvhpg8VLxS5kVA88pPkY9bGj3m6zfa3jSnFsfLH7".to_owned()),
+                    common::PubkeyValue("CfHKhq82hEPB1rJG5iJZPkaA6Wi2zpXRTntn5M8Xkwdp".to_owned()),
+                    common::PubkeyValue(TOKEN_2022_PROGRAM_ID.to_owned()),
+                    common::PubkeyValue(ASSOCIATED_TOKEN_PROGRAM_ID.to_owned()),
+                ],
+                launch_transaction_fingerprint: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn phase90_derives_associated_bonding_curve_ata() {
+        let derived = derive_associated_token_account(
+            "AH1oNvhpg8VLxS5kVA88pPkY9bGj3m6zfa3jSnFsfLH7",
+            "7EpM2UKJmxPwj1guKXCRNoy5ZSj2qgxxsv6p2zeZpump",
+            TOKEN_2022_PROGRAM_ID,
+        );
+        assert_eq!(
+            derived.as_deref(),
+            Some("CfHKhq82hEPB1rJG5iJZPkaA6Wi2zpXRTntn5M8Xkwdp")
+        );
+        let events = vec![phase90_token_created_event(None, None)];
+        let analysis = associated_curve_analysis(&events);
+        assert_eq!(
+            analysis.derived.as_deref(),
+            Some("CfHKhq82hEPB1rJG5iJZPkaA6Wi2zpXRTntn5M8Xkwdp")
+        );
+        assert_eq!(analysis.source, "deterministic_ata_derivation");
+        assert_eq!(analysis.confidence, "deterministic");
+        assert_eq!(analysis.matches_observed_account_list, Some(true));
+    }
+
+    #[test]
+    fn phase90_associated_bonding_curve_mismatch_fails_presence() {
+        let events = vec![phase90_token_created_event(
+            Some("11111111111111111111111111111111"),
+            None,
+        )];
+        let related = BTreeSet::new();
+        let analysis = associated_curve_analysis(&events);
+        assert_eq!(analysis.observed_matches_derived, Some(false));
+        assert!(!fresh_field_present(
+            "associated_bonding_curve_account_derived",
+            &events,
+            &related,
+        ));
+    }
+
+    #[test]
+    fn phase90_token_supply_protocol_constant_is_explicit() {
+        let events = vec![phase90_token_created_event(None, None)];
+        let supply = token_supply_analysis(&events);
+        assert_eq!(supply.stream_observed_raw, None);
+        assert_eq!(supply.source, "protocol_constant");
+        assert_eq!(supply.confidence, "protocol_constant");
+        assert_eq!(supply.selected_ui, Some(Decimal::from(1_000_000_000u64)));
+        assert_eq!(
+            supply.rpc_unavailable_reason,
+            "unavailable_blocked_by_rpc_budget"
+        );
+    }
+
+    #[test]
+    fn phase90_sol_balance_arrays_and_quote_delta_are_split() {
+        let mut meta = common::EventMeta::new(
+            common::EventSource::GeyserProcessed,
+            common::Canonicality::Processed,
+            1,
+        );
+        meta.signature = Some("sig-phase90".to_owned());
+        let observed = NormalizedEvent {
+            meta: meta.clone(),
+            payload: EventPayload::ObservedTransaction(common::ObservedTransactionEvent {
+                signature_hint: Some("sig-phase90".to_owned()),
+                slot_hint: Some(1),
+                entry_index: Some(0),
+                tx_position_estimate: None,
+                signer: Some("buyer".to_owned()),
+                program_ids: vec!["pump".to_owned()],
+                account_count: 2,
+                instruction_count: 1,
+                account_list_hash: Some("accounts".to_owned()),
+                instruction_shape_hash: Some("shape".to_owned()),
+                compute_unit_limit: None,
+                compute_unit_price: None,
+                estimated_priority_fee_lamports: Some(common::Lamports(7)),
+                tx_fee_lamports: Some(common::Lamports(5)),
+                compute_units_consumed: None,
+                pre_sol_balances_lamports: vec![common::Lamports(100)],
+                post_sol_balances_lamports: vec![common::Lamports(80)],
+                failed_transaction: false,
+                error_code: None,
+                bundle_like_evidence: None,
+                raw_packet_hash: "hash".to_owned(),
+                first_seen_by_shred_ns: 0,
+                decode_confidence: Decimal::ONE,
+            }),
+        };
+        let buy = NormalizedEvent {
+            meta,
+            payload: EventPayload::PumpBuy(common::PumpBuyEvent {
+                mint: common::PubkeyValue("mint".to_owned()),
+                buyer: common::PubkeyValue("buyer".to_owned()),
+                payer: common::PubkeyValue("buyer".to_owned()),
+                quote_in: Decimal::from(15u64),
+                token_out: Decimal::from(10u64),
+                price_before: None,
+                price_after: None,
+                effective_price: Decimal::new(15, 1),
+                slippage_estimate: None,
+                reserves_before: None,
+                reserves_after: None,
+                max_quote_cost: None,
+                compute_unit_limit: None,
+                compute_unit_price: None,
+                estimated_priority_fee_lamports: None,
+                estimated_base_fee_lamports: None,
+                estimated_tip_lamports: None,
+                is_creator: false,
+                is_known_cluster_member: false,
+                is_first_buy: true,
+                status: common::TransactionStatus::Success,
+            }),
+        };
+        let related = BTreeSet::from(["sig-phase90".to_owned()]);
+        let analysis = sol_balance_analysis(&[observed, buy], &related);
+        assert!(analysis.pre_observed);
+        assert!(analysis.post_observed);
+        assert_eq!(analysis.sample_pre_lamports, Some(100));
+        assert_eq!(analysis.sample_post_lamports, Some(80));
+        assert_eq!(
+            analysis.quote_amount_lamports_from_delta,
+            Some(Decimal::from(15u64))
+        );
+        assert_eq!(analysis.tx_fee_lamports, Some(5));
+        assert_eq!(analysis.priority_fee_lamports, Some(7));
+        assert_eq!(
+            analysis.trade_quote_source,
+            "transaction_meta_pre_post_balance"
+        );
     }
 }

@@ -2518,6 +2518,8 @@ fn canonical_observed_tx(
             estimated_priority_fee_lamports: None,
             tx_fee_lamports: None,
             compute_units_consumed: None,
+            pre_sol_balances_lamports: Vec::new(),
+            post_sol_balances_lamports: Vec::new(),
             failed_transaction: false,
             error_code: None,
             bundle_like_evidence: None,
