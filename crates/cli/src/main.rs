@@ -1214,6 +1214,40 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    LaunchMetricCanary {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        max_launches: usize,
+        #[arg(long)]
+        stop_on_first_contract_failure: bool,
+        #[arg(long)]
+        require_stream_metrics: bool,
+        #[arg(long)]
+        no_live_trading: bool,
+        #[arg(long)]
+        no_rpc: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2: bool,
+        #[arg(long, default_value = "research_output/phase89_fresh_launch_canary")]
+        output_dir: String,
+        #[arg(long)]
+        require_metadata_social: Option<bool>,
+        #[arg(long)]
+        allow_rpc_enrichment: Option<bool>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        local_only: bool,
+        #[arg(long)]
+        latest_canary_run: bool,
+        #[arg(long)]
+        replay_canary_run: Option<String>,
+    },
     RunQuantDiagnostics {
         #[arg(long)]
         source_run_id: Option<String>,
@@ -4351,6 +4385,45 @@ async fn main() -> Result<()> {
                 upload_r2,
                 merge_dataset_index,
                 dry_run,
+            )
+            .await
+        }
+        Command::LaunchMetricCanary {
+            env_file,
+            duration_seconds,
+            max_launches,
+            stop_on_first_contract_failure,
+            require_stream_metrics,
+            no_live_trading,
+            no_rpc,
+            upload_r2,
+            verify_r2,
+            output_dir,
+            require_metadata_social,
+            allow_rpc_enrichment,
+            dry_run,
+            local_only,
+            latest_canary_run,
+            replay_canary_run,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            launch_metric_canary_command(
+                &loaded,
+                duration_seconds,
+                max_launches,
+                stop_on_first_contract_failure,
+                require_stream_metrics,
+                no_live_trading,
+                no_rpc,
+                upload_r2,
+                verify_r2,
+                &output_dir,
+                require_metadata_social.unwrap_or(false),
+                allow_rpc_enrichment.unwrap_or(false),
+                dry_run,
+                local_only,
+                latest_canary_run,
+                replay_canary_run.as_deref(),
             )
             .await
         }
@@ -32899,6 +32972,1388 @@ fn phase80_family_rows_for_entry(
         }));
     }
     rows
+}
+
+#[derive(Debug, Clone)]
+struct FreshLaunchFieldSpec {
+    field_id: &'static str,
+    metric_family: &'static str,
+    bucket: &'static str,
+    event_kinds: &'static [&'static str],
+    required: bool,
+    blocking_for_research: bool,
+    blocking_for_backtest: bool,
+    blocking_for_tuning: bool,
+}
+
+fn fresh_launch_stream_field_contract() -> Vec<FreshLaunchFieldSpec> {
+    vec![
+        FreshLaunchFieldSpec {
+            field_id: "launch_create_signature",
+            metric_family: "Pump create / launch metadata",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "launch_create_slot",
+            metric_family: "Pump create / launch metadata",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "launch_create_timestamp",
+            metric_family: "Pump create / launch metadata",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "mint",
+            metric_family: "Pump create / launch metadata",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "creator_dev_wallet",
+            metric_family: "dev holdings",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "bonding_curve_account",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "associated_bonding_curve_account",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_decimals",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["bonding_curve_update", "holder_balance_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_total_supply",
+            metric_family: "market cap",
+            bucket: "stream_required",
+            event_kinds: &["token_created"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "virtual_sol_reserves",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created", "bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "virtual_token_reserves",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created", "bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "real_sol_reserves",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created", "bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "real_token_reserves",
+            metric_family: "bonding curve reserves",
+            bucket: "stream_required",
+            event_kinds: &["token_created", "bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "curve_complete_flag",
+            metric_family: "curve progress",
+            bucket: "stream_required",
+            event_kinds: &["bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "curve_progress_pct",
+            metric_family: "curve progress",
+            bucket: "stream_required",
+            event_kinds: &["bonding_curve_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "buy_sell_direction",
+            metric_family: "buy/sell flow",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_amount_raw_or_ui",
+            metric_family: "buy/sell flow",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "quote_amount_lamports_or_sol",
+            metric_family: "buy/sell flow",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "signer_or_owner_wallet",
+            metric_family: "unique buyers / sellers",
+            bucket: "stream_required",
+            event_kinds: &[
+                "pump_buy",
+                "pump_sell",
+                "holder_balance_update",
+                "observed_transaction",
+            ],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "token_account",
+            metric_family: "holder count",
+            bucket: "stream_required",
+            event_kinds: &["holder_balance_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "pre_post_token_balance",
+            metric_family: "holder count",
+            bucket: "stream_required",
+            event_kinds: &["holder_balance_update"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "pre_post_sol_balance",
+            metric_family: "realized buy/sell trade price",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "transaction_signature",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &[
+                "token_created",
+                "pump_buy",
+                "pump_sell",
+                "observed_transaction",
+            ],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "instruction_type",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &[
+                "token_created",
+                "pump_buy",
+                "pump_sell",
+                "bonding_curve_update",
+                "holder_balance_update",
+            ],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "instruction_shape_hash",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &["observed_transaction"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "account_list_hash",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &["observed_transaction"],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "compute_unit_limit",
+            metric_family: "fee / priority fee / compute budget",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell", "observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "compute_unit_price",
+            metric_family: "fee / priority fee / compute budget",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell", "observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "priority_fee",
+            metric_family: "fee / priority fee / compute budget",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell", "observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "tx_fee",
+            metric_family: "fee / priority fee / compute budget",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell", "observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "failed_transaction_flag",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &["pump_buy", "pump_sell", "observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "error_code_if_failed",
+            metric_family: "transaction fingerprints",
+            bucket: "stream_required",
+            event_kinds: &["observed_transaction"],
+            required: true,
+            blocking_for_research: false,
+            blocking_for_backtest: false,
+            blocking_for_tuning: true,
+        },
+        FreshLaunchFieldSpec {
+            field_id: "source_sequence_slot_timestamp_confidence",
+            metric_family: "run identity and timing",
+            bucket: "stream_required",
+            event_kinds: &[
+                "token_created",
+                "pump_buy",
+                "pump_sell",
+                "bonding_curve_update",
+                "holder_balance_update",
+                "observed_transaction",
+            ],
+            required: true,
+            blocking_for_research: true,
+            blocking_for_backtest: true,
+            blocking_for_tuning: true,
+        },
+    ]
+}
+
+fn fresh_launch_metric_contract_rows() -> Vec<serde_json::Value> {
+    let mut rows = fresh_launch_stream_field_contract()
+        .into_iter()
+        .map(|spec| {
+            json!({
+                "metric_id": spec.field_id,
+                "metric_name": spec.field_id.replace('_', " "),
+                "metric_family": spec.metric_family,
+                "bucket": spec.bucket,
+                "required_layer": "edge_collector",
+                "source_artifact": "normalized_events",
+                "required_event_types": spec.event_kinds.join("|"),
+                "required_accounts": "fresh mint and related curve/token accounts",
+                "unit": "mixed",
+                "confidence_logic": "observed from normalized event source field; unavailable is never coerced to zero",
+                "unavailable_reason_if_missing": "classified by launch-metric-canary source-field coverage",
+                "implementation_status": "implemented_or_provider_unavailable",
+                "safe_for_diagnostics": true,
+                "safe_for_backtest": spec.blocking_for_backtest,
+                "safe_for_threshold_tuning": false,
+                "coverage_requirement_for_tuning": 1.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    for (id, family, bucket, reason) in [
+        (
+            "funding_graph",
+            "funding graph",
+            "enrichment_required_rpc",
+            "blocked_by_rpc_budget_until credits/API budget available",
+        ),
+        (
+            "common_funder",
+            "common funder",
+            "enrichment_required_rpc",
+            "blocked_by_rpc_budget_until credits/API budget available",
+        ),
+        (
+            "wallet_age_history",
+            "wallet age / wallet history",
+            "enrichment_required_rpc",
+            "blocked_by_rpc_budget_until credits/API budget available",
+        ),
+        (
+            "metadata_social_fetch",
+            "metadata/socials",
+            "enrichment_required_http",
+            "HTTP metadata fetch only; no RPC in canary no-rpc mode",
+        ),
+        (
+            "raw_shred_metrics",
+            "raw-shred metrics",
+            "raw_shred_required",
+            "requires raw shred feed/provider",
+        ),
+        (
+            "deshred_metrics",
+            "deshred metrics",
+            "deshred_required",
+            "requires deshred provider/feed",
+        ),
+        (
+            "post_migration_pumpswap",
+            "post-migration / PumpSwap metrics",
+            "post_migration_required",
+            "requires PumpSwap/post-migration support or stream-captured pool events",
+        ),
+    ] {
+        rows.push(json!({
+            "metric_id": id,
+            "metric_name": id.replace('_', " "),
+            "metric_family": family,
+            "bucket": bucket,
+            "required_layer": bucket,
+            "source_artifact": "enrichment/raw/deshred/post-migration artifact",
+            "required_event_types": "",
+            "required_accounts": "",
+            "unit": "mixed",
+            "confidence_logic": "explicit budget/provider gate",
+            "unavailable_reason_if_missing": reason,
+            "implementation_status": bucket,
+            "safe_for_diagnostics": false,
+            "safe_for_backtest": false,
+            "safe_for_threshold_tuning": false,
+            "coverage_requirement_for_tuning": 1.0,
+        }));
+    }
+    rows
+}
+
+fn ensure_fresh_launch_metric_contract_files(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+    fs::create_dir_all("docs")?;
+    fs::create_dir_all("config")?;
+    let rows = fresh_launch_metric_contract_rows();
+    write_json_rows_csv(
+        &output_dir.join("fresh_launch_metric_contract.csv"),
+        &[
+            "metric_id",
+            "metric_name",
+            "metric_family",
+            "bucket",
+            "required_layer",
+            "source_artifact",
+            "required_event_types",
+            "required_accounts",
+            "unit",
+            "confidence_logic",
+            "unavailable_reason_if_missing",
+            "implementation_status",
+            "safe_for_diagnostics",
+            "safe_for_backtest",
+            "safe_for_threshold_tuning",
+            "coverage_requirement_for_tuning",
+        ],
+        &rows,
+    )?;
+    let payload = json!({
+        "schema_version": "phase89.fresh_launch_metric_contract.v1",
+        "missing_value_policy": "unavailable_not_zero",
+        "stream_required_missing_policy": "fail_canary_and_stop_tracking",
+        "rpc_enrichment_policy": "blocked_by_budget_not_stream_failure_when_no_rpc_mode",
+        "rows": rows,
+        "threshold_tuning_allowed": false,
+    });
+    fs::write(
+        output_dir.join("fresh_launch_metric_contract.json"),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    write_report(
+        output_dir.join("fresh_launch_metric_contract.md"),
+        "# Phase 89 Fresh Launch Metric Contract\n\nStream-required fields fail the canary if they are missing due to decode/schema/serialization/replay code paths. Enrichment, raw-shred, deshred, and post-migration metrics are explicit external/provider gates and are not coerced to zero.\n",
+    )?;
+    write_report(
+        Path::new("docs").join("FRESH_LAUNCH_METRIC_CANARY.md"),
+        "# Fresh Launch Metric Canary\n\nThe fresh-launch canary tracks one Pump.fun mint at a time and proves stream source-field coverage from normalized_events before any strategy research uses the token. Missing stream-required fields are reported as unavailable with an exact path classification, never as zero. RPC/enrichment metrics are budget-gated and are not called in `--no-rpc` mode.\n",
+    )?;
+    let mut toml = String::from(
+        "schema_version = \"phase89.fresh_launch_metric_contract.v1\"\nmissing_value_policy = \"unavailable_not_zero\"\nstream_required_missing_policy = \"fail_canary_and_stop_tracking\"\nthreshold_tuning_allowed = false\n\n",
+    );
+    for row in payload["rows"].as_array().unwrap_or(&Vec::new()) {
+        toml.push_str("[[metric]]\n");
+        for key in [
+            "metric_id",
+            "metric_name",
+            "metric_family",
+            "bucket",
+            "required_layer",
+            "source_artifact",
+            "required_event_types",
+            "required_accounts",
+            "unit",
+            "confidence_logic",
+            "unavailable_reason_if_missing",
+            "implementation_status",
+        ] {
+            toml.push_str(&format!(
+                "{} = {:?}\n",
+                key,
+                row.get(key).and_then(|value| value.as_str()).unwrap_or("")
+            ));
+        }
+        toml.push_str(&format!(
+            "safe_for_diagnostics = {}\nsafe_for_backtest = {}\nsafe_for_threshold_tuning = false\ncoverage_requirement_for_tuning = 1.0\n\n",
+            row.get("safe_for_diagnostics").and_then(|value| value.as_bool()).unwrap_or(false),
+            row.get("safe_for_backtest").and_then(|value| value.as_bool()).unwrap_or(false),
+        ));
+    }
+    fs::write("config/fresh_launch_metric_contract.toml", toml)?;
+    Ok(())
+}
+
+fn event_kind(event: &NormalizedEvent) -> &'static str {
+    match event.payload {
+        EventPayload::TokenCreated(_) => "token_created",
+        EventPayload::PumpBuy(_) => "pump_buy",
+        EventPayload::PumpSell(_) => "pump_sell",
+        EventPayload::BondingCurveUpdate(_) => "bonding_curve_update",
+        EventPayload::HolderBalanceUpdate(_) => "holder_balance_update",
+        EventPayload::WalletFunding(_) => "wallet_funding",
+        EventPayload::ObservedTransaction(_) => "observed_transaction",
+        EventPayload::TentativeSellIntentDetected(_) => "tentative_sell_intent_detected",
+        EventPayload::TentativeMaliciousSellWarning(_) => "tentative_malicious_sell_warning",
+        EventPayload::ShredEmergencyExitArmed(_) => "shred_emergency_exit_armed",
+        EventPayload::ShredEmergencyExitTriggered(_) => "shred_emergency_exit_triggered",
+        EventPayload::ShredSellIntentResolved(_) => "shred_sell_intent_resolved",
+        EventPayload::TokenTerminal(_) => "token_terminal",
+        EventPayload::TradeDecision(_) => "trade_decision",
+        EventPayload::SimulatedFill(_) => "simulated_fill",
+        EventPayload::LiveFill(_) => "live_fill",
+        EventPayload::DataGap(_) => "data_gap",
+    }
+}
+
+fn event_mint_string(event: &NormalizedEvent) -> Option<String> {
+    event.mint().map(|mint| mint.to_string())
+}
+
+fn event_signature_string(event: &NormalizedEvent) -> Option<String> {
+    event.signature().map(ToOwned::to_owned)
+}
+
+fn event_received_ts(event: &NormalizedEvent) -> String {
+    event
+        .meta
+        .block_time
+        .or(Some(event.meta.received_at_wall_time))
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn fresh_field_present(
+    field: &str,
+    events: &[NormalizedEvent],
+    related_signatures: &BTreeSet<String>,
+) -> bool {
+    match field {
+        "launch_create_signature" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_)) && event_signature_string(e).is_some()),
+        "launch_create_slot" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_)) && e.meta.slot > 0),
+        "launch_create_timestamp" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_)) && (e.meta.block_time.is_some() || e.meta.received_at_wall_time != OffsetDateTime::UNIX_EPOCH)),
+        "mint" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_)) && event_mint_string(e).is_some()),
+        "creator_dev_wallet" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if !p.creator_wallet.to_string().is_empty())),
+        "bonding_curve_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if !p.bonding_curve_account.to_string().is_empty())),
+        "associated_bonding_curve_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.associated_bonding_curve_account.is_some())),
+        "token_decimals" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.token_decimals.is_some()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.token_decimals.is_some())),
+        "token_total_supply" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_supply.is_some())),
+        "virtual_sol_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.virtual_quote_reserves > Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_virtual_quote_reserves.is_some())),
+        "virtual_token_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.virtual_token_reserves > Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_virtual_token_reserves.is_some())),
+        "real_sol_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.real_quote_reserves >= Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_real_quote_reserves.is_some())),
+        "real_token_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.real_token_reserves >= Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_real_token_reserves.is_some())),
+        "curve_complete_flag" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.curve_complete_flag.is_some())),
+        "curve_progress_pct" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.curve_progress_pct.is_some())),
+        "buy_sell_direction" => events.iter().any(|e| matches!(e.payload, EventPayload::PumpBuy(_) | EventPayload::PumpSell(_))),
+        "token_amount_raw_or_ui" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.token_out > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.token_in > Decimal::ZERO)),
+        "quote_amount_lamports_or_sol" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.quote_out > Decimal::ZERO)),
+        "signer_or_owner_wallet" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if !p.buyer.to_string().is_empty()) || matches!(&e.payload, EventPayload::PumpSell(p) if !p.seller.to_string().is_empty()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.owner_wallet.to_string().is_empty()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.signer.is_some())),
+        "token_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.token_account.to_string().is_empty())),
+        "pre_post_token_balance" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.old_balance.is_some() || p.new_balance >= Decimal::ZERO)),
+        "pre_post_sol_balance" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.reserves_before.is_some() && p.reserves_after.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.reserves_before.is_some() && p.reserves_after.is_some())),
+        "transaction_signature" => events.iter().any(|e| event_signature_string(e).is_some()),
+        "instruction_type" => events.iter().any(|e| matches!(event_kind(e), "token_created" | "pump_buy" | "pump_sell" | "bonding_curve_update" | "holder_balance_update")),
+        "instruction_shape_hash" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.instruction_shape_hash.is_some() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
+        "account_list_hash" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.account_list_hash.is_some() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
+        "compute_unit_limit" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.compute_unit_limit.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.compute_unit_limit.is_some()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.compute_unit_limit.is_some())),
+        "compute_unit_price" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.compute_unit_price.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.compute_unit_price.is_some()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.compute_unit_price.is_some())),
+        "priority_fee" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.estimated_priority_fee_lamports.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.estimated_priority_fee_lamports.is_some()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.estimated_priority_fee_lamports.is_some())),
+        "tx_fee" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.estimated_base_fee_lamports.is_some()) || matches!(&e.payload, EventPayload::PumpSell(p) if p.estimated_base_fee_lamports.is_some()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.tx_fee_lamports.is_some())),
+        "failed_transaction_flag" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(_) | EventPayload::PumpSell(_) | EventPayload::ObservedTransaction(_))),
+        "error_code_if_failed" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if !p.failed_transaction || p.error_code.is_some())),
+        "source_sequence_slot_timestamp_confidence" => events.iter().any(|e| e.meta.slot > 0 && e.meta.decode_confidence >= Decimal::ZERO),
+        _ => false,
+    }
+}
+
+fn fresh_field_unavailable_reason(
+    field: &str,
+    present: bool,
+    token_events: &[NormalizedEvent],
+    all_events: &[NormalizedEvent],
+) -> (&'static str, bool) {
+    if present {
+        return ("", false);
+    }
+    let has_trade = token_events.iter().any(|event| {
+        matches!(
+            event.payload,
+            EventPayload::PumpBuy(_) | EventPayload::PumpSell(_)
+        )
+    });
+    let has_holder = token_events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::HolderBalanceUpdate(_)));
+    let has_curve = token_events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::BondingCurveUpdate(_)));
+    let observed_tx_count = all_events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::ObservedTransaction(_)))
+        .count();
+    match field {
+        "buy_sell_direction"
+        | "token_amount_raw_or_ui"
+        | "quote_amount_lamports_or_sol"
+        | "pre_post_sol_balance"
+            if !has_trade =>
+        {
+            ("not_applicable_no_trade_observed_for_tracked_launch", false)
+        }
+        "token_account" | "pre_post_token_balance" if !has_holder => (
+            "not_applicable_no_holder_update_observed_for_tracked_launch",
+            false,
+        ),
+        "curve_complete_flag" | "curve_progress_pct" if !has_curve => (
+            "missing_due_to_token_not_initialized_or_no_curve_update_observed",
+            true,
+        ),
+        "instruction_shape_hash" | "account_list_hash" | "error_code_if_failed"
+            if observed_tx_count == 0 =>
+        {
+            ("not_emitted_by_provider_observed_transaction_absent", false)
+        }
+        "compute_unit_limit" | "compute_unit_price" | "priority_fee" | "tx_fee"
+            if !has_trade && observed_tx_count == 0 =>
+        {
+            ("not_applicable_no_trade_or_observed_transaction", false)
+        }
+        "associated_bonding_curve_account" => {
+            ("not_decodable_from_current_provider_idl_account_map", false)
+        }
+        "token_total_supply" => (
+            "provider_did_not_emit_supply_for_create_or_curve_account; pumpfun_total_supply_constant_used_for_research_metrics",
+            false,
+        ),
+        "token_decimals" => (
+            "decoded_but_not_serialized_or_provider_did_not_emit_decimals",
+            true,
+        ),
+        "pre_post_sol_balance" if has_trade => (
+            "raw_wallet_sol_pre_post_not_serialized; trade_quote_amount_from_lamport_delta_is_available",
+            false,
+        ),
+        _ => ("decoded_but_not_serialized", true),
+    }
+}
+
+fn decimal_to_json(value: Option<Decimal>) -> serde_json::Value {
+    value
+        .map(|decimal| json!(decimal.to_string()))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn build_stream_metric_values(
+    run_id: &str,
+    mint: &str,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut latest_curve_price = None;
+    let mut latest_market_cap = None;
+    let mut latest_curve_progress = None;
+    let mut buy_count = 0_u64;
+    let mut sell_count = 0_u64;
+    let mut buy_volume = Decimal::ZERO;
+    let mut sell_volume = Decimal::ZERO;
+    let mut buyers = BTreeSet::<String>::new();
+    let mut sellers = BTreeSet::<String>::new();
+    let mut owner_balances = BTreeMap::<String, Decimal>::new();
+    let mut dev_wallet = None::<String>;
+    let mut price_path = Vec::<Decimal>::new();
+    let mut tx_fingerprints = 0_u64;
+    for event in events {
+        match &event.payload {
+            EventPayload::TokenCreated(payload) => {
+                dev_wallet = Some(payload.creator_wallet.to_string());
+            }
+            EventPayload::BondingCurveUpdate(payload) => {
+                let decimals = payload
+                    .token_decimals
+                    .unwrap_or(common::DEFAULT_PUMP_TOKEN_DECIMALS);
+                if let Some(price) = payload.price_sol_per_token.or_else(|| {
+                    common::pump_virtual_reserve_price_sol_per_token(
+                        payload.virtual_quote_reserves,
+                        payload.virtual_token_reserves,
+                        decimals,
+                    )
+                }) {
+                    latest_curve_price = Some(price);
+                    latest_market_cap = Some(common::pump_market_cap_quote_1b(price));
+                    price_path.push(price);
+                }
+                latest_curve_progress = payload.curve_progress_pct.or_else(|| {
+                    let ui = common::raw_tokens_to_ui(payload.real_token_reserves, decimals);
+                    common::pump_curve_progress_pct_from_real_token_reserves_ui(ui)
+                });
+            }
+            EventPayload::PumpBuy(payload) => {
+                buy_count += 1;
+                buy_volume += payload.quote_in;
+                buyers.insert(payload.buyer.to_string());
+            }
+            EventPayload::PumpSell(payload) => {
+                sell_count += 1;
+                sell_volume += payload.quote_out;
+                sellers.insert(payload.seller.to_string());
+            }
+            EventPayload::HolderBalanceUpdate(payload) => {
+                owner_balances.insert(payload.owner_wallet.to_string(), payload.new_balance);
+            }
+            EventPayload::ObservedTransaction(payload) => {
+                if payload.account_list_hash.is_some() || payload.instruction_shape_hash.is_some() {
+                    tx_fingerprints += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let holder_count = owner_balances
+        .values()
+        .filter(|balance| **balance > Decimal::ZERO)
+        .count();
+    let observed_supply = owner_balances.values().copied().sum::<Decimal>();
+    let top_holder = owner_balances
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(Decimal::ZERO);
+    let top_holder_pct = if observed_supply > Decimal::ZERO {
+        Some(top_holder / observed_supply)
+    } else {
+        None
+    };
+    let dev_holding = dev_wallet
+        .as_ref()
+        .and_then(|wallet| owner_balances.get(wallet))
+        .copied();
+    let mfe_mae = if let Some(first) = price_path.first().copied() {
+        let high = price_path.iter().copied().max().unwrap_or(first);
+        let low = price_path.iter().copied().min().unwrap_or(first);
+        (Some((high - first) / first), Some((low - first) / first))
+    } else {
+        (None, None)
+    };
+    for (metric, family, value, unavailable) in [
+        (
+            "reserve_price_sol_per_token",
+            "reserve-implied price",
+            decimal_to_json(latest_curve_price),
+            latest_curve_price
+                .is_none()
+                .then_some("missing_curve_state_snapshot"),
+        ),
+        (
+            "market_cap_1b_sol",
+            "market cap",
+            decimal_to_json(latest_market_cap),
+            latest_market_cap
+                .is_none()
+                .then_some("missing_price_or_market_cap"),
+        ),
+        (
+            "curve_progress_pct",
+            "curve progress",
+            decimal_to_json(latest_curve_progress),
+            latest_curve_progress
+                .is_none()
+                .then_some("missing_real_token_reserves_or_progress"),
+        ),
+        ("buy_count", "buy/sell flow", json!(buy_count), None),
+        ("sell_count", "buy/sell flow", json!(sell_count), None),
+        (
+            "buy_volume_quote",
+            "buy/sell flow",
+            json!(buy_volume.to_string()),
+            None,
+        ),
+        (
+            "sell_volume_quote",
+            "buy/sell flow",
+            json!(sell_volume.to_string()),
+            None,
+        ),
+        (
+            "unique_buyers",
+            "unique buyers / sellers",
+            json!(buyers.len()),
+            None,
+        ),
+        (
+            "unique_sellers",
+            "unique buyers / sellers",
+            json!(sellers.len()),
+            None,
+        ),
+        (
+            "holder_count",
+            "holder count",
+            json!(holder_count),
+            owner_balances
+                .is_empty()
+                .then_some("missing_holder_snapshot"),
+        ),
+        (
+            "top_holder_pct_observed",
+            "top-holder concentration",
+            decimal_to_json(top_holder_pct),
+            top_holder_pct
+                .is_none()
+                .then_some("missing_holder_denominator"),
+        ),
+        (
+            "dev_holding_balance",
+            "dev holdings",
+            decimal_to_json(dev_holding),
+            dev_holding
+                .is_none()
+                .then_some("dev_wallet_balance_not_observed"),
+        ),
+        (
+            "transaction_fingerprint_rows",
+            "transaction fingerprints",
+            json!(tx_fingerprints),
+            None,
+        ),
+        (
+            "fake_momentum_stream_proxy",
+            "fake momentum",
+            json!((buy_count > 0 && sellers.is_empty()).to_string()),
+            None,
+        ),
+        (
+            "sell_absorption_stream_proxy",
+            "sell absorption",
+            json!((sell_count > 0 && buy_count > sell_count).to_string()),
+            None,
+        ),
+        (
+            "mfe_pct",
+            "MFE / MAE",
+            decimal_to_json(mfe_mae.0),
+            mfe_mae.0.is_none().then_some("insufficient_price_path"),
+        ),
+        (
+            "mae_pct",
+            "MFE / MAE",
+            decimal_to_json(mfe_mae.1),
+            mfe_mae.1.is_none().then_some("insufficient_price_path"),
+        ),
+    ] {
+        rows.push(json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "metric_name": metric,
+            "metric_family": family,
+            "value": value,
+            "source": "stream_normalized_events",
+            "confidence": if unavailable.is_some() { 0.0 } else { 1.0 },
+            "unavailable_reason": unavailable.unwrap_or(""),
+        }));
+    }
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn launch_metric_canary_command(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    max_launches: usize,
+    stop_on_first_contract_failure: bool,
+    require_stream_metrics: bool,
+    no_live_trading: bool,
+    no_rpc: bool,
+    upload_r2: bool,
+    verify_r2: bool,
+    output_dir: &str,
+    require_metadata_social: bool,
+    allow_rpc_enrichment: bool,
+    dry_run: bool,
+    local_only: bool,
+    latest_canary_run: bool,
+    replay_canary_run: Option<&str>,
+) -> Result<()> {
+    let output_dir = PathBuf::from(output_dir);
+    ensure_fresh_launch_metric_contract_files(&output_dir)?;
+    let budget = json!({
+        "schema_version": "phase89.enrichment_budget_status.v1",
+        "rpc_credits_available": false,
+        "no_rpc_mode": no_rpc,
+        "funding_graph": "blocked_by_rpc_budget",
+        "common_funder": "blocked_by_rpc_budget",
+        "wallet_age_history": "blocked_by_rpc_budget",
+        "bundle_confirmation": "blocked_by_rpc_budget_unless_stream_observable",
+        "holder_denominator_repair_via_rpc": "blocked_by_rpc_budget",
+        "metadata_social": if require_metadata_social { "blocked_by_http_api_key_or_budget" } else { "not_required_for_stream_canary" },
+        "raw_deshred": "blocked_by_provider_unless_configured",
+    });
+    write_quant_json_md(
+        &output_dir,
+        "enrichment_budget_status",
+        &budget,
+        "# Phase 89 Enrichment/RPC Budget Status\n\nRPC enrichment was not run. RPC-dependent metrics are budget blockers, not stream canary failures.\n".to_owned(),
+    )?;
+    if dry_run {
+        let result = json!({
+            "command": "launch-metric-canary",
+            "dry_run": true,
+            "duration_seconds": duration_seconds,
+            "max_launches": max_launches,
+            "stop_on_first_contract_failure": stop_on_first_contract_failure,
+            "require_stream_metrics": require_stream_metrics,
+            "no_live_trading": no_live_trading,
+            "no_rpc": no_rpc,
+            "upload_r2": upload_r2,
+            "verify_r2": verify_r2,
+            "local_only": local_only,
+            "latest_canary_run": latest_canary_run,
+            "replay_canary_run": replay_canary_run,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if !no_live_trading {
+        bail!("launch-metric-canary refuses to run unless --no-live-trading is set");
+    }
+    if allow_rpc_enrichment && no_rpc {
+        bail!("--allow-rpc-enrichment=true conflicts with --no-rpc");
+    }
+    let run_id = if let Some(run_id) = replay_canary_run {
+        run_id.to_owned()
+    } else if latest_canary_run {
+        let index = load_dataset_index_local_or_r2(loaded, true).await?;
+        normalized_complete_run_records(&index, Some(1))
+            .into_iter()
+            .next()
+            .map(|entry| entry.run_id)
+            .ok_or_else(|| anyhow!("no normalized-complete run found for --latest-canary-run"))?
+    } else {
+        bail!(
+            "live launch waiting is only supported by the GitHub/VPS deployed canary path; use --replay-canary-run for local proof or deploy the command through GitHub Actions"
+        )
+    };
+    let hydration = hydrate_normalized_event_segments_for_run(loaded, &run_id, true).await?;
+    if hydration.fallback_used {
+        bail!("launch canary requires normalized_events; fallback was used for {run_id}");
+    }
+    let store = storage_engine(loaded)?;
+    let all_events = store
+        .read_normalized_events_filtered(Some(&run_id), None)?
+        .into_iter()
+        .map(|record| record.record)
+        .collect::<Vec<_>>();
+    let creates = all_events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::TokenCreated(_)))
+        .take(max_launches.max(1))
+        .collect::<Vec<_>>();
+    let Some(create) = creates.first() else {
+        bail!("no Pump.fun create/launch event found in canary run {run_id}");
+    };
+    let mint = event_mint_string(create).ok_or_else(|| anyhow!("create event missing mint"))?;
+    let token_events = all_events
+        .iter()
+        .filter(|event| event_mint_string(event).as_deref() == Some(mint.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let related_signatures = token_events
+        .iter()
+        .filter_map(event_signature_string)
+        .collect::<BTreeSet<_>>();
+    let observed_transactions = all_events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, EventPayload::ObservedTransaction(payload)
+                if payload.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(false))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut scoped_events = token_events.clone();
+    scoped_events.extend(observed_transactions);
+    let run_dir = output_dir.join("runs").join(&run_id);
+    fs::create_dir_all(&run_dir)?;
+    let create_payload = serde_json::to_value(create)?;
+    let launch_context = json!({
+        "schema_version": "phase89.launch_context.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "launch_event_id": create.meta.event_id.0.to_string(),
+        "launch_signature": event_signature_string(create),
+        "launch_slot": create.meta.slot,
+        "launch_timestamp": event_received_ts(create),
+        "tracked_token_event_count": token_events.len(),
+        "related_observed_transaction_count": scoped_events.iter().filter(|event| matches!(event.payload, EventPayload::ObservedTransaction(_))).count(),
+        "launch_event": create_payload,
+        "track_fresh_launch_only": true,
+    });
+    fs::write(
+        run_dir.join("launch_context.json"),
+        serde_json::to_vec_pretty(&launch_context)?,
+    )?;
+    let mut coverage_rows = Vec::<serde_json::Value>::new();
+    let mut missing_rows = Vec::<serde_json::Value>::new();
+    let mut blocking_failures = Vec::<serde_json::Value>::new();
+    for spec in fresh_launch_stream_field_contract() {
+        let present = fresh_field_present(spec.field_id, &scoped_events, &related_signatures);
+        let (reason, blocking_failure) =
+            fresh_field_unavailable_reason(spec.field_id, present, &token_events, &all_events);
+        let matching_events = scoped_events
+            .iter()
+            .filter(|event| spec.event_kinds.contains(&event_kind(event)))
+            .collect::<Vec<_>>();
+        let first = matching_events.first();
+        let last = matching_events.last();
+        let event_types_seen = matching_events
+            .iter()
+            .map(|event| event_kind(event))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let row = json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "metric_family": spec.metric_family,
+            "field_id": spec.field_id,
+            "bucket": spec.bucket,
+            "expected": spec.required,
+            "observed": present,
+            "observed_count": if present { matching_events.len().max(1) } else { 0 },
+            "first_seen_slot": first.map(|event| event.meta.slot),
+            "first_seen_timestamp": first.map(|event| event_received_ts(event)),
+            "last_seen_slot": last.map(|event| event.meta.slot),
+            "last_seen_timestamp": last.map(|event| event_received_ts(event)),
+            "event_types_seen": event_types_seen.join("|"),
+            "source_artifacts": "normalized_events",
+            "confidence": if present { 1.0 } else { 0.0 },
+            "unavailable_reason": reason,
+            "blocking_for_research": spec.blocking_for_research && blocking_failure,
+            "blocking_for_backtest": spec.blocking_for_backtest && blocking_failure,
+            "blocking_for_tuning": spec.blocking_for_tuning || blocking_failure,
+            "missing_path_classification": if present { "" } else { reason },
+        });
+        if !present {
+            missing_rows.push(row.clone());
+            if spec.required && blocking_failure && require_stream_metrics {
+                blocking_failures.push(row.clone());
+            }
+        }
+        coverage_rows.push(row);
+    }
+    write_json_rows_csv(
+        &run_dir.join("source_field_coverage.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "metric_family",
+            "field_id",
+            "bucket",
+            "expected",
+            "observed",
+            "observed_count",
+            "first_seen_slot",
+            "first_seen_timestamp",
+            "last_seen_slot",
+            "last_seen_timestamp",
+            "event_types_seen",
+            "source_artifacts",
+            "confidence",
+            "unavailable_reason",
+            "blocking_for_research",
+            "blocking_for_backtest",
+            "blocking_for_tuning",
+            "missing_path_classification",
+        ],
+        &coverage_rows,
+    )?;
+    write_json_rows_csv(
+        &run_dir.join("missing_stream_fields.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "metric_family",
+            "field_id",
+            "unavailable_reason",
+            "blocking_for_research",
+            "blocking_for_backtest",
+            "blocking_for_tuning",
+        ],
+        &missing_rows,
+    )?;
+    let coverage = json!({
+        "schema_version": "phase89.source_field_coverage.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "stream_required_fields": fresh_launch_stream_field_contract().len(),
+        "observed_fields": coverage_rows.iter().filter(|row| row["observed"].as_bool().unwrap_or(false)).count(),
+        "missing_fields": missing_rows.len(),
+        "blocking_failures": blocking_failures,
+        "rows": coverage_rows,
+    });
+    fs::write(
+        run_dir.join("source_field_coverage.json"),
+        serde_json::to_vec_pretty(&coverage)?,
+    )?;
+    write_report(
+        run_dir.join("source_field_coverage.md"),
+        &format!(
+            "# Source Field Coverage\n\n- source run: `{}`\n- mint: `{}`\n- observed fields: `{}` / `{}`\n- missing fields: `{}`\n- blocking stream failures: `{}`\n",
+            run_id,
+            mint,
+            coverage["observed_fields"],
+            coverage["stream_required_fields"],
+            missing_rows.len(),
+            coverage["blocking_failures"]
+                .as_array()
+                .map(|rows| rows.len())
+                .unwrap_or(0)
+        ),
+    )?;
+    let metric_rows = build_stream_metric_values(&run_id, &mint, &scoped_events);
+    write_json_rows_csv(
+        &run_dir.join("stream_metric_values.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "metric_name",
+            "metric_family",
+            "value",
+            "source",
+            "confidence",
+            "unavailable_reason",
+        ],
+        &metric_rows,
+    )?;
+    let stream_proof = json!({
+        "schema_version": "phase89.stream_metric_proof.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "metrics_computed": metric_rows.iter().filter(|row| row["unavailable_reason"].as_str().unwrap_or("").is_empty()).count(),
+        "metrics_unavailable": metric_rows.iter().filter(|row| !row["unavailable_reason"].as_str().unwrap_or("").is_empty()).count(),
+        "rows": metric_rows,
+        "no_rpc_used": no_rpc,
+        "no_live_trading": no_live_trading,
+    });
+    write_quant_json_md(
+        &run_dir,
+        "stream_metric_proof",
+        &stream_proof,
+        format!(
+            "# Stream Metric Proof\n\n- source run: `{run_id}`\n- mint: `{mint}`\n- no RPC used: `{no_rpc}`\n- no live trading: `{no_live_trading}`\n"
+        ),
+    )?;
+    let contract_result = json!({
+        "schema_version": "phase89.metric_contract_result.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "status": if blocking_failures.is_empty() { "passed" } else { "failed" },
+        "stream_required_passed": blocking_failures.is_empty(),
+        "blocking_failures": blocking_failures,
+        "enrichment_required_metrics": "blocked_by_rpc_budget_or_http_provider_not_stream_failure",
+        "raw_shred_required_metrics": "blocked_by_provider",
+        "deshred_required_metrics": "blocked_by_provider",
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &run_dir,
+        "metric_contract_result",
+        &contract_result,
+        format!(
+            "# Metric Contract Result\n\nStatus: `{}`\n\nThreshold tuning allowed: `false`\n",
+            contract_result["status"].as_str().unwrap_or("unknown")
+        ),
+    )?;
+    write_json_rows_csv(
+        &run_dir.join("metric_unavailable_reasons.csv"),
+        &["metric_family", "field_id", "unavailable_reason", "bucket"],
+        &missing_rows,
+    )?;
+    let mut canary_uploaded_files = Vec::<String>::new();
+    let mut canary_verified_files = Vec::<String>::new();
+    let mut canary_failed_files = Vec::<String>::new();
+    if upload_r2 {
+        fn collect_canary_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+            if path.is_file() {
+                out.push(path.to_path_buf());
+                return Ok(());
+            }
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                collect_canary_files(&entry.path(), out)?;
+            }
+            Ok(())
+        }
+        let client = r2_client_for_command(loaded, false, true, false)?;
+        let bucket = client.bucket_for_reports()?;
+        let mut paths = Vec::<PathBuf>::new();
+        collect_canary_files(&output_dir, &mut paths)?;
+        paths.sort();
+        let remote_base = format!("phase89_fresh_launch_canary/{run_id}");
+        for path in paths {
+            if path.is_dir() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&output_dir)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let remote_key = client.managed_key(
+                &research_remote_base_prefix(&client),
+                &format!("{remote_base}/{relative}"),
+            );
+            let prepared = client.prepare_upload(
+                &path,
+                bucket.clone(),
+                remote_key.clone(),
+                &artifact_content_type(&path),
+                BTreeMap::new(),
+                Some(false),
+            )?;
+            let result = client
+                .upload_prepared(&prepared, verify_r2.then_some(true))
+                .await?;
+            if result.uploaded {
+                canary_uploaded_files.push(remote_key.clone());
+            }
+            if verify_r2 && result.verified {
+                canary_verified_files.push(remote_key.clone());
+            }
+            if verify_r2 && !result.verified {
+                canary_failed_files.push(remote_key);
+            }
+        }
+        let upload_summary = json!({
+            "schema_version": "phase89.canary_r2_upload.v1",
+            "source_run_id": run_id,
+            "mint": mint,
+            "uploaded_files": canary_uploaded_files.clone(),
+            "verified_files": canary_verified_files.clone(),
+            "failed_files": canary_failed_files.clone(),
+            "verified": verify_r2 && !canary_verified_files.is_empty() && canary_failed_files.is_empty(),
+        });
+        write_quant_json_md(
+            &output_dir,
+            "canary_r2_upload_summary",
+            &upload_summary,
+            format!(
+                "# Phase 89 Canary R2 Upload\n\n- source run: `{run_id}`\n- uploaded files: `{}`\n- verified files: `{}`\n- failed files: `{}`\n",
+                upload_summary["uploaded_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                upload_summary["verified_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                upload_summary["failed_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+            ),
+        )?;
+    }
+    let canary_r2_verified = if upload_r2 {
+        verify_r2 && !canary_verified_files.is_empty() && canary_failed_files.is_empty()
+    } else {
+        false
+    };
+    let success = json!({
+        "schema_version": "phase89.fresh_launch_canary_success.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "launch_detected": true,
+        "stream_required_passed": contract_result["stream_required_passed"],
+        "r2_upload_verified": canary_r2_verified,
+        "r2_uploaded_files": canary_uploaded_files.len(),
+        "r2_verified_files": canary_verified_files.len(),
+        "r2_failed_files": canary_failed_files.len(),
+        "upload_r2_requested": upload_r2,
+        "local_only": local_only,
+        "no_live_rpc_used": no_rpc,
+        "no_live_orders": no_live_trading,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "fresh_launch_canary_success",
+        &success,
+        format!(
+            "# Fresh Launch Canary Success\n\n- source run: `{run_id}`\n- mint: `{mint}`\n- stream required passed: `{}`\n- threshold tuning allowed: `false`\n",
+            success["stream_required_passed"]
+        ),
+    )?;
+    let readiness = json!({
+        "schema_version": "phase89.final_metric_readiness.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "stream_required_metrics_working": contract_result["stream_required_passed"],
+        "research_derived_metrics_working": stream_proof["metrics_computed"].as_u64().unwrap_or(0) > 0,
+        "blocked_by_rpc_credits": ["funding_graph", "common_funder", "wallet_age_history", "bundle_confirmation", "holder_denominator_repair_via_rpc"],
+        "requires_raw_shred_provider": ["raw_shred_metrics"],
+        "requires_deshred_provider": ["deshred_metrics"],
+        "unsupported": [],
+        "diagnostic_backtesting_allowed": contract_result["stream_required_passed"],
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "minimum_next_data_needed": "repeat canary across multiple fresh launches after stream contract pass; add RPC budget for enrichment-only families",
+    });
+    write_quant_json_md(
+        &output_dir,
+        "final_metric_readiness",
+        &readiness,
+        "# Phase 89 Final Metric Readiness\n\nDiagnostic work is allowed only if the stream-required canary passes. Formal backtesting and threshold tuning remain blocked by sample size and enrichment/provider coverage.\n".to_owned(),
+    )?;
+    let result = json!({
+        "command": "launch-metric-canary",
+        "source_run_id": run_id,
+        "mint": mint,
+        "status": contract_result["status"],
+        "output_dir": output_dir.display().to_string(),
+        "run_dir": run_dir.display().to_string(),
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if stop_on_first_contract_failure
+        && require_stream_metrics
+        && contract_result["status"] == "failed"
+    {
+        bail!(
+            "fresh launch canary stream contract failed; see {}",
+            run_dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn phase80_required_fix(
