@@ -22,10 +22,11 @@ use r2_storage::{
 use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
-    DeshredProviderSmokeOptions, GeyserProviderSmokeOptions, LiveRunOptions, RuntimeMode,
-    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
-    builtin_fixture_suite, builtin_shred_exit_fixture_suite, load_fixture_spec,
-    smoke_deshred_provider, smoke_geyser_provider, write_report,
+    DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
+    LiveRunOptions, RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor,
+    build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
+    collect_fresh_launch_canary_events, load_fixture_spec, smoke_deshred_provider,
+    smoke_geyser_provider, write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -33950,30 +33951,57 @@ async fn launch_metric_canary_command(
     if allow_rpc_enrichment && no_rpc {
         bail!("--allow-rpc-enrichment=true conflicts with --no-rpc");
     }
-    let run_id = if let Some(run_id) = replay_canary_run {
-        run_id.to_owned()
+    let (run_id, all_events, live_summary) = if let Some(run_id) = replay_canary_run {
+        let hydration = hydrate_normalized_event_segments_for_run(loaded, run_id, true).await?;
+        if hydration.fallback_used {
+            bail!("launch canary requires normalized_events; fallback was used for {run_id}");
+        }
+        let store = storage_engine(loaded)?;
+        let events = store
+            .read_normalized_events_filtered(Some(run_id), None)?
+            .into_iter()
+            .map(|record| record.record)
+            .collect::<Vec<_>>();
+        (run_id.to_owned(), events, None)
     } else if latest_canary_run {
         let index = load_dataset_index_local_or_r2(loaded, true).await?;
-        normalized_complete_run_records(&index, Some(1))
+        let run_id = normalized_complete_run_records(&index, Some(1))
             .into_iter()
             .next()
             .map(|entry| entry.run_id)
-            .ok_or_else(|| anyhow!("no normalized-complete run found for --latest-canary-run"))?
+            .ok_or_else(|| anyhow!("no normalized-complete run found for --latest-canary-run"))?;
+        let hydration = hydrate_normalized_event_segments_for_run(loaded, &run_id, true).await?;
+        if hydration.fallback_used {
+            bail!("launch canary requires normalized_events; fallback was used for {run_id}");
+        }
+        let store = storage_engine(loaded)?;
+        let events = store
+            .read_normalized_events_filtered(Some(&run_id), None)?
+            .into_iter()
+            .map(|record| record.record)
+            .collect::<Vec<_>>();
+        (run_id, events, None)
     } else {
-        bail!(
-            "live launch waiting is only supported by the GitHub/VPS deployed canary path; use --replay-canary-run for local proof or deploy the command through GitHub Actions"
+        let live_run_id = format!(
+            "live-launch-canary-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let (summary, events) = collect_fresh_launch_canary_events(
+            loaded,
+            FreshLaunchCanaryLiveOptions {
+                duration_seconds,
+                max_launches: max_launches.max(1),
+            },
         )
+        .await?;
+        if summary.tracked_mint.is_none() {
+            bail!(
+                "no fresh Pump.fun launch detected during live canary window; provider_status={}",
+                summary.provider_status
+            );
+        }
+        (live_run_id, events, Some(summary))
     };
-    let hydration = hydrate_normalized_event_segments_for_run(loaded, &run_id, true).await?;
-    if hydration.fallback_used {
-        bail!("launch canary requires normalized_events; fallback was used for {run_id}");
-    }
-    let store = storage_engine(loaded)?;
-    let all_events = store
-        .read_normalized_events_filtered(Some(&run_id), None)?
-        .into_iter()
-        .map(|record| record.record)
-        .collect::<Vec<_>>();
     let creates = all_events
         .iter()
         .filter(|event| matches!(event.payload, EventPayload::TokenCreated(_)))
@@ -34004,6 +34032,18 @@ async fn launch_metric_canary_command(
     scoped_events.extend(observed_transactions);
     let run_dir = output_dir.join("runs").join(&run_id);
     fs::create_dir_all(&run_dir)?;
+    if let Some(summary) = &live_summary {
+        fs::write(
+            run_dir.join("live_canary_stream_summary.json"),
+            serde_json::to_vec_pretty(summary)?,
+        )?;
+    }
+    let mut normalized_jsonl = String::new();
+    for event in &scoped_events {
+        normalized_jsonl.push_str(&serde_json::to_string(event)?);
+        normalized_jsonl.push('\n');
+    }
+    fs::write(run_dir.join("normalized_events.jsonl"), normalized_jsonl)?;
     let create_payload = serde_json::to_value(create)?;
     let launch_context = json!({
         "schema_version": "phase89.launch_context.v1",

@@ -53,7 +53,8 @@ pub use fixtures::{
 };
 pub use live_source::{
     DeshredCapability, DeshredProviderSmokeOptions, DeshredProviderSmokeSummary,
-    GeyserProviderSmokeOptions, GeyserProviderSmokeSummary, inspect_deshred_capability,
+    FreshLaunchCanaryLiveOptions, FreshLaunchCanaryLiveSummary, GeyserProviderSmokeOptions,
+    GeyserProviderSmokeSummary, collect_fresh_launch_canary_events, inspect_deshred_capability,
     smoke_deshred_provider, smoke_geyser_provider,
 };
 use live_source::{

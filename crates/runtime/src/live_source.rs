@@ -784,6 +784,156 @@ pub async fn smoke_geyser_provider(
     smoke_geyser_provider_with_connector(loaded, options, Arc::new(RealGeyserConnector)).await
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct FreshLaunchCanaryLiveOptions {
+    pub duration_seconds: u64,
+    pub max_launches: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct FreshLaunchCanaryLiveSummary {
+    pub provider_status: String,
+    pub connected: bool,
+    pub duration_seconds: u64,
+    pub transaction_updates: u64,
+    pub account_updates: u64,
+    pub slot_updates: u64,
+    pub normalized_events: u64,
+    pub pump_create_decoded: u64,
+    pub tracked_mint: Option<String>,
+    pub errors: Vec<String>,
+}
+
+pub async fn collect_fresh_launch_canary_events(
+    loaded: &LoadedConfig,
+    options: FreshLaunchCanaryLiveOptions,
+) -> Result<(FreshLaunchCanaryLiveSummary, Vec<NormalizedEvent>)> {
+    collect_fresh_launch_canary_events_with_connector(
+        loaded,
+        options,
+        Arc::new(RealGeyserConnector),
+    )
+    .await
+}
+
+pub async fn collect_fresh_launch_canary_events_with_connector(
+    loaded: &LoadedConfig,
+    options: FreshLaunchCanaryLiveOptions,
+    connector: Arc<dyn GeyserStreamConnector>,
+) -> Result<(FreshLaunchCanaryLiveSummary, Vec<NormalizedEvent>)> {
+    let config = loaded.config.geyser.clone();
+    let mut summary = FreshLaunchCanaryLiveSummary {
+        provider_status: "not_attempted".to_owned(),
+        duration_seconds: options.duration_seconds.max(1),
+        ..FreshLaunchCanaryLiveSummary::default()
+    };
+    if !geyser_endpoint_configured(&config) {
+        summary.provider_status = "not_attempted_missing_endpoint".to_owned();
+        summary
+            .errors
+            .push("geyser endpoint is not configured".to_owned());
+        return Err(anyhow!("geyser endpoint is not configured"));
+    }
+
+    let mut normalizer = GeyserEventNormalizer::from_loaded(loaded)?;
+    let mut ingest = GeyserIngestService::new(config.clone());
+    let request = ingest.proto_subscription_request();
+    let mut stream = match connector.connect_and_subscribe(&config, request).await {
+        Ok(stream) => {
+            summary.provider_status = "connected".to_owned();
+            summary.connected = true;
+            stream
+        }
+        Err(error) => {
+            if let Some(status) = error.downcast_ref::<Status>() {
+                summary.provider_status = match status.code() {
+                    tonic::Code::Unimplemented => "unsupported".to_owned(),
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                        "auth_rejected".to_owned()
+                    }
+                    _ => "connection_failed".to_owned(),
+                };
+                summary.errors.push(status.to_string());
+            } else {
+                summary.provider_status = "connection_failed".to_owned();
+                summary.errors.push(error.to_string());
+            }
+            return Err(anyhow!(summary.errors.join("; ")));
+        }
+    };
+
+    let deadline =
+        tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
+    let mut events = Vec::<NormalizedEvent>::new();
+    let mut launches_seen = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let poll_window = remaining.min(StdDuration::from_millis(250));
+        if poll_window.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(poll_window, stream.next()).await {
+            Ok(Some(Ok(update))) => {
+                match update.update_oneof.as_ref() {
+                    Some(UpdateOneof::Transaction(_)) | Some(UpdateOneof::TransactionStatus(_)) => {
+                        summary.transaction_updates = summary.transaction_updates.saturating_add(1);
+                    }
+                    Some(UpdateOneof::Account(_)) => {
+                        summary.account_updates = summary.account_updates.saturating_add(1);
+                    }
+                    Some(UpdateOneof::Slot(_)) => {
+                        summary.slot_updates = summary.slot_updates.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                let outputs = ingest.process_subscribe_update(update, monotonic_now_ns());
+                let normalized = outputs
+                    .into_iter()
+                    .flat_map(|output| normalizer.normalize_output(output))
+                    .collect::<Vec<_>>();
+                for event in normalized {
+                    if let EventPayload::TokenCreated(payload) = &event.payload {
+                        launches_seen = launches_seen.saturating_add(1);
+                        summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
+                        if summary.tracked_mint.is_none() {
+                            summary.tracked_mint = Some(payload.mint.to_string());
+                        }
+                    }
+                    summary.normalized_events = summary.normalized_events.saturating_add(1);
+                    events.push(event);
+                }
+                if summary.tracked_mint.is_some()
+                    && launches_seen >= options.max_launches.max(1)
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+            }
+            Ok(Some(Err(status))) => {
+                summary.provider_status = match status.code() {
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                        "auth_rejected".to_owned()
+                    }
+                    tonic::Code::Unimplemented => "unsupported".to_owned(),
+                    _ => "stream_error".to_owned(),
+                };
+                summary.errors.push(status.to_string());
+                return Err(anyhow!(summary.errors.join("; ")));
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    if summary.tracked_mint.is_some() {
+        summary.provider_status = "launch_detected".to_owned();
+    } else if summary.transaction_updates + summary.account_updates + summary.slot_updates == 0 {
+        summary.provider_status = "connected_zero_updates".to_owned();
+    } else {
+        summary.provider_status = "no_launch_detected".to_owned();
+    }
+    Ok((summary, events))
+}
+
 pub async fn smoke_geyser_provider_with_connector(
     loaded: &LoadedConfig,
     options: GeyserProviderSmokeOptions,
