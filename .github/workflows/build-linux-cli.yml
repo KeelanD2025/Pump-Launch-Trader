@@ -515,7 +515,16 @@ jobs:
           LOCAL_CANARY_DIR="phase89-live-canary"
           rm -rf "${LOCAL_CANARY_DIR}"
           mkdir -p "${LOCAL_CANARY_DIR}"
-          scp -r -P "${PORT}" "${VPS_USER}@${VPS_HOST}:${APP_DIR}/data/reports/phase89_fresh_launch_canary_live/." "${LOCAL_CANARY_DIR}/"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_CANARY_DIR}"
+          set -euo pipefail
+          REPORT_DIR="${APP_DIR}/data/reports/phase89_fresh_launch_canary_live"
+          if [[ ! -d "${REPORT_DIR}" ]]; then
+            echo "phase89 live canary report directory not found: ${REPORT_DIR}" >&2
+            exit 1
+          fi
+          tar -czf - -C "${REPORT_DIR}" .
+          EOF
 
       - name: Upload live canary reports
         if: ${{ always() && github.event.inputs.run_live_canary == 'true' }}
