@@ -12,8 +12,9 @@ use common::{
     TentativeMaliciousSellWarningEvent, TentativeSellConfirmationState,
     TentativeSellIntentDetectedEvent, TentativeSellResolutionOutcome, TentativeSellRiskLevel,
     TokenProgramType, TtlConfig, WalletFundingEvent, price_lamports_per_raw_token,
-    pump_curve_progress_pct_from_real_token_reserves_raw, pump_market_cap_quote_1b,
-    pump_market_cap_quote_total_supply, pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
+    price_sol_per_ui_token, pump_curve_progress_pct_from_real_token_reserves_raw,
+    pump_market_cap_quote_1b, pump_market_cap_quote_total_supply,
+    pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -307,6 +308,17 @@ impl CostBasisPosition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderRetentionStatus {
+    Active,
+    ReducedPosition,
+    Sold90Pct,
+    ExitedZeroBalance,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HolderBalance {
     pub balance: Decimal,
     #[serde(default)]
@@ -319,6 +331,12 @@ pub struct HolderBalance {
     pub first_seen_at: Option<OffsetDateTime>,
     pub last_trade_at: Option<OffsetDateTime>,
     pub cost_basis: CostBasisPosition,
+    #[serde(default)]
+    pub wallet_sell_through_pct: Decimal,
+    #[serde(default)]
+    pub wallet_sold_90pct_flag: bool,
+    #[serde(default)]
+    pub holder_retention_status: HolderRetentionStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +394,16 @@ pub struct HolderState {
     pub top_holders: Vec<HolderDistributionSnapshot>,
     pub gini: Decimal,
     pub hhi: Decimal,
+    #[serde(default)]
+    pub paperhand_90pct_wallet_count: usize,
+    #[serde(default)]
+    pub exited_holder_count_zero_balance: usize,
+    #[serde(default)]
+    pub net_holder_change: i64,
+    #[serde(default)]
+    pub holder_churn_rate: Decimal,
+    #[serde(default)]
+    pub holder_stickiness: Decimal,
     pub holder_count_history: VecDeque<(OffsetDateTime, usize)>,
     pub last_updated_at: Option<OffsetDateTime>,
 }
@@ -455,7 +483,7 @@ impl HolderState {
         }
         self.counters.holder_updates_applied += 1;
         self.last_updated_at = Some(observed_at);
-        self.recompute_distribution(observed_at);
+        self.rebuild_owner_balances_from_token_accounts(observed_at, token_decimals);
     }
 
     fn apply_owner_delta(
@@ -512,21 +540,82 @@ impl HolderState {
                 .cost_basis
                 .apply_sell(quote, tokens, observed_at, latest_price);
         }
+        Self::refresh_holder_behaviour(entry);
+    }
+
+    pub fn rebuild_owner_balances_from_token_accounts(
+        &mut self,
+        observed_at: OffsetDateTime,
+        decimals: u8,
+    ) {
+        let previous_holder_count = self.nonzero_holder_count;
+        let mut rebuilt = HashMap::<String, HolderBalance>::new();
+        for account in self.token_accounts.values() {
+            if account.raw_balance > Decimal::ZERO {
+                let old = self.owner_balances.get(&account.owner.0);
+                let entry =
+                    rebuilt
+                        .entry(account.owner.0.clone())
+                        .or_insert_with(|| HolderBalance {
+                            first_seen_at: old.and_then(|holder| holder.first_seen_at),
+                            last_trade_at: old.and_then(|holder| holder.last_trade_at),
+                            cost_basis: old
+                                .map(|holder| holder.cost_basis.clone())
+                                .unwrap_or_default(),
+                            excluded_reason: old.and_then(|holder| holder.excluded_reason.clone()),
+                            ..HolderBalance::default()
+                        });
+                if entry.first_seen_at.is_none() {
+                    entry.first_seen_at = account
+                        .last_sequence
+                        .map(|_| observed_at)
+                        .or(Some(observed_at));
+                }
+                entry.balance += account.raw_balance;
+                entry.ui_balance_sum += if account.ui_balance > Decimal::ZERO {
+                    account.ui_balance
+                } else {
+                    raw_tokens_to_ui(account.raw_balance, decimals)
+                };
+                entry.account_count += 1;
+                entry.last_updated_at = Some(observed_at);
+            }
+        }
+
+        for (owner, old) in &self.owner_balances {
+            if let Some(new_holder) = rebuilt.get_mut(owner) {
+                if new_holder.first_seen_at.is_none() {
+                    new_holder.first_seen_at = old.first_seen_at;
+                }
+                if new_holder.last_trade_at.is_none() {
+                    new_holder.last_trade_at = old.last_trade_at;
+                }
+                if new_holder.cost_basis.original_position_size <= Decimal::ZERO {
+                    new_holder.cost_basis = old.cost_basis.clone();
+                }
+                new_holder.wallet_sell_through_pct = old.wallet_sell_through_pct;
+                new_holder.wallet_sold_90pct_flag = old.wallet_sold_90pct_flag;
+                new_holder.holder_retention_status = old.holder_retention_status.clone();
+            }
+        }
+
+        self.owner_balances = rebuilt;
+        for holder in self.owner_balances.values_mut() {
+            Self::refresh_holder_behaviour(holder);
+        }
+        self.recompute_distribution_with_previous(observed_at, previous_holder_count);
     }
 
     pub fn recompute_distribution(&mut self, observed_at: OffsetDateTime) {
-        let mut account_counts = HashMap::<String, usize>::new();
-        let mut ui_sums = HashMap::<String, Decimal>::new();
-        for account in self.token_accounts.values() {
-            if account.raw_balance > Decimal::ZERO {
-                *account_counts.entry(account.owner.0.clone()).or_default() += 1;
-                *ui_sums.entry(account.owner.0.clone()).or_default() += account.ui_balance;
-            }
-        }
-        for (owner, holder) in self.owner_balances.iter_mut() {
-            holder.account_count = account_counts.get(owner).copied().unwrap_or_default();
-            holder.ui_balance_sum = ui_sums.get(owner).copied().unwrap_or_default();
-        }
+        let previous_holder_count = self.nonzero_holder_count;
+        self.recompute_distribution_with_previous(observed_at, previous_holder_count);
+    }
+
+    fn recompute_distribution_with_previous(
+        &mut self,
+        observed_at: OffsetDateTime,
+        previous_holder_count: usize,
+    ) {
         self.nonzero_holder_count = self
             .owner_balances
             .values()
@@ -564,11 +653,49 @@ impl HolderState {
             .collect();
         self.gini = compute_gini(balances.iter().map(|(_, balance)| *balance).collect());
         self.hhi = compute_hhi(balances.iter().map(|(_, balance)| *balance).collect());
+        self.paperhand_90pct_wallet_count = self
+            .owner_balances
+            .values()
+            .filter(|holder| holder.wallet_sold_90pct_flag)
+            .count();
+        self.exited_holder_count_zero_balance =
+            previous_holder_count.saturating_sub(self.nonzero_holder_count);
+        self.net_holder_change = self.nonzero_holder_count as i64 - previous_holder_count as i64;
+        self.holder_churn_rate = if previous_holder_count > 0 {
+            Decimal::from(self.exited_holder_count_zero_balance as u64)
+                / Decimal::from(previous_holder_count as u64)
+        } else {
+            Decimal::ZERO
+        };
+        self.holder_stickiness =
+            (Decimal::ONE - self.holder_churn_rate).clamp(Decimal::ZERO, Decimal::ONE);
         self.holder_count_history
             .push_back((observed_at, self.nonzero_holder_count));
         while self.holder_count_history.len() > MAX_HOLDER_HISTORY {
             self.holder_count_history.pop_front();
         }
+    }
+
+    fn refresh_holder_behaviour(holder: &mut HolderBalance) {
+        holder.wallet_sell_through_pct = if holder.cost_basis.original_position_size > Decimal::ZERO
+        {
+            let sold = (holder.cost_basis.original_position_size
+                - holder.cost_basis.remaining_position_size)
+                .max(Decimal::ZERO);
+            (sold / holder.cost_basis.original_position_size).clamp(Decimal::ZERO, Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        holder.wallet_sold_90pct_flag = holder.wallet_sell_through_pct >= Decimal::new(90, 2);
+        holder.holder_retention_status = if holder.balance <= Decimal::ZERO {
+            HolderRetentionStatus::ExitedZeroBalance
+        } else if holder.wallet_sold_90pct_flag {
+            HolderRetentionStatus::Sold90Pct
+        } else if holder.wallet_sell_through_pct > Decimal::ZERO {
+            HolderRetentionStatus::ReducedPosition
+        } else {
+            HolderRetentionStatus::Active
+        };
     }
 
     pub fn top_holder_pct(&self, rank: usize) -> Decimal {
@@ -1588,11 +1715,13 @@ impl StateEngine {
     fn apply_buy(&mut self, payload: &PumpBuyEvent, event: &NormalizedEvent) {
         let ttl_cfg = self.ttl.clone();
         let is_tentative = matches!(event.meta.canonicality, Canonicality::Tentative);
-        let price = if payload.token_out > Decimal::ZERO {
-            payload.quote_in / payload.token_out
-        } else {
-            payload.effective_price
-        };
+        let token_decimals = self
+            .tokens
+            .get(&payload.mint.0)
+            .map(|token| token.reserve_state.token_decimals)
+            .unwrap_or(DEFAULT_PUMP_TOKEN_DECIMALS);
+        let price = price_sol_per_ui_token(payload.quote_in, payload.token_out, token_decimals)
+            .unwrap_or(payload.effective_price);
         let tx_shape = event
             .signature()
             .and_then(|signature| self.observed_transactions.get(signature))
@@ -1677,11 +1806,13 @@ impl StateEngine {
     fn apply_sell(&mut self, payload: &PumpSellEvent, event: &NormalizedEvent) {
         let ttl_cfg = self.ttl.clone();
         let is_tentative = matches!(event.meta.canonicality, Canonicality::Tentative);
-        let price = if payload.token_in > Decimal::ZERO {
-            payload.quote_out / payload.token_in
-        } else {
-            payload.effective_price
-        };
+        let token_decimals = self
+            .tokens
+            .get(&payload.mint.0)
+            .map(|token| token.reserve_state.token_decimals)
+            .unwrap_or(DEFAULT_PUMP_TOKEN_DECIMALS);
+        let price = price_sol_per_ui_token(payload.quote_out, payload.token_in, token_decimals)
+            .unwrap_or(payload.effective_price);
         let tx_shape = event
             .signature()
             .and_then(|signature| self.observed_transactions.get(signature))
@@ -3078,6 +3209,26 @@ mod tests {
     }
 
     #[test]
+    fn realized_trade_price_is_sol_per_ui_token_not_lamports_per_raw_token() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let _ = engine
+            .apply_event(&buy("buy-price", "holder-a", 1_000_000_000, 1_000_000))
+            .expect("buy");
+        assert_eq!(
+            engine.token(&pubkey("mint")).unwrap().latest_price,
+            Decimal::ONE
+        );
+        let _ = engine
+            .apply_event(&sell("sell-price", "holder-a", 2_000_000_000, 1_000_000))
+            .expect("sell");
+        assert_eq!(
+            engine.token(&pubkey("mint")).unwrap().latest_price,
+            Decimal::from(2u64)
+        );
+    }
+
+    #[test]
     fn token_account_owner_change_moves_balance_between_owners() {
         let mut engine = StateEngine::new(ttl());
         let _ = engine.apply_event(&token_created()).expect("create");
@@ -3133,6 +3284,64 @@ mod tests {
         let token = engine.token(&pubkey("mint")).expect("token");
         assert_eq!(token.holder_state.nonzero_holder_count, 0);
         assert_eq!(token.holder_state.observed_holder_supply(), Decimal::ZERO);
+        assert!(!token.holder_state.owner_balances.contains_key("holder-a"));
+        assert_eq!(token.holder_state.exited_holder_count_zero_balance, 1);
+        assert_eq!(token.holder_state.net_holder_change, -1);
+    }
+
+    #[test]
+    fn sold_90pct_with_positive_balance_is_paperhand_not_holder_exit() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 100, 4, "sig-a",
+            ))
+            .expect("holder update");
+        let _ = engine.apply_event(&buy("buy-a", "holder-a", 100, 100));
+        let _ = engine.apply_event(&sell("sell-a", "holder-a", 90, 90));
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 10, 5, "sig-b",
+            ))
+            .expect("reduced holder update");
+        let token = engine.token(&pubkey("mint")).expect("token");
+        let holder = token
+            .holder_state
+            .owner_balances
+            .get("holder-a")
+            .expect("holder still present");
+        assert_eq!(token.holder_state.nonzero_holder_count, 1);
+        assert_eq!(holder.balance, Decimal::from(10u64));
+        assert!(holder.wallet_sold_90pct_flag);
+        assert!(matches!(
+            holder.holder_retention_status,
+            HolderRetentionStatus::Sold90Pct
+        ));
+        assert_eq!(token.holder_state.paperhand_90pct_wallet_count, 1);
+        assert_eq!(token.holder_state.exited_holder_count_zero_balance, 0);
+    }
+
+    #[test]
+    fn sell_to_zero_marks_exited_zero_balance_separate_from_paperhand() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 100, 4, "sig-a",
+            ))
+            .expect("holder update");
+        let _ = engine.apply_event(&buy("buy-a", "holder-a", 100, 100));
+        let _ = engine.apply_event(&sell("sell-a", "holder-a", 100, 100));
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 0, 5, "sig-b",
+            ))
+            .expect("zero holder update");
+        let token = engine.token(&pubkey("mint")).expect("token");
+        assert_eq!(token.holder_state.nonzero_holder_count, 0);
+        assert_eq!(token.holder_state.exited_holder_count_zero_balance, 1);
+        assert_eq!(token.holder_state.paperhand_90pct_wallet_count, 0);
     }
 
     #[test]

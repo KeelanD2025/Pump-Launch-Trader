@@ -20,7 +20,7 @@ use common::{
     pump_virtual_reserve_price_sol_per_token,
 };
 use futures::Stream;
-use idl::{AccountDecode, InstructionDecode, LoadedIdl};
+use idl::{AccountDecode, DecodedAccount, InstructionDecode, LoadedIdl};
 use ingest_geyser::{
     AccountUpdate, GeyserIngestService, IngestOutput, TransactionInstruction,
     TransactionTokenBalance, TransactionUpdate, YellowstoneEndpoint,
@@ -333,6 +333,20 @@ pub struct GeyserEventNormalizer {
     curve_to_mint: HashMap<String, String>,
     mint_to_creator: HashMap<String, String>,
     seen_buy_mints: HashSet<String>,
+    pending_curve_updates_by_curve_pubkey: HashMap<String, Vec<PendingCurveUpdate>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCurveUpdate {
+    meta: EventMeta,
+    curve_pubkey: String,
+    virtual_quote: Decimal,
+    virtual_token: Decimal,
+    real_quote: Decimal,
+    real_token: Decimal,
+    complete: bool,
+    transaction_signature: Option<String>,
+    write_version: u64,
 }
 
 impl GeyserEventNormalizer {
@@ -346,6 +360,7 @@ impl GeyserEventNormalizer {
             curve_to_mint: HashMap::new(),
             mint_to_creator: HashMap::new(),
             seen_buy_mints: HashSet::new(),
+            pending_curve_updates_by_curve_pubkey: HashMap::new(),
         })
     }
 
@@ -464,6 +479,8 @@ impl GeyserEventNormalizer {
                     self.curve_to_mint
                         .insert(bonding_curve.clone(), mint.clone());
                     self.mint_to_creator.insert(mint.clone(), creator.clone());
+                    let pending_curve_updates =
+                        self.flush_pending_curve_updates(&bonding_curve, &mint);
                     events.push(NormalizedEvent {
                         meta: instruction_meta,
                         payload: EventPayload::TokenCreated(TokenCreatedEvent {
@@ -513,6 +530,7 @@ impl GeyserEventNormalizer {
                             )),
                         }),
                     });
+                    events.extend(pending_curve_updates);
                 }
                 "buy" | "buy_v2" | "buy_exact_quote_in_v2" => {
                     let Some(mint) = account_alias(&account_map, &["mint", "base_mint"]) else {
@@ -673,77 +691,35 @@ impl GeyserEventNormalizer {
             if decoded.name != "BondingCurve" {
                 continue;
             }
+            let pending = pending_curve_update_from_decoded(
+                meta.clone(),
+                update.pubkey.clone(),
+                &decoded,
+                &update,
+            );
             let Some(mint) = self.curve_to_mint.get(&update.pubkey).cloned() else {
+                self.pending_curve_updates_by_curve_pubkey
+                    .entry(update.pubkey.clone())
+                    .or_default()
+                    .push(pending);
                 continue;
             };
-            let virtual_quote =
-                value_decimal(&decoded.fields, "virtual_quote_reserves").unwrap_or(Decimal::ZERO);
-            let virtual_token =
-                value_decimal(&decoded.fields, "virtual_token_reserves").unwrap_or(Decimal::ZERO);
-            let real_quote =
-                value_decimal(&decoded.fields, "real_quote_reserves").unwrap_or(Decimal::ZERO);
-            let real_token =
-                value_decimal(&decoded.fields, "real_token_reserves").unwrap_or(Decimal::ZERO);
-            let complete = decoded
-                .fields
-                .get("complete")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let token_decimals = DEFAULT_PUMP_TOKEN_DECIMALS;
-            let price_lamports_per_raw = price_lamports_per_raw_token(virtual_quote, virtual_token);
-            let price_sol_per_token = pump_virtual_reserve_price_sol_per_token(
-                virtual_quote,
-                virtual_token,
-                token_decimals,
-            )
-            .unwrap_or(Decimal::ZERO);
-            let curve_progress_pct =
-                pump_curve_progress_pct_from_real_token_reserves_raw(real_token, token_decimals);
-            let market_cap_quote_1b = pump_market_cap_quote_1b(price_sol_per_token);
-            return vec![NormalizedEvent {
-                meta,
-                payload: EventPayload::BondingCurveUpdate(BondingCurveUpdateEvent {
-                    mint: PubkeyValue(mint),
-                    virtual_quote_reserves: virtual_quote,
-                    virtual_token_reserves: virtual_token,
-                    real_quote_reserves: real_quote,
-                    real_token_reserves: real_token,
-                    token_decimals: Some(token_decimals),
-                    price_lamports_per_raw_token: price_lamports_per_raw,
-                    price_sol_per_token: Some(price_sol_per_token),
-                    reserve_price_source: Some("virtual_reserves".to_owned()),
-                    reserve_price_confidence: Some(if price_lamports_per_raw.is_some() {
-                        Decimal::ONE
-                    } else {
-                        Decimal::ZERO
-                    }),
-                    price: price_sol_per_token,
-                    market_cap_quote_1b: Some(market_cap_quote_1b),
-                    market_cap_quote_total_supply: Some(pump_market_cap_quote_total_supply(
-                        price_sol_per_token,
-                        Decimal::from(PUMP_TOTAL_SUPPLY_UI),
-                    )),
-                    market_cap_source: Some("price_times_supply".to_owned()),
-                    market_cap_confidence: Some(if price_lamports_per_raw.is_some() {
-                        Decimal::ONE
-                    } else {
-                        Decimal::ZERO
-                    }),
-                    market_cap_proxy: None,
-                    curve_complete_flag: Some(complete),
-                    curve_progress_pct,
-                    curve_progress_source: Some("real_token_reserves_ui_minus_reserved".to_owned()),
-                    curve_progress_confidence: curve_progress_pct.map(|_| Decimal::ONE),
-                    curve_completion_pct: curve_progress_pct,
-                    quote_reserve_delta: None,
-                    token_reserve_delta: None,
-                    update_reason: "geyser_account_update".to_owned(),
-                    caused_by_signature: update.transaction_signature,
-                    account_write_version: Some(update.write_version),
-                }),
-            }];
+            return vec![bonding_curve_event_from_pending(pending, &mint)];
         }
         Vec::new()
+    }
+
+    fn flush_pending_curve_updates(
+        &mut self,
+        curve_pubkey: &str,
+        mint: &str,
+    ) -> Vec<NormalizedEvent> {
+        self.pending_curve_updates_by_curve_pubkey
+            .remove(curve_pubkey)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pending| bonding_curve_event_from_pending(pending, mint))
+            .collect()
     }
 
     fn decode_instruction(
@@ -1865,54 +1841,81 @@ fn bundle_like_evidence(
     (!evidence.is_empty()).then(|| evidence.join("|"))
 }
 
+#[derive(Debug, Clone)]
+struct PreTokenBalance {
+    owner: Option<String>,
+    token_account: String,
+    amount_raw: Decimal,
+    account_index: u32,
+    decimals: u32,
+}
+
 fn holder_balance_events(meta: &EventMeta, update: &TransactionUpdate) -> Vec<NormalizedEvent> {
-    let mut pre = HashMap::<(String, String), (Option<String>, Decimal, u32)>::new();
+    let mut pre = HashMap::<(String, String), PreTokenBalance>::new();
     for balance in &update.pre_token_balances {
-        let owner = balance
-            .owner
-            .clone()
-            .unwrap_or_else(|| format!("owner_{}", balance.account_index));
+        let token_account = account_key_at(&update.account_keys, balance.account_index);
         pre.insert(
-            (balance.mint.clone(), owner),
-            (
-                Some(account_key_at(&update.account_keys, balance.account_index)),
-                token_amount(balance),
-                balance.account_index,
-            ),
+            (balance.mint.clone(), token_account.clone()),
+            PreTokenBalance {
+                owner: balance.owner.clone(),
+                token_account,
+                amount_raw: token_amount(balance),
+                account_index: balance.account_index,
+                decimals: balance.decimals,
+            },
         );
     }
     let mut events = Vec::new();
     for balance in &update.post_token_balances {
+        let token_account = account_key_at(&update.account_keys, balance.account_index);
+        let previous = pre.remove(&(balance.mint.clone(), token_account.clone()));
         let owner = balance
             .owner
             .clone()
+            .or_else(|| previous.as_ref().and_then(|old| old.owner.clone()))
             .unwrap_or_else(|| format!("owner_{}", balance.account_index));
-        let old = pre
-            .get(&(balance.mint.clone(), owner.clone()))
-            .map(|(_, amount, _)| *amount);
+        let old = previous.as_ref().map(|old| old.amount_raw);
         let new_balance = token_amount(balance);
         let delta = new_balance - old.unwrap_or(Decimal::ZERO);
         let token_decimals = u8::try_from(balance.decimals).ok();
         let mut holder_meta = meta.clone();
-        holder_meta.account_pubkey = Some(PubkeyValue(account_key_at(
-            &update.account_keys,
-            balance.account_index,
-        )));
+        holder_meta.account_pubkey = Some(PubkeyValue(token_account.clone()));
         events.push(NormalizedEvent {
             meta: holder_meta,
             payload: EventPayload::HolderBalanceUpdate(HolderBalanceUpdateEvent {
                 mint: PubkeyValue(balance.mint.clone()),
                 owner_wallet: PubkeyValue(owner.clone()),
-                token_account: PubkeyValue(account_key_at(
-                    &update.account_keys,
-                    balance.account_index,
-                )),
+                token_account: PubkeyValue(token_account),
                 token_decimals,
                 old_balance: old,
                 new_balance,
                 delta,
                 caused_by_signature: Some(update.signature.clone()),
                 update_reason: "geyser_token_balance".to_owned(),
+                confidence: Decimal::ONE,
+            }),
+        });
+    }
+    for ((mint, _), previous) in pre {
+        let owner = previous
+            .owner
+            .clone()
+            .unwrap_or_else(|| format!("owner_{}", previous.account_index));
+        let token_decimals = u8::try_from(previous.decimals).ok();
+        let mut holder_meta = meta.clone();
+        holder_meta.account_pubkey = Some(PubkeyValue(previous.token_account.clone()));
+        events.push(NormalizedEvent {
+            meta: holder_meta,
+            payload: EventPayload::HolderBalanceUpdate(HolderBalanceUpdateEvent {
+                mint: PubkeyValue(mint),
+                owner_wallet: PubkeyValue(owner),
+                token_account: PubkeyValue(previous.token_account),
+                token_decimals,
+                old_balance: Some(previous.amount_raw),
+                new_balance: Decimal::ZERO,
+                delta: -previous.amount_raw,
+                caused_by_signature: Some(update.signature.clone()),
+                update_reason: "geyser_token_balance_closed_or_zeroed".to_owned(),
                 confidence: Decimal::ONE,
             }),
         });
@@ -2003,10 +2006,91 @@ fn account_key_at(account_keys: &[String], index: u32) -> String {
         .unwrap_or_else(|| format!("account_{index}"))
 }
 
+fn pending_curve_update_from_decoded(
+    meta: EventMeta,
+    curve_pubkey: String,
+    decoded: &DecodedAccount,
+    update: &AccountUpdate,
+) -> PendingCurveUpdate {
+    PendingCurveUpdate {
+        meta,
+        curve_pubkey,
+        virtual_quote: value_decimal(&decoded.fields, "virtual_quote_reserves")
+            .unwrap_or(Decimal::ZERO),
+        virtual_token: value_decimal(&decoded.fields, "virtual_token_reserves")
+            .unwrap_or(Decimal::ZERO),
+        real_quote: value_decimal(&decoded.fields, "real_quote_reserves").unwrap_or(Decimal::ZERO),
+        real_token: value_decimal(&decoded.fields, "real_token_reserves").unwrap_or(Decimal::ZERO),
+        complete: decoded
+            .fields
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        transaction_signature: update.transaction_signature.clone(),
+        write_version: update.write_version,
+    }
+}
+
+fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> NormalizedEvent {
+    let token_decimals = DEFAULT_PUMP_TOKEN_DECIMALS;
+    let price_lamports_per_raw =
+        price_lamports_per_raw_token(pending.virtual_quote, pending.virtual_token);
+    let price_sol_per_token = pump_virtual_reserve_price_sol_per_token(
+        pending.virtual_quote,
+        pending.virtual_token,
+        token_decimals,
+    )
+    .unwrap_or(Decimal::ZERO);
+    let curve_progress_pct =
+        pump_curve_progress_pct_from_real_token_reserves_raw(pending.real_token, token_decimals);
+    let market_cap_quote_1b = pump_market_cap_quote_1b(price_sol_per_token);
+    let confidence = if price_lamports_per_raw.is_some() {
+        Decimal::ONE
+    } else {
+        Decimal::ZERO
+    };
+    let mut meta = pending.meta;
+    meta.account_pubkey = Some(PubkeyValue(pending.curve_pubkey));
+    NormalizedEvent {
+        meta,
+        payload: EventPayload::BondingCurveUpdate(BondingCurveUpdateEvent {
+            mint: PubkeyValue(mint.to_owned()),
+            virtual_quote_reserves: pending.virtual_quote,
+            virtual_token_reserves: pending.virtual_token,
+            real_quote_reserves: pending.real_quote,
+            real_token_reserves: pending.real_token,
+            token_decimals: Some(token_decimals),
+            price_lamports_per_raw_token: price_lamports_per_raw,
+            price_sol_per_token: Some(price_sol_per_token),
+            reserve_price_source: Some("virtual_reserves".to_owned()),
+            reserve_price_confidence: Some(confidence),
+            price: price_sol_per_token,
+            market_cap_quote_1b: Some(market_cap_quote_1b),
+            market_cap_quote_total_supply: Some(pump_market_cap_quote_total_supply(
+                price_sol_per_token,
+                Decimal::from(PUMP_TOTAL_SUPPLY_UI),
+            )),
+            market_cap_source: Some("price_times_supply".to_owned()),
+            market_cap_confidence: Some(confidence),
+            market_cap_proxy: None,
+            curve_complete_flag: Some(pending.complete),
+            curve_progress_pct,
+            curve_progress_source: Some("real_token_reserves_ui_minus_reserved".to_owned()),
+            curve_progress_confidence: curve_progress_pct.map(|_| Decimal::ONE),
+            curve_completion_pct: curve_progress_pct,
+            quote_reserve_delta: None,
+            token_reserve_delta: None,
+            update_reason: "geyser_account_update".to_owned(),
+            caused_by_signature: pending.transaction_signature,
+            account_write_version: Some(pending.write_version),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use common::{EventPayload, config::LoadedConfig};
-    use ingest_geyser::GeyserIngestService;
+    use common::{Canonicality, EventPayload, EventSource, config::LoadedConfig};
+    use ingest_geyser::{GeyserIngestService, TransactionTokenBalance, TransactionUpdate};
     use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, Message, SlotStatus, SubscribeUpdate, SubscribeUpdateDeshred,
         SubscribeUpdateDeshredTransaction, SubscribeUpdateDeshredTransactionInfo,
@@ -2035,6 +2119,53 @@ mod tests {
             filters: Vec::new(),
             update_oneof: Some(update_oneof),
             created_at: None,
+        }
+    }
+
+    fn holder_test_meta() -> EventMeta {
+        let mut meta = EventMeta::new(EventSource::GeyserProcessed, Canonicality::Processed, 123);
+        meta.signature = Some("holder-sig".to_owned());
+        meta
+    }
+
+    fn token_balance(
+        account_index: u32,
+        mint: &str,
+        owner: Option<&str>,
+        amount: &str,
+    ) -> TransactionTokenBalance {
+        TransactionTokenBalance {
+            account_index,
+            mint: mint.to_owned(),
+            owner: owner.map(str::to_owned),
+            program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()),
+            amount: amount.to_owned(),
+            decimals: 6,
+        }
+    }
+
+    fn holder_test_update(
+        account_keys: Vec<&str>,
+        pre_token_balances: Vec<TransactionTokenBalance>,
+        post_token_balances: Vec<TransactionTokenBalance>,
+    ) -> TransactionUpdate {
+        TransactionUpdate {
+            slot: 123,
+            signature: "holder-sig".to_owned(),
+            transaction_index: Some(1),
+            succeeded: true,
+            error_code: None,
+            account_keys: account_keys.into_iter().map(str::to_owned).collect(),
+            instructions: Vec::new(),
+            inner_instructions: Vec::new(),
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
+            pre_token_balances,
+            post_token_balances,
+            loaded_writable_addresses: Vec::new(),
+            loaded_readonly_addresses: Vec::new(),
+            compute_units_consumed: None,
+            fee_lamports: 0,
         }
     }
 
@@ -2138,6 +2269,128 @@ mod tests {
         loaded.config.geyser.auth_token_env = "MISSING_TOKEN_ENV".to_owned();
         let result = resolved_geyser_metadata(&loaded.config.geyser);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn holder_balance_events_are_keyed_by_token_account_not_owner() {
+        let update = holder_test_update(
+            vec![
+                "payer",
+                "owner-a-token-account-1",
+                "owner-a-token-account-2",
+            ],
+            vec![
+                token_balance(1, "mint-a", Some("owner-a"), "100"),
+                token_balance(2, "mint-a", Some("owner-a"), "5"),
+            ],
+            vec![
+                token_balance(1, "mint-a", Some("owner-a"), "110"),
+                token_balance(2, "mint-a", Some("owner-a"), "7"),
+            ],
+        );
+
+        let events = holder_balance_events(&holder_test_meta(), &update);
+        let holder_updates = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::HolderBalanceUpdate(update) => Some(update),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(holder_updates.len(), 2);
+        let first = holder_updates
+            .iter()
+            .find(|event| event.token_account.0 == "owner-a-token-account-1")
+            .expect("first token account update");
+        assert_eq!(first.old_balance, Some(Decimal::new(100, 0)));
+        assert_eq!(first.new_balance, Decimal::new(110, 0));
+        assert_eq!(first.delta, Decimal::new(10, 0));
+
+        let second = holder_updates
+            .iter()
+            .find(|event| event.token_account.0 == "owner-a-token-account-2")
+            .expect("second token account update");
+        assert_eq!(second.old_balance, Some(Decimal::new(5, 0)));
+        assert_eq!(second.new_balance, Decimal::new(7, 0));
+        assert_eq!(second.delta, Decimal::new(2, 0));
+    }
+
+    #[test]
+    fn holder_balance_events_emit_closed_token_account_zero_snapshot() {
+        let update = holder_test_update(
+            vec!["payer", "owner-a-token-account-1"],
+            vec![token_balance(1, "mint-a", Some("owner-a"), "100")],
+            Vec::new(),
+        );
+
+        let events = holder_balance_events(&holder_test_meta(), &update);
+        let holder_update = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::HolderBalanceUpdate(update) => Some(update),
+                _ => None,
+            })
+            .expect("closed token account update");
+
+        assert_eq!(holder_update.owner_wallet.0, "owner-a");
+        assert_eq!(holder_update.token_account.0, "owner-a-token-account-1");
+        assert_eq!(holder_update.old_balance, Some(Decimal::new(100, 0)));
+        assert_eq!(holder_update.new_balance, Decimal::ZERO);
+        assert_eq!(holder_update.delta, Decimal::new(-100, 0));
+        assert_eq!(
+            holder_update.update_reason,
+            "geyser_token_balance_closed_or_zeroed"
+        );
+    }
+
+    #[test]
+    fn curve_update_before_token_created_is_buffered_and_flushed() {
+        let loaded = loaded_config();
+        let mut normalizer = GeyserEventNormalizer::from_loaded(&loaded).expect("normalizer");
+        normalizer
+            .pending_curve_updates_by_curve_pubkey
+            .entry("curve-a".to_owned())
+            .or_default()
+            .push(PendingCurveUpdate {
+                meta: EventMeta::new(EventSource::GeyserProcessed, Canonicality::Processed, 7),
+                curve_pubkey: "curve-a".to_owned(),
+                virtual_quote: Decimal::from(30_000_000_000u64),
+                virtual_token: Decimal::from(1_000_000_000_000_000u64),
+                real_quote: Decimal::ZERO,
+                real_token: Decimal::from(793_100_000_000_000u64),
+                complete: false,
+                transaction_signature: Some("curve-sig".to_owned()),
+                write_version: 12,
+            });
+
+        let flushed = normalizer.flush_pending_curve_updates("curve-a", "mint-a");
+
+        assert_eq!(flushed.len(), 1);
+        assert!(
+            !normalizer
+                .pending_curve_updates_by_curve_pubkey
+                .contains_key("curve-a")
+        );
+        match &flushed[0].payload {
+            EventPayload::BondingCurveUpdate(update) => {
+                assert_eq!(update.mint.0, "mint-a");
+                assert_eq!(
+                    update.reserve_price_source.as_deref(),
+                    Some("virtual_reserves")
+                );
+                assert_eq!(
+                    update.market_cap_source.as_deref(),
+                    Some("price_times_supply")
+                );
+                assert_eq!(
+                    update.curve_progress_source.as_deref(),
+                    Some("real_token_reserves_ui_minus_reserved")
+                );
+                assert_eq!(update.account_write_version, Some(12));
+            }
+            other => panic!("unexpected event payload: {other:?}"),
+        }
     }
 
     #[test]
