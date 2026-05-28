@@ -33851,10 +33851,16 @@ fn sol_balance_analysis(
         .iter()
         .any(|payload| !payload.post_sol_balances_lamports.is_empty());
     let quote_amount_lamports_from_delta = events.iter().find_map(|event| match &event.payload {
-        EventPayload::PumpBuy(payload) if payload.quote_in > Decimal::ZERO => {
+        EventPayload::PumpBuy(payload)
+            if payload.status != common::TransactionStatus::Failed
+                && payload.quote_in > Decimal::ZERO =>
+        {
             Some(payload.quote_in)
         }
-        EventPayload::PumpSell(payload) if payload.quote_out > Decimal::ZERO => {
+        EventPayload::PumpSell(payload)
+            if payload.status != common::TransactionStatus::Failed
+                && payload.quote_out > Decimal::ZERO =>
+        {
             Some(payload.quote_out)
         }
         _ => None,
@@ -33934,6 +33940,23 @@ fn event_received_ts(event: &NormalizedEvent) -> String {
         .unwrap_or_default()
 }
 
+fn is_successful_launch_create(event: &NormalizedEvent) -> bool {
+    matches!(
+        &event.payload,
+        EventPayload::TokenCreated(payload) if payload.status != common::TransactionStatus::Failed
+    )
+}
+
+fn is_successful_trade(event: &NormalizedEvent) -> bool {
+    matches!(
+        &event.payload,
+        EventPayload::PumpBuy(payload) if payload.status != common::TransactionStatus::Failed
+    ) || matches!(
+        &event.payload,
+        EventPayload::PumpSell(payload) if payload.status != common::TransactionStatus::Failed
+    )
+}
+
 fn fresh_field_present(
     field: &str,
     events: &[NormalizedEvent],
@@ -33963,15 +33986,15 @@ fn fresh_field_present(
         "real_token_reserves" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.real_token_reserves >= Decimal::ZERO) || matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_real_token_reserves.is_some())),
         "curve_complete_flag" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.curve_complete_flag.is_some())),
         "curve_progress_pct" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.curve_progress_pct.is_some())),
-        "buy_sell_direction" => events.iter().any(|e| matches!(e.payload, EventPayload::PumpBuy(_) | EventPayload::PumpSell(_))),
-        "token_amount_raw_or_ui" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.token_out > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.token_in > Decimal::ZERO)),
-        "quote_amount_lamports_or_sol" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.quote_out > Decimal::ZERO)),
+        "buy_sell_direction" => events.iter().any(is_successful_trade),
+        "token_amount_raw_or_ui" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.status != common::TransactionStatus::Failed && p.token_out > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.status != common::TransactionStatus::Failed && p.token_in > Decimal::ZERO)),
+        "quote_amount_lamports_or_sol" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.status != common::TransactionStatus::Failed && p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.status != common::TransactionStatus::Failed && p.quote_out > Decimal::ZERO)),
         "signer_or_owner_wallet" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if !p.buyer.to_string().is_empty()) || matches!(&e.payload, EventPayload::PumpSell(p) if !p.seller.to_string().is_empty()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.owner_wallet.to_string().is_empty()) || matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.signer.is_some())),
         "token_account" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if !p.token_account.to_string().is_empty())),
         "pre_post_token_balance" => events.iter().any(|e| matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.old_balance.is_some() || p.new_balance >= Decimal::ZERO)),
         "pre_sol_balance_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if !p.pre_sol_balances_lamports.is_empty() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
         "post_sol_balance_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if !p.post_sol_balances_lamports.is_empty() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
-        "quote_amount_lamports_from_delta" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.quote_out > Decimal::ZERO)),
+        "quote_amount_lamports_from_delta" => events.iter().any(|e| matches!(&e.payload, EventPayload::PumpBuy(p) if p.status != common::TransactionStatus::Failed && p.quote_in > Decimal::ZERO) || matches!(&e.payload, EventPayload::PumpSell(p) if p.status != common::TransactionStatus::Failed && p.quote_out > Decimal::ZERO)),
         "transaction_signature" => events.iter().any(|e| event_signature_string(e).is_some()),
         "instruction_type" => events.iter().any(|e| matches!(event_kind(e), "token_created" | "pump_buy" | "pump_sell" | "bonding_curve_update" | "holder_balance_update")),
         "instruction_shape_hash" => events.iter().any(|e| matches!(&e.payload, EventPayload::ObservedTransaction(p) if p.instruction_shape_hash.is_some() && p.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(true))),
@@ -34133,12 +34156,16 @@ fn build_stream_metric_values(
                     common::pump_curve_progress_pct_from_real_token_reserves_ui(ui)
                 });
             }
-            EventPayload::PumpBuy(payload) => {
+            EventPayload::PumpBuy(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
                 buy_count += 1;
                 buy_volume += payload.quote_in;
                 buyers.insert(payload.buyer.to_string());
             }
-            EventPayload::PumpSell(payload) => {
+            EventPayload::PumpSell(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
                 sell_count += 1;
                 sell_volume += payload.quote_out;
                 sellers.insert(payload.seller.to_string());
@@ -34417,11 +34444,13 @@ async fn launch_metric_canary_command(
     };
     let creates = all_events
         .iter()
-        .filter(|event| matches!(event.payload, EventPayload::TokenCreated(_)))
+        .filter(|event| is_successful_launch_create(event))
         .take(max_launches.max(1))
         .collect::<Vec<_>>();
     let Some(create) = creates.first() else {
-        bail!("no Pump.fun create/launch event found in canary run {run_id}");
+        bail!(
+            "no successful Pump.fun create/launch event found in canary run {run_id}; failed create instructions are skipped"
+        );
     };
     let mint = event_mint_string(create).ok_or_else(|| anyhow!("create event missing mint"))?;
     let token_events = all_events
@@ -44017,8 +44046,17 @@ mod tests {
                     common::PubkeyValue(ASSOCIATED_TOKEN_PROGRAM_ID.to_owned()),
                 ],
                 launch_transaction_fingerprint: None,
+                status: common::TransactionStatus::Success,
             }),
         }
+    }
+
+    fn phase90_failed_token_created_event() -> NormalizedEvent {
+        let mut event = phase90_token_created_event(None, None);
+        if let EventPayload::TokenCreated(payload) = &mut event.payload {
+            payload.status = common::TransactionStatus::Failed;
+        }
+        event
     }
 
     #[test]
@@ -44151,5 +44189,76 @@ mod tests {
             analysis.trade_quote_source,
             "transaction_meta_pre_post_balance"
         );
+    }
+
+    #[test]
+    fn phase93_failed_create_is_not_valid_launch_canary_target() {
+        let failed = phase90_failed_token_created_event();
+        let success = phase90_token_created_event(None, None);
+        assert!(!is_successful_launch_create(&failed));
+        assert!(is_successful_launch_create(&success));
+        let events = [failed, success];
+        let chosen = events
+            .iter()
+            .find(|event| is_successful_launch_create(event))
+            .expect("successful create");
+        assert!(matches!(
+            &chosen.payload,
+            EventPayload::TokenCreated(payload)
+                if payload.status == common::TransactionStatus::Success
+        ));
+    }
+
+    #[test]
+    fn phase93_failed_trades_do_not_satisfy_quote_or_flow_presence() {
+        let mut meta = common::EventMeta::new(
+            common::EventSource::GeyserProcessed,
+            common::Canonicality::Processed,
+            1,
+        );
+        meta.signature = Some("failed-buy".to_owned());
+        let failed_buy = NormalizedEvent {
+            meta,
+            payload: EventPayload::PumpBuy(common::PumpBuyEvent {
+                mint: common::PubkeyValue("mint".to_owned()),
+                buyer: common::PubkeyValue("buyer".to_owned()),
+                payer: common::PubkeyValue("buyer".to_owned()),
+                quote_in: Decimal::from(10u64),
+                token_out: Decimal::from(100u64),
+                price_before: None,
+                price_after: None,
+                effective_price: Decimal::new(1, 1),
+                slippage_estimate: None,
+                reserves_before: None,
+                reserves_after: None,
+                max_quote_cost: None,
+                compute_unit_limit: None,
+                compute_unit_price: None,
+                estimated_priority_fee_lamports: None,
+                estimated_base_fee_lamports: None,
+                estimated_tip_lamports: None,
+                is_creator: false,
+                is_known_cluster_member: false,
+                is_first_buy: true,
+                status: common::TransactionStatus::Failed,
+            }),
+        };
+        let related = BTreeSet::new();
+        assert!(!fresh_field_present(
+            "buy_sell_direction",
+            std::slice::from_ref(&failed_buy),
+            &related,
+        ));
+        assert!(!fresh_field_present(
+            "quote_amount_lamports_or_sol",
+            std::slice::from_ref(&failed_buy),
+            &related,
+        ));
+        let metrics = build_stream_metric_values("run", "mint", &[failed_buy]);
+        let buy_count = metrics
+            .iter()
+            .find(|row| row["metric_name"] == "buy_count")
+            .and_then(|row| row["value"].as_u64());
+        assert_eq!(buy_count, Some(0));
     }
 }

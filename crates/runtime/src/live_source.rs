@@ -476,11 +476,14 @@ impl GeyserEventNormalizer {
                     if mint.is_empty() || creator.is_empty() || bonding_curve.is_empty() {
                         continue;
                     }
-                    self.curve_to_mint
-                        .insert(bonding_curve.clone(), mint.clone());
-                    self.mint_to_creator.insert(mint.clone(), creator.clone());
-                    let pending_curve_updates =
-                        self.flush_pending_curve_updates(&bonding_curve, &mint);
+                    let pending_curve_updates = if status != TransactionStatus::Failed {
+                        self.curve_to_mint
+                            .insert(bonding_curve.clone(), mint.clone());
+                        self.mint_to_creator.insert(mint.clone(), creator.clone());
+                        self.flush_pending_curve_updates(&bonding_curve, &mint)
+                    } else {
+                        Vec::new()
+                    };
                     events.push(NormalizedEvent {
                         meta: instruction_meta,
                         payload: EventPayload::TokenCreated(TokenCreatedEvent {
@@ -528,6 +531,7 @@ impl GeyserEventNormalizer {
                                 compute_budget.0,
                                 compute_budget.1
                             )),
+                            status,
                         }),
                     });
                     events.extend(pending_curve_updates);
@@ -883,7 +887,9 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
                     if let EventPayload::TokenCreated(payload) = &event.payload {
                         launches_seen = launches_seen.saturating_add(1);
                         summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
-                        if summary.tracked_mint.is_none() {
+                        if summary.tracked_mint.is_none()
+                            && payload.status != TransactionStatus::Failed
+                        {
                             summary.tracked_mint = Some(payload.mint.to_string());
                         }
                     }

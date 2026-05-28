@@ -105,6 +105,12 @@ pub enum TransactionStatus {
     Unknown,
 }
 
+impl Default for TransactionStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenTerminalVariant {
@@ -323,6 +329,8 @@ pub struct TokenCreatedEvent {
     pub fee_recipients: Vec<PubkeyValue>,
     pub raw_account_list: Vec<PubkeyValue>,
     pub launch_transaction_fingerprint: Option<String>,
+    #[serde(default)]
+    pub status: TransactionStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

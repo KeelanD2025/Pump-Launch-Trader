@@ -746,6 +746,7 @@ mod tests {
                 fee_recipients: vec![],
                 raw_account_list: vec![],
                 launch_transaction_fingerprint: Some("fingerprint-a".to_owned()),
+                status: common::TransactionStatus::Success,
             }),
         }
     }

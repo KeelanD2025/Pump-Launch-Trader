@@ -2484,6 +2484,7 @@ fn canonical_create(
             fee_recipients: vec![],
             raw_account_list: vec![],
             launch_transaction_fingerprint: Some(fingerprint.to_owned()),
+            status: common::TransactionStatus::Success,
         }),
     }
 }
@@ -2779,6 +2780,7 @@ fn shred_create_packet(
                     fee_recipients: vec![],
                     raw_account_list: vec![],
                     launch_transaction_fingerprint: Some(fingerprint.to_owned()),
+                    status: common::TransactionStatus::Success,
                 },
             },
         }],
