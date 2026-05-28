@@ -226,9 +226,9 @@ dedup_window = 8192
 tentative_ttl_ms = 4000
 
 [pump]
-program_ids = ["Pump111111111111111111111111111111111111111"]
+program_ids = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
 pump_swap_program_ids = []
-idl_paths = ["../fixtures/idl/pump_mock_idl.json"]
+idl_paths = ["../vendor/pumpfun/idl/pump.json"]
 
 [storage]
 root = "data"

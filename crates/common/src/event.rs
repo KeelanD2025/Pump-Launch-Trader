@@ -400,6 +400,20 @@ pub struct BondingCurveUpdateEvent {
     #[serde(default)]
     pub token_decimals: Option<u8>,
     #[serde(default)]
+    pub token_total_supply_raw: Option<Decimal>,
+    #[serde(default)]
+    pub token_total_supply_ui: Option<Decimal>,
+    #[serde(default)]
+    pub token_total_supply_source: Option<String>,
+    #[serde(default)]
+    pub token_total_supply_confidence: Option<String>,
+    #[serde(default)]
+    pub quote_mint: Option<PubkeyValue>,
+    #[serde(default)]
+    pub creator: Option<PubkeyValue>,
+    #[serde(default)]
+    pub reserve_field_schema: Option<String>,
+    #[serde(default)]
     pub price_lamports_per_raw_token: Option<Decimal>,
     #[serde(default)]
     pub price_sol_per_token: Option<Decimal>,

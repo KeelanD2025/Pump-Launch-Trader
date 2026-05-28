@@ -64,6 +64,7 @@ mod tests {
         data.extend_from_slice(&anchor_discriminator("global", "buy"));
         data.extend_from_slice(&10u64.to_le_bytes());
         data.extend_from_slice(&20u64.to_le_bytes());
+        data.push(1);
         let decoded = registry
             .decode_instruction(&data)
             .expect("decode")

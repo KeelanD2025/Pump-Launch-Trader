@@ -4537,7 +4537,7 @@ mod tests {
         assert!(
             loaded
                 .resolve_path(&loaded.config.pump.idl_paths[0])
-                .ends_with("fixtures/idl/pump_mock_idl.json")
+                .ends_with("vendor/pumpfun/idl/pump.json")
         );
         assert_eq!(loaded.hash.len(), 64);
     }

@@ -23,6 +23,8 @@ pub enum IdlError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdlDocument {
     #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
@@ -63,6 +65,10 @@ pub struct IdlInstruction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdlAccountItem {
     pub name: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub pda: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +404,91 @@ impl LoadedIdl {
         })
     }
 
+    pub fn program_address(&self) -> Option<&str> {
+        self.document
+            .address
+            .as_deref()
+            .or_else(|| self.document.metadata.as_ref()?.address.as_deref())
+    }
+
+    pub fn instruction_names(&self) -> Vec<String> {
+        let mut names = self
+            .document
+            .instructions
+            .iter()
+            .map(|instruction| instruction.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn account_names(&self) -> Vec<String> {
+        let mut names = self
+            .document
+            .accounts
+            .iter()
+            .map(|account| account.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn instruction_account_names(&self, name: &str) -> Option<Vec<String>> {
+        self.document
+            .instructions
+            .iter()
+            .find(|instruction| instruction.name == name)
+            .map(|instruction| {
+                instruction
+                    .accounts
+                    .iter()
+                    .map(|account| account.name.clone())
+                    .collect()
+            })
+    }
+
+    pub fn instruction_discriminator_hex(&self, name: &str) -> Option<String> {
+        self.document
+            .instructions
+            .iter()
+            .find(|instruction| instruction.name == name)
+            .and_then(|instruction| {
+                instruction
+                    .discriminator
+                    .clone()
+                    .map(discriminator_vec_to_array)
+                    .transpose()
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| {
+                self.document
+                    .instructions
+                    .iter()
+                    .any(|instruction| instruction.name == name)
+                    .then(|| anchor_discriminator("global", name))
+            })
+            .map(hex::encode)
+    }
+
+    pub fn account_field_names(&self, name: &str) -> Option<Vec<String>> {
+        let layout = self
+            .document
+            .accounts
+            .iter()
+            .find(|account| account.name == name)
+            .and_then(|account| account.ty.clone())
+            .or_else(|| self.defined_types.get(name).cloned())?;
+        Some(
+            layout
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| normalized_field(field, index).name.clone())
+                .collect(),
+        )
+    }
+
     pub fn decode_account(&self, data: &[u8]) -> Result<AccountDecode, IdlError> {
         if data.len() < 8 {
             return Ok(AccountDecode::Unknown {
@@ -637,6 +728,16 @@ mod tests {
             .join("pump_mock_idl.json")
     }
 
+    fn official_pumpfun_idl_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("vendor")
+            .join("pumpfun")
+            .join("idl")
+            .join("pump.json")
+    }
+
     fn encode_string(value: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -653,6 +754,70 @@ mod tests {
         let loaded = LoadedIdl::load(fixture_path()).expect("idl");
         assert_eq!(loaded.document.name, "pump");
         assert_eq!(loaded.hash.len(), 64);
+    }
+
+    #[test]
+    fn loads_official_pumpfun_idl_and_exposes_contract_fields() {
+        let loaded = LoadedIdl::load(official_pumpfun_idl_path()).expect("official idl");
+        assert_eq!(
+            loaded.program_address(),
+            Some("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        );
+        let instructions = loaded.instruction_names();
+        for expected in [
+            "create",
+            "create_v2",
+            "buy",
+            "sell",
+            "buy_v2",
+            "sell_v2",
+            "buy_exact_quote_in_v2",
+            "buy_exact_sol_in",
+        ] {
+            assert!(
+                instructions.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
+        let buy_accounts = loaded
+            .instruction_account_names("buy")
+            .expect("buy accounts");
+        assert!(
+            buy_accounts
+                .iter()
+                .any(|name| name == "associated_bonding_curve")
+        );
+        let buy_v2_accounts = loaded
+            .instruction_account_names("buy_v2")
+            .expect("buy_v2 accounts");
+        assert!(
+            buy_v2_accounts
+                .iter()
+                .any(|name| name == "associated_base_bonding_curve")
+        );
+        assert!(
+            buy_v2_accounts
+                .iter()
+                .any(|name| name == "associated_quote_bonding_curve")
+        );
+        let fields = loaded
+            .account_field_names("BondingCurve")
+            .expect("bonding curve fields");
+        for expected in [
+            "virtual_token_reserves",
+            "virtual_quote_reserves",
+            "real_token_reserves",
+            "real_quote_reserves",
+            "token_total_supply",
+            "complete",
+            "creator",
+            "quote_mint",
+        ] {
+            assert!(
+                fields.iter().any(|field| field == expected),
+                "missing field {expected}"
+            );
+        }
     }
 
     #[test]

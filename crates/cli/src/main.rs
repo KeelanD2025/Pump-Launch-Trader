@@ -1181,6 +1181,10 @@ enum Command {
         #[arg(long, default_value = "research_output/phase88_metric_completion")]
         output_dir: String,
     },
+    ValidatePumpfunIdl {
+        #[arg(long, default_value = "research_output/phase94_official_idl")]
+        output_dir: String,
+    },
     GenerateCanonicalLabels {
         #[arg(long)]
         env_file: Option<String>,
@@ -4349,6 +4353,9 @@ async fn main() -> Result<()> {
                 &output_dir,
             )
             .await
+        }
+        Command::ValidatePumpfunIdl { output_dir } => {
+            validate_pumpfun_idl_command(&loaded, &output_dir)
         }
         Command::GenerateCanonicalLabels {
             env_file,
@@ -33753,11 +33760,11 @@ fn associated_curve_analysis(events: &[NormalizedEvent]) -> AssociatedCurveAnaly
         .zip(derived.as_ref())
         .map(|(observed, derived)| observed == derived);
     let source = if observed.is_some() {
-        "observed_instruction_account"
+        "official_idl_account"
     } else if derived.is_some() {
-        "deterministic_ata_derivation"
+        "official_idl_pda_derivation"
     } else {
-        "unavailable_provider_or_idl"
+        "unavailable_missing_required_seed"
     };
     let confidence = if observed.is_some() {
         "observed"
@@ -33798,11 +33805,19 @@ fn token_supply_analysis(events: &[NormalizedEvent]) -> TokenSupplyAnalysis {
         EventPayload::TokenCreated(payload) => payload.initial_supply,
         _ => None,
     });
+    let bonding_curve_observed_raw = events.iter().find_map(|event| match &event.payload {
+        EventPayload::BondingCurveUpdate(payload) => payload.token_total_supply_raw,
+        _ => None,
+    });
     let protocol_constant_ui = Decimal::from(common::PUMP_TOTAL_SUPPLY_UI);
     let protocol_constant_raw = common::ui_tokens_to_raw(protocol_constant_ui, decimals);
-    let selected_raw = stream_observed_raw.or_else(|| has_create.then_some(protocol_constant_raw));
+    let selected_raw = bonding_curve_observed_raw
+        .or(stream_observed_raw)
+        .or_else(|| has_create.then_some(protocol_constant_raw));
     let selected_ui = selected_raw.map(|raw| common::raw_tokens_to_ui(raw, decimals));
-    let (source, confidence) = if stream_observed_raw.is_some() {
+    let (source, confidence) = if bonding_curve_observed_raw.is_some() {
+        ("bonding_curve_observed", "observed")
+    } else if stream_observed_raw.is_some() {
         ("stream_observed", "observed")
     } else if has_create {
         ("protocol_constant", "protocol_constant")
@@ -33811,7 +33826,7 @@ fn token_supply_analysis(events: &[NormalizedEvent]) -> TokenSupplyAnalysis {
     };
     TokenSupplyAnalysis {
         stream_observed_raw,
-        bonding_curve_observed_raw: None,
+        bonding_curve_observed_raw,
         protocol_constant_raw: has_create.then_some(protocol_constant_raw),
         protocol_constant_ui: has_create.then_some(protocol_constant_ui),
         rpc_verified_raw: None,
@@ -33976,7 +33991,7 @@ fn fresh_field_present(
         }
         "token_decimals" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.token_decimals.is_some()) || matches!(&e.payload, EventPayload::HolderBalanceUpdate(p) if p.token_decimals.is_some())),
         "token_total_supply_stream_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::TokenCreated(p) if p.initial_supply.is_some())),
-        "token_total_supply_bonding_curve_observed" => false,
+        "token_total_supply_bonding_curve_observed" => events.iter().any(|e| matches!(&e.payload, EventPayload::BondingCurveUpdate(p) if p.token_total_supply_raw.is_some())),
         "token_total_supply_protocol_constant" => events.iter().any(|e| matches!(e.payload, EventPayload::TokenCreated(_))),
         "token_total_supply_rpc_verified" => false,
         "token_total_supply_selected" => token_supply_analysis(events).selected_raw.is_some(),
@@ -34063,7 +34078,7 @@ fn fresh_field_unavailable_reason(
             ("not_applicable_no_trade_or_observed_transaction", false)
         }
         "associated_bonding_curve_account_observed" => (
-            "provider_or_idl_unavailable; deterministic_ata_derivation_used_when_possible",
+            "official_idl_account_not_present_in_decoded_instruction; official_idl_pda_derivation_used_when_possible",
             false,
         ),
         "associated_bonding_curve_account_derived" => {
@@ -34079,7 +34094,7 @@ fn fresh_field_unavailable_reason(
             false,
         ),
         "token_total_supply_bonding_curve_observed" => (
-            "bonding_curve_account_state_does_not_emit_total_supply_in_current_stream_decode",
+            "bonding_curve_account_update_not_in_stream_or_decoder_missing_field",
             false,
         ),
         "token_total_supply_protocol_constant" => {
@@ -43135,6 +43150,201 @@ fn combined_idl_hash(loaded: &LoadedConfig) -> Result<String> {
     Ok(StorageEngine::config_fingerprint(&loaded.hash, &combined))
 }
 
+fn validate_pumpfun_idl_command(loaded: &LoadedConfig, output_dir: &str) -> Result<()> {
+    let out = Path::new(output_dir);
+    fs::create_dir_all(out)?;
+    let idl_path = resolve_user_path(loaded, "vendor/pumpfun/idl/pump.json");
+    let idl = LoadedIdl::load(&idl_path)
+        .with_context(|| format!("load official Pump.fun IDL {}", idl_path.display()))?;
+    let expected_program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+    if idl.program_address() != Some(expected_program) {
+        bail!(
+            "official Pump.fun IDL program address mismatch: expected {expected_program}, got {:?}",
+            idl.program_address()
+        );
+    }
+
+    let instruction_names = idl.instruction_names();
+    let required_instructions = [
+        "create",
+        "buy",
+        "sell",
+        "create_v2",
+        "buy_v2",
+        "sell_v2",
+        "buy_exact_quote_in_v2",
+        "buy_exact_sol_in",
+    ];
+    let instruction_rows = required_instructions
+        .iter()
+        .map(|name| {
+            let present = instruction_names.iter().any(|candidate| candidate == name);
+            json!({
+                "instruction": name,
+                "present": present,
+                "discriminator": idl.instruction_discriminator_hex(name),
+                "accounts": idl.instruction_account_names(name).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let missing_instructions = instruction_rows
+        .iter()
+        .filter(|row| !row["present"].as_bool().unwrap_or(false))
+        .map(|row| row["instruction"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    if !missing_instructions.is_empty() {
+        bail!(
+            "official Pump.fun IDL missing required instructions: {}",
+            missing_instructions.join(", ")
+        );
+    }
+
+    let bonding_fields = idl
+        .account_field_names("BondingCurve")
+        .ok_or_else(|| anyhow!("official Pump.fun IDL missing BondingCurve account layout"))?;
+    let required_bonding_fields = [
+        "virtual_token_reserves",
+        "real_token_reserves",
+        "token_total_supply",
+        "complete",
+        "creator",
+        "quote_mint",
+    ];
+    let alias_requirements = [
+        (
+            "virtual_quote_or_sol_reserves",
+            &["virtual_quote_reserves", "virtual_sol_reserves"][..],
+        ),
+        (
+            "real_quote_or_sol_reserves",
+            &["real_quote_reserves", "real_sol_reserves"][..],
+        ),
+    ];
+    let mut field_rows = Vec::new();
+    for field in required_bonding_fields {
+        field_rows.push(json!({
+            "field": field,
+            "present": bonding_fields.iter().any(|candidate| candidate == field),
+            "aliases": [field],
+        }));
+    }
+    for (name, aliases) in alias_requirements {
+        field_rows.push(json!({
+            "field": name,
+            "present": aliases.iter().any(|alias| bonding_fields.iter().any(|candidate| candidate == alias)),
+            "aliases": aliases,
+        }));
+    }
+    let missing_fields = field_rows
+        .iter()
+        .filter(|row| !row["present"].as_bool().unwrap_or(false))
+        .map(|row| row["field"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    if !missing_fields.is_empty() {
+        bail!(
+            "official Pump.fun IDL missing BondingCurve fields: {}",
+            missing_fields.join(", ")
+        );
+    }
+
+    let account_map_rows = [
+        "create",
+        "create_v2",
+        "buy",
+        "sell",
+        "buy_v2",
+        "sell_v2",
+        "buy_exact_quote_in_v2",
+        "buy_exact_sol_in",
+    ]
+    .iter()
+    .map(|name| {
+        let accounts = idl.instruction_account_names(name).unwrap_or_default();
+        let indexed = accounts
+            .iter()
+            .enumerate()
+            .map(|(index, account)| {
+                json!({
+                    "account_name": account,
+                    "index": index,
+                    "pda_derivable": matches!(account.as_str(), "bonding_curve" | "associated_bonding_curve" | "associated_base_bonding_curve" | "associated_quote_bonding_curve" | "creator_vault" | "associated_creator_vault"),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "instruction_name": name,
+            "discriminator": idl.instruction_discriminator_hex(name),
+            "accounts": indexed,
+            "legacy_associated_bonding_curve_index": accounts.iter().position(|account| account == "associated_bonding_curve"),
+            "v2_associated_base_bonding_curve_index": accounts.iter().position(|account| account == "associated_base_bonding_curve"),
+            "v2_associated_quote_bonding_curve_index": accounts.iter().position(|account| account == "associated_quote_bonding_curve"),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let payload = json!({
+        "schema_version": "phase94.official_pumpfun_idl_validation.v1",
+        "source_path": idl_path,
+        "program_address": idl.program_address(),
+        "expected_program_address": expected_program,
+        "hash": idl.hash,
+        "metadata": idl.document.metadata,
+        "instructions": instruction_rows,
+        "bonding_curve_fields": field_rows,
+        "pda_seed_expectations": {
+            "bonding_curve": "official_idl_account_map_or_idl_pda_when present",
+            "associated_bonding_curve": "official IDL account, else ATA(owner=bonding_curve,mint,token_program)",
+            "associated_base_bonding_curve": "official v2 base associated account",
+            "associated_quote_bonding_curve": "official v2 quote associated account",
+            "creator_vault": "official v2 account when present",
+            "associated_creator_vault": "official v2 account when present"
+        },
+        "valid": true,
+    });
+    fs::write(
+        out.join("idl_validation.json"),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    write_report(
+        out.join("idl_validation.md"),
+        &format!(
+            "# Pump.fun IDL validation\n\n- IDL: `{}`\n- Program: `{}`\n- SHA-256: `{}`\n- Instructions checked: `{}`\n- BondingCurve fields checked: `{}`\n- Result: `passed`\n",
+            idl_path.display(),
+            expected_program,
+            idl.hash,
+            required_instructions.join(", "),
+            field_rows
+                .iter()
+                .map(|row| row["field"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )?;
+    fs::write(
+        out.join("instruction_account_maps.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "phase94.official_pumpfun_instruction_account_maps.v1",
+            "source_idl_hash": idl.hash,
+            "program_address": expected_program,
+            "maps": account_map_rows,
+        }))?,
+    )?;
+    write_report(
+        out.join("instruction_account_maps.md"),
+        &format!(
+            "# Official Pump.fun instruction account maps\n\nGenerated from vendored IDL `{}`.\n\nSupported instructions: `{}`.\n\nLegacy `associated_bonding_curve` and v2 `associated_base_bonding_curve` / `associated_quote_bonding_curve` are now sourced from the official IDL account names before deterministic ATA derivation fallback.\n",
+            idl_path.display(),
+            required_instructions.join(", ")
+        ),
+    )?;
+    println!(
+        "official Pump.fun IDL validation passed: {} ({})",
+        idl_path.display(),
+        idl.hash
+    );
+    Ok(())
+}
+
 fn now_for_token(token: &state::TokenState) -> OffsetDateTime {
     token
         .trade_stats
@@ -44076,7 +44286,7 @@ mod tests {
             analysis.derived.as_deref(),
             Some("CfHKhq82hEPB1rJG5iJZPkaA6Wi2zpXRTntn5M8Xkwdp")
         );
-        assert_eq!(analysis.source, "deterministic_ata_derivation");
+        assert_eq!(analysis.source, "official_idl_pda_derivation");
         assert_eq!(analysis.confidence, "deterministic");
         assert_eq!(analysis.matches_observed_account_list, Some(true));
     }

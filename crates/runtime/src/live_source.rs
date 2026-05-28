@@ -17,7 +17,7 @@ use common::{
     TokenProgramType, TransactionStatus, WalletFundingEvent, monotonic_now_ns,
     price_lamports_per_raw_token, pump_curve_progress_pct_from_real_token_reserves_raw,
     pump_market_cap_quote_1b, pump_market_cap_quote_total_supply,
-    pump_virtual_reserve_price_sol_per_token,
+    pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
 };
 use futures::Stream;
 use idl::{AccountDecode, DecodedAccount, InstructionDecode, LoadedIdl};
@@ -344,6 +344,10 @@ struct PendingCurveUpdate {
     virtual_token: Decimal,
     real_quote: Decimal,
     real_token: Decimal,
+    token_total_supply_raw: Option<Decimal>,
+    creator: Option<PubkeyValue>,
+    quote_mint: Option<PubkeyValue>,
+    reserve_field_schema: String,
     complete: bool,
     transaction_signature: Option<String>,
     write_version: u64,
@@ -473,6 +477,15 @@ impl GeyserEventNormalizer {
                         .get("bonding_curve")
                         .cloned()
                         .unwrap_or_default();
+                    let associated_bonding_curve = account_alias(
+                        &account_map,
+                        &[
+                            "associated_bonding_curve",
+                            "associated_base_bonding_curve",
+                            "associated_quote_bonding_curve",
+                        ],
+                    )
+                    .map(PubkeyValue);
                     if mint.is_empty() || creator.is_empty() || bonding_curve.is_empty() {
                         continue;
                     }
@@ -498,7 +511,7 @@ impl GeyserEventNormalizer {
                             creator_wallet: PubkeyValue(creator.clone()),
                             payer: PubkeyValue(payer),
                             bonding_curve_account: PubkeyValue(bonding_curve),
-                            associated_bonding_curve_account: None,
+                            associated_bonding_curve_account: associated_bonding_curve,
                             metadata_account: None,
                             name: value_string(&decoded.args, "name")
                                 .unwrap_or_else(|| "unknown".to_owned()),
@@ -2021,12 +2034,29 @@ fn pending_curve_update_from_decoded(
     PendingCurveUpdate {
         meta,
         curve_pubkey,
-        virtual_quote: value_decimal(&decoded.fields, "virtual_quote_reserves")
-            .unwrap_or(Decimal::ZERO),
+        virtual_quote: value_decimal_alias(
+            &decoded.fields,
+            &["virtual_quote_reserves", "virtual_sol_reserves"],
+        )
+        .unwrap_or(Decimal::ZERO),
         virtual_token: value_decimal(&decoded.fields, "virtual_token_reserves")
             .unwrap_or(Decimal::ZERO),
-        real_quote: value_decimal(&decoded.fields, "real_quote_reserves").unwrap_or(Decimal::ZERO),
+        real_quote: value_decimal_alias(
+            &decoded.fields,
+            &["real_quote_reserves", "real_sol_reserves"],
+        )
+        .unwrap_or(Decimal::ZERO),
         real_token: value_decimal(&decoded.fields, "real_token_reserves").unwrap_or(Decimal::ZERO),
+        token_total_supply_raw: value_decimal(&decoded.fields, "token_total_supply"),
+        creator: value_pubkey(&decoded.fields, "creator"),
+        quote_mint: value_pubkey(&decoded.fields, "quote_mint"),
+        reserve_field_schema: if decoded.fields.contains_key("virtual_quote_reserves")
+            || decoded.fields.contains_key("real_quote_reserves")
+        {
+            "quote_reserves_v2".to_owned()
+        } else {
+            "legacy_sol_reserves".to_owned()
+        },
         complete: decoded
             .fields
             .get("complete")
@@ -2050,6 +2080,9 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
     let curve_progress_pct =
         pump_curve_progress_pct_from_real_token_reserves_raw(pending.real_token, token_decimals);
     let market_cap_quote_1b = pump_market_cap_quote_1b(price_sol_per_token);
+    let token_total_supply_ui = pending
+        .token_total_supply_raw
+        .map(|raw| raw_tokens_to_ui(raw, token_decimals));
     let confidence = if price_lamports_per_raw.is_some() {
         Decimal::ONE
     } else {
@@ -2066,6 +2099,17 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
             real_quote_reserves: pending.real_quote,
             real_token_reserves: pending.real_token,
             token_decimals: Some(token_decimals),
+            token_total_supply_raw: pending.token_total_supply_raw,
+            token_total_supply_ui,
+            token_total_supply_source: pending
+                .token_total_supply_raw
+                .map(|_| "bonding_curve_observed".to_owned()),
+            token_total_supply_confidence: pending
+                .token_total_supply_raw
+                .map(|_| "observed".to_owned()),
+            quote_mint: pending.quote_mint,
+            creator: pending.creator,
+            reserve_field_schema: Some(pending.reserve_field_schema),
             price_lamports_per_raw_token: price_lamports_per_raw,
             price_sol_per_token: Some(price_sol_per_token),
             reserve_price_source: Some("virtual_reserves".to_owned()),
@@ -2365,6 +2409,10 @@ mod tests {
                 virtual_token: Decimal::from(1_000_000_000_000_000u64),
                 real_quote: Decimal::ZERO,
                 real_token: Decimal::from(793_100_000_000_000u64),
+                token_total_supply_raw: Some(Decimal::from(1_000_000_000_000_000u64)),
+                creator: None,
+                quote_mint: None,
+                reserve_field_schema: "quote_reserves_v2".to_owned(),
                 complete: false,
                 transaction_signature: Some("curve-sig".to_owned()),
                 write_version: 12,
