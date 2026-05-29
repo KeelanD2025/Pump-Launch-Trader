@@ -1,0 +1,142 @@
+schema_version = "phase99.risk_engine.v1"
+engine_status = "diagnostic_ready"
+threshold_tuning_allowed = false
+formal_backtesting_allowed = false
+
+[diagnostic_parameters]
+high_concentration_pct = "0.80"
+high_same_slot_count = "2"
+low_unique_buyer_ratio = "0.50"
+production_thresholds_tuned = false
+
+[[risk_family]]
+risk_id = "dev_exit_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "top_holder_dump_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "holder_concentration_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "holder_churn_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "paperhand_90pct_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "fake_momentum_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "sell_absorption_failure_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "no_buy_gap_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "same_slot_bundle_like_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "same_shape_bundle_like_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "priority_fee_cluster_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "account_list_cluster_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "signer_cluster_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "common_funder_risk"
+required_source = "bounded_rpc"
+pre_entry_feature_allowed = false
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "wallet_activity_risk"
+required_source = "bounded_rpc"
+pre_entry_feature_allowed = false
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "metadata_social_absence_risk"
+required_source = "metadata_http"
+pre_entry_feature_allowed = false
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "metadata_social_spam_risk"
+required_source = "metadata_http"
+pre_entry_feature_allowed = false
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "supply_semantics_risk"
+required_source = "bounded_rpc"
+pre_entry_feature_allowed = false
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "post_migration_unknown_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "data_quality_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "stream_gap_risk"
+required_source = "stream"
+pre_entry_feature_allowed = true
+post_event_label_only = false
+
+[[risk_family]]
+risk_id = "provider_confirmation_required"
+required_source = "provider_api"
+pre_entry_feature_allowed = false
+post_event_label_only = false

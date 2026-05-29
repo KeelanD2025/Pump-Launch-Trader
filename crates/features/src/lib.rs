@@ -4,6 +4,7 @@ use std::{
 };
 
 pub mod metric_engine;
+pub mod risk_engine;
 
 use common::{
     EventSource, PUMP_TOTAL_SUPPLY_UI, PubkeyValue, TentativeSellRiskLevel, raw_tokens_to_ui,
