@@ -1157,6 +1157,8 @@ enum Command {
         #[arg(long, default_value_t = true)]
         metadata_http_allowed: bool,
         #[arg(long)]
+        holder_rpc_audit_only: bool,
+        #[arg(long)]
         upload_r2: bool,
         #[arg(long)]
         verify_r2: bool,
@@ -4334,6 +4336,7 @@ async fn main() -> Result<()> {
             max_http_metadata_fetches,
             max_runtime_seconds,
             metadata_http_allowed,
+            holder_rpc_audit_only,
             upload_r2,
             verify_r2,
         } => {
@@ -4356,6 +4359,7 @@ async fn main() -> Result<()> {
                     ledger_required: true,
                 },
                 metadata_http_allowed,
+                holder_rpc_audit_only,
                 upload_r2,
                 verify_r2,
             )
@@ -29874,6 +29878,27 @@ struct RpcMicroStreamContext {
     same_slot_bundle_like: bool,
 }
 
+fn phase97_holder_rpc_boundary_row(mint: &str) -> serde_json::Value {
+    json!({
+        "mint": mint,
+        "holder_count_source": "stream_owner_summed_token_accounts",
+        "top_holder_source": "stream_owner_summed_token_accounts",
+        "dev_holding_source": "stream_owner_summed_token_accounts",
+        "holder_rpc_used": false,
+        "holder_rpc_required": false,
+        "holder_rpc_audit_status": "not_run_not_required",
+        "rpc_holder_data_did_not_overwrite_stream_state": true,
+        "rpc_top_holder_owners_resolved": 0,
+        "stream_top_holder_owner": "",
+        "rpc_top_holder_owner": "",
+        "stream_vs_rpc_top_holder_match": "not_run_not_required",
+        "missing_owner_mapping_repaired_count": 0,
+        "mismatch_count": 0,
+        "confidence": "stream_holder_authority",
+        "status": "not_run_not_required",
+    })
+}
+
 fn rpc_micro_provider_presence() -> BTreeMap<String, bool> {
     [
         "SOLANA_RPC_URL",
@@ -30444,6 +30469,7 @@ async fn rpc_metric_micro_canary_command(
     output_dir: &str,
     limits: RpcMicroCanaryBudgetLimits,
     metadata_http_allowed: bool,
+    holder_rpc_audit_only: bool,
     upload_r2: bool,
     verify_r2: bool,
 ) -> Result<()> {
@@ -30510,6 +30536,8 @@ async fn rpc_metric_micro_canary_command(
         "max_runtime_seconds": limits.max_runtime_seconds,
         "cache_required": limits.cache_required,
         "ledger_required": limits.ledger_required,
+        "holder_rpc_audit_only": holder_rpc_audit_only,
+        "holder_rpc_default_status": if holder_rpc_audit_only { "explicit_audit_enabled" } else { "disabled_not_required_for_holder_metrics" },
     });
     write_quant_json_md(
         &output_dir,
@@ -30592,38 +30620,8 @@ async fn rpc_metric_micro_canary_command(
             "unavailable_reason": if match_status == "unavailable" { "rpc_call_failed_or_budget_limited" } else { "" },
         }));
 
-        let largest = rpc_micro_json_rpc_call(
-            &client,
-            rpc_url,
-            &cache_dir,
-            &ledger_path,
-            &mut state,
-            limits,
-            mint,
-            "holder_denominator",
-            "getTokenLargestAccounts",
-            json!([mint]),
-            "fetch top token accounts for bounded holder denominator check",
-            "holder_denominator_check",
-        )
-        .await?;
-        let largest_accounts = largest
-            .as_ref()
-            .and_then(|v| v.pointer("/result/value"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| {
-                v.get("address")
-                    .and_then(|a| a.as_str())
-                    .map(ToOwned::to_owned)
-            })
-            .take(limits.max_wallets.min(10) as usize)
-            .collect::<Vec<_>>();
-        let mut owner_mismatch_count = 0_u64;
-        if !largest_accounts.is_empty() {
-            let accounts = rpc_micro_json_rpc_call(
+        if holder_rpc_audit_only {
+            let largest = rpc_micro_json_rpc_call(
                 &client,
                 rpc_url,
                 &cache_dir,
@@ -30632,68 +30630,122 @@ async fn rpc_metric_micro_canary_command(
                 limits,
                 mint,
                 "holder_denominator",
-                "getMultipleAccounts",
-                json!([largest_accounts, {"encoding":"jsonParsed"}]),
-                "resolve owners for top token accounts only",
+                "getTokenLargestAccounts",
+                json!([mint]),
+                "fetch top token accounts for explicit bounded holder audit only",
                 "holder_denominator_check",
             )
             .await?;
-            if let Some(values) = accounts
+            let largest_accounts = largest
                 .as_ref()
                 .and_then(|v| v.pointer("/result/value"))
                 .and_then(|v| v.as_array())
-            {
-                for value in values.iter().filter(|value| !value.is_null()) {
-                    if let Some(owner) = value
-                        .pointer("/data/parsed/info/owner")
-                        .and_then(|v| v.as_str())
-                    {
-                        rpc_top_owners.push(owner.to_owned());
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| {
+                    v.get("address")
+                        .and_then(|a| a.as_str())
+                        .map(ToOwned::to_owned)
+                })
+                .take(limits.max_wallets.min(10) as usize)
+                .collect::<Vec<_>>();
+            let mut owner_mismatch_count = 0_u64;
+            if !largest_accounts.is_empty() {
+                let accounts = rpc_micro_json_rpc_call(
+                    &client,
+                    rpc_url,
+                    &cache_dir,
+                    &ledger_path,
+                    &mut state,
+                    limits,
+                    mint,
+                    "holder_denominator",
+                    "getMultipleAccounts",
+                    json!([largest_accounts, {"encoding":"jsonParsed"}]),
+                    "resolve owners for top token accounts in explicit audit-only mode",
+                    "holder_denominator_check",
+                )
+                .await?;
+                if let Some(values) = accounts
+                    .as_ref()
+                    .and_then(|v| v.pointer("/result/value"))
+                    .and_then(|v| v.as_array())
+                {
+                    for value in values.iter().filter(|value| !value.is_null()) {
+                        if let Some(owner) = value
+                            .pointer("/data/parsed/info/owner")
+                            .and_then(|v| v.as_str())
+                        {
+                            rpc_top_owners.push(owner.to_owned());
+                        }
                     }
                 }
             }
-        }
-        let stream_top = stream_ctx
-            .top_stream_holder_owner
-            .clone()
-            .unwrap_or_default();
-        let stream_vs_rpc_match = if stream_top.is_empty() || rpc_top_owners.is_empty() {
-            "unavailable_snapshot_or_owner_mapping"
-        } else if rpc_top_owners
-            .first()
-            .is_some_and(|owner| owner == &stream_top)
-        {
-            "matched"
+            let stream_top = stream_ctx
+                .top_stream_holder_owner
+                .clone()
+                .unwrap_or_default();
+            let stream_vs_rpc_match = if stream_top.is_empty() || rpc_top_owners.is_empty() {
+                "unavailable_snapshot_or_owner_mapping"
+            } else if rpc_top_owners
+                .first()
+                .is_some_and(|owner| owner == &stream_top)
+            {
+                "matched"
+            } else {
+                owner_mismatch_count += 1;
+                "mismatch_current_rpc_state_may_not_match_launch_snapshot"
+            };
+            holder_rows.push(json!({
+                "mint": mint,
+                "holder_count_source": "stream_owner_summed_token_accounts",
+                "top_holder_source": "stream_owner_summed_token_accounts",
+                "dev_holding_source": "stream_owner_summed_token_accounts",
+                "holder_rpc_used": true,
+                "holder_rpc_required": false,
+                "holder_rpc_audit_status": "explicit_audit_only",
+                "rpc_holder_data_did_not_overwrite_stream_state": true,
+                "rpc_top_holder_owners_resolved": rpc_top_owners.len(),
+                "stream_top_holder_owner": stream_top,
+                "rpc_top_holder_owner": rpc_top_owners.first().cloned().unwrap_or_default(),
+                "stream_vs_rpc_top_holder_match": stream_vs_rpc_match,
+                "missing_owner_mapping_repaired_count": rpc_top_owners.len(),
+                "mismatch_count": owner_mismatch_count,
+                "confidence": if stream_vs_rpc_match == "matched" { "bounded_one_token_audit_only" } else { "current_rpc_snapshot_not_same_as_stream_snapshot" },
+                "status": if owner_mismatch_count == 0 { "audit_only_partial" } else { "mismatch_reported_not_overwritten" },
+            }));
         } else {
-            owner_mismatch_count += 1;
-            "mismatch_current_rpc_state_may_not_match_launch_snapshot"
-        };
-        holder_rows.push(json!({
-            "mint": mint,
-            "rpc_top_holder_owners_resolved": rpc_top_owners.len(),
-            "stream_top_holder_owner": stream_top,
-            "rpc_top_holder_owner": rpc_top_owners.first().cloned().unwrap_or_default(),
-            "stream_vs_rpc_top_holder_match": stream_vs_rpc_match,
-            "missing_owner_mapping_repaired_count": rpc_top_owners.len(),
-            "mismatch_count": owner_mismatch_count,
-            "confidence": if stream_vs_rpc_match == "matched" { "bounded_one_token" } else { "current_rpc_snapshot_not_same_as_stream_snapshot" },
-            "status": if owner_mismatch_count == 0 { "partial" } else { "mismatch_reported_not_overwritten" },
-        }));
+            holder_rows.push(phase97_holder_rpc_boundary_row(mint));
+        }
 
         let mut wallets = Vec::<String>::new();
         if let Some(creator) = stream_ctx.creator_wallet.clone() {
             wallets.push(creator);
         }
-        for buyer in stream_ctx
-            .initial_buyers
-            .iter()
-            .chain(rpc_top_owners.iter())
-        {
+        if let Some(stream_top_holder) = stream_ctx.top_stream_holder_owner.clone() {
+            if wallets.len() < limits.max_wallets.min(5) as usize
+                && !wallets.contains(&stream_top_holder)
+            {
+                wallets.push(stream_top_holder);
+            }
+        }
+        for buyer in stream_ctx.initial_buyers.iter() {
             if wallets.len() >= limits.max_wallets.min(5) as usize {
                 break;
             }
             if !wallets.contains(buyer) {
                 wallets.push(buyer.clone());
+            }
+        }
+        if holder_rpc_audit_only {
+            for buyer in rpc_top_owners.iter() {
+                if wallets.len() >= limits.max_wallets.min(5) as usize {
+                    break;
+                }
+                if !wallets.contains(buyer) {
+                    wallets.push(buyer.clone());
+                }
             }
         }
         let mut earliest_sig_by_wallet = BTreeMap::<String, String>::new();
@@ -30862,10 +30914,17 @@ async fn rpc_metric_micro_canary_command(
         }));
         holder_rows.push(json!({
             "mint": mint,
-            "status": "blocked_by_rpc_budget_or_credentials",
+            "holder_count_source": "stream_owner_summed_token_accounts",
+            "top_holder_source": "stream_owner_summed_token_accounts",
+            "dev_holding_source": "stream_owner_summed_token_accounts",
+            "holder_rpc_used": false,
+            "holder_rpc_required": false,
+            "holder_rpc_audit_status": "not_run_not_required",
+            "rpc_holder_data_did_not_overwrite_stream_state": true,
+            "status": "not_run_not_required",
             "stream_vs_rpc_top_holder_match": "unavailable",
             "mismatch_count": 0,
-            "confidence": "unavailable",
+            "confidence": "stream_holder_authority",
         }));
         wallet_rows.push(json!({
             "wallet": "",
@@ -30995,6 +31054,13 @@ async fn rpc_metric_micro_canary_command(
             "mismatch_count",
             "confidence",
             "status",
+            "holder_count_source",
+            "top_holder_source",
+            "dev_holding_source",
+            "holder_rpc_used",
+            "holder_rpc_required",
+            "holder_rpc_audit_status",
+            "rpc_holder_data_did_not_overwrite_stream_state",
         ],
     )?;
     csv_json_rows(
@@ -31087,7 +31153,11 @@ async fn rpc_metric_micro_canary_command(
         .and_then(|v| v.get("status"))
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let holder_audit_status = holder_status;
+    let holder_audit_status = holder_rows
+        .first()
+        .and_then(|v| v.get("holder_rpc_audit_status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(holder_status);
     let wallet_status = if wallet_rows.iter().any(|row| {
         row.get("wallet_activity_proxy_status")
             .and_then(|v| v.as_str())
@@ -31156,8 +31226,11 @@ async fn rpc_metric_micro_canary_command(
         "source_run_id": source_run_id,
         "token_supply_rpc_status": token_supply_status,
         "holder_rpc_audit_status": holder_audit_status,
-        "holder_rpc_audit_only": true,
+        "holder_rpc_audit_only": holder_rpc_audit_only,
+        "holder_rpc_used": holder_rpc_audit_only,
+        "holder_rpc_required": false,
         "holder_rpc_used_for_canonical_state": false,
+        "rpc_holder_data_did_not_overwrite_stream_state": true,
         "holder_denominator_status": "not_required_for_holder_metrics",
         "wallet_activity_proxy_status": wallet_status,
         "funding_graph_status": common_status,
@@ -31303,7 +31376,11 @@ async fn update_dataset_index_rpc_canary(
         "token_supply_rpc_status": aggregate["token_supply_rpc_status"].clone(),
         "holder_denominator_repair_status": "not_required_for_holder_metrics",
         "holder_rpc_audit_status": aggregate["holder_rpc_audit_status"].clone(),
+        "holder_rpc_audit_only": aggregate["holder_rpc_audit_only"].clone(),
+        "holder_rpc_used": aggregate["holder_rpc_used"].clone(),
+        "holder_rpc_required": false,
         "holder_rpc_used_for_canonical_state": false,
+        "rpc_holder_data_did_not_overwrite_stream_state": true,
         "wallet_age_history_status": aggregate["wallet_activity_proxy_status"].clone(),
         "funding_graph_status": aggregate["funding_graph_status"].clone(),
         "common_funder_status": aggregate["common_funder_status"].clone(),
@@ -46317,6 +46394,28 @@ mod tests {
         assert_eq!(holder["holder_rpc_used"], false);
         assert_eq!(holder["holder_rpc_required"], false);
         assert_eq!(holder["holder_rpc_audit_status"], "not_run_not_required");
+    }
+
+    #[test]
+    fn phase97_holder_rpc_boundary_disables_audit_by_default() {
+        let row = phase97_holder_rpc_boundary_row("mint");
+        assert_eq!(
+            row["holder_count_source"],
+            "stream_owner_summed_token_accounts"
+        );
+        assert_eq!(
+            row["top_holder_source"],
+            "stream_owner_summed_token_accounts"
+        );
+        assert_eq!(
+            row["dev_holding_source"],
+            "stream_owner_summed_token_accounts"
+        );
+        assert_eq!(row["holder_rpc_used"], false);
+        assert_eq!(row["holder_rpc_required"], false);
+        assert_eq!(row["holder_rpc_audit_status"], "not_run_not_required");
+        assert_eq!(row["rpc_holder_data_did_not_overwrite_stream_state"], true);
+        assert_eq!(row["status"], "not_run_not_required");
     }
 
     #[test]
