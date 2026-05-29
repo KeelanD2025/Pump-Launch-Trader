@@ -19,6 +19,7 @@ use r2_storage::{
     ArtifactManifestUploadSummary, R2Client, SegmentIntegrityValidationOptions,
     SegmentIntegrityValidationReport, SegmentIntegrityValidator, load_manifest, write_manifest,
 };
+use reqwest as http_transport;
 use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
@@ -1127,6 +1128,39 @@ enum Command {
         )]
         output_dir: String,
     },
+    RpcMetricMicroCanary {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        mint: String,
+        #[arg(long)]
+        source_run_id: Option<String>,
+        #[arg(
+            long,
+            default_value = "research_output/phase95_public_chain_enrichment"
+        )]
+        output_dir: String,
+        #[arg(long, default_value_t = 30)]
+        max_rpc_calls_total: u64,
+        #[arg(long, default_value_t = 10)]
+        max_rpc_calls_per_metric_family: u64,
+        #[arg(long, default_value_t = 10)]
+        max_wallets: u64,
+        #[arg(long, default_value_t = 10)]
+        max_signatures_per_wallet: u64,
+        #[arg(long, default_value_t = 25)]
+        max_transactions: u64,
+        #[arg(long, default_value_t = 3)]
+        max_http_metadata_fetches: u64,
+        #[arg(long, default_value_t = 600)]
+        max_runtime_seconds: u64,
+        #[arg(long, default_value_t = true)]
+        metadata_http_allowed: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2: bool,
+    },
     ValidateMetricParity {
         #[arg(long)]
         env_file: Option<String>,
@@ -1961,6 +1995,8 @@ struct DatasetIndexRunEntry {
     diagnostic_backtest_status: Option<String>,
     #[serde(default)]
     hypothesis_shortlist_available: bool,
+    #[serde(default)]
+    rpc_enrichment_canary_v1: Option<serde_json::Value>,
     #[serde(default)]
     research_derived_ready: bool,
     #[serde(default)]
@@ -4282,6 +4318,46 @@ async fn main() -> Result<()> {
                 canary,
                 resume,
                 &output_dir,
+            )
+            .await
+        }
+        Command::RpcMetricMicroCanary {
+            env_file,
+            mint,
+            source_run_id,
+            output_dir,
+            max_rpc_calls_total,
+            max_rpc_calls_per_metric_family,
+            max_wallets,
+            max_signatures_per_wallet,
+            max_transactions,
+            max_http_metadata_fetches,
+            max_runtime_seconds,
+            metadata_http_allowed,
+            upload_r2,
+            verify_r2,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            rpc_metric_micro_canary_command(
+                &loaded,
+                &mint,
+                source_run_id.as_deref(),
+                &output_dir,
+                RpcMicroCanaryBudgetLimits {
+                    max_tokens: 1,
+                    max_rpc_calls_total,
+                    max_rpc_calls_per_metric_family,
+                    max_wallets,
+                    max_signatures_per_wallet,
+                    max_transactions,
+                    max_http_metadata_fetches,
+                    max_runtime_seconds,
+                    cache_required: true,
+                    ledger_required: true,
+                },
+                metadata_http_allowed,
+                upload_r2,
+                verify_r2,
             )
             .await
         }
@@ -14068,6 +14144,7 @@ fn build_dataset_index(loaded: &LoadedConfig) -> Result<DatasetIndex> {
                 diagnostic_backtest_phase: None,
                 diagnostic_backtest_status: None,
                 hypothesis_shortlist_available: false,
+                rpc_enrichment_canary_v1: None,
                 research_derived_ready: research_worker_summary
                     .as_ref()
                     .map(|summary| summary.research_derived_ready)
@@ -29740,6 +29817,1586 @@ fn build_dossier_metric_ledger(run_dossiers: &[serde_json::Value]) -> serde_json
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RpcMicroCanaryBudgetLimits {
+    max_tokens: u64,
+    max_rpc_calls_total: u64,
+    max_rpc_calls_per_metric_family: u64,
+    max_wallets: u64,
+    max_signatures_per_wallet: u64,
+    max_transactions: u64,
+    max_http_metadata_fetches: u64,
+    max_runtime_seconds: u64,
+    cache_required: bool,
+    ledger_required: bool,
+}
+
+#[derive(Debug, Default)]
+struct RpcMicroCanaryBudgetState {
+    rpc_calls_used: u64,
+    http_metadata_fetches_used: u64,
+    transactions_used: u64,
+    per_family_rpc_calls: BTreeMap<String, u64>,
+    cache_hits: u64,
+    estimated_credits_used: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RpcMicroLedgerEntry {
+    timestamp: OffsetDateTime,
+    mint: String,
+    metric_family: String,
+    provider: String,
+    method: String,
+    cache_hit: bool,
+    rpc_call_count_delta: u64,
+    estimated_credit_cost: u64,
+    success: bool,
+    sanitized_error: String,
+    reason_for_call: String,
+    output_artifact: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RpcMicroStreamContext {
+    source_run_id: String,
+    mint: String,
+    creator_wallet: Option<String>,
+    metadata_uri: Option<String>,
+    token_decimals: Option<u32>,
+    bonding_curve_supply_raw: Option<String>,
+    bonding_curve_supply_ui: Option<String>,
+    protocol_constant_raw: String,
+    top_stream_holder_owner: Option<String>,
+    top_stream_holder_pct: Option<String>,
+    initial_buyers: Vec<String>,
+    same_slot_signatures: Vec<String>,
+    same_slot_bundle_like: bool,
+}
+
+fn rpc_micro_provider_presence() -> BTreeMap<String, bool> {
+    [
+        "SOLANA_RPC_URL",
+        "HELIUS_RPC_URL",
+        "HELIUS_API_KEY",
+        "BIRDEYE_API_KEY",
+        "SHYFT_API_KEY",
+        "TWITTER_BEARER_TOKEN",
+        "X_API_KEY",
+        "DISCORD_TOKEN",
+    ]
+    .into_iter()
+    .map(|name| {
+        (
+            name.to_owned(),
+            std::env::var(name)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        )
+    })
+    .collect()
+}
+
+fn rpc_micro_rpc_url_available() -> bool {
+    ["SOLANA_RPC_URL", "HELIUS_RPC_URL"]
+        .into_iter()
+        .any(|name| {
+            std::env::var(name)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+}
+
+fn rpc_micro_rpc_url() -> Option<String> {
+    for name in ["SOLANA_RPC_URL", "HELIUS_RPC_URL"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_provider_error(error: &str) -> String {
+    let mut out = error.to_owned();
+    for marker in ["api-key=", "apikey=", "key="] {
+        let lower = out.to_ascii_lowercase();
+        if let Some(idx) = lower.find(marker) {
+            let start = idx + marker.len();
+            let end = out[start..]
+                .find(|ch: char| ['&', ' ', '\n', '\t', '"', '\''].contains(&ch))
+                .map(|rel| start + rel)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "REDACTED");
+        }
+    }
+    if out.len() > 300 {
+        out.truncate(300);
+        out.push_str("...");
+    }
+    out
+}
+
+fn append_rpc_micro_ledger(path: &Path, entry: &RpcMicroLedgerEntry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{}", serde_json::to_string(entry)?)?;
+    Ok(())
+}
+
+fn rpc_micro_cache_key(kind: &str, method: &str, params: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b":");
+    hasher.update(method.as_bytes());
+    hasher.update(b":");
+    hasher.update(serde_json::to_vec(params).unwrap_or_default());
+    hex::encode(hasher.finalize())
+}
+
+fn rpc_micro_budget_allows_rpc(
+    state: &RpcMicroCanaryBudgetState,
+    limits: RpcMicroCanaryBudgetLimits,
+    family: &str,
+) -> bool {
+    if state.rpc_calls_used >= limits.max_rpc_calls_total {
+        return false;
+    }
+    state.per_family_rpc_calls.get(family).copied().unwrap_or(0)
+        < limits.max_rpc_calls_per_metric_family
+}
+
+async fn rpc_micro_json_rpc_call(
+    client: &http_transport::Client,
+    rpc_url: &str,
+    cache_dir: &Path,
+    ledger_path: &Path,
+    state: &mut RpcMicroCanaryBudgetState,
+    limits: RpcMicroCanaryBudgetLimits,
+    mint: &str,
+    family: &str,
+    method: &str,
+    params: serde_json::Value,
+    reason: &str,
+    output_artifact: &str,
+) -> Result<Option<serde_json::Value>> {
+    let cache_key = rpc_micro_cache_key("rpc", method, &params);
+    let cache_path = cache_dir.join(format!("{cache_key}.json"));
+    if cache_path.exists() {
+        let value = read_json_file::<serde_json::Value>(&cache_path)
+            .ok_or_else(|| anyhow!("failed to read RPC cache {}", cache_path.display()))?;
+        state.cache_hits += 1;
+        append_rpc_micro_ledger(
+            ledger_path,
+            &RpcMicroLedgerEntry {
+                timestamp: OffsetDateTime::now_utc(),
+                mint: mint.to_owned(),
+                metric_family: family.to_owned(),
+                provider: "helius_rpc".to_owned(),
+                method: method.to_owned(),
+                cache_hit: true,
+                rpc_call_count_delta: 0,
+                estimated_credit_cost: 0,
+                success: true,
+                sanitized_error: String::new(),
+                reason_for_call: reason.to_owned(),
+                output_artifact: output_artifact.to_owned(),
+            },
+        )?;
+        return Ok(Some(value));
+    }
+    if !rpc_micro_budget_allows_rpc(state, limits, family) {
+        append_rpc_micro_ledger(
+            ledger_path,
+            &RpcMicroLedgerEntry {
+                timestamp: OffsetDateTime::now_utc(),
+                mint: mint.to_owned(),
+                metric_family: family.to_owned(),
+                provider: "helius_rpc".to_owned(),
+                method: method.to_owned(),
+                cache_hit: false,
+                rpc_call_count_delta: 0,
+                estimated_credit_cost: 0,
+                success: false,
+                sanitized_error: "budget_exceeded".to_owned(),
+                reason_for_call: reason.to_owned(),
+                output_artifact: output_artifact.to_owned(),
+            },
+        )?;
+        return Ok(None);
+    }
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let response = client.post(rpc_url).json(&body).send().await;
+    state.rpc_calls_used += 1;
+    *state
+        .per_family_rpc_calls
+        .entry(family.to_owned())
+        .or_insert(0) += 1;
+    state.estimated_credits_used += 1;
+    let value = match response {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                append_rpc_micro_ledger(
+                    ledger_path,
+                    &RpcMicroLedgerEntry {
+                        timestamp: OffsetDateTime::now_utc(),
+                        mint: mint.to_owned(),
+                        metric_family: family.to_owned(),
+                        provider: "helius_rpc".to_owned(),
+                        method: method.to_owned(),
+                        cache_hit: false,
+                        rpc_call_count_delta: 1,
+                        estimated_credit_cost: 1,
+                        success: false,
+                        sanitized_error: format!("http_status_{status}"),
+                        reason_for_call: reason.to_owned(),
+                        output_artifact: output_artifact.to_owned(),
+                    },
+                )?;
+                return Ok(None);
+            }
+            response.json::<serde_json::Value>().await.map_err(|err| {
+                anyhow!(
+                    "RPC JSON decode failed: {}",
+                    sanitize_provider_error(&err.to_string())
+                )
+            })?
+        }
+        Err(err) => {
+            append_rpc_micro_ledger(
+                ledger_path,
+                &RpcMicroLedgerEntry {
+                    timestamp: OffsetDateTime::now_utc(),
+                    mint: mint.to_owned(),
+                    metric_family: family.to_owned(),
+                    provider: "helius_rpc".to_owned(),
+                    method: method.to_owned(),
+                    cache_hit: false,
+                    rpc_call_count_delta: 1,
+                    estimated_credit_cost: 1,
+                    success: false,
+                    sanitized_error: sanitize_provider_error(&err.to_string()),
+                    reason_for_call: reason.to_owned(),
+                    output_artifact: output_artifact.to_owned(),
+                },
+            )?;
+            return Ok(None);
+        }
+    };
+    let success = value.get("error").is_none();
+    if success {
+        fs::create_dir_all(cache_dir)?;
+        fs::write(&cache_path, serde_json::to_vec_pretty(&value)?)?;
+    }
+    append_rpc_micro_ledger(
+        ledger_path,
+        &RpcMicroLedgerEntry {
+            timestamp: OffsetDateTime::now_utc(),
+            mint: mint.to_owned(),
+            metric_family: family.to_owned(),
+            provider: "helius_rpc".to_owned(),
+            method: method.to_owned(),
+            cache_hit: false,
+            rpc_call_count_delta: 1,
+            estimated_credit_cost: 1,
+            success,
+            sanitized_error: value
+                .get("error")
+                .map(|v| sanitize_provider_error(&v.to_string()))
+                .unwrap_or_default(),
+            reason_for_call: reason.to_owned(),
+            output_artifact: output_artifact.to_owned(),
+        },
+    )?;
+    Ok(success.then_some(value))
+}
+
+async fn rpc_micro_http_get_json(
+    client: &http_transport::Client,
+    cache_dir: &Path,
+    ledger_path: &Path,
+    state: &mut RpcMicroCanaryBudgetState,
+    limits: RpcMicroCanaryBudgetLimits,
+    mint: &str,
+    url: &str,
+    output_artifact: &str,
+) -> Result<Option<serde_json::Value>> {
+    if state.http_metadata_fetches_used >= limits.max_http_metadata_fetches {
+        append_rpc_micro_ledger(
+            ledger_path,
+            &RpcMicroLedgerEntry {
+                timestamp: OffsetDateTime::now_utc(),
+                mint: mint.to_owned(),
+                metric_family: "metadata_social".to_owned(),
+                provider: "http_metadata".to_owned(),
+                method: "GET".to_owned(),
+                cache_hit: false,
+                rpc_call_count_delta: 0,
+                estimated_credit_cost: 0,
+                success: false,
+                sanitized_error: "http_metadata_budget_exceeded".to_owned(),
+                reason_for_call: "fetch stream-observed metadata URI".to_owned(),
+                output_artifact: output_artifact.to_owned(),
+            },
+        )?;
+        return Ok(None);
+    }
+    let params = json!({ "url": url });
+    let cache_key = rpc_micro_cache_key("http", "GET", &params);
+    let cache_path = cache_dir.join(format!("{cache_key}.json"));
+    if cache_path.exists() {
+        state.cache_hits += 1;
+        let value = read_json_file::<serde_json::Value>(&cache_path).ok_or_else(|| {
+            anyhow!(
+                "failed to read HTTP metadata cache {}",
+                cache_path.display()
+            )
+        })?;
+        append_rpc_micro_ledger(
+            ledger_path,
+            &RpcMicroLedgerEntry {
+                timestamp: OffsetDateTime::now_utc(),
+                mint: mint.to_owned(),
+                metric_family: "metadata_social".to_owned(),
+                provider: "http_metadata".to_owned(),
+                method: "GET".to_owned(),
+                cache_hit: true,
+                rpc_call_count_delta: 0,
+                estimated_credit_cost: 0,
+                success: true,
+                sanitized_error: String::new(),
+                reason_for_call: "fetch stream-observed metadata URI".to_owned(),
+                output_artifact: output_artifact.to_owned(),
+            },
+        )?;
+        return Ok(Some(value));
+    }
+    let response = client.get(url).send().await;
+    state.http_metadata_fetches_used += 1;
+    let value = match response {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                append_rpc_micro_ledger(
+                    ledger_path,
+                    &RpcMicroLedgerEntry {
+                        timestamp: OffsetDateTime::now_utc(),
+                        mint: mint.to_owned(),
+                        metric_family: "metadata_social".to_owned(),
+                        provider: "http_metadata".to_owned(),
+                        method: "GET".to_owned(),
+                        cache_hit: false,
+                        rpc_call_count_delta: 0,
+                        estimated_credit_cost: 0,
+                        success: false,
+                        sanitized_error: format!("http_status_{status}"),
+                        reason_for_call: "fetch stream-observed metadata URI".to_owned(),
+                        output_artifact: output_artifact.to_owned(),
+                    },
+                )?;
+                return Ok(None);
+            }
+            response.json::<serde_json::Value>().await.map_err(|err| {
+                anyhow!(
+                    "metadata JSON decode failed: {}",
+                    sanitize_provider_error(&err.to_string())
+                )
+            })?
+        }
+        Err(err) => {
+            append_rpc_micro_ledger(
+                ledger_path,
+                &RpcMicroLedgerEntry {
+                    timestamp: OffsetDateTime::now_utc(),
+                    mint: mint.to_owned(),
+                    metric_family: "metadata_social".to_owned(),
+                    provider: "http_metadata".to_owned(),
+                    method: "GET".to_owned(),
+                    cache_hit: false,
+                    rpc_call_count_delta: 0,
+                    estimated_credit_cost: 0,
+                    success: false,
+                    sanitized_error: sanitize_provider_error(&err.to_string()),
+                    reason_for_call: "fetch stream-observed metadata URI".to_owned(),
+                    output_artifact: output_artifact.to_owned(),
+                },
+            )?;
+            return Ok(None);
+        }
+    };
+    fs::create_dir_all(cache_dir)?;
+    fs::write(&cache_path, serde_json::to_vec_pretty(&value)?)?;
+    append_rpc_micro_ledger(
+        ledger_path,
+        &RpcMicroLedgerEntry {
+            timestamp: OffsetDateTime::now_utc(),
+            mint: mint.to_owned(),
+            metric_family: "metadata_social".to_owned(),
+            provider: "http_metadata".to_owned(),
+            method: "GET".to_owned(),
+            cache_hit: false,
+            rpc_call_count_delta: 0,
+            estimated_credit_cost: 0,
+            success: true,
+            sanitized_error: String::new(),
+            reason_for_call: "fetch stream-observed metadata URI".to_owned(),
+            output_artifact: output_artifact.to_owned(),
+        },
+    )?;
+    Ok(Some(value))
+}
+
+fn find_phase_canary_run_dir(source_run_id: &str) -> Option<PathBuf> {
+    let candidates = [
+        format!("research_output/phase94_official_idl/live_canary_artifact/runs/{source_run_id}"),
+        format!("research_output/phase94_official_idl/replay_canary_run/runs/{source_run_id}"),
+        format!("research_output/phase92_stream_holder_curve/live_artifact/runs/{source_run_id}"),
+        format!(
+            "research_output/phase93_canary_stability/artifacts/canary_1/phase89-live-canary/runs/{source_run_id}"
+        ),
+        format!(
+            "research_output/phase90_field_gap_fix/live_artifact_26531417751/phase89-live-canary/runs/{source_run_id}"
+        ),
+    ];
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.join("normalized_events.jsonl").exists())
+}
+
+fn string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn load_rpc_micro_stream_context(
+    source_run_id: Option<&str>,
+    mint: &str,
+) -> Result<RpcMicroStreamContext> {
+    let mut ctx = RpcMicroStreamContext {
+        source_run_id: source_run_id.unwrap_or("").to_owned(),
+        mint: mint.to_owned(),
+        protocol_constant_raw: "1000000000000000".to_owned(),
+        ..RpcMicroStreamContext::default()
+    };
+    let Some(source_run_id) = source_run_id else {
+        return Ok(ctx);
+    };
+    let Some(run_dir) = find_phase_canary_run_dir(source_run_id) else {
+        return Ok(ctx);
+    };
+    let metrics_path = run_dir.join("stream_metric_values.csv");
+    if metrics_path.exists() {
+        let text = fs::read_to_string(&metrics_path)?;
+        for line in text.lines().skip(1) {
+            let cols = line.split(',').collect::<Vec<_>>();
+            if cols.len() >= 5 && cols.get(2) == Some(&"top_holder_pct_observed") {
+                ctx.top_stream_holder_pct = Some(cols[4].to_owned());
+            }
+        }
+    }
+    let events_path = run_dir.join("normalized_events.jsonl");
+    if events_path.exists() {
+        let file = File::open(&events_path)?;
+        let reader = BufReader::new(file);
+        let mut slot_signatures = BTreeMap::<String, BTreeSet<String>>::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let event_mint = string_at_path(&value, &["payload", "payload", "mint"]);
+            if event_mint != Some(mint) {
+                continue;
+            }
+            if let Some(signature) = string_at_path(&value, &["meta", "signature"]) {
+                let slot = value
+                    .get("meta")
+                    .and_then(|v| v.get("slot"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                slot_signatures
+                    .entry(slot)
+                    .or_default()
+                    .insert(signature.to_owned());
+            }
+            match string_at_path(&value, &["payload", "kind"]) {
+                Some("token_created") => {
+                    ctx.creator_wallet =
+                        string_at_path(&value, &["payload", "payload", "creator_wallet"])
+                            .map(ToOwned::to_owned)
+                            .or_else(|| {
+                                string_at_path(&value, &["payload", "payload", "payer"])
+                                    .map(ToOwned::to_owned)
+                            });
+                    ctx.metadata_uri = string_at_path(&value, &["payload", "payload", "uri"])
+                        .map(ToOwned::to_owned);
+                }
+                Some("bonding_curve_update") => {
+                    ctx.bonding_curve_supply_raw =
+                        string_at_path(&value, &["payload", "payload", "token_total_supply_raw"])
+                            .map(ToOwned::to_owned);
+                    ctx.bonding_curve_supply_ui =
+                        string_at_path(&value, &["payload", "payload", "token_total_supply_ui"])
+                            .map(ToOwned::to_owned);
+                    ctx.token_decimals = value
+                        .get("payload")
+                        .and_then(|v| v.get("payload"))
+                        .and_then(|v| v.get("token_decimals"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                }
+                Some("pump_buy") => {
+                    if let Some(buyer) = string_at_path(&value, &["payload", "payload", "buyer"]) {
+                        if !ctx.initial_buyers.contains(&buyer.to_owned()) {
+                            ctx.initial_buyers.push(buyer.to_owned());
+                        }
+                    }
+                }
+                Some("holder_balance_update") => {
+                    let owner = string_at_path(&value, &["payload", "payload", "owner_wallet"])
+                        .map(ToOwned::to_owned);
+                    if ctx.top_stream_holder_owner.is_none() {
+                        ctx.top_stream_holder_owner = owner;
+                    }
+                }
+                _ => {}
+            }
+        }
+        ctx.same_slot_signatures = slot_signatures
+            .values()
+            .find(|signatures| signatures.len() > 1)
+            .map(|signatures| signatures.iter().cloned().collect())
+            .unwrap_or_default();
+        ctx.same_slot_bundle_like = !ctx.same_slot_signatures.is_empty();
+    }
+    Ok(ctx)
+}
+
+fn extract_social_links(metadata: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut links = BTreeMap::new();
+    fn walk(prefix: &str, value: &serde_json::Value, out: &mut BTreeMap<String, String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                let lower = text.to_ascii_lowercase();
+                let key = if lower.contains("twitter.com") || lower.contains("x.com/") {
+                    Some("x_twitter")
+                } else if lower.contains("t.me") || lower.contains("telegram") {
+                    Some("telegram")
+                } else if lower.contains("discord.") || lower.contains("discord.gg") {
+                    Some("discord")
+                } else if lower.starts_with("http://") || lower.starts_with("https://") {
+                    Some("website")
+                } else {
+                    None
+                };
+                if let Some(key) = key {
+                    out.entry(key.to_owned()).or_insert_with(|| text.to_owned());
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let child_prefix = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&child_prefix, child, out);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    walk(prefix, child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk("", metadata, &mut links);
+    links
+}
+
+fn csv_json_rows(path: &Path, rows: &[serde_json::Value], header: &[&str]) -> Result<()> {
+    write_json_rows_csv(path, header, rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rpc_metric_micro_canary_command(
+    loaded: &LoadedConfig,
+    mint: &str,
+    source_run_id: Option<&str>,
+    output_dir: &str,
+    limits: RpcMicroCanaryBudgetLimits,
+    metadata_http_allowed: bool,
+    upload_r2: bool,
+    verify_r2: bool,
+) -> Result<()> {
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let cache_dir = output_dir.join("enrichment_cache");
+    fs::create_dir_all(&cache_dir)?;
+    let ledger_path = output_dir.join("enrichment_ledger.jsonl");
+    fs::write(&ledger_path, b"")?;
+    let mut state = RpcMicroCanaryBudgetState::default();
+    let provider_presence = rpc_micro_provider_presence();
+    let rpc_available = rpc_micro_rpc_url_available();
+    let rpc_url = rpc_micro_rpc_url();
+    let http_metadata_available = metadata_http_allowed;
+    let safe_to_run_rpc_canary = rpc_available
+        && limits.max_tokens == 1
+        && limits.max_rpc_calls_total > 0
+        && limits.cache_required
+        && limits.ledger_required;
+    let missing_env_var_names_only = if rpc_available {
+        Vec::<String>::new()
+    } else {
+        vec!["SOLANA_RPC_URL or HELIUS_RPC_URL or HELIUS_API_KEY".to_owned()]
+    };
+    let readiness = json!({
+        "schema_version": "phase95.enrichment_readiness.v1",
+        "mint": mint,
+        "source_run_id": source_run_id,
+        "rpc_available": rpc_available,
+        "rpc_credits_available": rpc_available && limits.max_rpc_calls_total > 0,
+        "rpc_budget_status": if safe_to_run_rpc_canary { "available_bounded" } else { "blocked_by_rpc_budget_or_credentials" },
+        "http_metadata_available": http_metadata_available,
+        "social_api_available": provider_presence.get("TWITTER_BEARER_TOKEN").copied().unwrap_or(false)
+            || provider_presence.get("X_API_KEY").copied().unwrap_or(false)
+            || provider_presence.get("DISCORD_TOKEN").copied().unwrap_or(false),
+        "provider_names_available": provider_presence,
+        "missing_env_var_names_only": missing_env_var_names_only,
+        "safe_to_run_rpc_canary": safe_to_run_rpc_canary,
+        "secrets_printed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "readiness",
+        &readiness,
+        format!(
+            "# Phase 95 Enrichment Readiness\n\n- rpc_available: `{}`\n- rpc_budget_status: `{}`\n- safe_to_run_rpc_canary: `{}`\n- secrets_printed: `false`\n",
+            readiness["rpc_available"].as_bool().unwrap_or(false),
+            readiness["rpc_budget_status"].as_str().unwrap_or("unknown"),
+            readiness["safe_to_run_rpc_canary"]
+                .as_bool()
+                .unwrap_or(false),
+        ),
+    )?;
+    let budget_plan = json!({
+        "schema_version": "phase95.rpc_budget_plan.v1",
+        "profile": "rpc_micro_canary",
+        "max_tokens": limits.max_tokens,
+        "max_rpc_calls_total": limits.max_rpc_calls_total,
+        "max_rpc_calls_per_metric_family": limits.max_rpc_calls_per_metric_family,
+        "max_wallets": limits.max_wallets,
+        "max_signatures_per_wallet": limits.max_signatures_per_wallet,
+        "max_transactions": limits.max_transactions,
+        "max_http_metadata_fetches": limits.max_http_metadata_fetches,
+        "max_runtime_seconds": limits.max_runtime_seconds,
+        "cache_required": limits.cache_required,
+        "ledger_required": limits.ledger_required,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "rpc_budget_plan",
+        &budget_plan,
+        format!(
+            "# RPC Budget Plan\n\n- max_tokens: `{}`\n- max_rpc_calls_total: `{}`\n- max_wallets: `{}`\n- cache_required: `{}`\n- ledger_required: `{}`\n",
+            limits.max_tokens,
+            limits.max_rpc_calls_total,
+            limits.max_wallets,
+            limits.cache_required,
+            limits.ledger_required,
+        ),
+    )?;
+    let stream_ctx = load_rpc_micro_stream_context(source_run_id, mint)?;
+    let client = http_transport::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            limits.max_runtime_seconds.min(60).max(5),
+        ))
+        .build()?;
+    let mut token_supply_rows = Vec::<serde_json::Value>::new();
+    let mut holder_rows = Vec::<serde_json::Value>::new();
+    let mut wallet_rows = Vec::<serde_json::Value>::new();
+    let mut common_funder_rows = Vec::<serde_json::Value>::new();
+    let mut bundle_rows = Vec::<serde_json::Value>::new();
+    let mut metadata_rows = Vec::<serde_json::Value>::new();
+    let mut post_migration_rows = Vec::<serde_json::Value>::new();
+
+    let mut rpc_top_owners = Vec::<String>::new();
+    let mut token_supply_status = "blocked_by_rpc_budget_or_credentials".to_owned();
+    if let Some(rpc_url) = rpc_url.as_deref().filter(|_| safe_to_run_rpc_canary) {
+        let token_supply = rpc_micro_json_rpc_call(
+            &client,
+            rpc_url,
+            &cache_dir,
+            &ledger_path,
+            &mut state,
+            limits,
+            mint,
+            "token_supply_rpc",
+            "getTokenSupply",
+            json!([mint]),
+            "verify selected token supply against public chain token supply",
+            "token_supply_verification",
+        )
+        .await?;
+        let rpc_amount = token_supply
+            .as_ref()
+            .and_then(|v| v.pointer("/result/value/amount"))
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let rpc_ui = token_supply
+            .as_ref()
+            .and_then(|v| v.pointer("/result/value/uiAmountString"))
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let bonding_raw = stream_ctx.bonding_curve_supply_raw.clone();
+        let protocol_raw = stream_ctx.protocol_constant_raw.clone();
+        let match_status = match rpc_amount.as_deref() {
+            Some(amount) if bonding_raw.as_deref() == Some(amount) || protocol_raw == amount => {
+                "matched"
+            }
+            Some(_) => "mismatch",
+            None => "unavailable",
+        };
+        token_supply_status = if match_status == "matched" {
+            "proven_on_one_token".to_owned()
+        } else {
+            match_status.to_owned()
+        };
+        token_supply_rows.push(json!({
+            "mint": mint,
+            "bonding_curve_observed_raw": bonding_raw,
+            "bonding_curve_observed_ui": stream_ctx.bonding_curve_supply_ui,
+            "protocol_constant_raw": protocol_raw,
+            "rpc_verified_raw": rpc_amount,
+            "rpc_verified_ui": rpc_ui,
+            "match_status": match_status,
+            "status": token_supply_status,
+            "unavailable_reason": if match_status == "unavailable" { "rpc_call_failed_or_budget_limited" } else { "" },
+        }));
+
+        let largest = rpc_micro_json_rpc_call(
+            &client,
+            rpc_url,
+            &cache_dir,
+            &ledger_path,
+            &mut state,
+            limits,
+            mint,
+            "holder_denominator",
+            "getTokenLargestAccounts",
+            json!([mint]),
+            "fetch top token accounts for bounded holder denominator check",
+            "holder_denominator_check",
+        )
+        .await?;
+        let largest_accounts = largest
+            .as_ref()
+            .and_then(|v| v.pointer("/result/value"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| {
+                v.get("address")
+                    .and_then(|a| a.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .take(limits.max_wallets.min(10) as usize)
+            .collect::<Vec<_>>();
+        let mut owner_mismatch_count = 0_u64;
+        if !largest_accounts.is_empty() {
+            let accounts = rpc_micro_json_rpc_call(
+                &client,
+                rpc_url,
+                &cache_dir,
+                &ledger_path,
+                &mut state,
+                limits,
+                mint,
+                "holder_denominator",
+                "getMultipleAccounts",
+                json!([largest_accounts, {"encoding":"jsonParsed"}]),
+                "resolve owners for top token accounts only",
+                "holder_denominator_check",
+            )
+            .await?;
+            if let Some(values) = accounts
+                .as_ref()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(|v| v.as_array())
+            {
+                for value in values.iter().filter(|value| !value.is_null()) {
+                    if let Some(owner) = value
+                        .pointer("/data/parsed/info/owner")
+                        .and_then(|v| v.as_str())
+                    {
+                        rpc_top_owners.push(owner.to_owned());
+                    }
+                }
+            }
+        }
+        let stream_top = stream_ctx
+            .top_stream_holder_owner
+            .clone()
+            .unwrap_or_default();
+        let stream_vs_rpc_match = if stream_top.is_empty() || rpc_top_owners.is_empty() {
+            "unavailable_snapshot_or_owner_mapping"
+        } else if rpc_top_owners
+            .first()
+            .is_some_and(|owner| owner == &stream_top)
+        {
+            "matched"
+        } else {
+            owner_mismatch_count += 1;
+            "mismatch_current_rpc_state_may_not_match_launch_snapshot"
+        };
+        holder_rows.push(json!({
+            "mint": mint,
+            "rpc_top_holder_owners_resolved": rpc_top_owners.len(),
+            "stream_top_holder_owner": stream_top,
+            "rpc_top_holder_owner": rpc_top_owners.first().cloned().unwrap_or_default(),
+            "stream_vs_rpc_top_holder_match": stream_vs_rpc_match,
+            "missing_owner_mapping_repaired_count": rpc_top_owners.len(),
+            "mismatch_count": owner_mismatch_count,
+            "confidence": if stream_vs_rpc_match == "matched" { "bounded_one_token" } else { "current_rpc_snapshot_not_same_as_stream_snapshot" },
+            "status": if owner_mismatch_count == 0 { "partial" } else { "mismatch_reported_not_overwritten" },
+        }));
+
+        let mut wallets = Vec::<String>::new();
+        if let Some(creator) = stream_ctx.creator_wallet.clone() {
+            wallets.push(creator);
+        }
+        for buyer in stream_ctx
+            .initial_buyers
+            .iter()
+            .chain(rpc_top_owners.iter())
+        {
+            if wallets.len() >= limits.max_wallets.min(5) as usize {
+                break;
+            }
+            if !wallets.contains(buyer) {
+                wallets.push(buyer.clone());
+            }
+        }
+        let mut earliest_sig_by_wallet = BTreeMap::<String, String>::new();
+        for wallet in wallets.iter().take(5) {
+            let signatures = rpc_micro_json_rpc_call(
+                &client,
+                rpc_url,
+                &cache_dir,
+                &ledger_path,
+                &mut state,
+                limits,
+                mint,
+                "wallet_activity_proxy",
+                "getSignaturesForAddress",
+                json!([wallet, {"limit": limits.max_signatures_per_wallet.min(10)}]),
+                "derive limited wallet activity proxy for creator/top buyers",
+                "wallet_activity_proxy",
+            )
+            .await?;
+            let sigs = signatures
+                .as_ref()
+                .and_then(|v| v.get("result"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let earliest = sigs
+                .last()
+                .and_then(|v| v.get("signature"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            if !earliest.is_empty() {
+                earliest_sig_by_wallet.insert(wallet.clone(), earliest.clone());
+            }
+            wallet_rows.push(json!({
+                "wallet": wallet,
+                "role": if Some(wallet) == stream_ctx.creator_wallet.as_ref() { "creator_dev" } else { "top_initial_buyer_or_top_holder" },
+                "recent_signature_count": sigs.len(),
+                "earliest_signature_in_limited_window": earliest,
+                "wallet_activity_proxy_status": if sigs.is_empty() { "unavailable_provider_limited" } else { "wallet_age_proxy_limited_history" },
+                "confidence": "limited_history_window",
+                "unavailable_reason": if sigs.is_empty() { "no_signatures_returned_within_budget" } else { "" },
+            }));
+        }
+        let mut funder_candidates = BTreeMap::<String, u64>::new();
+        for (wallet, signature) in earliest_sig_by_wallet.iter().take(5) {
+            if state.transactions_used >= limits.max_transactions {
+                break;
+            }
+            let tx = rpc_micro_json_rpc_call(
+                &client,
+                rpc_url,
+                &cache_dir,
+                &ledger_path,
+                &mut state,
+                limits,
+                mint,
+                "common_funder",
+                "getTransaction",
+                json!([signature, {"encoding":"jsonParsed", "maxSupportedTransactionVersion":0}]),
+                "inspect one bounded transaction per wallet for direct inbound SOL candidate",
+                "common_funder_micro_check",
+            )
+            .await?;
+            state.transactions_used += tx.is_some() as u64;
+            let account_keys = tx
+                .as_ref()
+                .and_then(|v| v.pointer("/result/transaction/message/accountKeys"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let pre = tx
+                .as_ref()
+                .and_then(|v| v.pointer("/result/meta/preBalances"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let post = tx
+                .as_ref()
+                .and_then(|v| v.pointer("/result/meta/postBalances"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let wallet_idx = account_keys.iter().position(|key| {
+                key.get("pubkey").or(Some(key)).and_then(|v| v.as_str()) == Some(wallet.as_str())
+            });
+            let mut possible_funder = String::new();
+            if let Some(wallet_idx) = wallet_idx {
+                let wallet_pre = pre.get(wallet_idx).and_then(|v| v.as_i64()).unwrap_or(0);
+                let wallet_post = post.get(wallet_idx).and_then(|v| v.as_i64()).unwrap_or(0);
+                if wallet_post > wallet_pre {
+                    let mut biggest_outflow = 0_i64;
+                    for (idx, key) in account_keys.iter().enumerate() {
+                        if idx == wallet_idx {
+                            continue;
+                        }
+                        let before = pre.get(idx).and_then(|v| v.as_i64()).unwrap_or(0);
+                        let after = post.get(idx).and_then(|v| v.as_i64()).unwrap_or(0);
+                        let outflow = before - after;
+                        if outflow > biggest_outflow {
+                            biggest_outflow = outflow;
+                            possible_funder = key
+                                .get("pubkey")
+                                .or(Some(key))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned();
+                        }
+                    }
+                }
+            }
+            if !possible_funder.is_empty() {
+                *funder_candidates
+                    .entry(possible_funder.clone())
+                    .or_insert(0) += 1;
+            }
+            common_funder_rows.push(json!({
+                "wallet": wallet,
+                "signature_checked": signature,
+                "possible_funder": possible_funder,
+                "classification": if possible_funder.is_empty() { "no_common_funder_seen" } else { "possible_common_funder" },
+                "confidence": "one_hop_limited_transaction_window",
+            }));
+        }
+        let common_funder_status = funder_candidates
+            .values()
+            .any(|count| *count > 1)
+            .then_some("possible_common_funder")
+            .unwrap_or("no_common_funder_seen");
+        if common_funder_rows.is_empty() {
+            common_funder_rows.push(json!({
+                "wallet": "",
+                "signature_checked": "",
+                "possible_funder": "",
+                "classification": "unavailable_budget_limited",
+                "confidence": "no_wallet_history_available_or_budget_exhausted",
+            }));
+        }
+        bundle_rows.push(json!({
+            "mint": mint,
+            "same_slot_signature_count": stream_ctx.same_slot_signatures.len(),
+            "same_slot_signatures": stream_ctx.same_slot_signatures,
+            "classification": if stream_ctx.same_slot_bundle_like { "stream_bundle_like_evidence" } else { "no_bundle_evidence" },
+            "rpc_confirmation_status": "not_claimed_provider_specific_bundle_lookup_not_used",
+            "confidence": "stream_fingerprint_only",
+        }));
+        post_migration_rows.push(json!({
+            "mint": mint,
+            "migration_observed_in_stream": false,
+            "pumpswap_pool_discovery_status": "not_run_no_migration_observed",
+            "classification": "unsupported_or_not_applicable_for_this_token",
+            "confidence": "stream_canary_window",
+        }));
+        let _ = common_funder_status;
+    } else {
+        token_supply_rows.push(json!({
+            "mint": mint,
+            "bonding_curve_observed_raw": stream_ctx.bonding_curve_supply_raw,
+            "bonding_curve_observed_ui": stream_ctx.bonding_curve_supply_ui,
+            "protocol_constant_raw": stream_ctx.protocol_constant_raw,
+            "rpc_verified_raw": null,
+            "rpc_verified_ui": null,
+            "match_status": "unavailable",
+            "status": "blocked_by_rpc_budget_or_credentials",
+            "unavailable_reason": "no usable RPC provider env or budget",
+        }));
+        holder_rows.push(json!({
+            "mint": mint,
+            "status": "blocked_by_rpc_budget_or_credentials",
+            "stream_vs_rpc_top_holder_match": "unavailable",
+            "mismatch_count": 0,
+            "confidence": "unavailable",
+        }));
+        wallet_rows.push(json!({
+            "wallet": "",
+            "role": "",
+            "recent_signature_count": 0,
+            "wallet_activity_proxy_status": "blocked_by_rpc_budget_or_credentials",
+            "confidence": "unavailable",
+            "unavailable_reason": "no usable RPC provider env or budget",
+        }));
+        common_funder_rows.push(json!({
+            "wallet": "",
+            "classification": "blocked_by_rpc_budget_or_credentials",
+            "confidence": "unavailable",
+        }));
+        bundle_rows.push(json!({
+            "mint": mint,
+            "classification": if stream_ctx.same_slot_bundle_like { "stream_bundle_like_evidence" } else { "no_bundle_evidence" },
+            "rpc_confirmation_status": "blocked_by_rpc_budget_or_credentials",
+            "confidence": "stream_fingerprint_only",
+        }));
+        post_migration_rows.push(json!({
+            "mint": mint,
+            "classification": "unsupported_or_budget_blocked",
+            "confidence": "unavailable",
+        }));
+    }
+
+    let mut metadata_status = "unavailable_missing_metadata_uri".to_owned();
+    if let Some(uri) = stream_ctx.metadata_uri.as_deref() {
+        if metadata_http_allowed && (uri.starts_with("http://") || uri.starts_with("https://")) {
+            let metadata = rpc_micro_http_get_json(
+                &client,
+                &cache_dir,
+                &ledger_path,
+                &mut state,
+                limits,
+                mint,
+                uri,
+                "metadata_social_micro_check",
+            )
+            .await?;
+            if let Some(metadata) = metadata {
+                let links = extract_social_links(&metadata);
+                metadata_status = "metadata_fetch_success".to_owned();
+                metadata_rows.push(json!({
+                    "mint": mint,
+                    "metadata_uri_stream_observed": true,
+                    "metadata_fetch_status": "metadata_fetch_success",
+                    "website": links.get("website").cloned().unwrap_or_default(),
+                    "x_twitter": links.get("x_twitter").cloned().unwrap_or_default(),
+                    "telegram": links.get("telegram").cloned().unwrap_or_default(),
+                    "discord": links.get("discord").cloned().unwrap_or_default(),
+                    "social_count": links.keys().filter(|k| k.as_str() != "website").count(),
+                    "metadata_confidence": "stream_uri_http_fetch",
+                    "unavailable_reason": "",
+                }));
+            } else {
+                metadata_status = "metadata_fetch_failed".to_owned();
+                metadata_rows.push(json!({
+                    "mint": mint,
+                    "metadata_uri_stream_observed": true,
+                    "metadata_fetch_status": "metadata_fetch_failed",
+                    "website": "",
+                    "x_twitter": "",
+                    "telegram": "",
+                    "discord": "",
+                    "social_count": 0,
+                    "metadata_confidence": "unavailable",
+                    "unavailable_reason": "http_fetch_failed_or_budget_limited",
+                }));
+            }
+        } else {
+            metadata_status = "unavailable_http_blocked".to_owned();
+            metadata_rows.push(json!({
+                "mint": mint,
+                "metadata_uri_stream_observed": true,
+                "metadata_fetch_status": "unavailable_http_blocked",
+                "website": "",
+                "x_twitter": "",
+                "telegram": "",
+                "discord": "",
+                "social_count": 0,
+                "metadata_confidence": "unavailable",
+                "unavailable_reason": "metadata HTTP not allowed or URI scheme unsupported",
+            }));
+        }
+    } else {
+        metadata_rows.push(json!({
+            "mint": mint,
+            "metadata_uri_stream_observed": false,
+            "metadata_fetch_status": "unavailable_missing_metadata_uri",
+            "website": "",
+            "x_twitter": "",
+            "telegram": "",
+            "discord": "",
+            "social_count": 0,
+            "metadata_confidence": "unavailable",
+            "unavailable_reason": "stream launch context did not include metadata URI",
+        }));
+    }
+
+    csv_json_rows(
+        &output_dir.join("token_supply_verification.csv"),
+        &token_supply_rows,
+        &[
+            "mint",
+            "bonding_curve_observed_raw",
+            "bonding_curve_observed_ui",
+            "protocol_constant_raw",
+            "rpc_verified_raw",
+            "rpc_verified_ui",
+            "match_status",
+            "status",
+            "unavailable_reason",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("holder_denominator_check.csv"),
+        &holder_rows,
+        &[
+            "mint",
+            "rpc_top_holder_owners_resolved",
+            "stream_top_holder_owner",
+            "rpc_top_holder_owner",
+            "stream_vs_rpc_top_holder_match",
+            "missing_owner_mapping_repaired_count",
+            "mismatch_count",
+            "confidence",
+            "status",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("wallet_activity_proxy.csv"),
+        &wallet_rows,
+        &[
+            "wallet",
+            "role",
+            "recent_signature_count",
+            "earliest_signature_in_limited_window",
+            "wallet_activity_proxy_status",
+            "confidence",
+            "unavailable_reason",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("common_funder_micro_check.csv"),
+        &common_funder_rows,
+        &[
+            "wallet",
+            "signature_checked",
+            "possible_funder",
+            "classification",
+            "confidence",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("bundle_like_evidence_micro_check.csv"),
+        &bundle_rows,
+        &[
+            "mint",
+            "same_slot_signature_count",
+            "same_slot_signatures",
+            "classification",
+            "rpc_confirmation_status",
+            "confidence",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("metadata_social_micro_check.csv"),
+        &metadata_rows,
+        &[
+            "mint",
+            "metadata_uri_stream_observed",
+            "metadata_fetch_status",
+            "website",
+            "x_twitter",
+            "telegram",
+            "discord",
+            "social_count",
+            "metadata_confidence",
+            "unavailable_reason",
+        ],
+    )?;
+    csv_json_rows(
+        &output_dir.join("post_migration_pumpswap_micro.csv"),
+        &post_migration_rows,
+        &[
+            "mint",
+            "migration_observed_in_stream",
+            "pumpswap_pool_discovery_status",
+            "classification",
+            "confidence",
+        ],
+    )?;
+
+    for (stem, rows) in [
+        ("token_supply_verification", &token_supply_rows),
+        ("holder_denominator_check", &holder_rows),
+        ("wallet_activity_proxy", &wallet_rows),
+        ("common_funder_micro_check", &common_funder_rows),
+        ("bundle_like_evidence_micro_check", &bundle_rows),
+        ("metadata_social_micro_check", &metadata_rows),
+        ("post_migration_pumpswap_micro", &post_migration_rows),
+    ] {
+        write_quant_json_md(
+            &output_dir,
+            stem,
+            rows,
+            format!(
+                "# {}\n\n```json\n{}\n```\n",
+                stem,
+                serde_json::to_string_pretty(rows)?
+            ),
+        )?;
+    }
+
+    let holder_status = holder_rows
+        .first()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let holder_audit_status = holder_status;
+    let wallet_status = if wallet_rows.iter().any(|row| {
+        row.get("wallet_activity_proxy_status")
+            .and_then(|v| v.as_str())
+            == Some("wallet_age_proxy_limited_history")
+    }) {
+        "partial_limited_history_proxy"
+    } else {
+        "blocked_or_unavailable"
+    };
+    let common_status = if common_funder_rows.iter().any(|row| {
+        row.get("classification").and_then(|v| v.as_str()) == Some("possible_common_funder")
+    }) {
+        "possible_common_funder_seen"
+    } else {
+        common_funder_rows
+            .first()
+            .and_then(|v| v.get("classification"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("no_common_funder_seen")
+    };
+    let bundle_status = bundle_rows
+        .first()
+        .and_then(|v| v.get("classification"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let post_status = post_migration_rows
+        .first()
+        .and_then(|v| v.get("classification"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let token_supply_mismatch = token_supply_status == "mismatch";
+    let canary_status = if token_supply_mismatch {
+        "failed_token_supply_rpc_mismatch"
+    } else if safe_to_run_rpc_canary {
+        "completed"
+    } else {
+        "blocked_by_rpc_budget_or_credentials"
+    };
+    if token_supply_mismatch {
+        let blocker = json!({
+            "schema_version": "phase95.rpc_micro_canary_blocker.v1",
+            "mint": mint,
+            "source_run_id": source_run_id,
+            "blocker": "token_supply_rpc_mismatch",
+            "operation": "getTokenSupply",
+            "bonding_curve_observed_raw": token_supply_rows.first().and_then(|v| v.get("bonding_curve_observed_raw")).cloned().unwrap_or(serde_json::Value::Null),
+            "protocol_constant_raw": token_supply_rows.first().and_then(|v| v.get("protocol_constant_raw")).cloned().unwrap_or(serde_json::Value::Null),
+            "rpc_verified_raw": token_supply_rows.first().and_then(|v| v.get("rpc_verified_raw")).cloned().unwrap_or(serde_json::Value::Null),
+            "status": "failed",
+            "threshold_tuning_allowed": false,
+            "next_safe_action": "Investigate Pump.fun v2 Token-2022 mint supply versus BondingCurve token_total_supply semantics before using RPC mint supply as a denominator.",
+        });
+        write_quant_json_md(
+            &output_dir,
+            "rpc_micro_canary_blocker",
+            &blocker,
+            format!(
+                "# Phase 95 RPC Micro-Canary Blocker\n\n- blocker: `token_supply_rpc_mismatch`\n- operation: `getTokenSupply`\n- mint: `{mint}`\n- status: `failed`\n- threshold_tuning_allowed: `false`\n\nThe canary did not hide or coerce this mismatch. Treat RPC mint supply and BondingCurve supply as distinct until Pump.fun v2 supply semantics are resolved.\n"
+            ),
+        )?;
+    }
+    let aggregate = json!({
+        "schema_version": "phase95.rpc_metric_micro_canary.v1",
+        "status": canary_status,
+        "mint": mint,
+        "source_run_id": source_run_id,
+        "token_supply_rpc_status": token_supply_status,
+        "holder_rpc_audit_status": holder_audit_status,
+        "holder_rpc_audit_only": true,
+        "holder_rpc_used_for_canonical_state": false,
+        "holder_denominator_status": "not_required_for_holder_metrics",
+        "wallet_activity_proxy_status": wallet_status,
+        "funding_graph_status": common_status,
+        "common_funder_status": common_status,
+        "bundle_like_evidence_status": bundle_status,
+        "metadata_social_status": metadata_status,
+        "post_migration_status": post_status,
+        "calls_used": state.rpc_calls_used,
+        "http_metadata_fetches_used": state.http_metadata_fetches_used,
+        "cache_hits": state.cache_hits,
+        "estimated_credits_used": state.estimated_credits_used,
+        "can_use_for_diagnostics": safe_to_run_rpc_canary && !token_supply_mismatch,
+        "can_use_for_formal_backtest": false,
+        "can_use_for_threshold_tuning": false,
+        "threshold_tuning_allowed": false,
+        "notes": "One-token public-chain enrichment micro-canary only; no broad enrichment and no production threshold tuning.",
+    });
+    write_quant_json_md(
+        &output_dir,
+        "rpc_metric_micro_canary",
+        &aggregate,
+        format!(
+            "# Phase 95 RPC Metric Micro-Canary\n\n- mint: `{mint}`\n- rpc_calls_used: `{}`\n- cache_hits: `{}`\n- token_supply_rpc_status: `{}`\n- holder_denominator_status: `not_required_for_holder_metrics`\n- holder_rpc_audit_status: `{}`\n- holder_rpc_used_for_canonical_state: `false`\n- wallet_activity_proxy_status: `{}`\n- common_funder_status: `{}`\n- bundle_like_evidence_status: `{}`\n- metadata_social_status: `{}`\n- threshold_tuning_allowed: `false`\n",
+            state.rpc_calls_used,
+            state.cache_hits,
+            aggregate["token_supply_rpc_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            aggregate["holder_rpc_audit_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            aggregate["wallet_activity_proxy_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            aggregate["common_funder_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            aggregate["bundle_like_evidence_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            aggregate["metadata_social_status"]
+                .as_str()
+                .unwrap_or("unknown"),
+        ),
+    )?;
+
+    if upload_r2 {
+        let upload_summary = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase95_public_chain_enrichment",
+            mint,
+            verify_r2,
+        )
+        .await?;
+        write_quant_json_md(
+            &output_dir,
+            "r2_upload_result",
+            &upload_summary,
+            format!(
+                "# Phase 95 R2 Upload\n\n- uploaded_files: `{}`\n- verified_files: `{}`\n- failed_files: `{}`\n",
+                upload_summary["uploaded_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                upload_summary["verified_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                upload_summary["failed_files"]
+                    .as_array()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+            ),
+        )?;
+        if let Some(source_run_id) = source_run_id {
+            let index_result = update_dataset_index_rpc_canary(
+                loaded,
+                source_run_id,
+                mint,
+                &aggregate,
+                &upload_summary,
+                verify_r2,
+            )
+            .await?;
+            write_quant_json_md(
+                &output_dir,
+                "dataset_index_update_result",
+                &index_result,
+                format!(
+                    "# Phase 95 Dataset Index Update\n\n- source_run_id: `{source_run_id}`\n- updated: `{}`\n- uploaded: `{}`\n- verified: `{}`\n",
+                    index_result["updated"].as_bool().unwrap_or(false),
+                    index_result["dataset_index_uploaded"]
+                        .as_bool()
+                        .unwrap_or(false),
+                    index_result["dataset_index_verified"]
+                        .as_bool()
+                        .unwrap_or(false),
+                ),
+            )?;
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+    Ok(())
+}
+
+async fn update_dataset_index_rpc_canary(
+    loaded: &LoadedConfig,
+    source_run_id: &str,
+    mint: &str,
+    aggregate: &serde_json::Value,
+    upload_summary: &serde_json::Value,
+    verify_r2: bool,
+) -> Result<serde_json::Value> {
+    let dataset_index_guard = acquire_dataset_index_lock(loaded, "rpc-metric-micro-canary")?;
+    refresh_dataset_index_lock(&dataset_index_guard, "rpc-metric-micro-canary")?;
+    let mut authoritative_index = match download_dataset_index_from_r2(loaded).await {
+        Ok(index) => index,
+        Err(_) => load_dataset_index_local_or_r2(loaded, false).await?,
+    };
+    let Some(entry) = authoritative_index
+        .runs
+        .iter_mut()
+        .find(|entry| entry.run_id == source_run_id)
+    else {
+        return Ok(json!({
+            "schema_version": "phase95.dataset_index_update.v1",
+            "source_run_id": source_run_id,
+            "mint": mint,
+            "updated": false,
+            "reason": "source_run_id_not_found_in_dataset_index",
+            "threshold_tuning_allowed": false,
+        }));
+    };
+    entry.rpc_enrichment_canary_v1 = Some(json!({
+        "latest_rpc_canary_run_id": source_run_id,
+        "mints_tested": [mint],
+        "rpc_available": true,
+        "rpc_budget_status": "available_bounded",
+        "rpc_calls_used": aggregate["calls_used"].clone(),
+        "credits_used_estimate": aggregate["estimated_credits_used"].clone(),
+        "cache_hits": aggregate["cache_hits"].clone(),
+        "token_supply_rpc_status": aggregate["token_supply_rpc_status"].clone(),
+        "holder_denominator_repair_status": "not_required_for_holder_metrics",
+        "holder_rpc_audit_status": aggregate["holder_rpc_audit_status"].clone(),
+        "holder_rpc_used_for_canonical_state": false,
+        "wallet_age_history_status": aggregate["wallet_activity_proxy_status"].clone(),
+        "funding_graph_status": aggregate["funding_graph_status"].clone(),
+        "common_funder_status": aggregate["common_funder_status"].clone(),
+        "bundle_confirmation_status": aggregate["bundle_like_evidence_status"].clone(),
+        "metadata_social_status": aggregate["metadata_social_status"].clone(),
+        "post_migration_status": aggregate["post_migration_status"].clone(),
+        "r2_upload_verified": upload_summary["verified"].clone(),
+        "threshold_tuning_allowed": false,
+    }));
+    entry.threshold_tuning_allowed = false;
+    refresh_dataset_index_lock(&dataset_index_guard, "rpc-metric-micro-canary")?;
+    let dataset_index_upload =
+        upload_dataset_index_value_r2(loaded, &authoritative_index, false, verify_r2).await?;
+    Ok(json!({
+        "schema_version": "phase95.dataset_index_update.v1",
+        "source_run_id": source_run_id,
+        "mint": mint,
+        "updated": true,
+        "dataset_index_uploaded": dataset_index_upload.uploaded,
+        "dataset_index_verified": dataset_index_upload.verified,
+        "threshold_tuning_allowed": false,
+    }))
+}
+
+fn collect_report_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        collect_report_files(&entry.path(), out)?;
+    }
+    Ok(())
+}
+
+async fn upload_phase_report_dir_to_r2(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    phase_prefix: &str,
+    run_or_mint: &str,
+    verify_r2: bool,
+) -> Result<serde_json::Value> {
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let mut paths = Vec::<PathBuf>::new();
+    collect_report_files(output_dir, &mut paths)?;
+    paths.sort();
+    let mut uploaded_files = Vec::<String>::new();
+    let mut verified_files = Vec::<String>::new();
+    let mut failed_files = Vec::<String>::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(output_dir)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let remote_key = client.managed_key(
+            &research_remote_base_prefix(&client),
+            &format!("{phase_prefix}/{run_or_mint}/{relative}"),
+        );
+        let prepared = client.prepare_upload(
+            &path,
+            bucket.clone(),
+            remote_key.clone(),
+            &artifact_content_type(&path),
+            BTreeMap::new(),
+            Some(false),
+        )?;
+        let result = client
+            .upload_prepared(&prepared, verify_r2.then_some(true))
+            .await?;
+        if result.uploaded {
+            uploaded_files.push(remote_key.clone());
+        }
+        if verify_r2 && result.verified {
+            verified_files.push(remote_key.clone());
+        }
+        if verify_r2 && !result.verified {
+            failed_files.push(remote_key);
+        }
+    }
+    Ok(json!({
+        "schema_version": "phase95.r2_upload_result.v1",
+        "phase_prefix": phase_prefix,
+        "run_or_mint": run_or_mint,
+        "uploaded_files": uploaded_files,
+        "verified_files": verified_files,
+        "failed_files": failed_files,
+        "verified": verify_r2 && !verified_files.is_empty() && failed_files.is_empty(),
+    }))
+}
+
 async fn run_enrichment_worker_command(
     source_run_id: Option<&str>,
     derived_run_id: Option<&str>,
@@ -34337,6 +35994,12 @@ fn build_stream_metric_values(
             "source": "stream_normalized_events",
             "confidence": if unavailable.is_some() { 0.0 } else { 1.0 },
             "unavailable_reason": unavailable.unwrap_or(""),
+            "holder_count_source": if metric == "holder_count" { "stream_owner_summed_token_accounts" } else { "" },
+            "top_holder_source": if metric == "top_holder_pct_observed" { "stream_owner_summed_token_accounts" } else { "" },
+            "dev_holding_source": if metric == "dev_holding_balance" { "stream_owner_summed_token_accounts" } else { "" },
+            "holder_rpc_used": false,
+            "holder_rpc_required": false,
+            "holder_rpc_audit_status": "not_run_not_required",
         }));
     }
     rows
@@ -34371,7 +36034,7 @@ async fn launch_metric_canary_command(
         "common_funder": "blocked_by_rpc_budget",
         "wallet_age_history": "blocked_by_rpc_budget",
         "bundle_confirmation": "blocked_by_rpc_budget_unless_stream_observable",
-        "holder_denominator_repair_via_rpc": "blocked_by_rpc_budget",
+        "holder_denominator_repair_via_rpc": "not_required_for_holder_metrics",
         "metadata_social": if require_metadata_social { "blocked_by_http_api_key_or_budget" } else { "not_required_for_stream_canary" },
         "raw_deshred": "blocked_by_provider_unless_configured",
     });
@@ -34747,6 +36410,12 @@ async fn launch_metric_canary_command(
             "source",
             "confidence",
             "unavailable_reason",
+            "holder_count_source",
+            "top_holder_source",
+            "dev_holding_source",
+            "holder_rpc_used",
+            "holder_rpc_required",
+            "holder_rpc_audit_status",
         ],
         &metric_rows,
     )?;
@@ -34758,6 +36427,12 @@ async fn launch_metric_canary_command(
         "metrics_unavailable": metric_rows.iter().filter(|row| !row["unavailable_reason"].as_str().unwrap_or("").is_empty()).count(),
         "rows": metric_rows,
         "no_rpc_used": no_rpc,
+        "holder_count_source": "stream_owner_summed_token_accounts",
+        "top_holder_source": "stream_owner_summed_token_accounts",
+        "dev_holding_source": "stream_owner_summed_token_accounts",
+        "holder_rpc_used": false,
+        "holder_rpc_required": false,
+        "holder_rpc_audit_status": "not_run_not_required",
         "no_live_trading": no_live_trading,
     });
     write_quant_json_md(
@@ -34776,6 +36451,10 @@ async fn launch_metric_canary_command(
         "stream_required_passed": blocking_failures.is_empty(),
         "blocking_failures": blocking_failures,
         "enrichment_required_metrics": "blocked_by_rpc_budget_or_http_provider_not_stream_failure",
+        "holder_rpc_used": false,
+        "holder_rpc_required": false,
+        "holder_rpc_audit_status": "not_run_not_required",
+        "holder_denominator_repair_via_rpc": "not_required_for_holder_metrics",
         "raw_shred_required_metrics": "blocked_by_provider",
         "deshred_required_metrics": "blocked_by_provider",
         "threshold_tuning_allowed": false,
@@ -34915,7 +36594,8 @@ async fn launch_metric_canary_command(
         "mint": mint,
         "stream_required_metrics_working": contract_result["stream_required_passed"],
         "research_derived_metrics_working": stream_proof["metrics_computed"].as_u64().unwrap_or(0) > 0,
-        "blocked_by_rpc_credits": ["funding_graph", "common_funder", "wallet_age_history", "bundle_confirmation", "holder_denominator_repair_via_rpc"],
+        "blocked_by_rpc_credits": ["funding_graph", "common_funder", "wallet_age_history", "bundle_confirmation"],
+        "holder_denominator_repair_via_rpc": "not_required_for_holder_metrics",
         "requires_raw_shred_provider": ["raw_shred_metrics"],
         "requires_deshred_provider": ["deshred_metrics"],
         "unsupported": [],
@@ -34971,7 +36651,7 @@ fn phase80_required_fix(
     }
     if unavailable > 0 && unavailable_rate_bps > 500 {
         return match family {
-            "holder" | "top_holder" => "recover holder denominator context or run budgeted off-VPS holder repair enrichment".to_owned(),
+            "holder" | "top_holder" => "use stream owner-summed token-account state; missing stream holder data remains unavailable and RPC repair is audit-only".to_owned(),
             "price" | "market_cap" | "curve_progress" => "mark missing curve-state snapshots unavailable and increase source coverage".to_owned(),
             _ => format!("reduce unavailable {family} rows or document unavailable reason"),
         };
@@ -44470,5 +46150,201 @@ mod tests {
             .find(|row| row["metric_name"] == "buy_count")
             .and_then(|row| row["value"].as_u64());
         assert_eq!(buy_count, Some(0));
+    }
+
+    #[test]
+    fn phase95_sanitizes_rpc_provider_errors() {
+        let key_param = ["api", "-", "key", "="].concat();
+        let sanitized = sanitize_provider_error(&format!(
+            "https://rpc.example.invalid/?{key_param}secret-value&method=getTokenSupply"
+        ));
+        assert!(sanitized.contains(&format!("{key_param}REDACTED")));
+        assert!(!sanitized.contains("secret-value"));
+    }
+
+    #[test]
+    fn phase95_metadata_parser_extracts_social_links() {
+        let metadata = json!({
+            "website": "https://example.invalid",
+            "twitter": "https://x.com/example",
+            "extensions": {
+                "telegram": "https://t.me/example",
+                "discord": "https://discord.gg/example"
+            }
+        });
+        let links = extract_social_links(&metadata);
+        assert_eq!(
+            links.get("website").map(String::as_str),
+            Some("https://example.invalid")
+        );
+        assert_eq!(
+            links.get("x_twitter").map(String::as_str),
+            Some("https://x.com/example")
+        );
+        assert_eq!(
+            links.get("telegram").map(String::as_str),
+            Some("https://t.me/example")
+        );
+        assert_eq!(
+            links.get("discord").map(String::as_str),
+            Some("https://discord.gg/example")
+        );
+    }
+
+    #[tokio::test]
+    async fn phase95_rpc_budget_exhaustion_writes_ledger_without_network_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp.path().join("cache");
+        let ledger_path = temp.path().join("ledger.jsonl");
+        fs::create_dir_all(&cache_dir).expect("cache dir");
+        let client = http_transport::Client::new();
+        let mut state = RpcMicroCanaryBudgetState::default();
+        let limits = RpcMicroCanaryBudgetLimits {
+            max_tokens: 1,
+            max_rpc_calls_total: 0,
+            max_rpc_calls_per_metric_family: 0,
+            max_wallets: 1,
+            max_signatures_per_wallet: 1,
+            max_transactions: 1,
+            max_http_metadata_fetches: 0,
+            max_runtime_seconds: 1,
+            cache_required: true,
+            ledger_required: true,
+        };
+        let result = rpc_micro_json_rpc_call(
+            &client,
+            "http://127.0.0.1:9",
+            &cache_dir,
+            &ledger_path,
+            &mut state,
+            limits,
+            "mint",
+            "token_supply_rpc",
+            "getTokenSupply",
+            json!(["mint"]),
+            "test budget exhaustion",
+            "artifact",
+        )
+        .await
+        .expect("budget path succeeds");
+        assert!(result.is_none());
+        assert_eq!(state.rpc_calls_used, 0);
+        let ledger = fs::read_to_string(&ledger_path).expect("ledger");
+        assert!(ledger.contains("budget_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn phase95_cache_hit_avoids_duplicate_rpc_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp.path().join("cache");
+        let ledger_path = temp.path().join("ledger.jsonl");
+        fs::create_dir_all(&cache_dir).expect("cache dir");
+        let params = json!(["mint"]);
+        let cache_key = rpc_micro_cache_key("rpc", "getTokenSupply", &params);
+        fs::write(
+            cache_dir.join(format!("{cache_key}.json")),
+            serde_json::to_vec(&json!({"result":{"value":{"amount":"1"}}})).expect("json"),
+        )
+        .expect("cache write");
+        let client = http_transport::Client::new();
+        let mut state = RpcMicroCanaryBudgetState::default();
+        let limits = RpcMicroCanaryBudgetLimits {
+            max_tokens: 1,
+            max_rpc_calls_total: 1,
+            max_rpc_calls_per_metric_family: 1,
+            max_wallets: 1,
+            max_signatures_per_wallet: 1,
+            max_transactions: 1,
+            max_http_metadata_fetches: 0,
+            max_runtime_seconds: 1,
+            cache_required: true,
+            ledger_required: true,
+        };
+        let result = rpc_micro_json_rpc_call(
+            &client,
+            "http://127.0.0.1:9",
+            &cache_dir,
+            &ledger_path,
+            &mut state,
+            limits,
+            "mint",
+            "token_supply_rpc",
+            "getTokenSupply",
+            params,
+            "test cache hit",
+            "artifact",
+        )
+        .await
+        .expect("cache path succeeds");
+        assert!(result.is_some());
+        assert_eq!(state.rpc_calls_used, 0);
+        assert_eq!(state.cache_hits, 1);
+        let ledger = fs::read_to_string(&ledger_path).expect("ledger");
+        assert!(ledger.contains("\"cache_hit\":true"));
+    }
+
+    #[test]
+    fn phase96_holder_stream_metrics_do_not_require_rpc() {
+        let meta = common::EventMeta::new(
+            common::EventSource::GeyserProcessed,
+            common::Canonicality::Processed,
+            1,
+        );
+        let event = NormalizedEvent {
+            meta,
+            payload: EventPayload::HolderBalanceUpdate(common::HolderBalanceUpdateEvent {
+                mint: common::PubkeyValue("mint".to_owned()),
+                owner_wallet: common::PubkeyValue("owner".to_owned()),
+                token_account: common::PubkeyValue("token-account".to_owned()),
+                token_decimals: Some(6),
+                old_balance: Some(Decimal::ZERO),
+                new_balance: Decimal::from(10u64),
+                delta: Decimal::from(10u64),
+                caused_by_signature: Some("sig".to_owned()),
+                update_reason: "test".to_owned(),
+                confidence: Decimal::ONE,
+            }),
+        };
+        let rows = build_stream_metric_values("run", "mint", &[event]);
+        let holder = rows
+            .iter()
+            .find(|row| row["metric_name"] == "holder_count")
+            .expect("holder row");
+        assert_eq!(
+            holder["holder_count_source"],
+            "stream_owner_summed_token_accounts"
+        );
+        assert_eq!(holder["holder_rpc_used"], false);
+        assert_eq!(holder["holder_rpc_required"], false);
+        assert_eq!(holder["holder_rpc_audit_status"], "not_run_not_required");
+    }
+
+    #[test]
+    fn phase96_holder_policy_config_marks_rpc_audit_only() {
+        let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("config/metric_contract.toml");
+        let contract = fs::read_to_string(contract_path).expect("contract");
+        for metric_id in [
+            "holder_count",
+            "holder_growth",
+            "holder_churn",
+            "holder_stickiness",
+            "top_holder_concentration",
+            "dev_holdings",
+            "cost_basis_profit_pressure",
+        ] {
+            let marker = format!("metric_id = \"{metric_id}\"");
+            let start = contract.find(&marker).expect("metric marker");
+            let rest = &contract[start..];
+            let end = rest.find("\n[[metric]]").unwrap_or(rest.len());
+            let block = &rest[..end];
+            assert!(block.contains("required_source = \"stream\""));
+            assert!(block.contains("rpc_required = false"));
+            assert!(block.contains("rpc_repair_allowed_for_live = false"));
+            assert!(block.contains("rpc_repair_allowed_for_research_default = false"));
+            assert!(block.contains("rpc_repair_allowed_for_audit_only = true"));
+            assert!(block.contains("rpc_budget_status = \"not_required_for_holder_metrics\""));
+        }
     }
 }

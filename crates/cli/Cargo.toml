@@ -15,6 +15,7 @@ decoder = { path = "../decoder" }
 decision = { path = "../decision" }
 executor = { path = "../executor" }
 features = { path = "../features" }
+hex.workspace = true
 idl = { path = "../idl" }
 ingest-geyser = { path = "../ingest-geyser" }
 metrics = { path = "../metrics" }
@@ -22,6 +23,7 @@ r2-storage = { path = "../r2-storage" }
 risk = { path = "../risk" }
 rpc-budget = { path = "../rpc-budget" }
 runtime = { path = "../runtime" }
+reqwest.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,3 +35,6 @@ storage = { path = "../storage" }
 time.workspace = true
 tokio.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
