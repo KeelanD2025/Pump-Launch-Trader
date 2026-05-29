@@ -38,7 +38,7 @@ ping_interval_ms = 15000
 max_decoded_message_size = 67108864
 max_inflight_messages = 8192
 slot_gap_tolerance = 1
-program_filters = ["Pump111111111111111111111111111111111111111"]
+program_filters = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
 account_filters = []
 
 [ingest.shred]
@@ -86,7 +86,7 @@ subscribe_blocks = false
 geyser_only_allowed = true
 max_inflight_messages = 8192
 slot_gap_tolerance = 1
-program_filters = ["Pump111111111111111111111111111111111111111"]
+program_filters = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
 account_filters = []
 
 [shred]
@@ -96,7 +96,7 @@ dedup_window = 8192
 tentative_ttl_ms = 3000
 
 [pump]
-program_ids = ["Pump111111111111111111111111111111111111111"]
+program_ids = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
 pump_swap_program_ids = []
 idl_paths = ["../fixtures/idl/pump_mock_idl.json"]
 

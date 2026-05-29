@@ -4557,6 +4557,47 @@ mod tests {
     }
 
     #[test]
+    fn default_geyser_filters_include_official_pump_program() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("config")
+            .join("default.toml");
+        let loaded = LoadedConfig::from_file(&root).expect("config should load");
+        let official_pump_program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        assert!(
+            loaded
+                .config
+                .pump
+                .program_ids
+                .iter()
+                .any(|program| program == official_pump_program),
+            "default pump program ids must include the official Pump.fun program"
+        );
+        assert!(
+            loaded
+                .config
+                .geyser
+                .program_filters
+                .iter()
+                .any(|program| program == official_pump_program),
+            "default Geyser filters must subscribe to the official Pump.fun program"
+        );
+        assert!(
+            loaded
+                .config
+                .ingest
+                .geyser
+                .as_ref()
+                .expect("default ingest Geyser config")
+                .program_filters
+                .iter()
+                .any(|program| program == official_pump_program),
+            "default ingest Geyser filters must subscribe to the official Pump.fun program"
+        );
+    }
+
+    #[test]
     fn autopilot_validation_rejects_zero_parallel_runs() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")

@@ -166,7 +166,7 @@ ping_interval_ms = 15000
 max_decoded_message_size = 67108864
 max_inflight_messages = 8192
 slot_gap_tolerance = 1
-program_filters = ["Pump111111111111111111111111111111111111111"]
+program_filters = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
 account_filters = []
 
 [ingest.shred]
@@ -215,7 +215,7 @@ geyser_only_allowed = true
 max_inflight_messages = 8192
 slot_gap_tolerance = 1
 program_filters = [
-  "Pump111111111111111111111111111111111111111",
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
 ]
 account_filters = []
 
