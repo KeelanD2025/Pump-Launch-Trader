@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use sim::{FeeModel, Simulator};
 use solana_pubkey::Pubkey;
 use state::{StateEngine, StateSnapshot};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -36976,12 +36976,19 @@ async fn live_risk_canary_command(
             "risk_confidence": decimal_to_json(Some(output.risk_confidence)),
             "unavailable_risk_families": output.unavailable_risk_families.join("|"),
             "blocking_data_quality_reasons": output.blocking_data_quality_reasons.join("|"),
+            "denominator_source_for_market_cap": output.denominator_source_for_market_cap.clone(),
+            "denominator_source_for_holder_pct": output.denominator_source_for_holder_pct.clone(),
+            "rpc_supply_diagnostic_only": output.rpc_supply_diagnostic_only,
+            "supply_semantics_status": output.supply_semantics_status.clone(),
+            "supply_mismatch_ratio": decimal_to_json(output.supply_mismatch_ratio),
+            "supply_denominator_policy_version": output.supply_denominator_policy_version.clone(),
+            "rpc_mint_supply_canonical": false,
             "holder_rpc_used": false,
             "no_live_trading": true,
             "no_rpc": true,
         }));
         for evidence in &output.evidence {
-            let row = risk_evidence_row(&run_id, &mint, event, evidence);
+            let row = risk_evidence_row(&run_id, &mint, event, evidence, &output);
             time_safety_rows.push(row.clone());
             if evidence.time_role.pre_entry_safe() {
                 pre_entry_rows.push(row.clone());
@@ -37034,6 +37041,13 @@ async fn live_risk_canary_command(
             "risk_confidence",
             "unavailable_risk_families",
             "blocking_data_quality_reasons",
+            "denominator_source_for_market_cap",
+            "denominator_source_for_holder_pct",
+            "rpc_supply_diagnostic_only",
+            "supply_semantics_status",
+            "supply_mismatch_ratio",
+            "supply_denominator_policy_version",
+            "rpc_mint_supply_canonical",
             "holder_rpc_used",
             "no_live_trading",
             "no_rpc",
@@ -37116,6 +37130,16 @@ async fn live_risk_canary_command(
         "time_safety_passed": true,
         "provider_confirmed_bundle": false,
         "provider_confirmed_malicious_label": false,
+        "denominator_source_for_market_cap": "curve_economic_supply_or_protocol_constant",
+        "denominator_source_for_holder_pct": "curve_economic_supply",
+        "market_cap_denominator": "curve_economic_supply_or_protocol_constant",
+        "curve_progress_denominator": "bonding_curve_real_reserves_and_curve_economic_supply",
+        "top_holder_pct_denominator": "curve_economic_supply",
+        "dev_holding_pct_denominator": "curve_economic_supply",
+        "holder_count_source": "stream_owner_summed_token_accounts",
+        "rpc_mint_supply_canonical": false,
+        "rpc_supply_diagnostic_only": true,
+        "supply_denominator_policy_version": "phase102.supply_denominator.v1",
         "holder_rpc_used": false,
         "holder_rpc_required": false,
         "no_rpc": true,
@@ -37199,25 +37223,42 @@ fn risk_input_from_token(
     bundle: &StreamBundleContext,
 ) -> RiskSnapshotInput {
     let observed_supply = token.holder_state.observed_holder_supply();
+    let token_decimals = token.reserve_state.token_decimals;
+    let curve_economic_supply_raw =
+        common::ui_tokens_to_raw(Decimal::from(common::PUMP_TOTAL_SUPPLY_UI), token_decimals);
+    let mut excluded_curve_owners = HashSet::new();
+    if let Some(curve) = &token.bonding_curve {
+        excluded_curve_owners.insert(curve.0.clone());
+    }
     let dev_holding_pct = token.creator.as_ref().and_then(|creator| {
         token
             .holder_state
             .owner_balances
             .get(&creator.0)
             .and_then(|holder| {
-                if observed_supply > Decimal::ZERO {
-                    Some(holder.balance / observed_supply)
+                if observed_supply > Decimal::ZERO && curve_economic_supply_raw > Decimal::ZERO {
+                    Some(holder.balance.max(Decimal::ZERO) / curve_economic_supply_raw)
                 } else {
                     None
                 }
             })
     });
+    let top_holder_pct =
+        if observed_supply > Decimal::ZERO && curve_economic_supply_raw > Decimal::ZERO {
+            Some(token.holder_state.top_holder_pct_with_denominator(
+                1,
+                curve_economic_supply_raw,
+                &excluded_curve_owners,
+            ))
+        } else {
+            None
+        };
     RiskSnapshotInput {
         mint: mint.to_owned(),
         holder_count: Some(Decimal::from(
             token.holder_state.nonzero_holder_count as u64,
         )),
-        top_holder_pct: Some(token.holder_state.top_holder_pct(1)),
+        top_holder_pct,
         dev_holding_pct,
         paperhand_90pct_count: Some(Decimal::from(
             token.holder_state.paperhand_90pct_wallet_count as u64,
@@ -37350,6 +37391,7 @@ fn risk_evidence_row(
     mint: &str,
     event: &NormalizedEvent,
     evidence: &RiskEvidence,
+    output: &features::risk_engine::RiskSnapshotOutput,
 ) -> serde_json::Value {
     json!({
         "source_run_id": run_id,
@@ -37367,6 +37409,13 @@ fn risk_evidence_row(
         "confidence": decimal_to_json(Some(evidence.confidence)),
         "unavailable_reason": evidence.unavailable_reason.clone().unwrap_or_default(),
         "evidence": evidence.evidence.join("|"),
+        "denominator_source_for_market_cap": output.denominator_source_for_market_cap.clone(),
+        "denominator_source_for_holder_pct": output.denominator_source_for_holder_pct.clone(),
+        "rpc_supply_diagnostic_only": output.rpc_supply_diagnostic_only,
+        "supply_semantics_status": output.supply_semantics_status.clone(),
+        "supply_mismatch_ratio": decimal_to_json(output.supply_mismatch_ratio),
+        "supply_denominator_policy_version": output.supply_denominator_policy_version.clone(),
+        "rpc_mint_supply_canonical": false,
         "provider_confirmed_bundle": false,
         "holder_rpc_used": false,
     })
@@ -37400,6 +37449,13 @@ fn write_risk_rows(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
             "confidence",
             "unavailable_reason",
             "evidence",
+            "denominator_source_for_market_cap",
+            "denominator_source_for_holder_pct",
+            "rpc_supply_diagnostic_only",
+            "supply_semantics_status",
+            "supply_mismatch_ratio",
+            "supply_denominator_policy_version",
+            "rpc_mint_supply_canonical",
             "provider_confirmed_bundle",
             "holder_rpc_used",
         ],
@@ -46044,6 +46100,100 @@ mod tests {
         );
         let input = risk_input_from_token("mint", &token, &StreamBundleContext::default());
         assert_eq!(input.dev_holding_pct, None);
+    }
+
+    #[test]
+    fn live_risk_input_uses_curve_economic_holder_denominator() {
+        let mut token = state::TokenState::new(
+            common::PubkeyValue("mint".to_owned()),
+            common::EventSource::GeyserProcessed,
+        );
+        token.bonding_curve = Some(common::PubkeyValue("curve-owner".to_owned()));
+        token.reserve_state.token_decimals = 6;
+        token.holder_state.owner_balances.insert(
+            "curve-owner".to_owned(),
+            state::HolderBalance {
+                balance: common::ui_tokens_to_raw(Decimal::from(900_000_000u64), 6),
+                ..state::HolderBalance::default()
+            },
+        );
+        token.holder_state.owner_balances.insert(
+            "holder-a".to_owned(),
+            state::HolderBalance {
+                balance: common::ui_tokens_to_raw(Decimal::from(100_000_000u64), 6),
+                ..state::HolderBalance::default()
+            },
+        );
+        token
+            .holder_state
+            .recompute_distribution(OffsetDateTime::now_utc());
+
+        let input = risk_input_from_token("mint", &token, &StreamBundleContext::default());
+
+        assert_eq!(input.top_holder_pct, Some(Decimal::new(1, 1)));
+        assert_eq!(
+            input.supply_denominator_source.as_deref(),
+            Some("curve_economic_supply")
+        );
+    }
+
+    #[test]
+    fn live_risk_evidence_rows_emit_supply_policy_fields() {
+        let event = common::NormalizedEvent {
+            meta: common::EventMeta::new(
+                common::EventSource::GeyserProcessed,
+                common::Canonicality::Processed,
+                42,
+            ),
+            payload: common::EventPayload::ObservedTransaction(common::ObservedTransactionEvent {
+                signature_hint: None,
+                slot_hint: Some(42),
+                entry_index: None,
+                tx_position_estimate: None,
+                signer: None,
+                program_ids: Vec::new(),
+                account_count: 0,
+                instruction_count: 0,
+                account_list_hash: None,
+                instruction_shape_hash: None,
+                compute_unit_limit: None,
+                compute_unit_price: None,
+                estimated_priority_fee_lamports: None,
+                tx_fee_lamports: None,
+                compute_units_consumed: None,
+                pre_sol_balances_lamports: Vec::new(),
+                post_sol_balances_lamports: Vec::new(),
+                failed_transaction: false,
+                error_code: None,
+                bundle_like_evidence: None,
+                raw_packet_hash: String::new(),
+                first_seen_by_shred_ns: 0,
+                decode_confidence: Decimal::ONE,
+            }),
+        };
+        let engine = DiagnosticRiskEngine::default();
+        let output = engine.evaluate(RiskSnapshotInput {
+            mint: "mint".to_owned(),
+            rpc_supply_matches_curve_supply: Some(false),
+            rpc_supply_mismatch_ratio: Some(Decimal::from(2u64)),
+            ..RiskSnapshotInput::default()
+        });
+        let row = risk_evidence_row("run", "mint", &event, &output.evidence[0], &output);
+
+        assert_eq!(
+            row["denominator_source_for_market_cap"].as_str(),
+            Some("curve_economic_supply_or_protocol_constant")
+        );
+        assert_eq!(
+            row["denominator_source_for_holder_pct"].as_str(),
+            Some("curve_economic_supply")
+        );
+        assert_eq!(
+            row["supply_denominator_policy_version"].as_str(),
+            Some("phase102.supply_denominator.v1")
+        );
+        assert_eq!(row["rpc_mint_supply_canonical"].as_bool(), Some(false));
+        assert_eq!(row["rpc_supply_diagnostic_only"].as_bool(), Some(true));
     }
 
     fn pnl_sanity_input(
