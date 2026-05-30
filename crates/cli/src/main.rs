@@ -37077,6 +37077,7 @@ async fn live_risk_canary_command(
             "can_use_for_backtest",
             "can_use_for_tuning",
             "unavailable_reason",
+            "rug_outcome_reason",
         ],
         &post_event_rows,
     )?;
@@ -37478,12 +37479,18 @@ fn build_post_event_risk_labels(
             Some("token_state_unavailable_after_observation_window"),
         )]);
     };
-    let prices = token
+    let price_points = token
         .trade_stats
         .price_history
         .iter()
-        .filter_map(|(_, price)| (*price > Decimal::ZERO).then_some(*price))
+        .filter_map(|(timestamp, price)| (*price > Decimal::ZERO).then_some((*timestamp, *price)))
         .collect::<Vec<_>>();
+    let prices = price_points
+        .iter()
+        .map(|(_, price)| *price)
+        .collect::<Vec<_>>();
+    let launch_at = price_points.first().map(|(timestamp, _)| *timestamp);
+    let launch_price = price_points.first().map(|(_, price)| *price);
     let peak = prices
         .iter()
         .copied()
@@ -37493,14 +37500,75 @@ fn build_post_event_risk_labels(
         (Some(peak), Some(latest)) if peak > Decimal::ZERO => Some((peak - latest) / peak),
         _ => None,
     };
+    let stats_60 = price_window_stats(&price_points, 60);
+    let stats_180 = price_window_stats(&price_points, 180);
+    let stats_300 = price_window_stats(&price_points, 300);
+    let dead_60 = stats_60
+        .and_then(|stats| stats.max_drawdown)
+        .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
+    let dead_180 = stats_180
+        .and_then(|stats| stats.max_drawdown)
+        .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
+    let dead_300 = stats_300
+        .and_then(|stats| stats.max_drawdown)
+        .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
+    let rapid_collapse_80 = drawdown.is_some_and(|drawdown| drawdown >= Decimal::new(80, 2));
+    let rapid_collapse_95 = drawdown.is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
+    let buy_count = token.trade_stats.buy_count;
+    let sell_count = token.trade_stats.sell_count;
+    let no_buy_followthrough = buy_count <= 1 && sell_count > 0;
+    let volume_evaporated = token
+        .trade_stats
+        .last_buy_at
+        .zip(launch_at)
+        .is_some_and(|(last_buy, launch)| (last_buy - launch).whole_seconds() <= 60)
+        && sell_count > 0;
+    let holder_collapse = token.holder_state.holder_churn_rate >= Decimal::new(50, 2);
+    let top_holder_or_dev_dumped = token.developer_state.creator_sell_percentage
+        >= Decimal::new(90, 2)
+        || token
+            .trade_stats
+            .trade_history
+            .iter()
+            .any(|trade| trade.side == state::TradeSide::Sell && trade.is_top_holder_pre_sell);
+    let rug_like_outcome = dead_60
+        || dead_180
+        || dead_300
+        || rapid_collapse_80
+        || no_buy_followthrough
+        || volume_evaporated
+        || holder_collapse
+        || top_holder_or_dev_dumped;
+    let rug_outcome_reason = [
+        ("dead_within_60s", dead_60),
+        ("dead_within_180s", dead_180),
+        ("dead_within_300s", dead_300),
+        ("rapid_collapse_80pct", rapid_collapse_80),
+        ("rapid_collapse_95pct", rapid_collapse_95),
+        ("no_buy_followthrough", no_buy_followthrough),
+        ("volume_evaporated", volume_evaporated),
+        ("holder_collapse", holder_collapse),
+        ("top_holder_or_dev_dumped", top_holder_or_dev_dumped),
+    ]
+    .into_iter()
+    .filter_map(|(label, active)| active.then_some(label))
+    .collect::<Vec<_>>();
     let collapse_label = if prices.len() < 2 {
         "inconclusive_insufficient_horizon"
-    } else if drawdown.unwrap_or_default() >= Decimal::new(70, 2) {
-        "rapid_collapse"
+    } else if rug_like_outcome {
+        "rug_like_outcome"
     } else {
         "none_observed"
     };
-    Ok(vec![
+    let mut rows = vec![
+        post_event_label_row(
+            run_id,
+            mint,
+            "launch_price",
+            "price_outcome",
+            launch_price,
+            launch_price.is_none().then_some("insufficient_price_path"),
+        ),
         post_event_label_row(
             run_id,
             mint,
@@ -37517,6 +37585,86 @@ fn build_post_event_risk_labels(
             drawdown,
             drawdown.is_none().then_some("insufficient_price_path"),
         ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "dead_within_60s",
+            "rug_outcome",
+            dead_60,
+            stats_60
+                .is_none()
+                .then_some("insufficient_60s_price_horizon"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "dead_within_180s",
+            "rug_outcome",
+            dead_180,
+            stats_180
+                .is_none()
+                .then_some("insufficient_180s_price_horizon"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "dead_within_300s",
+            "rug_outcome",
+            dead_300,
+            stats_300
+                .is_none()
+                .then_some("insufficient_300s_price_horizon"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "rapid_collapse_80pct",
+            "rug_outcome",
+            rapid_collapse_80,
+            drawdown.is_none().then_some("insufficient_price_path"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "rapid_collapse_95pct",
+            "rug_outcome",
+            rapid_collapse_95,
+            drawdown.is_none().then_some("insufficient_price_path"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "no_buy_followthrough",
+            "flow_outcome",
+            no_buy_followthrough,
+            None,
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "volume_evaporated",
+            "flow_outcome",
+            volume_evaporated,
+            launch_at
+                .is_none()
+                .then_some("missing_launch_trade_timestamp"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "holder_collapse",
+            "holder_outcome",
+            holder_collapse,
+            None,
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "top_holder_or_dev_dumped",
+            "rug_outcome",
+            top_holder_or_dev_dumped,
+            None,
+        ),
         json!({
             "source_run_id": run_id,
             "mint": mint,
@@ -37528,7 +37676,16 @@ fn build_post_event_risk_labels(
             "can_use_for_backtest": prices.len() >= 2,
             "can_use_for_tuning": false,
             "unavailable_reason": if prices.len() >= 2 { "" } else { "insufficient_price_path" },
+            "rug_outcome_reason": rug_outcome_reason.join("|"),
         }),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "rug_like_outcome",
+            "rug_outcome",
+            rug_like_outcome,
+            prices.is_empty().then_some("insufficient_price_path"),
+        ),
         post_event_label_row(
             run_id,
             mint,
@@ -37545,7 +37702,34 @@ fn build_post_event_risk_labels(
             Some(token.holder_state.holder_churn_rate),
             None,
         ),
-    ])
+    ];
+    for (horizon, stats) in [(60, stats_60), (180, stats_180), (300, stats_300)] {
+        rows.push(post_event_label_row(
+            run_id,
+            mint,
+            &format!("peak_price_{horizon}s"),
+            "price_outcome",
+            stats.and_then(|stats| stats.peak_price),
+            stats.is_none().then_some("insufficient_price_horizon"),
+        ));
+        rows.push(post_event_label_row(
+            run_id,
+            mint,
+            &format!("last_price_{horizon}s"),
+            "price_outcome",
+            stats.and_then(|stats| stats.last_price),
+            stats.is_none().then_some("insufficient_price_horizon"),
+        ));
+        rows.push(post_event_label_row(
+            run_id,
+            mint,
+            &format!("max_drawdown_{horizon}s"),
+            "price_outcome",
+            stats.and_then(|stats| stats.max_drawdown),
+            stats.is_none().then_some("insufficient_price_horizon"),
+        ));
+    }
+    Ok(rows)
 }
 
 fn post_event_label_row(
@@ -37567,6 +37751,66 @@ fn post_event_label_row(
         "can_use_for_backtest": unavailable_reason.is_none(),
         "can_use_for_tuning": false,
         "unavailable_reason": unavailable_reason.unwrap_or(""),
+        "rug_outcome_reason": "",
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PriceWindowStats {
+    peak_price: Option<Decimal>,
+    last_price: Option<Decimal>,
+    max_drawdown: Option<Decimal>,
+}
+
+fn price_window_stats(
+    price_points: &[(OffsetDateTime, Decimal)],
+    horizon_seconds: i64,
+) -> Option<PriceWindowStats> {
+    let launch_at = price_points.first().map(|(timestamp, _)| *timestamp)?;
+    let cutoff = launch_at + time::Duration::seconds(horizon_seconds);
+    let window = price_points
+        .iter()
+        .copied()
+        .filter(|(timestamp, _)| *timestamp <= cutoff)
+        .collect::<Vec<_>>();
+    if window.len() < 2 {
+        return None;
+    }
+    let peak_price = window
+        .iter()
+        .map(|(_, price)| *price)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let last_price = window.last().map(|(_, price)| *price);
+    let max_drawdown = peak_price.zip(last_price).and_then(|(peak, last)| {
+        (peak > Decimal::ZERO).then_some(((peak - last) / peak).clamp(Decimal::ZERO, Decimal::ONE))
+    });
+    Some(PriceWindowStats {
+        peak_price,
+        last_price,
+        max_drawdown,
+    })
+}
+
+fn post_event_bool_label_row(
+    run_id: &str,
+    mint: &str,
+    label_id: &str,
+    label_family: &str,
+    value: bool,
+    unavailable_reason: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "label_id": label_id,
+        "label_family": label_family,
+        "value": value,
+        "feature_time_class": "post_event_label",
+        "can_use_pre_entry": false,
+        "can_use_for_backtest": unavailable_reason.is_none(),
+        "can_use_for_tuning": false,
+        "unavailable_reason": unavailable_reason.unwrap_or(""),
+        "rug_outcome_reason": "",
     })
 }
 
@@ -46194,6 +46438,95 @@ mod tests {
         );
         assert_eq!(row["rpc_mint_supply_canonical"].as_bool(), Some(false));
         assert_eq!(row["rpc_supply_diagnostic_only"].as_bool(), Some(true));
+    }
+
+    fn token_with_price_path(prices: &[(i64, Decimal)]) -> state::TokenState {
+        let mut token = state::TokenState::new(
+            common::PubkeyValue("mint".to_owned()),
+            common::EventSource::GeyserProcessed,
+        );
+        for (seconds, price) in prices {
+            token.trade_stats.price_history.push_back((
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(*seconds),
+                *price,
+            ));
+        }
+        token
+    }
+
+    fn label_value(rows: &[serde_json::Value], label_id: &str) -> serde_json::Value {
+        rows.iter()
+            .find(|row| row["label_id"].as_str() == Some(label_id))
+            .map(|row| row["value"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    #[test]
+    fn rug_labels_detect_dead_within_60s_and_rapid_collapse_95pct() {
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert(
+            "mint".to_owned(),
+            token_with_price_path(&[(0, Decimal::ONE), (30, Decimal::new(4, 2))]),
+        );
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        assert_eq!(label_value(&rows, "dead_within_60s"), true);
+        assert_eq!(label_value(&rows, "rapid_collapse_95pct"), true);
+        assert_eq!(label_value(&rows, "rug_like_outcome"), true);
+        assert_eq!(
+            label_value(&rows, "rug_outcome_post_event_label"),
+            "rug_like_outcome"
+        );
+    }
+
+    #[test]
+    fn rug_labels_detect_dead_within_180s_and_80pct_collapse() {
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert(
+            "mint".to_owned(),
+            token_with_price_path(&[
+                (0, Decimal::ONE),
+                (70, Decimal::new(90, 2)),
+                (120, Decimal::new(19, 2)),
+            ]),
+        );
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        assert_eq!(label_value(&rows, "dead_within_60s"), false);
+        assert_eq!(label_value(&rows, "dead_within_180s"), false);
+        assert_eq!(label_value(&rows, "rapid_collapse_80pct"), true);
+        assert_eq!(label_value(&rows, "rug_like_outcome"), true);
+    }
+
+    #[test]
+    fn rug_labels_detect_no_buy_followthrough_and_volume_evaporation() {
+        let mut token = token_with_price_path(&[(0, Decimal::ONE), (120, Decimal::ONE)]);
+        token.trade_stats.buy_count = 1;
+        token.trade_stats.sell_count = 1;
+        token.trade_stats.last_buy_at = Some(OffsetDateTime::UNIX_EPOCH);
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert("mint".to_owned(), token);
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        assert_eq!(label_value(&rows, "no_buy_followthrough"), true);
+        assert_eq!(label_value(&rows, "volume_evaporated"), true);
+        assert_eq!(label_value(&rows, "rug_like_outcome"), true);
+    }
+
+    #[test]
+    fn rug_outcome_labels_are_post_event_only() {
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert(
+            "mint".to_owned(),
+            token_with_price_path(&[(0, Decimal::ONE), (30, Decimal::new(4, 2))]),
+        );
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        for row in rows {
+            assert_eq!(row["feature_time_class"].as_str(), Some("post_event_label"));
+            assert_eq!(row["can_use_pre_entry"].as_bool(), Some(false));
+            assert_eq!(row["can_use_for_tuning"].as_bool(), Some(false));
+        }
     }
 
     fn pnl_sanity_input(

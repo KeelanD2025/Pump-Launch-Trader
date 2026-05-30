@@ -1,0 +1,25 @@
+schema_version = "phase104.rug_outcome_labels.v1"
+threshold_tuning_allowed = false
+binary_malicious_labels_allowed = false
+external_manual_observation_allowed_for_calibration = true
+external_manual_observation_allowed_as_pre_entry_feature = false
+
+[price]
+dead_drawdown_pct = "0.95"
+rapid_collapse_80pct = "0.80"
+rapid_collapse_95pct = "0.95"
+horizons_seconds = [60, 180, 300, 900]
+
+[flow]
+no_buy_followthrough_max_buys = 1
+volume_evaporation_last_buy_within_seconds = 60
+
+[holder]
+holder_collapse_churn_pct = "0.50"
+source = "stream_owner_summed_token_accounts"
+rpc_repair_allowed = false
+
+[time_safety]
+rug_outcome_labels_time_class = "post_event_label"
+can_use_pre_entry = false
+can_use_for_tuning = false
