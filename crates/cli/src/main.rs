@@ -9,6 +9,10 @@ use common::{
     TentativeSellIntentDetectedEvent, TentativeSellResolutionOutcome,
 };
 use decoder::DecoderRegistry;
+use features::risk_engine::{
+    DiagnosticRiskEngine, RiskEvidence, RiskSnapshotInput, RiskTimeRole,
+    validate_no_post_event_pre_entry_leak,
+};
 use features::{FeatureEngine, FeatureSnapshot};
 use idl::LoadedIdl;
 use ingest_geyser::GeyserIngestService;
@@ -1290,6 +1294,22 @@ enum Command {
         latest_canary_run: bool,
         #[arg(long)]
         replay_canary_run: Option<String>,
+    },
+    LiveRiskCanary {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        duration_seconds: u64,
+        #[arg(long)]
+        no_live_trading: bool,
+        #[arg(long)]
+        no_rpc: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2: bool,
+        #[arg(long, default_value = "research_output/phase100_live_risk_canary")]
+        output_dir: String,
     },
     RunQuantDiagnostics {
         #[arg(long)]
@@ -4514,6 +4534,27 @@ async fn main() -> Result<()> {
                 local_only,
                 latest_canary_run,
                 replay_canary_run.as_deref(),
+            )
+            .await
+        }
+        Command::LiveRiskCanary {
+            env_file,
+            duration_seconds,
+            no_live_trading,
+            no_rpc,
+            upload_r2,
+            verify_r2,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            live_risk_canary_command(
+                &loaded,
+                duration_seconds,
+                no_live_trading,
+                no_rpc,
+                upload_r2,
+                verify_r2,
+                &output_dir,
             )
             .await
         }
@@ -36706,6 +36747,649 @@ async fn launch_metric_canary_command(
         );
     }
     Ok(())
+}
+
+async fn live_risk_canary_command(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    no_live_trading: bool,
+    no_rpc: bool,
+    upload_r2: bool,
+    verify_r2: bool,
+    output_dir: &str,
+) -> Result<()> {
+    if !no_live_trading {
+        bail!("live-risk-canary refuses to run unless --no-live-trading is set");
+    }
+    if !no_rpc {
+        bail!("live-risk-canary refuses to run unless --no-rpc is set; holder RPC is forbidden");
+    }
+
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let run_id = format!(
+        "live-risk-canary-{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let (summary, all_events) = collect_fresh_launch_canary_events(
+        loaded,
+        FreshLaunchCanaryLiveOptions {
+            duration_seconds,
+            max_launches: 1,
+        },
+    )
+    .await?;
+    if summary.tracked_mint.is_none() {
+        bail!(
+            "no fresh Pump.fun launch detected during live risk canary window; provider_status={}",
+            summary.provider_status
+        );
+    }
+
+    let create = all_events
+        .iter()
+        .find(|event| is_successful_launch_create(event))
+        .ok_or_else(|| anyhow!("live risk canary saw no successful TokenCreated event"))?;
+    let mint = event_mint_string(create).ok_or_else(|| anyhow!("create event missing mint"))?;
+    let token_events = all_events
+        .iter()
+        .filter(|event| event_mint_string(event).as_deref() == Some(mint.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let related_signatures = token_events
+        .iter()
+        .filter_map(event_signature_string)
+        .collect::<BTreeSet<_>>();
+    let observed_transactions = all_events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, EventPayload::ObservedTransaction(payload)
+                if payload.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(false))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut scoped_events = token_events.clone();
+    scoped_events.extend(observed_transactions);
+
+    let run_dir = output_dir.join("runs").join(&run_id);
+    fs::create_dir_all(&run_dir)?;
+    fs::write(
+        run_dir.join("live_canary_stream_summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    let mut normalized_jsonl = String::new();
+    for event in &scoped_events {
+        normalized_jsonl.push_str(&serde_json::to_string(event)?);
+        normalized_jsonl.push('\n');
+    }
+    fs::write(run_dir.join("normalized_events.jsonl"), normalized_jsonl)?;
+
+    let mut state_engine = StateEngine::new(loaded.config.ttl.clone());
+    let risk_engine = DiagnosticRiskEngine::default();
+    let bundle_context = stream_bundle_context(&mint, create.meta.slot, &scoped_events);
+    let mut risk_timeline = Vec::<serde_json::Value>::new();
+    let mut pre_entry_rows = Vec::<serde_json::Value>::new();
+    let mut bundle_rows = Vec::<serde_json::Value>::new();
+    let mut rug_rows = Vec::<serde_json::Value>::new();
+    let mut metadata_funding_rows = Vec::<serde_json::Value>::new();
+    let mut time_safety_rows = Vec::<serde_json::Value>::new();
+    let mut all_evidence = Vec::<RiskEvidence>::new();
+
+    for (event_index, event) in scoped_events.iter().enumerate() {
+        state_engine.apply_event(event)?;
+        let snapshot = state_engine.snapshot();
+        let Some(token) = snapshot.tokens.get(&mint) else {
+            continue;
+        };
+        let input = risk_input_from_token(&mint, token, &bundle_context);
+        let output = risk_engine.evaluate(input);
+        risk_timeline.push(json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "event_index": event_index,
+            "event_id": event.meta.event_id.0.to_string(),
+            "event_kind": event_kind(event),
+            "available_at_slot": event.meta.slot,
+            "available_at_timestamp": event_received_ts(event),
+            "risk_score_total": decimal_to_json(Some(output.risk_score_total)),
+            "risk_score_stream_only": decimal_to_json(Some(output.risk_score_stream_only)),
+            "risk_score_enrichment": decimal_to_json(Some(output.risk_score_enrichment)),
+            "risk_classification": format!("{:?}", output.risk_classification),
+            "risk_evidence_count": output.risk_evidence_count,
+            "risk_confidence": decimal_to_json(Some(output.risk_confidence)),
+            "unavailable_risk_families": output.unavailable_risk_families.join("|"),
+            "blocking_data_quality_reasons": output.blocking_data_quality_reasons.join("|"),
+            "holder_rpc_used": false,
+            "no_live_trading": true,
+            "no_rpc": true,
+        }));
+        for evidence in &output.evidence {
+            let row = risk_evidence_row(&run_id, &mint, event, evidence);
+            time_safety_rows.push(row.clone());
+            if evidence.time_role.pre_entry_safe() {
+                pre_entry_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("bundle") {
+                bundle_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("dev")
+                || evidence.risk_family.contains("holder")
+                || evidence.risk_family.contains("fake")
+                || evidence.risk_family.contains("sell")
+                || evidence.risk_family.contains("data_quality")
+            {
+                rug_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("metadata")
+                || evidence.risk_family.contains("funding")
+                || evidence.risk_family.contains("supply")
+            {
+                metadata_funding_rows.push(row);
+            }
+        }
+        all_evidence.extend(output.evidence);
+    }
+
+    validate_no_post_event_pre_entry_leak(&all_evidence)
+        .map_err(|err| anyhow!("Phase 100 time-safety gate failed: {err}"))?;
+    let post_event_rows = build_post_event_risk_labels(&run_id, &mint, &state_engine.snapshot())?;
+    for row in &post_event_rows {
+        if row["can_use_pre_entry"].as_bool().unwrap_or(false) {
+            bail!("post-event label leaked into pre-entry feature set");
+        }
+    }
+
+    write_json_rows_csv(
+        &run_dir.join("risk_timeline.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "event_index",
+            "event_id",
+            "event_kind",
+            "available_at_slot",
+            "available_at_timestamp",
+            "risk_score_total",
+            "risk_score_stream_only",
+            "risk_score_enrichment",
+            "risk_classification",
+            "risk_evidence_count",
+            "risk_confidence",
+            "unavailable_risk_families",
+            "blocking_data_quality_reasons",
+            "holder_rpc_used",
+            "no_live_trading",
+            "no_rpc",
+        ],
+        &risk_timeline,
+    )?;
+    write_risk_rows(
+        &run_dir.join("pre_entry_risk_features.csv"),
+        &pre_entry_rows,
+    )?;
+    write_risk_rows(&run_dir.join("bundle_like_evidence.csv"), &bundle_rows)?;
+    write_risk_rows(&run_dir.join("rug_dump_evidence.csv"), &rug_rows)?;
+    write_risk_rows(
+        &run_dir.join("metadata_funding_evidence.csv"),
+        &metadata_funding_rows,
+    )?;
+    write_json_rows_csv(
+        &run_dir.join("post_event_risk_labels.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "label_id",
+            "label_family",
+            "value",
+            "feature_time_class",
+            "can_use_pre_entry",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "unavailable_reason",
+        ],
+        &post_event_rows,
+    )?;
+    write_risk_rows(&output_dir.join("time_safety_gate.csv"), &time_safety_rows)?;
+    let time_safety = json!({
+        "schema_version": "phase100.time_safety_gate.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "passed": true,
+        "risk_fields_checked": time_safety_rows.len(),
+        "post_event_labels_checked": post_event_rows.len(),
+        "post_event_labels_marked_pre_entry": 0,
+        "enrichment_late_marked_pre_entry": time_safety_rows.iter().filter(|row| {
+            row["feature_time_class"].as_str() == Some("enrichment_late_feature")
+                && row["can_use_pre_entry"].as_bool().unwrap_or(false)
+        }).count(),
+        "holder_rpc_used": false,
+        "no_rpc": true,
+        "no_live_trading": true,
+    });
+    if time_safety["enrichment_late_marked_pre_entry"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+    {
+        bail!("enrichment-late feature was marked pre-entry safe");
+    }
+    write_quant_json_md(
+        &output_dir,
+        "time_safety_gate",
+        &time_safety,
+        format!(
+            "# Phase 100 Time-Safety Gate\n\n- source run: `{run_id}`\n- mint: `{mint}`\n- passed: `true`\n- post-event labels marked pre-entry: `0`\n"
+        ),
+    )?;
+
+    let summary_json = json!({
+        "schema_version": "phase100.live_risk_canary_summary.v1",
+        "source_run_id": run_id,
+        "mint": mint,
+        "launch_detected": true,
+        "launch_signature": event_signature_string(create),
+        "launch_slot": create.meta.slot,
+        "launch_timestamp": event_received_ts(create),
+        "risk_timeline_rows": risk_timeline.len(),
+        "pre_entry_risk_feature_rows": pre_entry_rows.len(),
+        "post_event_label_rows": post_event_rows.len(),
+        "bundle_like_evidence_rows": bundle_rows.len(),
+        "rug_dump_evidence_rows": rug_rows.len(),
+        "metadata_funding_evidence_rows": metadata_funding_rows.len(),
+        "time_safety_passed": true,
+        "provider_confirmed_bundle": false,
+        "provider_confirmed_malicious_label": false,
+        "holder_rpc_used": false,
+        "holder_rpc_required": false,
+        "no_rpc": true,
+        "no_live_trading": true,
+        "threshold_tuning_allowed": false,
+        "formal_backtesting_allowed": false,
+        "diagnostic_backtesting_allowed": true,
+    });
+    write_quant_json_md(
+        &run_dir,
+        "risk_canary_summary",
+        &summary_json,
+        format!(
+            "# Phase 100 Live Risk Canary\n\n- source run: `{run_id}`\n- mint: `{mint}`\n- risk timeline rows: `{}`\n- time-safety passed: `true`\n- threshold tuning allowed: `false`\n",
+            summary_json["risk_timeline_rows"]
+        ),
+    )?;
+
+    let mut r2_upload = json!({
+        "schema_version": "phase100.r2_upload_result.v1",
+        "uploaded_files": [],
+        "verified_files": [],
+        "failed_files": [],
+        "verified": false,
+        "upload_requested": upload_r2,
+    });
+    if upload_r2 {
+        r2_upload = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase100_live_risk_canary",
+            &run_id,
+            verify_r2,
+        )
+        .await?;
+        write_quant_json_md(
+            &output_dir,
+            "r2_upload_result",
+            &r2_upload,
+            format!(
+                "# Phase 100 R2 Upload\n\n- source run: `{run_id}`\n- verified: `{}`\n",
+                r2_upload["verified"]
+            ),
+        )?;
+        r2_upload = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase100_live_risk_canary",
+            &run_id,
+            verify_r2,
+        )
+        .await?;
+    }
+
+    let aggregate = json!({
+        "command": "live-risk-canary",
+        "source_run_id": run_id,
+        "mint": mint,
+        "output_dir": output_dir.display().to_string(),
+        "run_dir": run_dir.display().to_string(),
+        "time_safety_passed": true,
+        "r2_upload_verified": r2_upload["verified"],
+        "threshold_tuning_allowed": false,
+    });
+    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamBundleContext {
+    same_slot_tx_count: u64,
+    same_instruction_shape_count: u64,
+    same_account_list_hash_count: u64,
+    same_signer_cluster_count: u64,
+    priority_fee_cluster_count: u64,
+}
+
+fn risk_input_from_token(
+    mint: &str,
+    token: &state::TokenState,
+    bundle: &StreamBundleContext,
+) -> RiskSnapshotInput {
+    let observed_supply = token.holder_state.observed_holder_supply();
+    let dev_holding_pct = token.creator.as_ref().and_then(|creator| {
+        token
+            .holder_state
+            .owner_balances
+            .get(&creator.0)
+            .and_then(|holder| {
+                (observed_supply > Decimal::ZERO).then_some(holder.balance / observed_supply)
+            })
+    });
+    RiskSnapshotInput {
+        mint: mint.to_owned(),
+        holder_count: Some(Decimal::from(
+            token.holder_state.nonzero_holder_count as u64,
+        )),
+        top_holder_pct: Some(token.holder_state.top_holder_pct(1)),
+        dev_holding_pct,
+        paperhand_90pct_count: Some(Decimal::from(
+            token.holder_state.paperhand_90pct_wallet_count as u64,
+        )),
+        holder_churn_rate: Some(token.holder_state.holder_churn_rate),
+        buy_count: Some(Decimal::from(token.trade_stats.buy_count)),
+        sell_count: Some(Decimal::from(token.trade_stats.sell_count)),
+        unique_buyers: Some(Decimal::from(token.trade_stats.unique_buyers.len() as u64)),
+        same_slot_tx_count: Some(Decimal::from(bundle.same_slot_tx_count)),
+        same_instruction_shape_count: Some(Decimal::from(bundle.same_instruction_shape_count)),
+        same_account_list_hash_count: Some(Decimal::from(bundle.same_account_list_hash_count)),
+        same_signer_cluster_count: Some(Decimal::from(bundle.same_signer_cluster_count)),
+        priority_fee_cluster_count: Some(Decimal::from(bundle.priority_fee_cluster_count)),
+        fake_momentum_stream_proxy: None,
+        sell_absorption_stream_proxy: None,
+        metadata_uri_present: Some(!token.uri.trim().is_empty()),
+        metadata_fetch_success: None,
+        social_count: None,
+        one_hop_funder_candidate_count: None,
+        rpc_supply_matches_curve_supply: None,
+        rpc_supply_mismatch_ratio: None,
+        data_gap_active: Some(
+            token
+                .data_quality_flags
+                .iter()
+                .any(|flag| flag.contains("gap")),
+        ),
+        stream_gap_active: Some(
+            token
+                .data_quality_flags
+                .iter()
+                .any(|flag| flag.contains("stream")),
+        ),
+        post_migration_supported: None,
+    }
+}
+
+fn stream_bundle_context(
+    mint: &str,
+    launch_slot: u64,
+    events: &[NormalizedEvent],
+) -> StreamBundleContext {
+    let mut shape_counts = BTreeMap::<String, u64>::new();
+    let mut account_hash_counts = BTreeMap::<String, u64>::new();
+    let mut signer_counts = BTreeMap::<String, u64>::new();
+    let mut priority_counts = BTreeMap::<String, u64>::new();
+    let mut same_slot_tx_count = 0u64;
+    for event in events {
+        if !matches!(event.payload, EventPayload::ObservedTransaction(_)) {
+            continue;
+        }
+        if event.meta.slot == launch_slot {
+            same_slot_tx_count += 1;
+        }
+        let value = match serde_json::to_value(event) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let mentions_mint = json_find_strings(&value, "mint")
+            .iter()
+            .any(|value| value == mint);
+        if !mentions_mint && event.meta.slot != launch_slot {
+            continue;
+        }
+        if let Some(value) = json_find_strings(&value, "instruction_shape_hash")
+            .into_iter()
+            .next()
+        {
+            *shape_counts.entry(value).or_default() += 1;
+        }
+        if let Some(value) = json_find_strings(&value, "account_list_hash")
+            .into_iter()
+            .next()
+        {
+            *account_hash_counts.entry(value).or_default() += 1;
+        }
+        if let Some(value) = json_find_strings(&value, "signer").into_iter().next() {
+            *signer_counts.entry(value).or_default() += 1;
+        }
+        if let Some(value) = json_find_strings(&value, "compute_unit_price")
+            .into_iter()
+            .chain(json_find_strings(&value, "priority_fee_lamports").into_iter())
+            .next()
+        {
+            *priority_counts.entry(value).or_default() += 1;
+        }
+    }
+    StreamBundleContext {
+        same_slot_tx_count,
+        same_instruction_shape_count: max_duplicate_count(&shape_counts),
+        same_account_list_hash_count: max_duplicate_count(&account_hash_counts),
+        same_signer_cluster_count: max_duplicate_count(&signer_counts),
+        priority_fee_cluster_count: max_duplicate_count(&priority_counts),
+    }
+}
+
+fn max_duplicate_count(counts: &BTreeMap<String, u64>) -> u64 {
+    counts.values().copied().max().unwrap_or(0)
+}
+
+fn json_find_strings(value: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match value {
+        serde_json::Value::Object(map) => {
+            for (current, child) in map {
+                if current == key {
+                    match child {
+                        serde_json::Value::String(value) => out.push(value.clone()),
+                        serde_json::Value::Number(value) => out.push(value.to_string()),
+                        serde_json::Value::Bool(value) => out.push(value.to_string()),
+                        _ => {}
+                    }
+                }
+                out.extend(json_find_strings(child, key));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                out.extend(json_find_strings(child, key));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn risk_evidence_row(
+    run_id: &str,
+    mint: &str,
+    event: &NormalizedEvent,
+    evidence: &RiskEvidence,
+) -> serde_json::Value {
+    json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "risk_id": evidence.risk_id,
+        "risk_family": evidence.risk_family,
+        "source": format!("{:?}", evidence.source),
+        "feature_time_class": risk_time_role_label(evidence.time_role),
+        "available_at_slot": event.meta.slot,
+        "available_at_timestamp": event_received_ts(event),
+        "can_use_pre_entry": evidence.time_role.pre_entry_safe(),
+        "can_use_for_backtest": evidence.score.is_some(),
+        "can_use_for_tuning": false,
+        "score": decimal_to_json(evidence.score),
+        "confidence": decimal_to_json(Some(evidence.confidence)),
+        "unavailable_reason": evidence.unavailable_reason.clone().unwrap_or_default(),
+        "evidence": evidence.evidence.join("|"),
+        "provider_confirmed_bundle": false,
+        "holder_rpc_used": false,
+    })
+}
+
+fn risk_time_role_label(role: RiskTimeRole) -> &'static str {
+    match role {
+        RiskTimeRole::PreEntryFeature => "pre_entry_feature",
+        RiskTimeRole::DecisionTimeFeature => "decision_time_feature",
+        RiskTimeRole::PostEventLabel => "post_event_label",
+        RiskTimeRole::EnrichmentLateFeature => "enrichment_late_feature",
+    }
+}
+
+fn write_risk_rows(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
+    write_json_rows_csv(
+        path,
+        &[
+            "source_run_id",
+            "mint",
+            "risk_id",
+            "risk_family",
+            "source",
+            "feature_time_class",
+            "available_at_slot",
+            "available_at_timestamp",
+            "can_use_pre_entry",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "score",
+            "confidence",
+            "unavailable_reason",
+            "evidence",
+            "provider_confirmed_bundle",
+            "holder_rpc_used",
+        ],
+        rows,
+    )
+}
+
+fn build_post_event_risk_labels(
+    run_id: &str,
+    mint: &str,
+    snapshot: &StateSnapshot,
+) -> Result<Vec<serde_json::Value>> {
+    let Some(token) = snapshot.tokens.get(mint) else {
+        return Ok(vec![post_event_label_row(
+            run_id,
+            mint,
+            "rug_outcome_post_event_label",
+            "rug_outcome",
+            None,
+            Some("token_state_unavailable_after_observation_window"),
+        )]);
+    };
+    let prices = token
+        .trade_stats
+        .price_history
+        .iter()
+        .filter_map(|(_, price)| (*price > Decimal::ZERO).then_some(*price))
+        .collect::<Vec<_>>();
+    let peak = prices
+        .iter()
+        .copied()
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let latest = prices.last().copied();
+    let drawdown = match (peak, latest) {
+        (Some(peak), Some(latest)) if peak > Decimal::ZERO => Some((peak - latest) / peak),
+        _ => None,
+    };
+    let collapse_label = if prices.len() < 2 {
+        "inconclusive_insufficient_horizon"
+    } else if drawdown.unwrap_or_default() >= Decimal::new(70, 2) {
+        "rapid_collapse"
+    } else {
+        "none_observed"
+    };
+    Ok(vec![
+        post_event_label_row(
+            run_id,
+            mint,
+            "peak_price_after_launch",
+            "price_outcome",
+            peak,
+            peak.is_none().then_some("insufficient_price_path"),
+        ),
+        post_event_label_row(
+            run_id,
+            mint,
+            "drawdown_from_peak",
+            "price_outcome",
+            drawdown,
+            drawdown.is_none().then_some("insufficient_price_path"),
+        ),
+        json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "label_id": "rug_outcome_post_event_label",
+            "label_family": "rug_outcome",
+            "value": collapse_label,
+            "feature_time_class": "post_event_label",
+            "can_use_pre_entry": false,
+            "can_use_for_backtest": prices.len() >= 2,
+            "can_use_for_tuning": false,
+            "unavailable_reason": if prices.len() >= 2 { "" } else { "insufficient_price_path" },
+        }),
+        post_event_label_row(
+            run_id,
+            mint,
+            "dev_sold_after_entry",
+            "rug_outcome",
+            Some(token.developer_state.creator_sell_percentage),
+            None,
+        ),
+        post_event_label_row(
+            run_id,
+            mint,
+            "holder_count_collapse",
+            "holder_outcome",
+            Some(token.holder_state.holder_churn_rate),
+            None,
+        ),
+    ])
+}
+
+fn post_event_label_row(
+    run_id: &str,
+    mint: &str,
+    label_id: &str,
+    label_family: &str,
+    value: Option<Decimal>,
+    unavailable_reason: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "label_id": label_id,
+        "label_family": label_family,
+        "value": decimal_to_json(value),
+        "feature_time_class": "post_event_label",
+        "can_use_pre_entry": false,
+        "can_use_for_backtest": unavailable_reason.is_none(),
+        "can_use_for_tuning": false,
+        "unavailable_reason": unavailable_reason.unwrap_or(""),
+    })
 }
 
 fn phase80_required_fix(

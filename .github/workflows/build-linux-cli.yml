@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_risk_canary:
+        description: Run one Phase 100 live risk canary after deploy
+        required: false
+        default: false
+        type: boolean
       run_geyser_diagnostic:
         description: Run a short provider stream diagnostic after deploy
         required: false
@@ -691,6 +696,133 @@ jobs:
           path: phase89-live-canary
           if-no-files-found: error
 
+      - name: Run Phase 100 live risk canary on VPS
+        if: ${{ github.event.inputs.run_risk_canary == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          CANARY_DURATION_SECONDS: ${{ github.event.inputs.smoke_duration_seconds }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-1800}"
+
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=180 \
+            -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-1800}"
+          BIN="${APP_DIR}/target/release/cli"
+          VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          OUT_DIR="${APP_DIR}/data/reports/phase100_live_risk_canary"
+          LOCK_PATH="${APP_DIR}/data/autopilot/autopilot.lock"
+
+          if [[ -f "${ENV_FILE}" ]]; then
+            set -a
+            source "${ENV_FILE}"
+            set +a
+          else
+            echo "::error::VPS env file not found at ${ENV_FILE}"
+            exit 1
+          fi
+
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+          {
+            echo "# Phase 100 Live Risk Canary Precheck"
+            echo
+            echo "## systemd timer"
+            systemctl status pump-launch-quant-edge-once.timer --no-pager || true
+            echo
+            echo "## systemd service"
+            systemctl status pump-launch-quant-edge-once.service --no-pager || true
+            echo
+            echo "## autopilot-status"
+            "${BIN}" autopilot-status "${VALIDATE_CONFIG[@]}" || true
+            echo
+            echo "## disk-preflight"
+            "${BIN}" disk-preflight "${VALIDATE_CONFIG[@]}" || true
+            echo
+            echo "## edge-only footprint"
+            "${BIN}" validate-vps-edge-only-footprint "${VALIDATE_CONFIG[@]}" || true
+            echo
+            echo "## stream-only"
+            "${BIN}" validate-stream-only "${VALIDATE_CONFIG[@]}" || true
+            echo
+            echo "## edge mode"
+            "${BIN}" validate-edge-mode "${VALIDATE_CONFIG[@]}" || true
+          } > "${OUT_DIR}/live_risk_precheck.md"
+
+          if [[ -f "${LOCK_PATH}" ]]; then
+            export LOCK_PATH
+            python3 - <<'PY' > "${OUT_DIR}/live_risk_precheck_lock.json"
+          import json, os
+          from pathlib import Path
+          lock = json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8"))
+          print(json.dumps(lock, indent=2))
+          PY
+            LOCK_PID="$(python3 -c 'import json, os; from pathlib import Path; print(json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8")).get("pid", ""))')"
+            if [[ -n "${LOCK_PID}" ]] && ps -p "${LOCK_PID}" >/dev/null 2>&1; then
+              ps -fp "${LOCK_PID}" > "${OUT_DIR}/live_risk_precheck_lock_process.txt" || true
+              echo "::error::Autopilot lock has active PID; refusing to overlap live risk canary"
+              exit 1
+            fi
+            echo "::error::Autopilot lock exists but PID is not active; refusing to clear blindly"
+            exit 1
+          fi
+
+          "${BIN}" live-risk-canary \
+            --config "${APP_DIR}/config/default.toml" \
+            --config-override "${APP_DIR}/config/local.toml" \
+            --env-file "${ENV_FILE}" \
+            --duration-seconds "${CANARY_DURATION_SECONDS}" \
+            --no-live-trading \
+            --no-rpc \
+            --upload-r2 \
+            --verify-r2 \
+            --output-dir "${OUT_DIR}"
+          EOF
+
+      - name: Download Phase 100 risk canary reports from VPS
+        if: ${{ always() && github.event.inputs.run_risk_canary == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          LOCAL_RISK_DIR="phase100-live-risk-canary"
+          rm -rf "${LOCAL_RISK_DIR}"
+          mkdir -p "${LOCAL_RISK_DIR}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_RISK_DIR}"
+          set -euo pipefail
+          REPORT_DIR="${APP_DIR}/data/reports/phase100_live_risk_canary"
+          if [[ ! -d "${REPORT_DIR}" ]]; then
+            echo "phase100 live risk canary report directory not found: ${REPORT_DIR}" >&2
+            exit 1
+          fi
+          tar -czf - -C "${REPORT_DIR}" .
+          EOF
+
+      - name: Upload Phase 100 risk canary reports
+        if: ${{ always() && github.event.inputs.run_risk_canary == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase100-live-risk-canary
+          path: phase100-live-risk-canary
+          if-no-files-found: error
+
       - name: Restart edge timer after smoke
         if: ${{ github.event.inputs.restart_timer == 'true' }}
         shell: bash
@@ -719,6 +851,7 @@ jobs:
             echo "- restart_timer_requested: ${{ github.event.inputs.restart_timer }}"
             echo "- run_smoke_requested: ${{ github.event.inputs.run_smoke }}"
             echo "- run_live_canary_requested: ${{ github.event.inputs.run_live_canary }}"
+            echo "- run_risk_canary_requested: ${{ github.event.inputs.run_risk_canary }}"
             echo "- run_geyser_diagnostic_requested: ${{ github.event.inputs.run_geyser_diagnostic }}"
             echo "- vps_user: ${VPS_USER}"
             echo "- vps_host: ${VPS_HOST}"
