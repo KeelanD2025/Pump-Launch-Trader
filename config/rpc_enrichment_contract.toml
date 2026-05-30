@@ -1,0 +1,346 @@
+contract_version = "phase101.rpc_http_enrichment.v1"
+profile = "rpc_risk_hardening_micro"
+threshold_tuning_allowed = false
+
+[budget]
+max_tokens = 3
+max_rpc_calls_total = 90
+max_rpc_calls_per_token = 30
+max_rpc_calls_per_family_per_token = 10
+max_wallets_per_token = 10
+max_signatures_per_wallet = 10
+max_transactions_per_token = 25
+max_http_metadata_fetches_per_token = 3
+max_runtime_seconds_per_token = 600
+cache_required = true
+ledger_required = true
+
+[[metric]]
+metric_id = "token_supply_rpc_semantics"
+metric_family = "supply_semantics"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "blocked_by_rpc_budget_or_credentials"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "mint_account_decode"
+metric_family = "supply_semantics"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "not_all_token_program_semantics_validated"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "token_program_token2022_detection"
+metric_family = "supply_semantics"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "mint_account_decode_required"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "metadata_uri_http_fetch"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "missing_metadata_uri_or_http_fetch_failed"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "website_extraction"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "metadata_fetch_failed_or_no_website_link"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "x_twitter_extraction"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "metadata_fetch_failed_or_no_x_twitter_link"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "telegram_extraction"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "metadata_fetch_failed_or_no_telegram_link"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "discord_extraction"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "metadata_fetch_failed_or_no_discord_link"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "social_count"
+metric_family = "metadata_social"
+source = "http"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "metadata_fetch_failed"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "limited_wallet_activity_proxy"
+metric_family = "wallet_activity"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "blocked_by_rpc_budget_or_provider_limited"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "bounded_wallet_age_proxy"
+metric_family = "wallet_activity"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "limited_history_proxy_not_lifetime_age"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "one_hop_common_funder"
+metric_family = "funding_graph"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "inconclusive_limited_sample_or_budget_limited"
+evidence_required_for_provider_confirmation = "direct_one_hop_inbound_transfer_candidate"
+
+[[metric]]
+metric_id = "one_hop_funding_graph"
+metric_family = "funding_graph"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "bounded_one_hop_only_no_recursive_graph"
+evidence_required_for_provider_confirmation = "direct_one_hop_edges_only"
+
+[[metric]]
+metric_id = "funding_cluster_risk"
+metric_family = "funding_graph"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "requires_more_repeated_bounded_samples"
+evidence_required_for_provider_confirmation = "repeated_direct_funder_in_bounded_sample"
+
+[[metric]]
+metric_id = "bundle_provider_confirmation"
+metric_family = "bundle_detection"
+source = "provider_api"
+required_env_vars_names_only = ["bundle provider API key"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "blocked_by_provider"
+can_use_for_diagnostics = false
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "no_provider_bundle_confirmation_api_configured"
+evidence_required_for_provider_confirmation = "explicit_provider_bundle_confirmation"
+
+[[metric]]
+metric_id = "bundle_same_slot_rpc_tx_check"
+metric_family = "bundle_detection"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "no_same_slot_candidates_or_budget_limited"
+evidence_required_for_provider_confirmation = "not_provider_confirmation"
+
+[[metric]]
+metric_id = "bundle_stream_proxy_correlation"
+metric_family = "bundle_detection"
+source = "stream"
+required_env_vars_names_only = []
+budget_required = false
+cache_required = false
+ledger_required = false
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "no_stream_fingerprint_candidates"
+evidence_required_for_provider_confirmation = "not_provider_confirmation"
+
+[[metric]]
+metric_id = "pumpswap_post_migration_discovery"
+metric_family = "post_migration"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "not_applicable_no_migration_observed_or_budget_limited"
+evidence_required_for_provider_confirmation = "migration_or_pool_evidence"
+
+[[metric]]
+metric_id = "post_migration_pool_account_lookup"
+metric_family = "post_migration"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "partial"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "requires_actual_migration_fixture_or_observed_migration"
+evidence_required_for_provider_confirmation = "pool_account_lookup_result"
+
+[[metric]]
+metric_id = "supply_semantics_risk"
+metric_family = "supply_semantics"
+source = "rpc"
+required_env_vars_names_only = ["SOLANA_RPC_URL or HELIUS_RPC_URL"]
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "token_supply_semantics_not_checked"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "enrichment_cache_ledger_budget"
+metric_family = "enrichment_controls"
+source = "rpc"
+required_env_vars_names_only = []
+budget_required = true
+cache_required = true
+ledger_required = true
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "ledger_or_cache_missing"
+evidence_required_for_provider_confirmation = "not_applicable"
+
+[[metric]]
+metric_id = "holder_rpc_boundary_guard"
+metric_family = "holder_boundary"
+source = "stream"
+required_env_vars_names_only = []
+budget_required = false
+cache_required = false
+ledger_required = false
+implemented_status = "implemented"
+can_use_for_diagnostics = true
+can_use_for_formal_backtest = false
+can_use_for_threshold_tuning = false
+unavailable_reason_if_missing = "holder_boundary_guard_missing"
+evidence_required_for_provider_confirmation = "holder_rpc_used_false_and_stream_authoritative"

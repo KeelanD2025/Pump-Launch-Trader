@@ -1396,6 +1396,18 @@ enum Command {
         #[arg(long)]
         verify: bool,
     },
+    UploadPhaseReportDirR2 {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        phase_prefix: String,
+        #[arg(long)]
+        run_or_mint: String,
+        #[arg(long)]
+        local_output_dir: String,
+        #[arg(long)]
+        verify: bool,
+    },
     DiagnoseR2Segment {
         #[arg(long)]
         env_file: Option<String>,
@@ -4654,6 +4666,23 @@ async fn main() -> Result<()> {
             let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
             upload_research_results_r2_command(&loaded, &source_run_id, &local_output_dir, verify)
                 .await
+        }
+        Command::UploadPhaseReportDirR2 {
+            env_file,
+            phase_prefix,
+            run_or_mint,
+            local_output_dir,
+            verify,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            upload_phase_report_dir_r2_command(
+                &loaded,
+                &phase_prefix,
+                &run_or_mint,
+                &local_output_dir,
+                verify,
+            )
+            .await
         }
         Command::DiagnoseR2Segment {
             env_file,
@@ -30322,8 +30351,12 @@ async fn rpc_micro_http_get_json(
     Ok(Some(value))
 }
 
-fn find_phase_canary_run_dir(source_run_id: &str) -> Option<PathBuf> {
-    let candidates = [
+fn phase_canary_run_dir_candidates(source_run_id: &str) -> Vec<PathBuf> {
+    [
+        format!("research_output/phase100_live_risk_canary/runs/{source_run_id}"),
+        format!(
+            "research_output/phase100_provider_unblock/recovered_live_risk_canary_artifacts/runs/{source_run_id}"
+        ),
         format!("research_output/phase94_official_idl/live_canary_artifact/runs/{source_run_id}"),
         format!("research_output/phase94_official_idl/replay_canary_run/runs/{source_run_id}"),
         format!("research_output/phase92_stream_holder_curve/live_artifact/runs/{source_run_id}"),
@@ -30333,10 +30366,15 @@ fn find_phase_canary_run_dir(source_run_id: &str) -> Option<PathBuf> {
         format!(
             "research_output/phase90_field_gap_fix/live_artifact_26531417751/phase89-live-canary/runs/{source_run_id}"
         ),
-    ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn find_phase_canary_run_dir(source_run_id: &str) -> Option<PathBuf> {
+    phase_canary_run_dir_candidates(source_run_id)
+        .into_iter()
         .find(|path| path.join("normalized_events.jsonl").exists())
 }
 
@@ -31513,6 +31551,41 @@ async fn upload_phase_report_dir_to_r2(
         "failed_files": failed_files,
         "verified": verify_r2 && !verified_files.is_empty() && failed_files.is_empty(),
     }))
+}
+
+async fn upload_phase_report_dir_r2_command(
+    loaded: &LoadedConfig,
+    phase_prefix: &str,
+    run_or_mint: &str,
+    local_output_dir: &str,
+    verify: bool,
+) -> Result<()> {
+    let output_dir = PathBuf::from(local_output_dir);
+    let summary =
+        upload_phase_report_dir_to_r2(loaded, &output_dir, phase_prefix, run_or_mint, verify)
+            .await?;
+    write_quant_json_md(
+        &output_dir,
+        "r2_upload_result",
+        &summary,
+        format!(
+            "# Phase Report R2 Upload\n\n- phase_prefix: `{phase_prefix}`\n- run_or_mint: `{run_or_mint}`\n- uploaded_files: `{}`\n- verified_files: `{}`\n- failed_files: `{}`\n- threshold_tuning_allowed: `false`\n",
+            summary["uploaded_files"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            summary["verified_files"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            summary["failed_files"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0),
+        ),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 async fn run_enrichment_worker_command(
@@ -47122,6 +47195,20 @@ mod tests {
         assert_eq!(row["holder_rpc_audit_status"], "not_run_not_required");
         assert_eq!(row["rpc_holder_data_did_not_overwrite_stream_state"], true);
         assert_eq!(row["status"], "not_run_not_required");
+    }
+
+    #[test]
+    fn phase101_rpc_micro_loader_includes_phase100_risk_canary_artifacts() {
+        let candidates = phase_canary_run_dir_candidates("live-risk-canary-test");
+        assert!(candidates.iter().any(|path| {
+            path.to_string_lossy()
+                .contains("phase100_live_risk_canary/runs/live-risk-canary-test")
+        }));
+        assert!(candidates.iter().any(|path| path
+            .to_string_lossy()
+            .contains(
+                "phase100_provider_unblock/recovered_live_risk_canary_artifacts/runs/live-risk-canary-test"
+            )));
     }
 
     #[test]
