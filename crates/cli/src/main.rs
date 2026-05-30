@@ -37088,7 +37088,11 @@ fn risk_input_from_token(
             .owner_balances
             .get(&creator.0)
             .and_then(|holder| {
-                (observed_supply > Decimal::ZERO).then_some(holder.balance / observed_supply)
+                if observed_supply > Decimal::ZERO {
+                    Some(holder.balance / observed_supply)
+                } else {
+                    None
+                }
             })
     });
     RiskSnapshotInput {
@@ -45904,6 +45908,24 @@ mod tests {
         );
         assert_eq!(class, "fee_killed_win");
         assert_eq!(cause, "fee_slippage_impact_killed");
+    }
+
+    #[test]
+    fn live_risk_input_zero_holder_supply_marks_dev_pct_unavailable() {
+        let mut token = state::TokenState::new(
+            common::PubkeyValue("mint".to_owned()),
+            common::EventSource::GeyserProcessed,
+        );
+        token.creator = Some(common::PubkeyValue("creator".to_owned()));
+        token.holder_state.owner_balances.insert(
+            "creator".to_owned(),
+            state::HolderBalance {
+                balance: Decimal::ZERO,
+                ..state::HolderBalance::default()
+            },
+        );
+        let input = risk_input_from_token("mint", &token, &StreamBundleContext::default());
+        assert_eq!(input.dev_holding_pct, None);
     }
 
     fn pnl_sanity_input(
