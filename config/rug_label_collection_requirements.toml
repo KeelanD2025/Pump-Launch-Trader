@@ -1,0 +1,23 @@
+schema_version = "phase105.rug_label_collection_requirements.v1"
+threshold_tuning_allowed = false
+live_trading_allowed = false
+manual_external_observation_is_calibration_only = true
+
+[observation_windows]
+required_seconds = [60, 180, 300, 900]
+current_1800s_window_sufficient_if_full_paths_retained = true
+
+[retention]
+normalized_events_required = true
+price_path_required = true
+curve_path_required = true
+holder_path_required = true
+flow_path_required = true
+dev_top_holder_path_required = true
+post_event_unavailable_reasons_required = true
+
+[boundaries]
+holder_rpc_allowed = false
+rpc_mint_supply_canonical = false
+binary_malicious_labels_allowed = false
+provider_confirmed_bundle_requires_provider_api_evidence = true

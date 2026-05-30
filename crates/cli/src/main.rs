@@ -37503,6 +37503,7 @@ fn build_post_event_risk_labels(
     let stats_60 = price_window_stats(&price_points, 60);
     let stats_180 = price_window_stats(&price_points, 180);
     let stats_300 = price_window_stats(&price_points, 300);
+    let stats_900 = price_window_stats(&price_points, 900);
     let dead_60 = stats_60
         .and_then(|stats| stats.max_drawdown)
         .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
@@ -37510,6 +37511,9 @@ fn build_post_event_risk_labels(
         .and_then(|stats| stats.max_drawdown)
         .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
     let dead_300 = stats_300
+        .and_then(|stats| stats.max_drawdown)
+        .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
+    let dead_900 = stats_900
         .and_then(|stats| stats.max_drawdown)
         .is_some_and(|drawdown| drawdown >= Decimal::new(95, 2));
     let rapid_collapse_80 = drawdown.is_some_and(|drawdown| drawdown >= Decimal::new(80, 2));
@@ -37531,24 +37535,44 @@ fn build_post_event_risk_labels(
             .trade_history
             .iter()
             .any(|trade| trade.side == state::TradeSide::Sell && trade.is_top_holder_pre_sell);
+    let liquidity_exit_proxy = rapid_collapse_80 && sell_count > 0;
+    let post_launch_price_never_recovered = peak
+        .zip(latest)
+        .is_some_and(|(peak, latest)| rapid_collapse_80 && latest < peak * Decimal::new(50, 2));
+    let curve_stalled = false;
+    let curve_stalled_unavailable = if token.reserve_state.curve_progress_pct.is_some() {
+        Some("curve_progress_history_not_retained_in_state_snapshot")
+    } else {
+        Some("curve_path_missing")
+    };
     let rug_like_outcome = dead_60
         || dead_180
         || dead_300
+        || dead_900
         || rapid_collapse_80
         || no_buy_followthrough
         || volume_evaporated
         || holder_collapse
-        || top_holder_or_dev_dumped;
+        || top_holder_or_dev_dumped
+        || liquidity_exit_proxy
+        || post_launch_price_never_recovered;
     let rug_outcome_reason = [
         ("dead_within_60s", dead_60),
         ("dead_within_180s", dead_180),
         ("dead_within_300s", dead_300),
+        ("dead_within_900s", dead_900),
         ("rapid_collapse_80pct", rapid_collapse_80),
         ("rapid_collapse_95pct", rapid_collapse_95),
         ("no_buy_followthrough", no_buy_followthrough),
         ("volume_evaporated", volume_evaporated),
         ("holder_collapse", holder_collapse),
         ("top_holder_or_dev_dumped", top_holder_or_dev_dumped),
+        ("curve_stalled", curve_stalled),
+        ("liquidity_exit_proxy", liquidity_exit_proxy),
+        (
+            "post_launch_price_never_recovered",
+            post_launch_price_never_recovered,
+        ),
     ]
     .into_iter()
     .filter_map(|(label, active)| active.then_some(label))
@@ -37618,6 +37642,16 @@ fn build_post_event_risk_labels(
         post_event_bool_label_row(
             run_id,
             mint,
+            "dead_within_900s",
+            "rug_outcome",
+            dead_900,
+            stats_900
+                .is_none()
+                .then_some("insufficient_900s_price_horizon"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
             "rapid_collapse_80pct",
             "rug_outcome",
             rapid_collapse_80,
@@ -37665,6 +37699,30 @@ fn build_post_event_risk_labels(
             top_holder_or_dev_dumped,
             None,
         ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "curve_stalled",
+            "curve_outcome",
+            curve_stalled,
+            curve_stalled_unavailable,
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "liquidity_exit_proxy",
+            "rug_outcome",
+            liquidity_exit_proxy,
+            drawdown.is_none().then_some("insufficient_price_path"),
+        ),
+        post_event_bool_label_row(
+            run_id,
+            mint,
+            "post_launch_price_never_recovered",
+            "price_outcome",
+            post_launch_price_never_recovered,
+            drawdown.is_none().then_some("insufficient_price_path"),
+        ),
         json!({
             "source_run_id": run_id,
             "mint": mint,
@@ -37703,7 +37761,12 @@ fn build_post_event_risk_labels(
             None,
         ),
     ];
-    for (horizon, stats) in [(60, stats_60), (180, stats_180), (300, stats_300)] {
+    for (horizon, stats) in [
+        (60, stats_60),
+        (180, stats_180),
+        (300, stats_300),
+        (900, stats_900),
+    ] {
         rows.push(post_event_label_row(
             run_id,
             mint,
@@ -46496,6 +46559,45 @@ mod tests {
         assert_eq!(label_value(&rows, "dead_within_180s"), false);
         assert_eq!(label_value(&rows, "rapid_collapse_80pct"), true);
         assert_eq!(label_value(&rows, "rug_like_outcome"), true);
+    }
+
+    #[test]
+    fn rug_labels_emit_300s_900s_and_recovery_labels() {
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert(
+            "mint".to_owned(),
+            token_with_price_path(&[
+                (0, Decimal::ONE),
+                (240, Decimal::new(10, 2)),
+                (600, Decimal::new(4, 2)),
+            ]),
+        );
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        assert_eq!(label_value(&rows, "dead_within_300s"), false);
+        assert_eq!(label_value(&rows, "dead_within_900s"), true);
+        assert_eq!(label_value(&rows, "rapid_collapse_95pct"), true);
+        assert_eq!(
+            label_value(&rows, "post_launch_price_never_recovered"),
+            true
+        );
+        assert_eq!(label_value(&rows, "rug_like_outcome"), true);
+    }
+
+    #[test]
+    fn rug_labels_emit_curve_and_liquidity_exit_proxy_fields() {
+        let mut token = token_with_price_path(&[(0, Decimal::ONE), (30, Decimal::new(19, 2))]);
+        token.trade_stats.sell_count = 1;
+        let mut snapshot = StateSnapshot::default();
+        snapshot.tokens.insert("mint".to_owned(), token);
+        let rows = build_post_event_risk_labels("run", "mint", &snapshot).expect("labels");
+
+        assert_eq!(label_value(&rows, "liquidity_exit_proxy"), true);
+        assert_eq!(label_value(&rows, "curve_stalled"), false);
+        assert!(rows.iter().any(|row| {
+            row["label_id"].as_str() == Some("curve_stalled")
+                && row["unavailable_reason"].as_str() == Some("curve_path_missing")
+        }));
     }
 
     #[test]
