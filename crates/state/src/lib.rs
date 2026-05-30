@@ -190,7 +190,7 @@ impl BondingCurveState {
         self.market_cap_source = update
             .market_cap_source
             .clone()
-            .or_else(|| Some("price_times_supply".to_owned()));
+            .or_else(|| Some("price_times_curve_economic_supply".to_owned()));
         self.market_cap_confidence = update.market_cap_confidence.unwrap_or_else(|| {
             if self.market_cap_quote_1b.is_some() {
                 Decimal::ONE

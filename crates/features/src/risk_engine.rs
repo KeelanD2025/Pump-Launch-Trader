@@ -141,6 +141,12 @@ pub struct RiskSnapshotOutput {
     pub risk_score_stream_only: Decimal,
     pub risk_score_enrichment: Decimal,
     pub risk_classification: DiagnosticRiskClassification,
+    pub denominator_source_for_market_cap: String,
+    pub denominator_source_for_holder_pct: String,
+    pub rpc_supply_diagnostic_only: bool,
+    pub supply_semantics_status: String,
+    pub supply_mismatch_ratio: Option<Decimal>,
+    pub supply_denominator_policy_version: String,
     pub risk_evidence_count: usize,
     pub risk_confidence: Decimal,
     pub unavailable_risk_families: Vec<String>,
@@ -261,6 +267,20 @@ impl DiagnosticRiskEngine {
             risk_score_stream_only,
             risk_score_enrichment,
             risk_classification: classification,
+            denominator_source_for_market_cap: "curve_economic_supply_or_protocol_constant"
+                .to_owned(),
+            denominator_source_for_holder_pct: input
+                .supply_denominator_source
+                .clone()
+                .unwrap_or_else(|| "curve_economic_supply".to_owned()),
+            rpc_supply_diagnostic_only: true,
+            supply_semantics_status: match input.rpc_supply_matches_curve_supply {
+                Some(true) => "rpc_mint_supply_matches_curve_economic_supply".to_owned(),
+                Some(false) => "rpc_mint_supply_diagnostic_only_mismatch".to_owned(),
+                None => "rpc_supply_semantics_not_checked".to_owned(),
+            },
+            supply_mismatch_ratio: input.rpc_supply_mismatch_ratio,
+            supply_denominator_policy_version: "phase102.supply_denominator.v1".to_owned(),
             risk_evidence_count: available.len(),
             risk_confidence,
             unavailable_risk_families,
@@ -678,6 +698,23 @@ mod tests {
             .iter()
             .find(|row| row.risk_id == "supply_semantics_risk")
             .expect("supply evidence");
+        assert_eq!(
+            out.denominator_source_for_market_cap,
+            "curve_economic_supply_or_protocol_constant"
+        );
+        assert_eq!(
+            out.denominator_source_for_holder_pct,
+            "curve_economic_supply"
+        );
+        assert!(out.rpc_supply_diagnostic_only);
+        assert_eq!(
+            out.supply_semantics_status,
+            "rpc_mint_supply_diagnostic_only_mismatch"
+        );
+        assert_eq!(
+            out.supply_denominator_policy_version,
+            "phase102.supply_denominator.v1"
+        );
         assert_eq!(supply.score, Some(Decimal::ONE));
         assert!(
             supply

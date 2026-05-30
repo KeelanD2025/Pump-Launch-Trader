@@ -77,9 +77,9 @@ pub fn pump_market_cap_quote_1b(price_quote_per_token: Decimal) -> Decimal {
 
 pub fn pump_market_cap_quote_total_supply(
     price_quote_per_token: Decimal,
-    token_total_supply_ui: Decimal,
+    curve_economic_supply_ui: Decimal,
 ) -> Decimal {
-    price_quote_per_token * token_total_supply_ui
+    price_quote_per_token * curve_economic_supply_ui
 }
 
 pub fn pump_curve_progress_pct_from_real_token_reserves_ui(balance_ui: Decimal) -> Option<Decimal> {

@@ -2120,7 +2120,7 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
                 price_sol_per_token,
                 Decimal::from(PUMP_TOTAL_SUPPLY_UI),
             )),
-            market_cap_source: Some("price_times_supply".to_owned()),
+            market_cap_source: Some("price_times_curve_economic_supply".to_owned()),
             market_cap_confidence: Some(confidence),
             market_cap_proxy: None,
             curve_complete_flag: Some(pending.complete),
@@ -2435,7 +2435,7 @@ mod tests {
                 );
                 assert_eq!(
                     update.market_cap_source.as_deref(),
-                    Some("price_times_supply")
+                    Some("price_times_curve_economic_supply")
                 );
                 assert_eq!(
                     update.curve_progress_source.as_deref(),
