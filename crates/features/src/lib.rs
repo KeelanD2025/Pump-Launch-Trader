@@ -25,6 +25,7 @@ const WINDOW_15S: Duration = Duration::seconds(15);
 const WINDOW_30S: Duration = Duration::seconds(30);
 const WINDOW_1M: Duration = Duration::minutes(1);
 const WINDOW_5M: Duration = Duration::minutes(5);
+const SUPPLY_DENOMINATOR_POLICY_VERSION: &str = "phase102.supply_denominator.v1";
 
 macro_rules! dec {
     ($value:literal) => {
@@ -300,6 +301,8 @@ impl Default for FeatureRegistry {
             "dev_balance",
             "creator_ownership_pct",
             "dev_holding_pct_total_supply",
+            "dev_holding_pct_curve_economic_supply",
+            "token_supply_selected_for_holder_pct",
             "dev_holding_pct_circulating",
         ] {
             registry.register_core(
@@ -325,6 +328,11 @@ impl Default for FeatureRegistry {
             "price_change_from_launch_pct",
             "market_cap_quote_1b",
             "market_cap_quote_total_supply",
+            "token_supply_curve_economic_ui",
+            "token_supply_protocol_constant_ui",
+            "token_supply_selected_for_market_cap",
+            "token_supply_selected_for_curve_progress",
+            "supply_denominator_policy_version",
             "market_cap_confidence",
             "curve_complete_flag",
             "curve_progress_pct",
@@ -416,6 +424,7 @@ impl Default for FeatureRegistry {
             "top1_holder_pct",
             "top1_holder_pct_observed",
             "top1_holder_pct_total_supply",
+            "top1_holder_pct_curve_economic_supply",
             "top1_holder_pct_circulating",
             "top3_holder_pct",
             "top5_holder_pct",
@@ -1430,6 +1439,18 @@ fn compute_dev_holdings(
             total_pct,
             confidence,
         );
+        set_numeric(
+            values,
+            "dev_holding_pct_curve_economic_supply",
+            total_pct,
+            confidence,
+        );
+        set_text(
+            values,
+            "token_supply_selected_for_holder_pct",
+            "token_supply_curve_economic_or_protocol_constant",
+            Decimal::ONE,
+        );
         set_numeric(values, "creator_ownership_pct", total_pct, confidence);
     } else {
         let reason = total_pct_metric
@@ -1437,6 +1458,16 @@ fn compute_dev_holdings(
             .clone()
             .unwrap_or_else(|| "dev total-supply denominator unavailable".to_owned());
         set_unavailable(values, "dev_holding_pct_total_supply", reason.clone());
+        set_unavailable(
+            values,
+            "dev_holding_pct_curve_economic_supply",
+            reason.clone(),
+        );
+        set_unavailable(
+            values,
+            "token_supply_selected_for_holder_pct",
+            reason.clone(),
+        );
         set_unavailable(values, "creator_ownership_pct", reason);
     }
     if let Some(circulating_pct) = metric_decimal(&circulating_pct_metric) {
@@ -1643,6 +1674,36 @@ fn compute_curve_features(
             curve.market_cap_confidence.max(dec!(0.8)),
         );
     }
+    set_numeric(
+        values,
+        "token_supply_curve_economic_ui",
+        Decimal::from(PUMP_TOTAL_SUPPLY_UI),
+        Decimal::ONE,
+    );
+    set_numeric(
+        values,
+        "token_supply_protocol_constant_ui",
+        Decimal::from(PUMP_TOTAL_SUPPLY_UI),
+        Decimal::ONE,
+    );
+    set_text(
+        values,
+        "token_supply_selected_for_market_cap",
+        "token_supply_curve_economic_or_protocol_constant",
+        Decimal::ONE,
+    );
+    set_text(
+        values,
+        "token_supply_selected_for_curve_progress",
+        "bonding_curve_real_reserves_and_curve_economic_supply",
+        Decimal::ONE,
+    );
+    set_text(
+        values,
+        "supply_denominator_policy_version",
+        SUPPLY_DENOMINATOR_POLICY_VERSION,
+        Decimal::ONE,
+    );
     set_numeric(
         values,
         "market_cap_confidence",
@@ -2154,6 +2215,18 @@ fn compute_holder_features(
             top1_total,
             dec!(0.8),
         );
+        set_numeric(
+            values,
+            "top1_holder_pct_curve_economic_supply",
+            top1_total,
+            dec!(0.8),
+        );
+        set_text(
+            values,
+            "token_supply_selected_for_holder_pct",
+            "token_supply_curve_economic_or_protocol_constant",
+            Decimal::ONE,
+        );
         if top1_circulating <= Decimal::ONE + Decimal::new(1, 6) {
             set_numeric(
                 values,
@@ -2176,6 +2249,11 @@ fn compute_holder_features(
         );
         set_unavailable(
             values,
+            "top1_holder_pct_curve_economic_supply",
+            "top-holder curve-economic denominator invariant failed",
+        );
+        set_unavailable(
+            values,
             "top1_holder_pct_circulating",
             "top-holder circulating denominator invariant failed",
         );
@@ -2184,6 +2262,11 @@ fn compute_holder_features(
             values,
             "top1_holder_pct_total_supply",
             "top-holder total-supply denominator requires Pump curve/create context",
+        );
+        set_unavailable(
+            values,
+            "top1_holder_pct_curve_economic_supply",
+            "top-holder curve-economic denominator requires Pump curve/create context",
         );
         set_unavailable(
             values,
@@ -5192,6 +5275,19 @@ mod tests {
             dec!(0.5)
         );
         assert_eq!(
+            features
+                .decimal("top1_holder_pct_curve_economic_supply")
+                .unwrap(),
+            dec!(0.5)
+        );
+        assert_eq!(
+            features
+                .value("token_supply_selected_for_holder_pct")
+                .expect("holder denominator")
+                .status,
+            FeatureStatus::Available
+        );
+        assert_eq!(
             features.decimal("top1_holder_pct_circulating").unwrap(),
             dec!(0.5)
         );
@@ -5234,6 +5330,10 @@ mod tests {
         );
         assert_eq!(
             features.decimal("dev_holding_pct_total_supply"),
+            Some(dec!(0.1))
+        );
+        assert_eq!(
+            features.decimal("dev_holding_pct_curve_economic_supply"),
             Some(dec!(0.1))
         );
         assert_eq!(features.decimal("creator_ownership_pct"), Some(dec!(0.1)));

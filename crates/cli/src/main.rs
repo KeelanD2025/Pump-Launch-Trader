@@ -37195,6 +37195,7 @@ fn risk_input_from_token(
         one_hop_funder_candidate_count: None,
         rpc_supply_matches_curve_supply: None,
         rpc_supply_mismatch_ratio: None,
+        supply_denominator_source: Some("curve_economic_supply".to_owned()),
         data_gap_active: Some(
             token
                 .data_quality_flags

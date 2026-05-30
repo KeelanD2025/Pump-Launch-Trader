@@ -1,0 +1,36 @@
+version = "phase102.supply_denominator.v1"
+
+[canonical.market_cap]
+selected_denominator = "token_supply_curve_economic_raw_or_protocol_constant"
+rpc_mint_supply_allowed = false
+rpc_mint_supply_audit_only = true
+
+[canonical.curve_progress]
+selected_denominator = "bonding_curve_real_reserves_and_curve_economic_supply"
+rpc_mint_supply_allowed = false
+
+[canonical.holder_state]
+holder_count_source = "stream_owner_summed_token_accounts"
+holder_growth_source = "stream_owner_summed_token_accounts"
+holder_churn_source = "stream_owner_summed_token_accounts"
+holder_stickiness_source = "stream_owner_summed_token_accounts"
+rpc_required = false
+rpc_repair_allowed_for_live = false
+rpc_repair_allowed_for_research_default = false
+rpc_repair_allowed_for_audit_only = true
+
+[canonical.holder_percentages]
+top_holder_pct_primary = "pct_of_curve_economic_supply"
+dev_holding_pct_primary = "pct_of_curve_economic_supply"
+rpc_mint_supply_variant = "diagnostic_audit_display_only"
+rpc_mint_supply_canonical = false
+
+[risk_engine]
+supply_mismatch_raises_uncertainty = true
+supply_mismatch_is_malicious_label = false
+block_tuning_when_strategy_denominator_unresolved = true
+
+[readiness]
+diagnostic_backtesting_allowed = true
+formal_backtesting_allowed = false
+threshold_tuning_allowed = false

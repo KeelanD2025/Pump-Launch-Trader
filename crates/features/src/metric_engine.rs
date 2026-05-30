@@ -209,7 +209,10 @@ impl MetricEngine {
                     "SOL",
                     "metric_engine.price_sol_per_token",
                     MetricConfidence::Verified,
-                    Some("price * canonical Pump.fun total supply".to_owned()),
+                    Some(
+                        "price * Pump.fun curve-economic supply denominator; RPC mint supply is diagnostic-only when it diverges"
+                            .to_owned(),
+                    ),
                     true,
                     true,
                 ),

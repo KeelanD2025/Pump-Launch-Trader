@@ -128,6 +128,7 @@ pub struct RiskSnapshotInput {
     pub one_hop_funder_candidate_count: Option<Decimal>,
     pub rpc_supply_matches_curve_supply: Option<bool>,
     pub rpc_supply_mismatch_ratio: Option<Decimal>,
+    pub supply_denominator_source: Option<String>,
     pub data_gap_active: Option<bool>,
     pub stream_gap_active: Option<bool>,
     pub post_migration_supported: Option<bool>,
@@ -508,7 +509,16 @@ impl DiagnosticRiskEngine {
                 RiskTimeRole::EnrichmentLateFeature,
                 dec!(0.05),
                 dec!(0.8),
-                vec!["rpc_supply_matches_curve_supply=true".to_owned()],
+                vec![
+                    "rpc_supply_matches_curve_supply=true".to_owned(),
+                    format!(
+                        "canonical_denominator={}",
+                        input
+                            .supply_denominator_source
+                            .as_deref()
+                            .unwrap_or("curve_economic_supply")
+                    ),
+                ],
             ),
             Some(false) => RiskEvidence::available(
                 "supply_semantics_risk",
@@ -520,6 +530,13 @@ impl DiagnosticRiskEngine {
                 vec![
                     "rpc_supply_matches_curve_supply=false".to_owned(),
                     "rpc_mint_supply_not_canonical_for_pumpfun_denominator".to_owned(),
+                    format!(
+                        "canonical_denominator={}",
+                        input
+                            .supply_denominator_source
+                            .as_deref()
+                            .unwrap_or("curve_economic_supply")
+                    ),
                 ],
             ),
             None => RiskEvidence::unavailable(
@@ -667,6 +684,12 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|row| row == "rpc_mint_supply_not_canonical_for_pumpfun_denominator")
+        );
+        assert!(
+            supply
+                .evidence
+                .iter()
+                .any(|row| row == "canonical_denominator=curve_economic_supply")
         );
     }
 
