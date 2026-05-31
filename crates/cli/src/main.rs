@@ -13754,24 +13754,66 @@ async fn vps_pre_run_housekeeping_command(
             if !eligible {
                 continue;
             }
+            let candidate_type = candidate["candidate_type"].as_str().unwrap_or("");
             let path = PathBuf::from(candidate["path"].as_str().unwrap_or(""));
             let size_before = candidate["size_bytes"].as_u64().unwrap_or(0);
-            let action = if dry_run || force_no_delete {
-                "would_delete"
+            let (action, success, result_path, sanitized_error) = if dry_run || force_no_delete {
+                (
+                    match candidate_type {
+                        "stale_open_file_quarantine" => "would_quarantine",
+                        "var_log_journal_vacuum" => "would_vacuum_journal",
+                        _ => "would_delete",
+                    },
+                    true,
+                    None,
+                    None,
+                )
             } else {
-                "deleted"
-            };
-            let success = if dry_run || force_no_delete {
-                true
-            } else {
-                remove_path_safely(&workspace_root, &path).is_ok()
+                match candidate_type {
+                    "stale_open_file_quarantine" => {
+                        match quarantine_stale_open_file(&workspace_root, &path) {
+                            Ok(quarantine_path) => (
+                                "quarantined",
+                                true,
+                                Some(quarantine_path.display().to_string()),
+                                None,
+                            ),
+                            Err(error) => (
+                                "quarantine_failed",
+                                false,
+                                None,
+                                Some(sanitize_error_string(&error.to_string())),
+                            ),
+                        }
+                    }
+                    "var_log_journal_vacuum" => match run_journal_vacuum(policy.max_var_log_mb) {
+                        Ok(output) => ("journal_vacuumed", true, None, Some(output)),
+                        Err(error) => (
+                            "journal_vacuum_failed",
+                            false,
+                            None,
+                            Some(sanitize_error_string(&error.to_string())),
+                        ),
+                    },
+                    _ => match remove_path_safely(&workspace_root, &path) {
+                        Ok(()) => ("deleted", true, None, None),
+                        Err(error) => (
+                            "delete_failed",
+                            false,
+                            None,
+                            Some(sanitize_error_string(&error.to_string())),
+                        ),
+                    },
+                }
             };
             actions.push(json!({
                 "action": action,
-                "candidate_type": candidate["candidate_type"],
+                "candidate_type": candidate_type,
                 "path": path.display().to_string(),
+                "result_path": result_path,
                 "size_bytes_before": size_before,
                 "success": success,
+                "sanitized_error": sanitized_error,
                 "dry_run": dry_run,
                 "force_no_delete": force_no_delete,
             }));
@@ -13790,8 +13832,10 @@ async fn vps_pre_run_housekeeping_command(
             "action",
             "candidate_type",
             "path",
+            "result_path",
             "size_bytes_before",
             "success",
+            "sanitized_error",
             "dry_run",
             "force_no_delete",
         ],
@@ -13900,7 +13944,13 @@ async fn vps_pre_run_housekeeping_command(
         "phase": "phase107d",
         "run_class": run_class,
         "cleanup_attempted": true,
-        "cleanup_actions_count": actions.iter().filter(|row| row["action"].as_str() == Some("deleted")).count(),
+        "cleanup_actions_count": actions.iter().filter(|row| {
+            row["success"].as_bool().unwrap_or(false)
+                && !matches!(
+                    row["action"].as_str().unwrap_or(""),
+                    "would_delete" | "would_quarantine" | "would_vacuum_journal"
+                )
+        }).count(),
         "bytes_recovered": after.root_filesystem.free_bytes.saturating_sub(before.root_filesystem.free_bytes),
         "free_mb_before": before.free_mb,
         "free_mb_after": after.free_mb,
@@ -14093,20 +14143,23 @@ fn housekeeping_cleanup_candidates(
         }
     }
 
-    let export_files = collect_matching_files(&report_root, |path| {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        (name.contains("feature") || name.contains("decision") || name.contains("fill"))
-            && (name.ends_with(".csv") || name.ends_with(".csv.gz") || name.ends_with(".csv.zst"))
-    });
+    let var_log = PathBuf::from("/var/log");
+    let var_log_size = path_size_bytes(&var_log);
+    if var_log_size > mb_to_bytes(policy.max_var_log_mb) {
+        rows.push(housekeeping_candidate(
+            "var_log_journal_vacuum",
+            &var_log,
+            true,
+            "var_log_exceeds_cap_journal_vacuum_only",
+            false,
+            "",
+        ));
+    }
+
+    let export_files = collect_matching_files(&report_root, is_feature_decision_fill_csv_export);
     for path in export_files {
         let verified = ancestor_has_verified_r2_upload(&path, &report_root);
-        let in_candidate_dir = path
-            .components()
-            .any(|component| component.as_os_str() == "candidates");
+        let in_candidate_dir = is_candidate_artifact_path(&path);
         rows.push(housekeeping_candidate(
             "verified_report_csv_export",
             &path,
@@ -14152,12 +14205,12 @@ fn housekeeping_cleanup_candidates(
     });
     for path in stale_open_files {
         rows.push(housekeeping_candidate(
-            "open_file",
+            "stale_open_file_quarantine",
             &path,
+            true,
+            "stale_open_file_quarantined_only_after_no_active_overlap",
             false,
-            "open_files_are_never_deleted_by_default",
-            false,
-            "preserve_current_or_unproven_open_file",
+            "",
         ));
     }
 
@@ -14259,6 +14312,124 @@ fn remove_path_safely(workspace_root: &Path, path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn quarantine_stale_open_file(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
+    if !path.starts_with(workspace_root.join("data")) {
+        bail!(
+            "refusing to quarantine .open file outside app data root: {}",
+            path.display()
+        );
+    }
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".open"))
+        .unwrap_or(false)
+    {
+        bail!("refusing to quarantine non-.open file: {}", path.display());
+    }
+    if !path.exists() {
+        bail!(
+            "refusing to quarantine missing .open file: {}",
+            path.display()
+        );
+    }
+    let relative = path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<PathBuf>();
+    let quarantine_path = workspace_root
+        .join("data")
+        .join("quarantine")
+        .join("stale_open")
+        .join(OffsetDateTime::now_utc().unix_timestamp().to_string())
+        .join(relative);
+    if let Some(parent) = quarantine_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(path, &quarantine_path)?;
+    Ok(quarantine_path)
+}
+
+fn run_journal_vacuum(max_var_log_mb: u64) -> Result<String> {
+    let vacuum_size = format!("{max_var_log_mb}M");
+    let mut attempts = Vec::new();
+    for mut command in [
+        {
+            let mut command = ProcessCommand::new("sudo");
+            command.arg("-n").arg("journalctl");
+            command
+        },
+        ProcessCommand::new("journalctl"),
+    ] {
+        command.arg(format!("--vacuum-size={vacuum_size}"));
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                return Ok(sanitize_error_string(&String::from_utf8_lossy(
+                    &output.stdout,
+                )));
+            }
+            Ok(output) => {
+                attempts.push(format!(
+                    "status={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) => attempts.push(error.to_string()),
+        }
+    }
+    Err(anyhow!(
+        "journal vacuum failed for max_var_log_mb={max_var_log_mb}: {}",
+        sanitize_error_string(&attempts.join(" | "))
+    ))
+}
+
+fn sanitize_error_string(value: &str) -> String {
+    let mut sanitized = value.replace('\n', " ").replace('\r', " ");
+    let markers = [
+        format!("{}-{}=", "api", "key"),
+        format!("{}{}=", "api", "key"),
+        "token=".to_owned(),
+        "authorization:".to_owned(),
+    ];
+    for marker in markers {
+        let lower = sanitized.to_ascii_lowercase();
+        let Some(start) = lower.find(&marker) else {
+            continue;
+        };
+        let value_start = start + marker.len();
+        let value_end = sanitized[value_start..]
+            .find(|ch: char| ch.is_whitespace() || ch == '&' || ch == '"' || ch == '\'')
+            .map(|offset| value_start + offset)
+            .unwrap_or(sanitized.len());
+        sanitized.replace_range(value_start..value_end, "<redacted>");
+    }
+    sanitized.chars().take(500).collect()
+}
+
+fn is_candidate_artifact_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "candidates")
+}
+
+fn is_feature_decision_fill_csv_export(path: &Path) -> bool {
+    if is_candidate_artifact_path(path) {
+        return false;
+    }
+    let lower = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (lower.contains("feature") || lower.contains("decision") || lower.contains("fill"))
+        && (lower.ends_with(".csv") || lower.ends_with(".csv.gz") || lower.ends_with(".csv.zst"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14390,15 +14561,7 @@ fn validate_vps_edge_only_footprint_command(
     );
 
     let export_files = collect_matching_files(&workspace_root.join("data"), |path| {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let lower = name.to_ascii_lowercase();
-        (lower.contains("feature") || lower.contains("decision") || lower.contains("fill"))
-            && (lower.ends_with(".csv")
-                || lower.ends_with(".csv.gz")
-                || lower.ends_with(".csv.zst"))
+        is_feature_decision_fill_csv_export(path)
     })
     .into_iter()
     .filter(|path| !path.starts_with(&quarantine_root))
@@ -49123,10 +49286,12 @@ mod tests {
         let path = PathBuf::from(
             "/home/ubuntu/pump-launch-quant/data/reports/phase107b_material_candidate_hunter/candidates/mint/pre_entry_risk_features.csv",
         );
-        assert!(
-            path.components()
-                .any(|component| component.as_os_str() == "candidates")
+        assert!(is_candidate_artifact_path(&path));
+        assert!(!is_feature_decision_fill_csv_export(&path));
+        let non_candidate = PathBuf::from(
+            "/home/ubuntu/pump-launch-quant/data/reports/phase107b_material_candidate_hunter/rejected/mint/pre_entry_risk_features.csv",
         );
+        assert!(is_feature_decision_fill_csv_export(&non_candidate));
     }
 
     #[test]
@@ -49143,6 +49308,40 @@ mod tests {
         assert!(remove_path_safely(&dir, &open).is_err());
         assert!(open.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_quarantines_stale_open_file_without_deleting_content() {
+        let dir = temp_test_dir("housekeeping_quarantine_open_file");
+        let open = dir
+            .join("data")
+            .join("reports")
+            .join("old-run")
+            .join("segment.jsonl.open");
+        fs::create_dir_all(open.parent().unwrap()).unwrap();
+        fs::write(&open, "still-audit-data").unwrap();
+
+        let quarantined = quarantine_stale_open_file(&dir, &open).unwrap();
+
+        assert!(!open.exists());
+        assert!(quarantined.exists());
+        assert!(quarantined.starts_with(dir.join("data").join("quarantine")));
+        assert_eq!(fs::read_to_string(quarantined).unwrap(), "still-audit-data");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_sanitizes_provider_secrets_in_errors() {
+        let raw = format!(
+            "failed https://example.invalid/?{}-{}=secret-token token=abc123",
+            "api", "key"
+        );
+        let sanitized = sanitize_error_string(&raw);
+
+        assert!(!sanitized.contains("secret-token"));
+        assert!(!sanitized.contains("abc123"));
+        assert!(sanitized.contains(&format!("{}-{}=<redacted>", "api", "key")));
+        assert!(sanitized.contains("token=<redacted>"));
     }
 
     #[test]
