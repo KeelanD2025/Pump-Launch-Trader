@@ -14349,8 +14349,28 @@ fn remove_var_log_file_safely(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    fs::remove_file(path)?;
-    Ok(())
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let output = ProcessCommand::new("sudo")
+                .arg("-n")
+                .arg("rm")
+                .arg("-f")
+                .arg(path)
+                .output()
+                .context("running sudo rm for rotated /var/log file")?;
+            if output.status.success() && !path.exists() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "sudo rm failed for rotated /var/log file: status={:?} stderr={}",
+                    output.status.code(),
+                    sanitize_error_string(&String::from_utf8_lossy(&output.stderr))
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn quarantine_stale_open_file(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
