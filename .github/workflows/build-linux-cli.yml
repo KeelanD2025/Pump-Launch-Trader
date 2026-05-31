@@ -43,6 +43,11 @@ on:
         required: false
         default: "material_candidate_hunter"
         type: string
+      housekeeping_dry_run:
+        description: Run VPS housekeeping in dry-run mode
+        required: false
+        default: false
+        type: boolean
       run_geyser_diagnostic:
         description: Run a short provider stream diagnostic after deploy
         required: false
@@ -337,6 +342,7 @@ jobs:
           RUN_RISK_CANARY: ${{ github.event.inputs.run_risk_canary }}
           RUN_MATERIAL_HUNTER: ${{ github.event.inputs.run_material_hunter }}
           HOUSEKEEPING_RUN_CLASS: ${{ github.event.inputs.housekeeping_run_class }}
+          HOUSEKEEPING_DRY_RUN: ${{ github.event.inputs.housekeeping_dry_run }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
@@ -354,7 +360,7 @@ jobs:
 
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
             -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
-            APP_DIR="${APP_DIR}" RUN_CLASS="${RUN_CLASS}" 'bash -se' <<'EOF'
+            APP_DIR="${APP_DIR}" RUN_CLASS="${RUN_CLASS}" HOUSEKEEPING_DRY_RUN="${HOUSEKEEPING_DRY_RUN}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
           BIN="${APP_DIR}/target/release/cli"
@@ -368,6 +374,11 @@ jobs:
 
           rm -rf "${OUT_DIR}"
           mkdir -p "${OUT_DIR}"
+          DRY_RUN_ARGS=()
+          if [[ "${HOUSEKEEPING_DRY_RUN:-false}" == "true" ]]; then
+            DRY_RUN_ARGS+=(--dry-run)
+          fi
+
           "${BIN}" vps-pre-run-housekeeping \
             --config "${APP_DIR}/config/default.toml" \
             --config-override "${APP_DIR}/config/local.toml" \
@@ -375,7 +386,8 @@ jobs:
             --run-class "${RUN_CLASS}" \
             --output-dir "${OUT_DIR}" \
             --verify-r2 \
-            --json
+            --json \
+            "${DRY_RUN_ARGS[@]}"
           EOF
 
       - name: Run optional smoke cycle on VPS
