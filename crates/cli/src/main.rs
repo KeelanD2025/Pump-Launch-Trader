@@ -14104,17 +14104,24 @@ fn housekeeping_cleanup_candidates(
     });
     for path in export_files {
         let verified = ancestor_has_verified_r2_upload(&path, &report_root);
+        let in_candidate_dir = path
+            .components()
+            .any(|component| component.as_os_str() == "candidates");
         rows.push(housekeeping_candidate(
             "verified_report_csv_export",
             &path,
-            verified,
-            if verified {
+            verified && !in_candidate_dir,
+            if in_candidate_dir {
+                "candidate_artifacts_are_preserved"
+            } else if verified {
                 "ancestor_r2_upload_verified"
             } else {
                 "no_verified_r2_upload_proof"
             },
             true,
-            if verified {
+            if in_candidate_dir {
+                "preserve_candidate_artifacts"
+            } else if verified {
                 ""
             } else {
                 "preserve_unverified_report_export"
@@ -49109,6 +49116,17 @@ mod tests {
 
         assert!(ancestor_has_verified_r2_upload(&csv, &report_root));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_candidate_artifact_csvs_are_preserved() {
+        let path = PathBuf::from(
+            "/home/ubuntu/pump-launch-quant/data/reports/phase107b_material_candidate_hunter/candidates/mint/pre_entry_risk_features.csv",
+        );
+        assert!(
+            path.components()
+                .any(|component| component.as_os_str() == "candidates")
+        );
     }
 
     #[test]
