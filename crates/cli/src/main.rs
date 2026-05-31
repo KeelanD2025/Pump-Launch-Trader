@@ -14417,7 +14417,8 @@ fn quarantine_stale_open_file(workspace_root: &Path, path: &Path) -> Result<Path
 }
 
 fn run_journal_vacuum(max_var_log_mb: u64) -> Result<String> {
-    let vacuum_size = format!("{max_var_log_mb}M");
+    let journal_target_mb = (max_var_log_mb / 2).max(64);
+    let vacuum_size = format!("{journal_target_mb}M");
     let mut attempts = Vec::new();
     for mut command in [
         {
