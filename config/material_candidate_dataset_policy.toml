@@ -1,0 +1,25 @@
+schema_version = "phase107b.material_candidate_dataset_policy.v1"
+threshold_tuning_allowed = false
+live_trading_allowed = false
+large_dataset_allowed = false
+holder_rpc_allowed = false
+rpc_mint_supply_canonical = false
+binary_malicious_labels_allowed = false
+
+[rejected_dead_tokens]
+storage = "compact_rejection_audit"
+write_tombstone = true
+write_full_candidate_artifacts = false
+retain_for_calibration = true
+
+[material_candidates]
+storage = "candidate_dataset_artifacts"
+requires_survival_gate = true
+requires_time_safety = true
+requires_holder_rpc_used_false = true
+
+[future_modeling]
+must_join_rejection_tombstones_as_negative_labels = true
+formal_backtesting_allowed = false
+threshold_tuning_allowed = false
+

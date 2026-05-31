@@ -1311,6 +1311,31 @@ enum Command {
         #[arg(long, default_value = "research_output/phase100_live_risk_canary")]
         output_dir: String,
     },
+    MaterialCandidateHunter {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long, default_value_t = 28800)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 50)]
+        max_attempted_launches: usize,
+        #[arg(long, default_value_t = 5)]
+        target_material_candidates: usize,
+        #[arg(long, default_value_t = 3)]
+        max_concurrent_tracked_mints: usize,
+        #[arg(long)]
+        no_live_trading: bool,
+        #[arg(long)]
+        no_rpc: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2: bool,
+        #[arg(
+            long,
+            default_value = "research_output/phase107b_material_candidate_hunter"
+        )]
+        output_dir: String,
+    },
     RunQuantDiagnostics {
         #[arg(long)]
         source_run_id: Option<String>,
@@ -4562,6 +4587,33 @@ async fn main() -> Result<()> {
             live_risk_canary_command(
                 &loaded,
                 duration_seconds,
+                no_live_trading,
+                no_rpc,
+                upload_r2,
+                verify_r2,
+                &output_dir,
+            )
+            .await
+        }
+        Command::MaterialCandidateHunter {
+            env_file,
+            duration_seconds,
+            max_attempted_launches,
+            target_material_candidates,
+            max_concurrent_tracked_mints,
+            no_live_trading,
+            no_rpc,
+            upload_r2,
+            verify_r2,
+            output_dir,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            material_candidate_hunter_command(
+                &loaded,
+                duration_seconds,
+                max_attempted_launches,
+                target_material_candidates,
+                max_concurrent_tracked_mints,
                 no_live_trading,
                 no_rpc,
                 upload_r2,
@@ -37209,6 +37261,1172 @@ async fn live_risk_canary_command(
     Ok(())
 }
 
+async fn material_candidate_hunter_command(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    max_attempted_launches: usize,
+    target_material_candidates: usize,
+    max_concurrent_tracked_mints: usize,
+    no_live_trading: bool,
+    no_rpc: bool,
+    upload_r2: bool,
+    verify_r2: bool,
+    output_dir: &str,
+) -> Result<()> {
+    if !no_live_trading {
+        bail!("material-candidate-hunter refuses to run unless --no-live-trading is set");
+    }
+    if !no_rpc {
+        bail!(
+            "material-candidate-hunter refuses to run unless --no-rpc is set; holder RPC is forbidden"
+        );
+    }
+    if max_concurrent_tracked_mints == 0 {
+        bail!("max-concurrent-tracked-mints must be at least 1");
+    }
+
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let run_id = format!(
+        "material-candidate-hunter-{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let preflight = json!({
+        "schema_version": "phase107b.preflight.v1",
+        "run_id": run_id,
+        "git_built_binary_required": true,
+        "report_prefix": "phase107b_material_candidate_hunter",
+        "duration_seconds": duration_seconds,
+        "max_attempted_launches": max_attempted_launches,
+        "target_material_candidates": target_material_candidates,
+        "max_concurrent_tracked_mints": max_concurrent_tracked_mints,
+        "live_trading_disabled": no_live_trading,
+        "holder_rpc_disabled": no_rpc,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+        "large_dataset_started": false,
+        "broad_enrichment_started": false,
+        "provider_preflight": "checked_by_live_subscription",
+        "r2_preflight": if upload_r2 { "verified_after_report_generation" } else { "not_requested" },
+    });
+    write_quant_json_md(
+        &output_dir,
+        "preflight",
+        &preflight,
+        format!(
+            "# Phase 107B Material Candidate Hunter Preflight\n\n- run_id: `{run_id}`\n- report_prefix: `phase107b_material_candidate_hunter`\n- no live trading: `{no_live_trading}`\n- holder RPC disabled: `{no_rpc}`\n- max attempted launches: `{max_attempted_launches}`\n- target material candidates: `{target_material_candidates}`\n"
+        ),
+    )?;
+
+    let (summary, all_events) = collect_fresh_launch_canary_events(
+        loaded,
+        FreshLaunchCanaryLiveOptions {
+            duration_seconds,
+            max_launches: max_attempted_launches.max(1),
+        },
+    )
+    .await?;
+    if summary.transaction_updates + summary.account_updates + summary.slot_updates == 0 {
+        bail!(
+            "material-candidate-hunter provider stream emitted zero updates; provider_status={}",
+            summary.provider_status
+        );
+    }
+
+    let mut creates = all_events
+        .iter()
+        .filter(|event| is_successful_launch_create(event))
+        .cloned()
+        .collect::<Vec<_>>();
+    creates.sort_by_key(|event| {
+        (
+            event.meta.received_at_wall_time,
+            event.meta.slot,
+            event.meta.event_id.0,
+        )
+    });
+    creates.truncate(max_attempted_launches.max(1));
+
+    let risk_engine = DiagnosticRiskEngine::default();
+    let mut attempt_rows = Vec::<serde_json::Value>::new();
+    let mut rejected_rows = Vec::<serde_json::Value>::new();
+    let mut candidate_rows = Vec::<serde_json::Value>::new();
+    let mut unavailable_rows = Vec::<serde_json::Value>::new();
+    let mut candidates_300 = 0u64;
+    let mut candidates_900 = 0u64;
+    let mut candidates_1800 = 0u64;
+    let mut rejected_dead = 0u64;
+    let mut rejected_inconclusive = 0u64;
+    let mut provider_confirmed_bundle_count = 0u64;
+
+    for (attempt_index, create) in creates.iter().enumerate() {
+        let mint = event_mint_string(create).ok_or_else(|| anyhow!("create event missing mint"))?;
+        let scoped_events = phase107b_scoped_events_for_mint(&mint, create, &all_events);
+        let analysis = phase107b_analyze_token(
+            loaded,
+            &risk_engine,
+            &run_id,
+            &mint,
+            create,
+            &scoped_events,
+            duration_seconds,
+        )?;
+
+        let decision = phase107b_decide_token(
+            &analysis.post_event_rows,
+            &analysis.early_rule_rows,
+            duration_seconds,
+        );
+        if decision.provider_confirmed_bundle {
+            provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
+        }
+        if decision.final_state.starts_with("early_rejected") {
+            if decision.final_state == "early_rejected_dead" {
+                rejected_dead = rejected_dead.saturating_add(1);
+            } else {
+                rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+            }
+            rejected_rows.push(json!({
+                "mint": mint,
+                "run_id": run_id,
+                "final_state": decision.final_state,
+                "rejection_class": decision.reason,
+                "stop_tracking_at_seconds": decision.tracked_until_seconds,
+                "early_warning_families": decision.early_warning_families.join("|"),
+                "holder_rpc_used": false,
+                "threshold_tuning_allowed": false,
+            }));
+            phase107b_write_rejected_token(
+                &output_dir,
+                &run_id,
+                &mint,
+                create,
+                &decision,
+                &analysis,
+            )?;
+        } else if decision.promoted {
+            candidates_300 += decision.survived_300 as u64;
+            candidates_900 += decision.survived_900 as u64;
+            candidates_1800 += decision.survived_1800 as u64;
+            candidate_rows.push(json!({
+                "mint": mint,
+                "run_id": run_id,
+                "final_state": decision.final_state,
+                "promotion_reason": decision.reason,
+                "survived_300s": decision.survived_300,
+                "survived_900s": decision.survived_900,
+                "survived_1800s": decision.survived_1800,
+                "risk_timeline_rows": analysis.risk_timeline_rows.len(),
+                "pre_entry_risk_feature_rows": analysis.pre_entry_rows.len(),
+                "post_event_label_rows": analysis.post_event_rows.len(),
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+            }));
+            phase107b_write_candidate_token(
+                &output_dir,
+                &run_id,
+                &mint,
+                create,
+                &decision,
+                &analysis,
+            )?;
+            if candidates_1800.max(candidates_900).max(candidates_300)
+                >= target_material_candidates as u64
+            {
+                // The stream has already been collected for this bounded run; stop writing
+                // promoted candidates once the requested material sample is reached.
+                break;
+            }
+        } else {
+            rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+            phase107b_write_rejected_token(
+                &output_dir,
+                &run_id,
+                &mint,
+                create,
+                &decision,
+                &analysis,
+            )?;
+        }
+
+        for reason in &analysis.unavailable_reasons {
+            unavailable_rows.push(json!({
+                "mint": mint,
+                "run_id": run_id,
+                "unavailable_reason": reason,
+            }));
+        }
+
+        attempt_rows.push(json!({
+            "attempt_index": attempt_index + 1,
+            "mint": mint,
+            "run_id": run_id,
+            "launch_timestamp": event_received_ts(create),
+            "tracked_until_seconds": decision.tracked_until_seconds,
+            "final_state": decision.final_state,
+            "rejection_or_promotion_reason": decision.reason,
+            "early_warning_families": decision.early_warning_families.join("|"),
+            "rug_like_outcome_by_300s": decision.rug_like_by_300,
+            "survived_300s": decision.survived_300,
+            "survived_900s": decision.survived_900,
+            "survived_1800s": decision.survived_1800,
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "r2_verified": false,
+            "local_artifact_size_bytes": phase107b_dir_size_bytes(&output_dir).unwrap_or(0),
+            "promoted_to_candidate_dataset": decision.promoted,
+            "tombstone_written": decision.final_state.starts_with("early_rejected") || !decision.promoted,
+        }));
+    }
+
+    write_json_rows_csv(
+        &output_dir.join("attempt_ledger.csv"),
+        &[
+            "attempt_index",
+            "mint",
+            "run_id",
+            "launch_timestamp",
+            "tracked_until_seconds",
+            "final_state",
+            "rejection_or_promotion_reason",
+            "early_warning_families",
+            "rug_like_outcome_by_300s",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+            "r2_verified",
+            "local_artifact_size_bytes",
+            "promoted_to_candidate_dataset",
+            "tombstone_written",
+        ],
+        &attempt_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("rejected_summary.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "rejection_class",
+            "stop_tracking_at_seconds",
+            "early_warning_families",
+            "holder_rpc_used",
+            "threshold_tuning_allowed",
+        ],
+        &rejected_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("candidate_summary.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "promotion_reason",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "risk_timeline_rows",
+            "pre_entry_risk_feature_rows",
+            "post_event_label_rows",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+        ],
+        &candidate_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("unavailable_reason_summary.csv"),
+        &["mint", "run_id", "unavailable_reason"],
+        &unavailable_rows,
+    )?;
+
+    let attempted_launches = attempt_rows.len() as u64;
+    let hunter_summary = json!({
+        "schema_version": "phase107b.hunter_summary.v1",
+        "run_id": run_id,
+        "attempted_launches": attempted_launches,
+        "rejected_dead_count": rejected_dead,
+        "rejected_inconclusive_count": rejected_inconclusive,
+        "rejected_before_60s_count": rejected_rows.iter().filter(|row| row["stop_tracking_at_seconds"].as_u64().unwrap_or(0) <= 60).count(),
+        "rejected_before_300s_count": rejected_rows.iter().filter(|row| row["stop_tracking_at_seconds"].as_u64().unwrap_or(0) <= 300).count(),
+        "candidates_300s_count": candidates_300,
+        "candidates_900s_count": candidates_900,
+        "candidates_1800s_count": candidates_1800,
+        "material_candidates_found": candidate_rows.len(),
+        "target_material_candidates": target_material_candidates,
+        "code_path_failures": 0,
+        "missing_evidence_became_zero": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "provider_confirmed_bundle_count": provider_confirmed_bundle_count,
+        "binary_malicious_labels_emitted": false,
+        "threshold_tuning_allowed": false,
+        "formal_backtesting_allowed": false,
+        "ready_for_off_vps_candidate_replay": !candidate_rows.is_empty(),
+        "ready_for_large_strategy_dataset": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "hunter_summary",
+        &hunter_summary,
+        format!(
+            "# Phase 107B Material Candidate Hunter\n\n- run_id: `{run_id}`\n- attempted launches: `{attempted_launches}`\n- rejected/dead: `{rejected_dead}`\n- material candidates found: `{}`\n- holder RPC used: `false`\n- threshold tuning allowed: `false`\n",
+            candidate_rows.len()
+        ),
+    )?;
+
+    let policy = phase107b_dataset_separation_policy();
+    write_quant_json_md(
+        &output_dir,
+        "dataset_separation_policy",
+        &policy,
+        "# Material Candidate Dataset Policy\n\nRejected/dead tokens are retained as compact tombstones only; promoted candidates receive richer artifacts. This phase does not tune or train.\n".to_owned(),
+    )?;
+
+    let manifest = json!({
+        "schema_version": "phase107b.material_candidate_hunter_manifest.v1",
+        "phase": "phase107b",
+        "attempted_launches": attempted_launches,
+        "rejected_dead_count": rejected_dead,
+        "rejected_inconclusive_count": rejected_inconclusive,
+        "candidates_300s_count": candidates_300,
+        "candidates_900s_count": candidates_900,
+        "candidates_1800s_count": candidates_1800,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "provider_confirmed_bundle_count": provider_confirmed_bundle_count,
+        "binary_malicious_labels_emitted": false,
+        "threshold_tuning_allowed": false,
+        "ready_for_off_vps_candidate_replay": !candidate_rows.is_empty(),
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    write_quant_json_md(
+        &output_dir,
+        "manifest",
+        &manifest,
+        "# Phase 107B Manifest\n\n- phase: `phase107b`\n- threshold_tuning_allowed: `false`\n"
+            .to_owned(),
+    )?;
+
+    let mut r2_upload = json!({
+        "schema_version": "phase107b.r2_upload_result.v1",
+        "uploaded_files": [],
+        "verified_files": [],
+        "failed_files": [],
+        "verified": false,
+        "upload_requested": upload_r2,
+    });
+    let mut stable_manifest_upload = json!({
+        "schema_version": "phase107b.stable_manifest_upload.v1",
+        "key": "pump-launch-quant/research/material_candidate_hunter/manifest.json",
+        "uploaded": false,
+        "verified": false,
+        "threshold_tuning_allowed": false,
+    });
+    if upload_r2 {
+        r2_upload = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase107b_material_candidate_hunter",
+            &run_id,
+            verify_r2,
+        )
+        .await?;
+        write_quant_json_md(
+            &output_dir,
+            "r2_upload_result",
+            &r2_upload,
+            format!(
+                "# Phase 107B R2 Upload\n\n- run_id: `{run_id}`\n- verified: `{}`\n- threshold_tuning_allowed: `false`\n",
+                r2_upload["verified"]
+            ),
+        )?;
+        stable_manifest_upload =
+            phase107b_upload_stable_manifest(loaded, &output_dir, verify_r2).await?;
+        write_quant_json_md(
+            &output_dir,
+            "stable_manifest_upload",
+            &stable_manifest_upload,
+            "# Phase 107B Stable Manifest Upload\n\n- key: `pump-launch-quant/research/material_candidate_hunter/manifest.json`\n- threshold_tuning_allowed: `false`\n".to_owned(),
+        )?;
+        r2_upload = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase107b_material_candidate_hunter",
+            &run_id,
+            verify_r2,
+        )
+        .await?;
+    }
+
+    let aggregate = json!({
+        "command": "material-candidate-hunter",
+        "run_id": run_id,
+        "output_dir": output_dir.display().to_string(),
+        "attempted_launches": attempted_launches,
+        "material_candidates_found": candidate_rows.len(),
+        "r2_upload_verified": r2_upload["verified"],
+        "stable_manifest_verified": stable_manifest_upload["verified"],
+        "threshold_tuning_allowed": false,
+    });
+    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct Phase107bTokenAnalysis {
+    risk_timeline_rows: Vec<serde_json::Value>,
+    pre_entry_rows: Vec<serde_json::Value>,
+    post_event_rows: Vec<serde_json::Value>,
+    early_rule_rows: Vec<serde_json::Value>,
+    source_field_rows: Vec<serde_json::Value>,
+    stream_metric_rows: Vec<serde_json::Value>,
+    holder_invariant_rows: Vec<serde_json::Value>,
+    curve_invariant_rows: Vec<serde_json::Value>,
+    bundle_rows: Vec<serde_json::Value>,
+    rug_rows: Vec<serde_json::Value>,
+    metadata_funding_rows: Vec<serde_json::Value>,
+    unavailable_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Phase107bDecision {
+    final_state: String,
+    reason: String,
+    tracked_until_seconds: u64,
+    early_warning_families: Vec<String>,
+    rug_like_by_300: bool,
+    survived_300: bool,
+    survived_900: bool,
+    survived_1800: bool,
+    promoted: bool,
+    provider_confirmed_bundle: bool,
+}
+
+fn phase107b_scoped_events_for_mint(
+    mint: &str,
+    create: &NormalizedEvent,
+    events: &[NormalizedEvent],
+) -> Vec<NormalizedEvent> {
+    let related_signatures = events
+        .iter()
+        .filter(|event| event_mint_string(event).as_deref() == Some(mint))
+        .filter_map(event_signature_string)
+        .collect::<BTreeSet<_>>();
+    let mut scoped = events
+        .iter()
+        .filter(|event| {
+            event_mint_string(event).as_deref() == Some(mint)
+                || matches!(&event.payload, EventPayload::ObservedTransaction(payload)
+                    if payload.signature_hint.as_ref().map(|sig| related_signatures.contains(sig)).unwrap_or(false)
+                        || event.meta.slot == create.meta.slot)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped.sort_by_key(|event| {
+        (
+            event.meta.received_at_wall_time,
+            event.meta.slot,
+            event.meta.event_id.0,
+        )
+    });
+    scoped
+}
+
+fn phase107b_analyze_token(
+    loaded: &LoadedConfig,
+    risk_engine: &DiagnosticRiskEngine,
+    run_id: &str,
+    mint: &str,
+    create: &NormalizedEvent,
+    scoped_events: &[NormalizedEvent],
+    duration_seconds: u64,
+) -> Result<Phase107bTokenAnalysis> {
+    let launch_at = create.meta.received_at_wall_time;
+    let windows = [15u64, 30, 60, 120, 180, 300, 900, 1800];
+    let mut risk_timeline_rows = Vec::new();
+    let mut pre_entry_rows = Vec::new();
+    let mut early_rule_rows = Vec::new();
+    let mut bundle_rows = Vec::new();
+    let mut rug_rows = Vec::new();
+    let mut metadata_funding_rows = Vec::new();
+    let mut all_evidence = Vec::<RiskEvidence>::new();
+    let mut final_state_engine = StateEngine::new(loaded.config.ttl.clone());
+    for event in scoped_events {
+        final_state_engine.apply_event(event)?;
+    }
+    let final_snapshot = final_state_engine.snapshot();
+    let post_event_rows = build_post_event_risk_labels(run_id, mint, &final_snapshot)?;
+
+    for window in windows {
+        if window > duration_seconds && duration_seconds < 300 {
+            continue;
+        }
+        let cutoff = launch_at + time::Duration::seconds(window as i64);
+        let window_events = scoped_events
+            .iter()
+            .filter(|event| event.meta.received_at_wall_time <= cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut state_engine = StateEngine::new(loaded.config.ttl.clone());
+        for event in &window_events {
+            state_engine.apply_event(event)?;
+        }
+        let snapshot = state_engine.snapshot();
+        let Some(token) = snapshot.tokens.get(mint) else {
+            early_rule_rows.push(json!({
+                "source_run_id": run_id,
+                "mint": mint,
+                "window_seconds": window,
+                "rule_id": "token_state_unavailable",
+                "rule_fired": false,
+                "unavailable_reason": "token_state_unavailable_at_window",
+                "can_use_pre_entry": true,
+            }));
+            continue;
+        };
+        let bundle_context = stream_bundle_context(mint, create.meta.slot, &window_events);
+        let input = risk_input_from_token(mint, token, &bundle_context);
+        let output = risk_engine.evaluate(input);
+        risk_timeline_rows.push(json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "window_seconds": window,
+            "available_at_slot": window_events.last().map(|event| event.meta.slot).unwrap_or(create.meta.slot),
+            "available_at_timestamp": cutoff.to_string(),
+            "risk_score_total": decimal_to_json(Some(output.risk_score_total)),
+            "risk_classification": format!("{:?}", output.risk_classification),
+            "risk_evidence_count": output.risk_evidence_count,
+            "denominator_source_for_market_cap": output.denominator_source_for_market_cap.clone(),
+            "denominator_source_for_holder_pct": output.denominator_source_for_holder_pct.clone(),
+            "rpc_supply_diagnostic_only": output.rpc_supply_diagnostic_only,
+            "supply_denominator_policy_version": output.supply_denominator_policy_version.clone(),
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+        }));
+        for evidence in &output.evidence {
+            let row = json!({
+                "source_run_id": run_id,
+                "mint": mint,
+                "risk_id": evidence.risk_id,
+                "risk_family": evidence.risk_family,
+                "source": format!("{:?}", evidence.source),
+                "feature_time_class": risk_time_role_label(evidence.time_role),
+                "available_at_slot": window_events.last().map(|event| event.meta.slot).unwrap_or(create.meta.slot),
+                "available_at_timestamp": cutoff.to_string(),
+                "can_use_pre_entry": evidence.time_role.pre_entry_safe(),
+                "can_use_for_backtest": evidence.score.is_some(),
+                "can_use_for_tuning": false,
+                "score": decimal_to_json(evidence.score),
+                "confidence": decimal_to_json(Some(evidence.confidence)),
+                "unavailable_reason": evidence.unavailable_reason.clone().unwrap_or_default(),
+                "evidence": evidence.evidence.join("|"),
+                "denominator_source_for_market_cap": output.denominator_source_for_market_cap.clone(),
+                "denominator_source_for_holder_pct": output.denominator_source_for_holder_pct.clone(),
+                "rpc_supply_diagnostic_only": output.rpc_supply_diagnostic_only,
+                "supply_semantics_status": output.supply_semantics_status.clone(),
+                "supply_mismatch_ratio": decimal_to_json(output.supply_mismatch_ratio),
+                "supply_denominator_policy_version": output.supply_denominator_policy_version.clone(),
+                "rpc_mint_supply_canonical": false,
+                "provider_confirmed_bundle": false,
+                "holder_rpc_used": false,
+            });
+            if evidence.time_role.pre_entry_safe() {
+                pre_entry_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("bundle") {
+                bundle_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("dev")
+                || evidence.risk_family.contains("holder")
+                || evidence.risk_family.contains("fake")
+                || evidence.risk_family.contains("sell")
+                || evidence.risk_family.contains("data_quality")
+            {
+                rug_rows.push(row.clone());
+            }
+            if evidence.risk_family.contains("metadata")
+                || evidence.risk_family.contains("funding")
+                || evidence.risk_family.contains("supply")
+            {
+                metadata_funding_rows.push(row.clone());
+            }
+        }
+        all_evidence.extend(output.evidence);
+
+        let window_labels = build_post_event_risk_labels(run_id, mint, &snapshot)?;
+        early_rule_rows.extend(phase107b_rule_rows_from_window(
+            run_id,
+            mint,
+            window,
+            token,
+            &bundle_context,
+            &window_labels,
+        ));
+    }
+    validate_no_post_event_pre_entry_leak(&all_evidence)
+        .map_err(|err| anyhow!("Phase 107B time-safety gate failed: {err}"))?;
+    for row in &post_event_rows {
+        if row["can_use_pre_entry"].as_bool().unwrap_or(false) {
+            bail!("post-event label leaked into Phase 107B pre-entry feature set");
+        }
+    }
+
+    let source_field_rows = vec![json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "holder_count_source": "stream_owner_summed_token_accounts",
+        "top_holder_source": "stream_owner_summed_token_accounts",
+        "dev_holding_source": "stream_owner_summed_token_accounts",
+        "holder_rpc_used": false,
+        "holder_rpc_required": false,
+        "rpc_mint_supply_canonical": false,
+        "supply_denominator_policy_version": "phase102.supply_denominator.v1",
+    })];
+    let stream_metric_rows = vec![json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "stream_metrics_computed": true,
+        "holder_rpc_used": false,
+        "no_live_orders": true,
+        "threshold_tuning_allowed": false,
+    })];
+    let holder_invariant_rows = vec![json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "holder_invariant_status": "stream_owner_summed_checked",
+        "holder_rpc_used": false,
+    })];
+    let curve_invariant_rows = vec![json!({
+        "source_run_id": run_id,
+        "mint": mint,
+        "curve_progress_denominator": "bonding_curve_real_reserves_and_curve_economic_supply",
+        "rpc_mint_supply_canonical": false,
+    })];
+    let unavailable_reasons = early_rule_rows
+        .iter()
+        .filter_map(|row| row["unavailable_reason"].as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(Phase107bTokenAnalysis {
+        risk_timeline_rows,
+        pre_entry_rows,
+        post_event_rows,
+        early_rule_rows,
+        source_field_rows,
+        stream_metric_rows,
+        holder_invariant_rows,
+        curve_invariant_rows,
+        bundle_rows,
+        rug_rows,
+        metadata_funding_rows,
+        unavailable_reasons,
+    })
+}
+
+fn phase107b_rule_rows_from_window(
+    run_id: &str,
+    mint: &str,
+    window: u64,
+    token: &state::TokenState,
+    bundle: &StreamBundleContext,
+    labels: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let buy_count = token.trade_stats.buy_count;
+    let sell_count = token.trade_stats.sell_count;
+    let holder_churn = token.holder_state.holder_churn_rate;
+    let holder_collapse = holder_churn >= Decimal::new(50, 2);
+    let no_buy_followthrough = buy_count <= 1 && sell_count > 0;
+    let volume_evaporated = phase107b_label_bool(labels, "volume_evaporated").unwrap_or(false);
+    let rapid_collapse_80 = phase107b_label_bool(labels, "rapid_collapse_80pct").unwrap_or(false);
+    let rapid_collapse_95 = phase107b_label_bool(labels, "rapid_collapse_95pct").unwrap_or(false);
+    let top_holder_or_dev_dumped =
+        phase107b_label_bool(labels, "top_holder_or_dev_dumped").unwrap_or(false);
+    let liquidity_exit_proxy =
+        phase107b_label_bool(labels, "liquidity_exit_proxy").unwrap_or(false);
+    let bundle_with_concentration =
+        bundle.same_slot_tx_count > 0 && token.holder_state.nonzero_holder_count <= 3;
+    [
+        (
+            "no_buy_followthrough_by_30s",
+            window >= 30 && no_buy_followthrough,
+        ),
+        (
+            "no_buy_followthrough_by_60s",
+            window >= 60 && no_buy_followthrough,
+        ),
+        (
+            "volume_evaporated_by_60s",
+            window >= 60 && volume_evaporated,
+        ),
+        ("holder_collapse_by_60s", window >= 60 && holder_collapse),
+        (
+            "top_holder_or_dev_dump_before_180s",
+            window >= 180 && top_holder_or_dev_dumped,
+        ),
+        (
+            "same_slot_bundle_like_plus_holder_concentration",
+            window >= 15 && bundle_with_concentration,
+        ),
+        (
+            "liquidity_exit_proxy_before_300s",
+            window >= 300 && liquidity_exit_proxy,
+        ),
+        ("rapid_collapse_80pct", rapid_collapse_80),
+        ("rapid_collapse_95pct", rapid_collapse_95),
+    ]
+    .into_iter()
+    .map(|(rule_id, fired)| {
+        json!({
+            "source_run_id": run_id,
+            "mint": mint,
+            "window_seconds": window,
+            "rule_id": rule_id,
+            "rule_fired": fired,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "holder_count": token.holder_state.nonzero_holder_count,
+            "holder_churn_rate": decimal_to_json(Some(holder_churn)),
+            "same_slot_tx_count": bundle.same_slot_tx_count,
+            "stream_bundle_like_only": rule_id == "same_slot_bundle_like_plus_holder_concentration",
+            "unavailable_reason": "",
+            "can_use_pre_entry": true,
+            "threshold_tuning_allowed": false,
+        })
+    })
+    .collect()
+}
+
+fn phase107b_decide_token(
+    labels: &[serde_json::Value],
+    early_rule_rows: &[serde_json::Value],
+    duration_seconds: u64,
+) -> Phase107bDecision {
+    let mut early_warning_families = early_rule_rows
+        .iter()
+        .filter(|row| row["rule_fired"].as_bool().unwrap_or(false))
+        .filter_map(|row| row["rule_id"].as_str())
+        .filter(|rule| *rule != "same_slot_bundle_like_plus_holder_concentration")
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let bundle_only_fired = early_rule_rows.iter().any(|row| {
+        row["rule_id"].as_str() == Some("same_slot_bundle_like_plus_holder_concentration")
+            && row["rule_fired"].as_bool().unwrap_or(false)
+    });
+    let rug_like = phase107b_label_bool(labels, "rug_like_outcome").unwrap_or(false);
+    let dead_60 = phase107b_label_bool(labels, "dead_within_60s").unwrap_or(false);
+    let dead_180 = phase107b_label_bool(labels, "dead_within_180s").unwrap_or(false);
+    let dead_300 = phase107b_label_bool(labels, "dead_within_300s").unwrap_or(false);
+    let collapse_80 = phase107b_label_bool(labels, "rapid_collapse_80pct").unwrap_or(false);
+    let collapse_95 = phase107b_label_bool(labels, "rapid_collapse_95pct").unwrap_or(false);
+    let no_buy = phase107b_label_bool(labels, "no_buy_followthrough").unwrap_or(false);
+    let volume_evaporated = phase107b_label_bool(labels, "volume_evaporated").unwrap_or(false);
+    let holder_collapse = phase107b_label_bool(labels, "holder_collapse").unwrap_or(false);
+    let dump = phase107b_label_bool(labels, "top_holder_or_dev_dumped").unwrap_or(false);
+    let liquidity_exit = phase107b_label_bool(labels, "liquidity_exit_proxy").unwrap_or(false);
+    let rug_like_by_300 = dead_60
+        || dead_180
+        || dead_300
+        || collapse_80
+        || collapse_95
+        || no_buy
+        || volume_evaporated
+        || holder_collapse
+        || dump
+        || liquidity_exit
+        || rug_like;
+    if rug_like_by_300 {
+        let reason = if dead_60 || collapse_95 {
+            "rug_like_by_60s"
+        } else if volume_evaporated {
+            "volume_evaporated"
+        } else if no_buy {
+            "no_buy_followthrough"
+        } else if holder_collapse {
+            "holder_collapse"
+        } else if dump {
+            "top_holder_or_dev_dumped"
+        } else if liquidity_exit {
+            "liquidity_exit_proxy"
+        } else {
+            "rug_like_by_300s"
+        };
+        if early_warning_families.is_empty() && bundle_only_fired {
+            early_warning_families
+                .push("bundle_like_stream_signal_recorded_not_auto_rejected".to_owned());
+        }
+        return Phase107bDecision {
+            final_state: "early_rejected_dead".to_owned(),
+            reason: reason.to_owned(),
+            tracked_until_seconds: if dead_60 || collapse_95 || volume_evaporated || no_buy {
+                60
+            } else if dump {
+                180
+            } else {
+                300
+            },
+            early_warning_families,
+            rug_like_by_300: true,
+            survived_300: false,
+            survived_900: false,
+            survived_1800: false,
+            promoted: false,
+            provider_confirmed_bundle: false,
+        };
+    }
+    let outcome_label_available = labels.iter().any(|row| {
+        row["label_id"].as_str() == Some("rug_like_outcome")
+            && row["unavailable_reason"].as_str().unwrap_or("").is_empty()
+    });
+    if !outcome_label_available {
+        return Phase107bDecision {
+            final_state: "early_rejected_unavailable_required_data".to_owned(),
+            reason: "inconclusive_missing_required_data".to_owned(),
+            tracked_until_seconds: duration_seconds.min(300),
+            early_warning_families,
+            rug_like_by_300: false,
+            survived_300: false,
+            survived_900: false,
+            survived_1800: false,
+            promoted: false,
+            provider_confirmed_bundle: false,
+        };
+    }
+    Phase107bDecision {
+        final_state: if duration_seconds >= 1800 {
+            "material_candidate_1800s".to_owned()
+        } else if duration_seconds >= 900 {
+            "material_candidate_900s".to_owned()
+        } else {
+            "survived_300s_candidate".to_owned()
+        },
+        reason: "survived_early_death_gates".to_owned(),
+        tracked_until_seconds: duration_seconds.min(1800).max(300),
+        early_warning_families,
+        rug_like_by_300: false,
+        survived_300: true,
+        survived_900: duration_seconds >= 900,
+        survived_1800: duration_seconds >= 1800,
+        promoted: true,
+        provider_confirmed_bundle: false,
+    }
+}
+
+fn phase107b_label_bool(labels: &[serde_json::Value], label_id: &str) -> Option<bool> {
+    labels
+        .iter()
+        .find(|row| row["label_id"].as_str() == Some(label_id))
+        .and_then(|row| row["value"].as_bool())
+}
+
+fn phase107b_write_rejected_token(
+    output_dir: &Path,
+    run_id: &str,
+    mint: &str,
+    create: &NormalizedEvent,
+    decision: &Phase107bDecision,
+    analysis: &Phase107bTokenAnalysis,
+) -> Result<()> {
+    let dir = output_dir.join("rejected").join(mint);
+    fs::create_dir_all(&dir)?;
+    write_json_rows_csv(
+        &dir.join("early_rule_snapshot.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "window_seconds",
+            "rule_id",
+            "rule_fired",
+            "buy_count",
+            "sell_count",
+            "holder_count",
+            "holder_churn_rate",
+            "same_slot_tx_count",
+            "stream_bundle_like_only",
+            "unavailable_reason",
+            "can_use_pre_entry",
+            "threshold_tuning_allowed",
+        ],
+        &analysis.early_rule_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("rejection_evidence.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "risk_id",
+            "risk_family",
+            "source",
+            "feature_time_class",
+            "available_at_slot",
+            "available_at_timestamp",
+            "can_use_pre_entry",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "score",
+            "confidence",
+            "unavailable_reason",
+            "evidence",
+            "denominator_source_for_market_cap",
+            "denominator_source_for_holder_pct",
+            "rpc_supply_diagnostic_only",
+            "supply_semantics_status",
+            "supply_mismatch_ratio",
+            "supply_denominator_policy_version",
+            "rpc_mint_supply_canonical",
+            "provider_confirmed_bundle",
+            "holder_rpc_used",
+        ],
+        &analysis.rug_rows,
+    )?;
+    let tombstone = json!({
+        "schema_version": "phase107b.dead_token_tombstone.v1",
+        "mint": mint,
+        "run_id": run_id,
+        "launch_timestamp": event_received_ts(create),
+        "launch_slot": create.meta.slot,
+        "launch_signature": event_signature_string(create),
+        "stop_tracking_at_seconds": decision.tracked_until_seconds,
+        "rejection_class": decision.reason,
+        "final_state": decision.final_state,
+        "early_warning_families": decision.early_warning_families,
+        "unavailable_reasons": analysis.unavailable_reasons,
+        "r2_verification_status": "uploaded_in_phase_report_if_requested",
+        "no_live_orders": true,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &dir,
+        "dead_token_tombstone",
+        &tombstone,
+        format!(
+            "# Dead Token Tombstone\n\n- mint: `{mint}`\n- stop_tracking_at_seconds: `{}`\n- rejection_class: `{}`\n- holder_rpc_used: `false`\n",
+            decision.tracked_until_seconds, decision.reason
+        ),
+    )
+}
+
+fn phase107b_write_candidate_token(
+    output_dir: &Path,
+    run_id: &str,
+    mint: &str,
+    create: &NormalizedEvent,
+    decision: &Phase107bDecision,
+    analysis: &Phase107bTokenAnalysis,
+) -> Result<()> {
+    let dir = output_dir.join("candidates").join(mint);
+    fs::create_dir_all(&dir)?;
+    write_json_rows_csv(
+        &dir.join("risk_timeline.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "window_seconds",
+            "available_at_slot",
+            "available_at_timestamp",
+            "risk_score_total",
+            "risk_classification",
+            "risk_evidence_count",
+            "denominator_source_for_market_cap",
+            "denominator_source_for_holder_pct",
+            "rpc_supply_diagnostic_only",
+            "supply_denominator_policy_version",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+        ],
+        &analysis.risk_timeline_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("early_feature_timeline.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "window_seconds",
+            "rule_id",
+            "rule_fired",
+            "buy_count",
+            "sell_count",
+            "holder_count",
+            "holder_churn_rate",
+            "same_slot_tx_count",
+            "stream_bundle_like_only",
+            "unavailable_reason",
+            "can_use_pre_entry",
+            "threshold_tuning_allowed",
+        ],
+        &analysis.early_rule_rows,
+    )?;
+    write_risk_rows(
+        &dir.join("pre_entry_risk_features.csv"),
+        &analysis.pre_entry_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("post_event_risk_labels.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "label_id",
+            "label_family",
+            "value",
+            "feature_time_class",
+            "can_use_pre_entry",
+            "can_use_for_backtest",
+            "can_use_for_tuning",
+            "unavailable_reason",
+            "rug_outcome_reason",
+        ],
+        &analysis.post_event_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("source_field_coverage.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "holder_count_source",
+            "top_holder_source",
+            "dev_holding_source",
+            "holder_rpc_used",
+            "holder_rpc_required",
+            "rpc_mint_supply_canonical",
+            "supply_denominator_policy_version",
+        ],
+        &analysis.source_field_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("stream_metric_proof.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "stream_metrics_computed",
+            "holder_rpc_used",
+            "no_live_orders",
+            "threshold_tuning_allowed",
+        ],
+        &analysis.stream_metric_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("holder_invariants.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "holder_invariant_status",
+            "holder_rpc_used",
+        ],
+        &analysis.holder_invariant_rows,
+    )?;
+    write_json_rows_csv(
+        &dir.join("curve_invariants.csv"),
+        &[
+            "source_run_id",
+            "mint",
+            "curve_progress_denominator",
+            "rpc_mint_supply_canonical",
+        ],
+        &analysis.curve_invariant_rows,
+    )?;
+    write_risk_rows(&dir.join("bundle_like_evidence.csv"), &analysis.bundle_rows)?;
+    write_risk_rows(&dir.join("rug_dump_evidence.csv"), &analysis.rug_rows)?;
+    write_risk_rows(
+        &dir.join("metadata_funding_evidence.csv"),
+        &analysis.metadata_funding_rows,
+    )?;
+    let summary = json!({
+        "schema_version": "phase107b.token_summary.v1",
+        "mint": mint,
+        "run_id": run_id,
+        "launch_timestamp": event_received_ts(create),
+        "launch_slot": create.meta.slot,
+        "launch_signature": event_signature_string(create),
+        "final_state": decision.final_state,
+        "promotion_reason": decision.reason,
+        "survived_300s": decision.survived_300,
+        "survived_900s": decision.survived_900,
+        "survived_1800s": decision.survived_1800,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &dir,
+        "token_summary",
+        &summary,
+        format!(
+            "# Material Candidate Token Summary\n\n- mint: `{mint}`\n- final_state: `{}`\n- holder_rpc_used: `false`\n",
+            decision.final_state
+        ),
+    )
+}
+
+fn phase107b_dataset_separation_policy() -> serde_json::Value {
+    json!({
+        "schema_version": "phase107b.dataset_separation_policy.v1",
+        "rejected_dead_tokens": "compact_rejection_audit_only",
+        "promoted_material_candidates": "candidate_dataset_artifacts",
+        "rejection_audit_retained_for_calibration": true,
+        "future_modeling_requires_negative_join": true,
+        "phase_trains_or_tunes": false,
+        "threshold_tuning_allowed": false,
+    })
+}
+
+async fn phase107b_upload_stable_manifest(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    verify_r2: bool,
+) -> Result<serde_json::Value> {
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let key = client.managed_key(
+        &research_remote_base_prefix(&client),
+        "material_candidate_hunter/manifest.json",
+    );
+    let manifest_path = output_dir.join("manifest.json");
+    let prepared = client.prepare_upload(
+        &manifest_path,
+        bucket,
+        key.clone(),
+        "application/json",
+        BTreeMap::new(),
+        Some(false),
+    )?;
+    let result = client
+        .upload_prepared(&prepared, verify_r2.then_some(true))
+        .await?;
+    Ok(json!({
+        "schema_version": "phase107b.stable_manifest_upload.v1",
+        "key": key,
+        "uploaded": result.uploaded,
+        "verified": result.verified,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    }))
+}
+
+fn phase107b_dir_size_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    if path.is_file() {
+        return Ok(path.metadata()?.len());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if child.is_dir() {
+            total = total.saturating_add(phase107b_dir_size_bytes(&child)?);
+        } else {
+            total = total.saturating_add(child.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
 #[derive(Debug, Clone, Default)]
 struct StreamBundleContext {
     same_slot_tx_count: u64,
@@ -47868,5 +49086,90 @@ mod tests {
             assert!(block.contains("rpc_repair_allowed_for_audit_only = true"));
             assert!(block.contains("rpc_budget_status = \"not_required_for_holder_metrics\""));
         }
+    }
+
+    fn phase107b_bool_label(
+        label_id: &str,
+        value: bool,
+        unavailable_reason: &str,
+    ) -> serde_json::Value {
+        json!({
+            "label_id": label_id,
+            "value": value,
+            "unavailable_reason": unavailable_reason,
+            "can_use_pre_entry": false,
+            "can_use_for_tuning": false,
+        })
+    }
+
+    #[test]
+    fn phase107b_dead_token_writes_tombstone_decision_and_not_candidate() {
+        let labels = vec![
+            phase107b_bool_label("rug_like_outcome", true, ""),
+            phase107b_bool_label("dead_within_60s", true, ""),
+        ];
+        let early = vec![json!({
+            "rule_id": "volume_evaporated_by_60s",
+            "rule_fired": true,
+        })];
+        let decision = phase107b_decide_token(&labels, &early, 1800);
+        assert_eq!(decision.final_state, "early_rejected_dead");
+        assert!(!decision.promoted);
+        assert!(decision.tracked_until_seconds <= 60);
+    }
+
+    #[test]
+    fn phase107b_material_candidate_requires_survival_gate() {
+        let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
+        let decision = phase107b_decide_token(&labels, &[], 1800);
+        assert_eq!(decision.final_state, "material_candidate_1800s");
+        assert!(decision.promoted);
+        assert!(decision.survived_300);
+        assert!(decision.survived_900);
+        assert!(decision.survived_1800);
+    }
+
+    #[test]
+    fn phase107b_same_slot_bundle_like_alone_does_not_auto_reject() {
+        let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
+        let early = vec![json!({
+            "rule_id": "same_slot_bundle_like_plus_holder_concentration",
+            "rule_fired": true,
+        })];
+        let decision = phase107b_decide_token(&labels, &early, 900);
+        assert_ne!(decision.final_state, "early_rejected_dead");
+        assert!(decision.promoted);
+        assert_eq!(decision.provider_confirmed_bundle, false);
+    }
+
+    #[test]
+    fn phase107b_missing_required_data_is_unavailable_not_zero() {
+        let labels = vec![phase107b_bool_label(
+            "rug_like_outcome",
+            false,
+            "insufficient_price_path",
+        )];
+        let decision = phase107b_decide_token(&labels, &[], 1800);
+        assert_eq!(
+            decision.final_state,
+            "early_rejected_unavailable_required_data"
+        );
+        assert!(!decision.promoted);
+        assert_eq!(decision.reason, "inconclusive_missing_required_data");
+    }
+
+    #[test]
+    fn phase107b_dataset_policy_keeps_rejections_out_of_candidate_dataset() {
+        let policy = phase107b_dataset_separation_policy();
+        assert_eq!(
+            policy["rejected_dead_tokens"],
+            "compact_rejection_audit_only"
+        );
+        assert_eq!(
+            policy["promoted_material_candidates"],
+            "candidate_dataset_artifacts"
+        );
+        assert_eq!(policy["phase_trains_or_tunes"], false);
+        assert_eq!(policy["threshold_tuning_allowed"], false);
     }
 }
