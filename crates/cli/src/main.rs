@@ -1452,6 +1452,16 @@ enum Command {
         #[arg(long)]
         verify: bool,
     },
+    UploadSingleReportR2 {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long)]
+        local_file: String,
+        #[arg(long)]
+        remote_key: String,
+        #[arg(long)]
+        verify: bool,
+    },
     DiagnoseR2Segment {
         #[arg(long)]
         env_file: Option<String>,
@@ -4754,6 +4764,15 @@ async fn main() -> Result<()> {
                 verify,
             )
             .await
+        }
+        Command::UploadSingleReportR2 {
+            env_file,
+            local_file,
+            remote_key,
+            verify,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            upload_single_report_r2_command(&loaded, &local_file, &remote_key, verify).await
         }
         Command::DiagnoseR2Segment {
             env_file,
@@ -32719,6 +32738,48 @@ async fn upload_phase_report_dir_r2_command(
     Ok(())
 }
 
+async fn upload_single_report_r2_command(
+    loaded: &LoadedConfig,
+    local_file: &str,
+    remote_key: &str,
+    verify: bool,
+) -> Result<()> {
+    let local_path = PathBuf::from(local_file);
+    if !local_path.is_file() {
+        bail!("local report file does not exist: {}", local_path.display());
+    }
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let key = if remote_key.starts_with("pump-launch-quant/") {
+        remote_key.trim_start_matches('/').to_owned()
+    } else {
+        client.managed_key("", remote_key)
+    };
+    let prepared = client.prepare_upload(
+        &local_path,
+        bucket,
+        key.clone(),
+        &artifact_content_type(&local_path),
+        BTreeMap::new(),
+        Some(false),
+    )?;
+    let result = client
+        .upload_prepared(&prepared, verify.then_some(true))
+        .await?;
+    let summary = json!({
+        "schema_version": "single_report_r2_upload.v1",
+        "local_file": local_path.display().to_string(),
+        "remote_key": key,
+        "uploaded": result.uploaded,
+        "verified": verify && result.verified,
+        "failed": verify && !result.verified,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 async fn run_enrichment_worker_command(
     source_run_id: Option<&str>,
     derived_run_id: Option<&str>,
@@ -37432,6 +37493,7 @@ async fn launch_metric_canary_command(
                 duration_seconds,
                 max_launches: max_launches.max(1),
                 stop_when_max_launches_seen: false,
+                retain_only_tracked_mints: false,
             },
         )
         .await?;
@@ -38026,6 +38088,7 @@ async fn live_risk_canary_command(
             duration_seconds,
             max_launches: 1,
             stop_when_max_launches_seen: false,
+            retain_only_tracked_mints: false,
         },
     )
     .await?;
@@ -38405,6 +38468,7 @@ async fn material_candidate_hunter_command(
             duration_seconds,
             max_launches: max_attempted_launches.max(1),
             stop_when_max_launches_seen: false,
+            retain_only_tracked_mints: true,
         },
     )
     .await?;

@@ -794,6 +794,8 @@ pub struct FreshLaunchCanaryLiveOptions {
     pub duration_seconds: u64,
     pub max_launches: usize,
     pub stop_when_max_launches_seen: bool,
+    #[serde(default)]
+    pub retain_only_tracked_mints: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -805,9 +807,32 @@ pub struct FreshLaunchCanaryLiveSummary {
     pub account_updates: u64,
     pub slot_updates: u64,
     pub normalized_events: u64,
+    #[serde(default)]
+    pub retained_events: u64,
     pub pump_create_decoded: u64,
     pub tracked_mint: Option<String>,
     pub errors: Vec<String>,
+}
+
+fn should_retain_fresh_launch_event(
+    event: &NormalizedEvent,
+    retain_only_tracked_mints: bool,
+    tracked_mints: &HashSet<String>,
+    tracked_launch_slots: &HashSet<u64>,
+) -> bool {
+    if !retain_only_tracked_mints {
+        return true;
+    }
+    match &event.payload {
+        EventPayload::TokenCreated(payload) => {
+            payload.status != TransactionStatus::Failed && tracked_mints.contains(&payload.mint.0)
+        }
+        EventPayload::ObservedTransaction(_) => tracked_launch_slots.contains(&event.meta.slot),
+        _ => event
+            .mint()
+            .map(|mint| tracked_mints.contains(&mint.0))
+            .unwrap_or(false),
+    }
 }
 
 pub async fn collect_fresh_launch_canary_events(
@@ -872,6 +897,8 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
         tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
     let mut events = Vec::<NormalizedEvent>::new();
     let mut launches_seen = 0usize;
+    let mut tracked_mints = HashSet::<String>::new();
+    let mut tracked_launch_slots = HashSet::<u64>::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let poll_window = remaining.min(StdDuration::from_millis(250));
@@ -901,14 +928,26 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
                     if let EventPayload::TokenCreated(payload) = &event.payload {
                         launches_seen = launches_seen.saturating_add(1);
                         summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
-                        if summary.tracked_mint.is_none()
-                            && payload.status != TransactionStatus::Failed
-                        {
-                            summary.tracked_mint = Some(payload.mint.to_string());
+                        if payload.status != TransactionStatus::Failed {
+                            if tracked_mints.len() < options.max_launches.max(1) {
+                                tracked_mints.insert(payload.mint.0.clone());
+                                tracked_launch_slots.insert(event.meta.slot);
+                            }
+                            if summary.tracked_mint.is_none() {
+                                summary.tracked_mint = Some(payload.mint.to_string());
+                            }
                         }
                     }
                     summary.normalized_events = summary.normalized_events.saturating_add(1);
-                    events.push(event);
+                    if should_retain_fresh_launch_event(
+                        &event,
+                        options.retain_only_tracked_mints,
+                        &tracked_mints,
+                        &tracked_launch_slots,
+                    ) {
+                        summary.retained_events = summary.retained_events.saturating_add(1);
+                        events.push(event);
+                    }
                 }
                 if summary.tracked_mint.is_some()
                     && launches_seen >= options.max_launches.max(1)
@@ -2141,7 +2180,11 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use common::{Canonicality, EventPayload, EventSource, config::LoadedConfig};
+    use common::{
+        Canonicality, EventMeta, EventPayload, EventSource, NormalizedEvent, PubkeyValue,
+        QuoteAssetType, TokenCreatedEvent, TokenProgramType, TransactionStatus,
+        config::LoadedConfig,
+    };
     use ingest_geyser::{GeyserIngestService, TransactionTokenBalance, TransactionUpdate};
     use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, Message, SlotStatus, SubscribeUpdate, SubscribeUpdateDeshred,
@@ -2180,6 +2223,80 @@ mod tests {
         meta
     }
 
+    fn test_meta(slot: u64, signature: &str) -> EventMeta {
+        let mut meta = EventMeta::new(EventSource::GeyserProcessed, Canonicality::Processed, slot);
+        meta.signature = Some(signature.to_owned());
+        meta
+    }
+
+    fn test_pubkey(value: &str) -> PubkeyValue {
+        PubkeyValue(value.to_owned())
+    }
+
+    fn test_create_event(mint: &str, slot: u64, status: TransactionStatus) -> NormalizedEvent {
+        NormalizedEvent {
+            meta: test_meta(slot, "create-sig"),
+            payload: EventPayload::TokenCreated(TokenCreatedEvent {
+                mint: test_pubkey(mint),
+                token_program: TokenProgramType::SplToken,
+                quote_mint: test_pubkey("So11111111111111111111111111111111111111112"),
+                quote_asset_type: QuoteAssetType::NativeSol,
+                creator_wallet: test_pubkey("creator"),
+                payer: test_pubkey("payer"),
+                bonding_curve_account: test_pubkey("curve"),
+                associated_bonding_curve_account: Some(test_pubkey("associated_curve")),
+                metadata_account: None,
+                name: "Test".to_owned(),
+                symbol: "TEST".to_owned(),
+                uri: String::new(),
+                create_instruction_variant: "create".to_owned(),
+                initial_virtual_quote_reserves: None,
+                initial_virtual_token_reserves: None,
+                initial_real_quote_reserves: None,
+                initial_real_token_reserves: None,
+                initial_supply: None,
+                creator_initial_buy: None,
+                same_transaction_buys: 0,
+                same_slot_buys: 0,
+                fee_recipients: Vec::new(),
+                raw_account_list: Vec::new(),
+                launch_transaction_fingerprint: None,
+                status,
+            }),
+        }
+    }
+
+    fn test_observed_transaction(slot: u64, signature: &str) -> NormalizedEvent {
+        NormalizedEvent {
+            meta: test_meta(slot, signature),
+            payload: EventPayload::ObservedTransaction(common::ObservedTransactionEvent {
+                signature_hint: Some(signature.to_owned()),
+                slot_hint: Some(slot),
+                entry_index: None,
+                tx_position_estimate: None,
+                signer: Some("signer".to_owned()),
+                program_ids: Vec::new(),
+                account_count: 0,
+                instruction_count: 0,
+                account_list_hash: Some("accounts".to_owned()),
+                instruction_shape_hash: Some("shape".to_owned()),
+                compute_unit_limit: None,
+                compute_unit_price: None,
+                estimated_priority_fee_lamports: None,
+                tx_fee_lamports: None,
+                compute_units_consumed: None,
+                pre_sol_balances_lamports: Vec::new(),
+                post_sol_balances_lamports: Vec::new(),
+                failed_transaction: false,
+                error_code: None,
+                bundle_like_evidence: None,
+                raw_packet_hash: "packet".to_owned(),
+                first_seen_by_shred_ns: 0,
+                decode_confidence: Decimal::ONE,
+            }),
+        }
+    }
+
     fn token_balance(
         account_index: u32,
         mint: &str,
@@ -2194,6 +2311,61 @@ mod tests {
             amount: amount.to_owned(),
             decimals: 6,
         }
+    }
+
+    #[test]
+    fn fresh_launch_retention_keeps_everything_when_unbounded() {
+        let tracked_mints = HashSet::new();
+        let tracked_launch_slots = HashSet::new();
+        let unrelated = test_observed_transaction(100, "unrelated-sig");
+        assert!(should_retain_fresh_launch_event(
+            &unrelated,
+            false,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
+    }
+
+    #[test]
+    fn fresh_launch_retention_keeps_tracked_mints_and_launch_slot_only() {
+        let tracked_mints = HashSet::from(["tracked-mint".to_owned()]);
+        let tracked_launch_slots = HashSet::from([123_u64]);
+        let create = test_create_event("tracked-mint", 123, TransactionStatus::Success);
+        let same_slot_observed = test_observed_transaction(123, "same-slot");
+        let other_create = test_create_event("other-mint", 124, TransactionStatus::Success);
+        let failed_create = test_create_event("tracked-mint", 123, TransactionStatus::Failed);
+        let unrelated_observed = test_observed_transaction(124, "unrelated");
+
+        assert!(should_retain_fresh_launch_event(
+            &create,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
+        assert!(should_retain_fresh_launch_event(
+            &same_slot_observed,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
+        assert!(!should_retain_fresh_launch_event(
+            &other_create,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
+        assert!(!should_retain_fresh_launch_event(
+            &failed_create,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
+        assert!(!should_retain_fresh_launch_event(
+            &unrelated_observed,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots
+        ));
     }
 
     fn holder_test_update(
