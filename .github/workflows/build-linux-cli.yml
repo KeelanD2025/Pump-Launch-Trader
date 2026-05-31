@@ -33,6 +33,16 @@ on:
         required: false
         default: false
         type: boolean
+      run_housekeeping_only:
+        description: Run mandatory VPS pre-run housekeeping without starting collection
+        required: false
+        default: false
+        type: boolean
+      housekeeping_run_class:
+        description: Run class for housekeeping-only proof
+        required: false
+        default: "material_candidate_hunter"
+        type: string
       run_geyser_diagnostic:
         description: Run a short provider stream diagnostic after deploy
         required: false
@@ -206,6 +216,7 @@ jobs:
           scp -P "${PORT}" dist/cli "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new"
           scp -P "${PORT}" dist/cli.sha256 "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new.sha256"
           scp -P "${PORT}" dist/build_info.json "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/build_info.json.new"
+          scp -P "${PORT}" deploy/systemd/pump-launch-quant-edge-once.service "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/pump-launch-quant-edge-once.service.new"
 
       - name: Install and validate prebuilt CLI on VPS
         shell: bash
@@ -234,6 +245,7 @@ jobs:
           NEW_BIN="${APP_DIR}/target/release/cli.new"
           NEW_SHA="${APP_DIR}/target/release/cli.new.sha256"
           NEW_BUILD_INFO="${APP_DIR}/target/release/build_info.json.new"
+          NEW_EDGE_SERVICE="${APP_DIR}/target/release/pump-launch-quant-edge-once.service.new"
           BUILD_INFO_TARGET="${APP_DIR}/target/release/build_info.json"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
@@ -276,6 +288,11 @@ jobs:
 
           mv "${NEW_BUILD_INFO}" "${BUILD_INFO_TARGET}"
           mv "${NEW_SHA}" "${BIN}.sha256"
+          if [[ -f "${NEW_EDGE_SERVICE}" ]]; then
+            sudo install -m 0644 "${NEW_EDGE_SERVICE}" /etc/systemd/system/pump-launch-quant-edge-once.service
+            rm -f "${NEW_EDGE_SERVICE}"
+            sudo systemctl daemon-reload
+          fi
 
           trap - ERR
 
@@ -305,6 +322,60 @@ jobs:
           )
           print(json.dumps(summary, indent=2))
           PY
+          EOF
+
+      - name: Run mandatory VPS pre-run housekeeping
+        if: ${{ github.event.inputs.run_smoke == 'true' || github.event.inputs.run_live_canary == 'true' || github.event.inputs.run_risk_canary == 'true' || github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          RUN_SMOKE: ${{ github.event.inputs.run_smoke }}
+          RUN_LIVE_CANARY: ${{ github.event.inputs.run_live_canary }}
+          RUN_RISK_CANARY: ${{ github.event.inputs.run_risk_canary }}
+          RUN_MATERIAL_HUNTER: ${{ github.event.inputs.run_material_hunter }}
+          HOUSEKEEPING_RUN_CLASS: ${{ github.event.inputs.housekeeping_run_class }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          RUN_CLASS="${HOUSEKEEPING_RUN_CLASS:-material_candidate_hunter}"
+          if [[ "${RUN_MATERIAL_HUNTER}" == "true" ]]; then
+            RUN_CLASS="material_candidate_hunter"
+          elif [[ "${RUN_RISK_CANARY}" == "true" ]]; then
+            RUN_CLASS="risk_canary"
+          elif [[ "${RUN_LIVE_CANARY}" == "true" ]]; then
+            RUN_CLASS="launch_canary"
+          elif [[ "${RUN_SMOKE}" == "true" ]]; then
+            RUN_CLASS="smoke"
+          fi
+
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+            -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" RUN_CLASS="${RUN_CLASS}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          OUT_DIR="${APP_DIR}/data/reports/pre_run_housekeeping/latest"
+
+          if [[ ! -f "${ENV_FILE}" ]]; then
+            echo "::error::VPS env file not found at ${ENV_FILE}"
+            exit 1
+          fi
+
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+          "${BIN}" vps-pre-run-housekeeping \
+            --config "${APP_DIR}/config/default.toml" \
+            --config-override "${APP_DIR}/config/local.toml" \
+            --env-file "${ENV_FILE}" \
+            --run-class "${RUN_CLASS}" \
+            --output-dir "${OUT_DIR}" \
+            --verify-r2 \
+            --json
           EOF
 
       - name: Run optional smoke cycle on VPS
@@ -1013,6 +1084,41 @@ jobs:
           name: phase107b-material-candidate-hunter
           path: phase107b-material-candidate-hunter
           if-no-files-found: error
+
+      - name: Download VPS pre-run housekeeping reports
+        if: ${{ always() && (github.event.inputs.run_smoke == 'true' || github.event.inputs.run_live_canary == 'true' || github.event.inputs.run_risk_canary == 'true' || github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_housekeeping_only == 'true') }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          LOCAL_DIR="phase107d-vps-pre-run-housekeeping"
+          rm -rf "${LOCAL_DIR}"
+          mkdir -p "${LOCAL_DIR}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_DIR}"
+          set -euo pipefail
+          REPORT_DIR="${APP_DIR}/data/reports/pre_run_housekeeping/latest"
+          if [[ ! -d "${REPORT_DIR}" ]]; then
+            mkdir -p /tmp/empty-housekeeping
+            tar -czf - -C /tmp/empty-housekeeping .
+            exit 0
+          fi
+          tar -czf - -C "${REPORT_DIR}" .
+          EOF
+
+      - name: Upload VPS pre-run housekeeping reports
+        if: ${{ always() && (github.event.inputs.run_smoke == 'true' || github.event.inputs.run_live_canary == 'true' || github.event.inputs.run_risk_canary == 'true' || github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_housekeeping_only == 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase107d-vps-pre-run-housekeeping
+          path: phase107d-vps-pre-run-housekeeping
+          if-no-files-found: warn
 
       - name: Restart edge timer after smoke
         if: ${{ github.event.inputs.restart_timer == 'true' }}

@@ -1,0 +1,15 @@
+[vps_pre_run_housekeeping]
+enabled = true
+mandatory = true
+target_free_mb = 4096
+minimum_start_free_mb = 2048
+absolute_block_free_mb = 1536
+rollback_binary_keep = 2
+max_target_cache_mb = 512
+max_var_log_mb = 256
+max_active_spool_mb = 64
+keep_latest_verified_runs = 5
+keep_latest_reports = 10
+compact_rejected_after_r2_verified = true
+delete_unverified_data = false
+delete_active_data = false

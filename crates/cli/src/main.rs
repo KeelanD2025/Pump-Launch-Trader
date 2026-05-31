@@ -780,6 +780,25 @@ enum Command {
         i_understand_this_deletes_cloudflare_r2_data: bool,
     },
     VpsStorageStatus,
+    VpsPreRunHousekeeping {
+        #[arg(long)]
+        env_file: Option<String>,
+        #[arg(long, default_value = "material_candidate_hunter")]
+        run_class: String,
+        #[arg(
+            long,
+            default_value = "research_output/phase107d_vps_pre_run_housekeeping"
+        )]
+        output_dir: String,
+        #[arg(long)]
+        verify_r2: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        force_no_delete: bool,
+    },
     ValidateVpsEdgeOnlyFootprint {
         #[arg(long, default_value_t = 512)]
         max_var_log_mb: u64,
@@ -5055,6 +5074,27 @@ async fn main() -> Result<()> {
             .await
         }
         Command::VpsStorageStatus => vps_storage_status_command(&loaded),
+        Command::VpsPreRunHousekeeping {
+            env_file,
+            run_class,
+            output_dir,
+            verify_r2,
+            json,
+            dry_run,
+            force_no_delete,
+        } => {
+            let _env_overlay = apply_env_file_overlay(&loaded, env_file.as_deref())?;
+            vps_pre_run_housekeeping_command(
+                &loaded,
+                &run_class,
+                &output_dir,
+                verify_r2,
+                json,
+                dry_run,
+                force_no_delete,
+            )
+            .await
+        }
         Command::ValidateVpsEdgeOnlyFootprint {
             max_var_log_mb,
             max_target_mb,
@@ -13577,6 +13617,720 @@ fn vps_storage_status_command(loaded: &LoadedConfig) -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct VpsHousekeepingPolicy {
+    target_free_mb: u64,
+    minimum_start_free_mb: u64,
+    absolute_block_free_mb: u64,
+    rollback_binary_keep: usize,
+    max_target_cache_mb: u64,
+    max_var_log_mb: u64,
+    max_active_spool_mb: u64,
+    keep_latest_reports: usize,
+}
+
+impl Default for VpsHousekeepingPolicy {
+    fn default() -> Self {
+        Self {
+            target_free_mb: 4096,
+            minimum_start_free_mb: 2048,
+            absolute_block_free_mb: 1536,
+            rollback_binary_keep: 2,
+            max_target_cache_mb: 512,
+            max_var_log_mb: 256,
+            max_active_spool_mb: 64,
+            keep_latest_reports: 10,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn vps_pre_run_housekeeping_command(
+    loaded: &LoadedConfig,
+    run_class: &str,
+    output_dir: &str,
+    verify_r2: bool,
+    json_output: bool,
+    dry_run: bool,
+    force_no_delete: bool,
+) -> Result<()> {
+    let policy = VpsHousekeepingPolicy::default();
+    let output_dir = PathBuf::from(output_dir);
+    fs::create_dir_all(&output_dir)?;
+    let run_class = normalize_housekeeping_run_class(run_class)?;
+    let live_stream_required = matches!(
+        run_class.as_str(),
+        "edge_timer"
+            | "smoke"
+            | "launch_canary"
+            | "risk_canary"
+            | "material_candidate_hunter"
+            | "controlled_dataset"
+    );
+
+    let before = collect_disk_preflight_summary(loaded)?;
+    let workspace_root = workspace_root_from_config(loaded);
+    let storage_root = PathBuf::from(&loaded.config.storage.root);
+    let report_root = storage_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join("reports");
+    let state = load_or_default_autopilot_state(loaded);
+    let active_run_id = active_autopilot_run_id_from_state(&state).map(ToOwned::to_owned);
+    let lock_path = workspace_root
+        .join("data")
+        .join("autopilot")
+        .join("autopilot.lock");
+    let lock_status = housekeeping_lock_status(&lock_path);
+    let active_overlap_detected = active_run_id.is_some()
+        || lock_status
+            .get("active_pid")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        || (lock_status
+            .get("exists")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            && !lock_status
+                .get("stale_without_active_pid")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false));
+
+    let snapshot = json!({
+        "schema_version": "phase107d.pre_cleanup_snapshot.v1",
+        "phase": "phase107d",
+        "run_class": run_class,
+        "dry_run": dry_run,
+        "force_no_delete": force_no_delete,
+        "workspace_root": workspace_root.display().to_string(),
+        "storage_root": storage_root.display().to_string(),
+        "active_run_id": active_run_id,
+        "lock_status": lock_status,
+        "disk_preflight": before,
+        "target_size_bytes": path_size_bytes(&workspace_root.join("target")),
+        "report_root_size_bytes": path_size_bytes(&report_root),
+        "dev_shm_build_dir_count": collect_dev_shm_build_dirs().len(),
+        "rollback_binary_count": collect_cli_rollback_binaries(&workspace_root).len(),
+        "live_trading_enabled": loaded.config.live.enabled,
+        "holder_rpc_allowed": loaded.config.enrichment.rpc.allow_token_largest_accounts_rpc,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "pre_cleanup_snapshot",
+        &snapshot,
+        format!(
+            "# Phase 107D Pre-Cleanup Snapshot\n\n- run class: `{}`\n- dry run: `{}`\n- free MB before: `{}`\n- active overlap detected: `{}`\n",
+            run_class, dry_run, before.free_mb, active_overlap_detected
+        ),
+    )?;
+
+    let candidates = housekeeping_cleanup_candidates(loaded, &policy)?;
+    write_json_rows_csv(
+        &output_dir.join("cleanup_candidates.csv"),
+        &[
+            "candidate_type",
+            "path",
+            "size_bytes",
+            "eligible",
+            "reason",
+            "r2_verified_required",
+            "preserve_reason",
+        ],
+        &candidates,
+    )?;
+    fs::write(
+        output_dir.join("cleanup_candidates.json"),
+        serde_json::to_vec_pretty(&candidates)?,
+    )?;
+
+    let mut actions = Vec::<serde_json::Value>::new();
+    if !active_overlap_detected {
+        for candidate in &candidates {
+            let eligible = candidate["eligible"].as_bool().unwrap_or(false);
+            if !eligible {
+                continue;
+            }
+            let path = PathBuf::from(candidate["path"].as_str().unwrap_or(""));
+            let size_before = candidate["size_bytes"].as_u64().unwrap_or(0);
+            let action = if dry_run || force_no_delete {
+                "would_delete"
+            } else {
+                "deleted"
+            };
+            let success = if dry_run || force_no_delete {
+                true
+            } else {
+                remove_path_safely(&workspace_root, &path).is_ok()
+            };
+            actions.push(json!({
+                "action": action,
+                "candidate_type": candidate["candidate_type"],
+                "path": path.display().to_string(),
+                "size_bytes_before": size_before,
+                "success": success,
+                "dry_run": dry_run,
+                "force_no_delete": force_no_delete,
+            }));
+        }
+    } else {
+        actions.push(json!({
+            "action": "skipped_cleanup_due_to_active_overlap",
+            "success": false,
+            "dry_run": dry_run,
+            "force_no_delete": force_no_delete,
+        }));
+    }
+    write_json_rows_csv(
+        &output_dir.join("cleanup_actions.csv"),
+        &[
+            "action",
+            "candidate_type",
+            "path",
+            "size_bytes_before",
+            "success",
+            "dry_run",
+            "force_no_delete",
+        ],
+        &actions,
+    )?;
+    write_quant_json_md(
+        &output_dir,
+        "cleanup_actions",
+        &json!({
+            "schema_version": "phase107d.cleanup_actions.v1",
+            "actions": actions,
+        }),
+        format!(
+            "# Phase 107D Cleanup Actions\n\n- dry run: `{dry_run}`\n- force no delete: `{force_no_delete}`\n- cleanup actions: `{}`\n",
+            actions.len()
+        ),
+    )?;
+
+    let after = collect_disk_preflight_summary(loaded)?;
+    let disk_preflight_passed = after.free_mb >= policy.minimum_start_free_mb
+        && after.free_mb >= policy.absolute_block_free_mb
+        && !after.critical
+        && !after.emergency;
+    let edge_only_footprint_passed = validate_vps_edge_only_footprint_command(
+        loaded,
+        policy.max_var_log_mb,
+        policy.max_target_cache_mb,
+        64,
+        policy.max_active_spool_mb,
+        policy.rollback_binary_keep,
+        true,
+    )
+    .is_ok();
+    let stream_only_passed = loaded.validate_stream_only().is_ok();
+    let edge_mode_passed = loaded.validate_edge_mode().is_ok();
+    let provider_summary = if live_stream_required && !dry_run {
+        Some(
+            smoke_geyser_provider(
+                loaded,
+                GeyserProviderSmokeOptions {
+                    duration_seconds: 15,
+                    max_updates: Some(1),
+                    strict: false,
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let provider_updates_flowing = provider_summary
+        .as_ref()
+        .map(|summary| {
+            summary.transaction_updates
+                + summary.account_updates
+                + summary.slot_updates
+                + summary.block_updates
+                + summary.block_meta_updates
+                > 0
+        })
+        .unwrap_or(!live_stream_required || dry_run);
+
+    let mut r2_upload = json!({
+        "verified": !verify_r2 || dry_run,
+        "upload_requested": verify_r2,
+        "dry_run": dry_run,
+    });
+    if verify_r2 && !dry_run {
+        r2_upload = upload_phase_report_dir_to_r2(
+            loaded,
+            &output_dir,
+            "phase107d_vps_pre_run_housekeeping",
+            &format!(
+                "{}-{}",
+                run_class,
+                OffsetDateTime::now_utc().unix_timestamp()
+            ),
+            true,
+        )
+        .await?;
+        write_quant_json_md(
+            &output_dir,
+            "r2_upload_result",
+            &r2_upload,
+            format!(
+                "# Phase 107D R2 Upload\n\n- verified: `{}`\n- threshold_tuning_allowed: `false`\n",
+                r2_upload["verified"].as_bool().unwrap_or(false)
+            ),
+        )?;
+    }
+    let r2_write_verify_passed = r2_upload["verified"].as_bool().unwrap_or(false);
+    let hard_stop_reasons = housekeeping_gate_failures(
+        &policy,
+        &after,
+        disk_preflight_passed,
+        edge_only_footprint_passed,
+        stream_only_passed,
+        edge_mode_passed,
+        provider_updates_flowing,
+        r2_write_verify_passed,
+        active_overlap_detected,
+    );
+    let safe_to_start_run = hard_stop_reasons.is_empty();
+    let gate = json!({
+        "schema_version": "phase107d.pre_run_gate.v1",
+        "phase": "phase107d",
+        "run_class": run_class,
+        "cleanup_attempted": true,
+        "cleanup_actions_count": actions.iter().filter(|row| row["action"].as_str() == Some("deleted")).count(),
+        "bytes_recovered": after.root_filesystem.free_bytes.saturating_sub(before.root_filesystem.free_bytes),
+        "free_mb_before": before.free_mb,
+        "free_mb_after": after.free_mb,
+        "target_free_mb": policy.target_free_mb,
+        "minimum_start_free_mb": policy.minimum_start_free_mb,
+        "pre_cycle_min_free_mb": after.pre_cycle_min_free_mb,
+        "warning_floor_mb": after.warning_free_mb,
+        "disk_preflight_passed": disk_preflight_passed,
+        "edge_only_footprint_passed": edge_only_footprint_passed,
+        "stream_only_passed": stream_only_passed,
+        "edge_mode_passed": edge_mode_passed,
+        "provider_updates_flowing": provider_updates_flowing,
+        "provider_summary": provider_summary,
+        "r2_write_verify_passed": r2_write_verify_passed,
+        "active_overlap_detected": active_overlap_detected,
+        "hard_stop_required": !safe_to_start_run,
+        "hard_stop_reasons": hard_stop_reasons,
+        "safe_to_start_run": safe_to_start_run,
+        "live_trading_enabled": loaded.config.live.enabled,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+    });
+    write_quant_json_md(
+        &output_dir,
+        "pre_run_gate",
+        &gate,
+        format!(
+            "# Phase 107D Pre-Run Gate\n\n- run class: `{}`\n- safe to start run: `{}`\n- free MB before: `{}`\n- free MB after: `{}`\n- hard stop required: `{}`\n",
+            run_class, safe_to_start_run, before.free_mb, after.free_mb, !safe_to_start_run
+        ),
+    )?;
+    if !safe_to_start_run {
+        write_quant_json_md(
+            &output_dir,
+            "safety_blocker",
+            &gate,
+            "# Phase 107D Safety Blocker\n\nHousekeeping could not make the VPS safe. Collection must not start.\n".to_owned(),
+        )?;
+    }
+
+    let manifest = json!({
+        "schema_version": "phase107d.vps_pre_run_housekeeping_manifest.v1",
+        "phase": "phase107d",
+        "housekeeping_enabled": true,
+        "housekeeping_mandatory": true,
+        "bytes_recovered": after.root_filesystem.free_bytes.saturating_sub(before.root_filesystem.free_bytes),
+        "free_mb_before": before.free_mb,
+        "free_mb_after": after.free_mb,
+        "disk_preflight_passed": disk_preflight_passed,
+        "edge_only_footprint_passed": edge_only_footprint_passed,
+        "safe_to_start_material_candidate_hunter": safe_to_start_run && run_class == "material_candidate_hunter",
+        "workflow_hard_stop_enabled": true,
+        "systemd_pre_run_enabled": true,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    write_quant_json_md(
+        &output_dir,
+        "manifest",
+        &manifest,
+        "# Phase 107D Manifest\n\n- housekeeping mandatory: `true`\n- threshold_tuning_allowed: `false`\n".to_owned(),
+    )?;
+    if verify_r2 && !dry_run {
+        let stable = upload_housekeeping_manifest(loaded, &output_dir, true).await?;
+        write_quant_json_md(
+            &output_dir,
+            "stable_manifest_upload",
+            &stable,
+            "# Phase 107D Stable Manifest Upload\n\n- key: `pump-launch-quant/research/vps_pre_run_housekeeping/manifest.json`\n".to_owned(),
+        )?;
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&gate)?);
+    }
+    if !safe_to_start_run {
+        bail!(
+            "VPS pre-run housekeeping gate blocked {}: {}",
+            run_class,
+            gate["hard_stop_reasons"]
+        );
+    }
+    Ok(())
+}
+
+fn normalize_housekeeping_run_class(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "edge_timer"
+        | "smoke"
+        | "launch_canary"
+        | "risk_canary"
+        | "material_candidate_hunter"
+        | "controlled_dataset" => Ok(normalized),
+        _ => Err(anyhow!(
+            "unsupported vps-pre-run-housekeeping run-class: {value}"
+        )),
+    }
+}
+
+fn housekeeping_lock_status(lock_path: &Path) -> serde_json::Value {
+    if !lock_path.exists() {
+        return json!({
+            "exists": false,
+            "active_pid": false,
+            "stale_without_active_pid": false,
+        });
+    }
+    let raw = fs::read_to_string(lock_path).unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}));
+    let pid = parsed.get("pid").and_then(|value| value.as_i64());
+    let active_pid = pid
+        .map(|pid| process_is_active(pid as u32))
+        .unwrap_or(false);
+    json!({
+        "exists": true,
+        "path": lock_path.display().to_string(),
+        "pid": pid,
+        "active_pid": active_pid,
+        "stale_without_active_pid": !active_pid,
+        "raw_parse_ok": parsed.as_object().map(|map| !map.is_empty()).unwrap_or(false),
+    })
+}
+
+fn process_is_active(pid: u32) -> bool {
+    ProcessCommand::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn housekeeping_cleanup_candidates(
+    loaded: &LoadedConfig,
+    policy: &VpsHousekeepingPolicy,
+) -> Result<Vec<serde_json::Value>> {
+    let workspace_root = workspace_root_from_config(loaded);
+    let storage_root = PathBuf::from(&loaded.config.storage.root);
+    let report_root = storage_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join("reports");
+    let mut rows = Vec::<serde_json::Value>::new();
+
+    for path in collect_dev_shm_build_dirs() {
+        rows.push(housekeeping_candidate(
+            "stale_dev_shm_build_dir",
+            &path,
+            true,
+            "safe_stale_dev_shm_build_dir",
+            false,
+            "",
+        ));
+    }
+
+    let rollbacks = collect_cli_rollback_binaries(&workspace_root);
+    let rollback_delete_count = rollbacks.len().saturating_sub(policy.rollback_binary_keep);
+    for path in rollbacks.into_iter().take(rollback_delete_count) {
+        rows.push(housekeeping_candidate(
+            "old_rollback_binary",
+            &path,
+            true,
+            "rollback_binary_beyond_keep_cap",
+            false,
+            "",
+        ));
+    }
+
+    for relative in [
+        "target/debug",
+        "target/tmp",
+        "target/release/deps",
+        "target/release/build",
+        "target/release/incremental",
+        "target/release/examples",
+    ] {
+        let path = workspace_root.join(relative);
+        if path.exists() {
+            rows.push(housekeeping_candidate(
+                "old_target_build_cache",
+                &path,
+                true,
+                "target_build_cache_not_required_for_prebuilt_vps_runtime",
+                false,
+                "",
+            ));
+        }
+    }
+
+    let export_files = collect_matching_files(&report_root, |path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        (name.contains("feature") || name.contains("decision") || name.contains("fill"))
+            && (name.ends_with(".csv") || name.ends_with(".csv.gz") || name.ends_with(".csv.zst"))
+    });
+    for path in export_files {
+        let verified = ancestor_has_verified_r2_upload(&path, &report_root);
+        rows.push(housekeeping_candidate(
+            "verified_report_csv_export",
+            &path,
+            verified,
+            if verified {
+                "ancestor_r2_upload_verified"
+            } else {
+                "no_verified_r2_upload_proof"
+            },
+            true,
+            if verified {
+                ""
+            } else {
+                "preserve_unverified_report_export"
+            },
+        ));
+    }
+
+    let housekeeping_reports = collect_child_dirs(&report_root.join("pre_run_housekeeping"));
+    let delete_count = housekeeping_reports
+        .len()
+        .saturating_sub(policy.keep_latest_reports);
+    for path in housekeeping_reports.into_iter().take(delete_count) {
+        rows.push(housekeeping_candidate(
+            "old_housekeeping_report",
+            &path,
+            ancestor_has_verified_r2_upload(&path, &report_root),
+            "old_housekeeping_report_beyond_keep_cap",
+            true,
+            "",
+        ));
+    }
+
+    let stale_open_files = collect_matching_files(&workspace_root.join("data"), |path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".open"))
+            .unwrap_or(false)
+    });
+    for path in stale_open_files {
+        rows.push(housekeeping_candidate(
+            "open_file",
+            &path,
+            false,
+            "open_files_are_never_deleted_by_default",
+            false,
+            "preserve_current_or_unproven_open_file",
+        ));
+    }
+
+    rows.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["path"].as_str().unwrap_or(""))
+    });
+    Ok(rows)
+}
+
+fn housekeeping_candidate(
+    candidate_type: &str,
+    path: &Path,
+    eligible: bool,
+    reason: &str,
+    r2_verified_required: bool,
+    preserve_reason: &str,
+) -> serde_json::Value {
+    json!({
+        "candidate_type": candidate_type,
+        "path": path.display().to_string(),
+        "size_bytes": path_size_bytes(path),
+        "eligible": eligible,
+        "reason": reason,
+        "r2_verified_required": r2_verified_required,
+        "preserve_reason": preserve_reason,
+    })
+}
+
+fn collect_child_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+fn ancestor_has_verified_r2_upload(path: &Path, stop_at: &Path) -> bool {
+    let mut cursor = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+    loop {
+        for name in ["r2_upload_result.json", "stable_manifest_upload.json"] {
+            let candidate = cursor.join(name);
+            if let Ok(raw) = fs::read_to_string(&candidate) {
+                if serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("verified")
+                            .and_then(|v| v.as_bool())
+                            .or_else(|| value.get("r2_upload_verified").and_then(|v| v.as_bool()))
+                    })
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+        if cursor == stop_at || !cursor.pop() {
+            break;
+        }
+    }
+    false
+}
+
+fn remove_path_safely(workspace_root: &Path, path: &Path) -> Result<()> {
+    let allowed_roots = [
+        workspace_root.join("target"),
+        workspace_root.join("data"),
+        PathBuf::from("/dev/shm"),
+    ];
+    if !allowed_roots.iter().any(|root| path.starts_with(root)) {
+        bail!(
+            "refusing to delete outside allowed cleanup roots: {}",
+            path.display()
+        );
+    }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".open"))
+        .unwrap_or(false)
+    {
+        bail!("refusing to delete .open file: {}", path.display());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn housekeeping_gate_failures(
+    policy: &VpsHousekeepingPolicy,
+    after: &DiskPreflightSummary,
+    disk_preflight_passed: bool,
+    edge_only_footprint_passed: bool,
+    stream_only_passed: bool,
+    edge_mode_passed: bool,
+    provider_updates_flowing: bool,
+    r2_write_verify_passed: bool,
+    active_overlap_detected: bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if active_overlap_detected {
+        failures.push("active_overlap_detected".to_owned());
+    }
+    if after.free_mb < policy.absolute_block_free_mb {
+        failures.push(format!(
+            "free_mb_below_absolute_block:{}<{}",
+            after.free_mb, policy.absolute_block_free_mb
+        ));
+    }
+    if !disk_preflight_passed {
+        failures.push(format!(
+            "disk_preflight_failed:free_mb={} minimum_start_free_mb={}",
+            after.free_mb, policy.minimum_start_free_mb
+        ));
+    }
+    if !edge_only_footprint_passed {
+        failures.push("edge_only_footprint_failed".to_owned());
+    }
+    if !stream_only_passed {
+        failures.push("stream_only_validation_failed".to_owned());
+    }
+    if !edge_mode_passed {
+        failures.push("edge_mode_validation_failed".to_owned());
+    }
+    if !provider_updates_flowing {
+        failures.push("provider_updates_not_flowing".to_owned());
+    }
+    if !r2_write_verify_passed {
+        failures.push("r2_write_verify_failed".to_owned());
+    }
+    failures
+}
+
+async fn upload_housekeeping_manifest(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    verify: bool,
+) -> Result<serde_json::Value> {
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let local = output_dir.join("manifest.json");
+    let key = client.managed_key(
+        &research_remote_base_prefix(&client),
+        "vps_pre_run_housekeeping/manifest.json",
+    );
+    let prepared = client.prepare_upload(
+        &local,
+        bucket,
+        key.clone(),
+        "application/json",
+        BTreeMap::new(),
+        Some(false),
+    )?;
+    let result = client
+        .upload_prepared(&prepared, verify.then_some(true))
+        .await?;
+    Ok(json!({
+        "schema_version": "phase107d.stable_manifest_upload.v1",
+        "key": key,
+        "uploaded": result.uploaded,
+        "verified": verify && result.verified,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    }))
 }
 
 fn validate_vps_edge_only_footprint_command(
@@ -48287,6 +49041,89 @@ mod tests {
                 .map(|name| name.starts_with("cli.prev."))
                 .unwrap_or(false)
         }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_gate_blocks_below_threshold() {
+        let policy = VpsHousekeepingPolicy::default();
+        let preflight = DiskPreflightSummary {
+            free_mb: policy.absolute_block_free_mb - 1,
+            critical: true,
+            ..DiskPreflightSummary::default()
+        };
+        let failures = housekeeping_gate_failures(
+            &policy, &preflight, false, true, true, true, true, true, false,
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("free_mb_below_absolute_block"))
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("disk_preflight_failed"))
+        );
+    }
+
+    #[test]
+    fn housekeeping_gate_blocks_footprint_failure() {
+        let policy = VpsHousekeepingPolicy::default();
+        let preflight = DiskPreflightSummary {
+            free_mb: policy.minimum_start_free_mb,
+            ..DiskPreflightSummary::default()
+        };
+        let failures = housekeeping_gate_failures(
+            &policy, &preflight, true, false, true, true, true, true, false,
+        );
+        assert_eq!(failures, vec!["edge_only_footprint_failed"]);
+    }
+
+    #[test]
+    fn housekeeping_preserves_unverified_csv_export() {
+        let dir = temp_test_dir("housekeeping_unverified_csv");
+        let report_root = dir.join("data").join("reports");
+        let run_dir = report_root.join("run-a");
+        fs::create_dir_all(&run_dir).unwrap();
+        let csv = run_dir.join("pre_entry_risk_features.csv");
+        fs::write(&csv, "a,b\n1,2\n").unwrap();
+
+        assert!(!ancestor_has_verified_r2_upload(&csv, &report_root));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_allows_verified_csv_export() {
+        let dir = temp_test_dir("housekeeping_verified_csv");
+        let report_root = dir.join("data").join("reports");
+        let run_dir = report_root.join("run-a");
+        fs::create_dir_all(&run_dir).unwrap();
+        let csv = run_dir.join("pre_entry_risk_features.csv");
+        fs::write(&csv, "a,b\n1,2\n").unwrap();
+        fs::write(
+            run_dir.join("r2_upload_result.json"),
+            r#"{"verified":true}"#,
+        )
+        .unwrap();
+
+        assert!(ancestor_has_verified_r2_upload(&csv, &report_root));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_remove_path_refuses_open_files() {
+        let dir = temp_test_dir("housekeeping_open_file");
+        let open = dir
+            .join("data")
+            .join("reports")
+            .join("run-a")
+            .join("segment.jsonl.open");
+        fs::create_dir_all(open.parent().unwrap()).unwrap();
+        fs::write(&open, "open").unwrap();
+
+        assert!(remove_path_safely(&dir, &open).is_err());
+        assert!(open.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1,0 +1,10 @@
+[vps_artifact_retention]
+keep_candidate_dirs_full = true
+keep_compact_rejected_tombstones = true
+keep_latest_housekeeping_reports = 10
+keep_latest_verified_runs = 5
+compact_rejected_after_r2_verified = true
+delete_unverified_reports = false
+delete_active_spool = false
+delete_open_files = false
+rollback_binary_keep = 2

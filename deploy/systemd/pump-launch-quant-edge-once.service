@@ -8,6 +8,6 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/pump-launch-quant
 EnvironmentFile=/home/ubuntu/pump-launch-quant.env
+ExecStartPre=/home/ubuntu/pump-launch-quant/target/release/cli vps-pre-run-housekeeping --config /home/ubuntu/pump-launch-quant/config/default.toml --config-override /home/ubuntu/pump-launch-quant/config/local.toml --env-file /home/ubuntu/pump-launch-quant.env --run-class edge_timer --output-dir /home/ubuntu/pump-launch-quant/data/reports/pre_run_housekeeping/latest --verify-r2 --json
 ExecStart=/home/ubuntu/pump-launch-quant/target/release/cli run-autopilot --config /home/ubuntu/pump-launch-quant/config/default.toml --config-override /home/ubuntu/pump-launch-quant/config/local.toml --mode edge-collector --once --duration-seconds 300
 Nice=5
-
