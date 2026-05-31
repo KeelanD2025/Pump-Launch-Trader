@@ -37325,7 +37325,7 @@ async fn material_candidate_hunter_command(
         FreshLaunchCanaryLiveOptions {
             duration_seconds,
             max_launches: max_attempted_launches.max(1),
-            stop_when_max_launches_seen: true,
+            stop_when_max_launches_seen: false,
         },
     )
     .await?;
@@ -37349,6 +37349,11 @@ async fn material_candidate_hunter_command(
         )
     });
     creates.truncate(max_attempted_launches.max(1));
+    let collection_end_at = all_events
+        .iter()
+        .map(|event| event.meta.received_at_wall_time)
+        .max()
+        .unwrap_or_else(OffsetDateTime::now_utc);
 
     let risk_engine = DiagnosticRiskEngine::default();
     let mut attempt_rows = Vec::<serde_json::Value>::new();
@@ -37373,12 +37378,13 @@ async fn material_candidate_hunter_command(
             create,
             &scoped_events,
             duration_seconds,
+            collection_end_at,
         )?;
 
         let decision = phase107b_decide_token(
             &analysis.post_event_rows,
             &analysis.early_rule_rows,
-            duration_seconds,
+            analysis.observed_horizon_seconds,
         );
         if decision.provider_confirmed_bundle {
             provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
@@ -37709,6 +37715,7 @@ async fn material_candidate_hunter_command(
 
 #[derive(Debug, Clone)]
 struct Phase107bTokenAnalysis {
+    observed_horizon_seconds: u64,
     risk_timeline_rows: Vec<serde_json::Value>,
     pre_entry_rows: Vec<serde_json::Value>,
     post_event_rows: Vec<serde_json::Value>,
@@ -37775,6 +37782,7 @@ fn phase107b_analyze_token(
     create: &NormalizedEvent,
     scoped_events: &[NormalizedEvent],
     duration_seconds: u64,
+    collection_end_at: OffsetDateTime,
 ) -> Result<Phase107bTokenAnalysis> {
     let launch_at = create.meta.received_at_wall_time;
     let windows = [15u64, 30, 60, 120, 180, 300, 900, 1800];
@@ -37791,6 +37799,19 @@ fn phase107b_analyze_token(
     }
     let final_snapshot = final_state_engine.snapshot();
     let post_event_rows = build_post_event_risk_labels(run_id, mint, &final_snapshot)?;
+    let scoped_horizon_seconds = scoped_events
+        .iter()
+        .map(|event| {
+            (event.meta.received_at_wall_time - launch_at)
+                .whole_seconds()
+                .max(0) as u64
+        })
+        .max()
+        .unwrap_or(0);
+    let collection_horizon_seconds = (collection_end_at - launch_at).whole_seconds().max(0) as u64;
+    let observed_horizon_seconds = scoped_horizon_seconds
+        .max(collection_horizon_seconds)
+        .min(duration_seconds);
 
     for window in windows {
         if window > duration_seconds && duration_seconds < 300 {
@@ -37946,6 +37967,7 @@ fn phase107b_analyze_token(
         .into_iter()
         .collect::<Vec<_>>();
     Ok(Phase107bTokenAnalysis {
+        observed_horizon_seconds,
         risk_timeline_rows,
         pre_entry_rows,
         post_event_rows,
@@ -38122,6 +38144,20 @@ fn phase107b_decide_token(
             final_state: "early_rejected_unavailable_required_data".to_owned(),
             reason: "inconclusive_missing_required_data".to_owned(),
             tracked_until_seconds: duration_seconds.min(300),
+            early_warning_families,
+            rug_like_by_300: false,
+            survived_300: false,
+            survived_900: false,
+            survived_1800: false,
+            promoted: false,
+            provider_confirmed_bundle: false,
+        };
+    }
+    if duration_seconds < 300 {
+        return Phase107bDecision {
+            final_state: "terminal_inconclusive".to_owned(),
+            reason: "insufficient_observed_horizon_for_300s_promotion".to_owned(),
+            tracked_until_seconds: duration_seconds,
             early_warning_families,
             rug_like_by_300: false,
             survived_300: false,
@@ -49160,6 +49196,15 @@ mod tests {
         assert!(decision.survived_300);
         assert!(decision.survived_900);
         assert!(decision.survived_1800);
+    }
+
+    #[test]
+    fn phase107b_material_candidate_requires_observed_300s_horizon() {
+        let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
+        let decision = phase107b_decide_token(&labels, &[], 120);
+        assert_eq!(decision.final_state, "terminal_inconclusive");
+        assert!(!decision.promoted);
+        assert!(!decision.survived_300);
     }
 
     #[test]
