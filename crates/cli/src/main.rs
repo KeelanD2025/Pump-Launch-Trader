@@ -37433,13 +37433,6 @@ async fn material_candidate_hunter_command(
                 &decision,
                 &analysis,
             )?;
-            if candidates_1800.max(candidates_900).max(candidates_300)
-                >= target_material_candidates as u64
-            {
-                // The stream has already been collected for this bounded run; stop writing
-                // promoted candidates once the requested material sample is reached.
-                break;
-            }
         } else {
             rejected_inconclusive = rejected_inconclusive.saturating_add(1);
             phase107b_write_rejected_token(
@@ -37480,6 +37473,12 @@ async fn material_candidate_hunter_command(
             "promoted_to_candidate_dataset": decision.promoted,
             "tombstone_written": decision.final_state.starts_with("early_rejected") || !decision.promoted,
         }));
+
+        if candidates_1800.max(candidates_900).max(candidates_300)
+            >= target_material_candidates as u64
+        {
+            break;
+        }
     }
 
     write_json_rows_csv(
@@ -37653,6 +37652,37 @@ async fn material_candidate_hunter_command(
             &stable_manifest_upload,
             "# Phase 107B Stable Manifest Upload\n\n- key: `pump-launch-quant/research/material_candidate_hunter/manifest.json`\n- threshold_tuning_allowed: `false`\n".to_owned(),
         )?;
+        if r2_upload["verified"].as_bool().unwrap_or(false) {
+            for row in &mut attempt_rows {
+                if let Some(map) = row.as_object_mut() {
+                    map.insert("r2_verified".to_owned(), json!(true));
+                }
+            }
+            write_json_rows_csv(
+                &output_dir.join("attempt_ledger.csv"),
+                &[
+                    "attempt_index",
+                    "mint",
+                    "run_id",
+                    "launch_timestamp",
+                    "tracked_until_seconds",
+                    "final_state",
+                    "rejection_or_promotion_reason",
+                    "early_warning_families",
+                    "rug_like_outcome_by_300s",
+                    "survived_300s",
+                    "survived_900s",
+                    "survived_1800s",
+                    "holder_rpc_used",
+                    "rpc_mint_supply_canonical",
+                    "r2_verified",
+                    "local_artifact_size_bytes",
+                    "promoted_to_candidate_dataset",
+                    "tombstone_written",
+                ],
+                &attempt_rows,
+            )?;
+        }
         r2_upload = upload_phase_report_dir_to_r2(
             loaded,
             &output_dir,
