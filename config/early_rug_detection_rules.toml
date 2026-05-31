@@ -1,0 +1,68 @@
+schema_version = "phase106.early_rug_detection_rules.v1"
+threshold_tuning_allowed = false
+live_trading_allowed = false
+binary_malicious_labels_allowed = false
+
+[[rules]]
+id = "no_buy_followthrough_by_30s"
+pre_entry_safe = true
+earliest_window_seconds = 30
+required_fields = ["buy_count", "sell_count"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "no_buy_followthrough_by_60s"
+pre_entry_safe = true
+earliest_window_seconds = 60
+required_fields = ["buy_count", "sell_count"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "volume_evaporated_by_60s"
+pre_entry_safe = true
+earliest_window_seconds = 60
+required_fields = ["buy_count", "sell_count", "no_buy_gap_seconds"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "holder_collapse_by_60s"
+pre_entry_safe = true
+earliest_window_seconds = 60
+required_fields = ["holder_count", "holder_churn_rate"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "top_holder_or_dev_dump_before_180s"
+pre_entry_safe = true
+earliest_window_seconds = 180
+required_fields = ["dev_sold_pct", "top_holder_sold_pct"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "same_slot_bundle_like_plus_holder_concentration"
+pre_entry_safe = true
+earliest_window_seconds = 15
+required_fields = ["stream_bundle_like_score", "top_holder_pct_curve_economic_supply"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "common_funder_plus_bundle_like_signal"
+pre_entry_safe = false
+earliest_window_seconds = 60
+required_fields = ["funding_cluster_risk", "stream_bundle_like_score"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
+
+[[rules]]
+id = "liquidity_exit_proxy_before_300s"
+pre_entry_safe = true
+earliest_window_seconds = 300
+required_fields = ["drawdown_so_far", "sell_count"]
+unavailable_behavior = "unavailable_not_zero"
+diagnostic_weight = "diagnostic_only"
