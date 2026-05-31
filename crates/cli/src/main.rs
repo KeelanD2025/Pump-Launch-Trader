@@ -13786,7 +13786,7 @@ async fn vps_pre_run_housekeeping_command(
                             ),
                         }
                     }
-                    "var_log_journal_vacuum" => match run_journal_vacuum(policy.max_var_log_mb) {
+                    "var_log_journal_vacuum" => match run_var_log_cleanup(policy.max_var_log_mb) {
                         Ok(output) => ("journal_vacuumed", true, None, Some(output)),
                         Err(error) => (
                             "journal_vacuum_failed",
@@ -14448,6 +14448,75 @@ fn run_journal_vacuum(max_var_log_mb: u64) -> Result<String> {
         "journal vacuum failed for max_var_log_mb={max_var_log_mb}: {}",
         sanitize_error_string(&attempts.join(" | "))
     ))
+}
+
+fn run_var_log_cleanup(max_var_log_mb: u64) -> Result<String> {
+    let mut summaries = Vec::new();
+    match run_journal_vacuum(max_var_log_mb) {
+        Ok(summary) => summaries.push(format!("journal_vacuum={summary}")),
+        Err(error) => summaries.push(format!(
+            "journal_vacuum_error={}",
+            sanitize_error_string(&error.to_string())
+        )),
+    }
+
+    match run_logrotate_once() {
+        Ok(summary) => summaries.push(format!("logrotate={summary}")),
+        Err(error) => summaries.push(format!(
+            "logrotate_error={}",
+            sanitize_error_string(&error.to_string())
+        )),
+    }
+
+    let mut pruned_count = 0usize;
+    let mut pruned_bytes = 0u64;
+    let mut prune_errors = Vec::new();
+    for path in collect_matching_files(Path::new("/var/log"), is_rotated_var_log_file) {
+        let size = path_size_bytes(&path);
+        match remove_var_log_file_safely(&path) {
+            Ok(()) => {
+                pruned_count += 1;
+                pruned_bytes += size;
+            }
+            Err(error) => prune_errors.push(format!(
+                "{}:{}",
+                path.display(),
+                sanitize_error_string(&error.to_string())
+            )),
+        }
+    }
+    summaries.push(format!(
+        "rotated_pruned_count={pruned_count} rotated_pruned_bytes={pruned_bytes}"
+    ));
+    if !prune_errors.is_empty() {
+        summaries.push(format!(
+            "rotated_prune_errors={}",
+            sanitize_error_string(&prune_errors.join(" | "))
+        ));
+    }
+
+    Ok(sanitize_error_string(&summaries.join("; ")))
+}
+
+fn run_logrotate_once() -> Result<String> {
+    let output = ProcessCommand::new("sudo")
+        .arg("-n")
+        .arg("logrotate")
+        .arg("-f")
+        .arg("/etc/logrotate.conf")
+        .output()
+        .context("running sudo logrotate for /var/log cleanup")?;
+    if output.status.success() {
+        Ok(sanitize_error_string(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    } else {
+        Err(anyhow!(
+            "logrotate failed: status={:?} stderr={}",
+            output.status.code(),
+            sanitize_error_string(&String::from_utf8_lossy(&output.stderr))
+        ))
+    }
 }
 
 fn sanitize_error_string(value: &str) -> String {
