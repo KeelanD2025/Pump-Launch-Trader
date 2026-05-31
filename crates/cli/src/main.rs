@@ -13795,6 +13795,15 @@ async fn vps_pre_run_housekeeping_command(
                             Some(sanitize_error_string(&error.to_string())),
                         ),
                     },
+                    "rotated_var_log_file" => match remove_var_log_file_safely(&path) {
+                        Ok(()) => ("deleted_rotated_var_log", true, None, None),
+                        Err(error) => (
+                            "delete_rotated_var_log_failed",
+                            false,
+                            None,
+                            Some(sanitize_error_string(&error.to_string())),
+                        ),
+                    },
                     _ => match remove_path_safely(&workspace_root, &path) {
                         Ok(()) => ("deleted", true, None, None),
                         Err(error) => (
@@ -14146,6 +14155,16 @@ fn housekeeping_cleanup_candidates(
     let var_log = PathBuf::from("/var/log");
     let var_log_size = path_size_bytes(&var_log);
     if var_log_size > mb_to_bytes(policy.max_var_log_mb) {
+        for path in collect_matching_files(&var_log, is_rotated_var_log_file) {
+            rows.push(housekeeping_candidate(
+                "rotated_var_log_file",
+                &path,
+                true,
+                "old_rotated_var_log_beyond_cap",
+                false,
+                "",
+            ));
+        }
         rows.push(housekeeping_candidate(
             "var_log_journal_vacuum",
             &var_log,
@@ -14314,6 +14333,26 @@ fn remove_path_safely(workspace_root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_var_log_file_safely(path: &Path) -> Result<()> {
+    if !path.starts_with("/var/log") {
+        bail!(
+            "refusing to delete log outside /var/log: {}",
+            path.display()
+        );
+    }
+    if !path.is_file() {
+        bail!("refusing to delete non-file log path: {}", path.display());
+    }
+    if !is_rotated_var_log_file(path) {
+        bail!(
+            "refusing to delete current or unrecognized log file: {}",
+            path.display()
+        );
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 fn quarantine_stale_open_file(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
     if !path.starts_with(workspace_root.join("data")) {
         bail!(
@@ -14430,6 +14469,32 @@ fn is_feature_decision_fill_csv_export(path: &Path) -> bool {
         .to_ascii_lowercase();
     (lower.contains("feature") || lower.contains("decision") || lower.contains("fill"))
         && (lower.ends_with(".csv") || lower.ends_with(".csv.gz") || lower.ends_with(".csv.zst"))
+}
+
+fn is_rotated_var_log_file(path: &Path) -> bool {
+    if !path.starts_with("/var/log") {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.ends_with(".gz")
+        || name.ends_with(".old")
+        || name.ends_with(".journal~")
+        || name.ends_with(".1")
+        || name.ends_with(".2")
+        || name.ends_with(".3")
+        || name.ends_with(".4")
+        || name.ends_with(".5")
+        || name.ends_with(".6")
+        || name.ends_with(".7")
+        || name.ends_with(".8")
+        || name.ends_with(".9")
+    {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".log.") || lower.contains("-20")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49342,6 +49407,18 @@ mod tests {
         assert!(!sanitized.contains("abc123"));
         assert!(sanitized.contains(&format!("{}-{}=<redacted>", "api", "key")));
         assert!(sanitized.contains("token=<redacted>"));
+    }
+
+    #[test]
+    fn housekeeping_identifies_only_rotated_var_log_files() {
+        assert!(is_rotated_var_log_file(Path::new("/var/log/syslog.1")));
+        assert!(is_rotated_var_log_file(Path::new("/var/log/auth.log.2.gz")));
+        assert!(is_rotated_var_log_file(Path::new(
+            "/var/log/journal/archive/system.journal~"
+        )));
+        assert!(!is_rotated_var_log_file(Path::new("/var/log/syslog")));
+        assert!(!is_rotated_var_log_file(Path::new("/var/log/auth.log")));
+        assert!(!is_rotated_var_log_file(Path::new("/tmp/syslog.1")));
     }
 
     #[test]
