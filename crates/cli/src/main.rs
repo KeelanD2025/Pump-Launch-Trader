@@ -36352,6 +36352,7 @@ async fn launch_metric_canary_command(
             FreshLaunchCanaryLiveOptions {
                 duration_seconds,
                 max_launches: max_launches.max(1),
+                stop_when_max_launches_seen: false,
             },
         )
         .await?;
@@ -36945,6 +36946,7 @@ async fn live_risk_canary_command(
         FreshLaunchCanaryLiveOptions {
             duration_seconds,
             max_launches: 1,
+            stop_when_max_launches_seen: false,
         },
     )
     .await?;
@@ -37323,6 +37325,7 @@ async fn material_candidate_hunter_command(
         FreshLaunchCanaryLiveOptions {
             duration_seconds,
             max_launches: max_attempted_launches.max(1),
+            stop_when_max_launches_seen: true,
         },
     )
     .await?;

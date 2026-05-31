@@ -793,6 +793,7 @@ pub async fn smoke_geyser_provider(
 pub struct FreshLaunchCanaryLiveOptions {
     pub duration_seconds: u64,
     pub max_launches: usize,
+    pub stop_when_max_launches_seen: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -911,7 +912,8 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
                 }
                 if summary.tracked_mint.is_some()
                     && launches_seen >= options.max_launches.max(1)
-                    && tokio::time::Instant::now() >= deadline
+                    && (options.stop_when_max_launches_seen
+                        || tokio::time::Instant::now() >= deadline)
                 {
                     break;
                 }
