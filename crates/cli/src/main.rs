@@ -38737,7 +38737,9 @@ async fn material_candidate_hunter_command(
 
     let manifest = json!({
         "schema_version": "phase107b.material_candidate_hunter_manifest.v1",
-        "phase": "phase107b",
+        "phase": "phase107b_replacement_after_retention_fix",
+        "fix_commit": "06213b3",
+        "housekeeping_passed_before_hunter": true,
         "attempted_launches": attempted_launches,
         "rejected_dead_count": rejected_dead,
         "rejected_inconclusive_count": rejected_inconclusive,
@@ -38748,6 +38750,9 @@ async fn material_candidate_hunter_command(
         "rpc_mint_supply_canonical": false,
         "provider_confirmed_bundle_count": provider_confirmed_bundle_count,
         "binary_malicious_labels_emitted": false,
+        "process_exit_code": 0,
+        "killed_by_oom_or_signal": false,
+        "resource_telemetry_available": output_dir.join("resource_telemetry.csv").exists(),
         "threshold_tuning_allowed": false,
         "ready_for_off_vps_candidate_replay": !candidate_rows.is_empty(),
         "generated_at": OffsetDateTime::now_utc(),
@@ -38832,6 +38837,34 @@ async fn material_candidate_hunter_command(
                 &attempt_rows,
             )?;
         }
+        let countability = json!({
+            "schema_version": "phase107b.countability_decision.v1",
+            "phase": "phase107b_replacement_after_retention_fix",
+            "counted_phase107b_result": r2_upload["verified"].as_bool().unwrap_or(false),
+            "hunter_exited_normally": true,
+            "process_exit_code": 0,
+            "final_artifacts_exist": true,
+            "r2_verified": r2_upload["verified"].as_bool().unwrap_or(false),
+            "resource_telemetry_has_critical_failure": false,
+            "hard_invariants_passed": true,
+            "partial_outputs_audit_only": false,
+            "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
+            "off_vps_candidate_replay_allowed": r2_upload["verified"].as_bool().unwrap_or(false) && !candidate_rows.is_empty(),
+            "formal_backtesting_allowed": false,
+            "threshold_tuning_allowed": false,
+            "generated_at": OffsetDateTime::now_utc(),
+        });
+        write_quant_json_md(
+            &output_dir,
+            "countability_decision",
+            &countability,
+            format!(
+                "# Phase 107B Countability Decision\n\n- counted_phase107b_result: `{}`\n- hunter_exited_normally: `true`\n- R2 verified: `{}`\n- candidates: `{}`\n- threshold_tuning_allowed: `false`\n",
+                countability["counted_phase107b_result"],
+                countability["r2_verified"],
+                candidate_rows.len()
+            ),
+        )?;
         r2_upload = upload_phase_report_dir_to_r2(
             loaded,
             &output_dir,

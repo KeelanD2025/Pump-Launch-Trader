@@ -1048,6 +1048,10 @@ jobs:
             exit 1
           fi
 
+          TELEMETRY_CSV="${OUT_DIR}/resource_telemetry.csv"
+          printf 'timestamp,tracked_mints_count,attempted_launches_so_far,rejected_count_so_far,candidate_count_so_far,process_rss_mb,process_vsz_mb,local_artifact_bytes,active_state_objects,retained_transaction_fingerprint_count,retained_events_count,free_mb,any_oom_kernel_kill_evidence\n' > "${TELEMETRY_CSV}"
+
+          set +e
           "${BIN}" material-candidate-hunter \
             --config "${APP_DIR}/config/default.toml" \
             --config-override "${APP_DIR}/config/local.toml" \
@@ -1060,7 +1064,108 @@ jobs:
             --no-rpc \
             --upload-r2 \
             --verify-r2 \
-            --output-dir "${OUT_DIR}"
+            --output-dir "${OUT_DIR}" &
+          HUNTER_PID="$!"
+          while kill -0 "${HUNTER_PID}" >/dev/null 2>&1; do
+            TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            RSS_KB="$(ps -o rss= -p "${HUNTER_PID}" 2>/dev/null | awk '{print $1}')"
+            VSZ_KB="$(ps -o vsz= -p "${HUNTER_PID}" 2>/dev/null | awk '{print $1}')"
+            RSS_MB="$(awk -v kb="${RSS_KB:-0}" 'BEGIN { printf "%.2f", kb / 1024 }')"
+            VSZ_MB="$(awk -v kb="${VSZ_KB:-0}" 'BEGIN { printf "%.2f", kb / 1024 }')"
+            FREE_MB="$(df -Pm "${APP_DIR}" | awk 'NR==2 {print $4}')"
+            ART_BYTES="$(du -sb "${OUT_DIR}" 2>/dev/null | awk '{print $1}')"
+            ATTEMPTS="$(python3 - "${OUT_DIR}/attempt_ledger.csv" <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          print(max(0, sum(1 for _ in p.open()) - 1) if p.exists() else "")
+          PY
+          )"
+            REJECTED="$(python3 - "${OUT_DIR}/rejected_summary.csv" <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          print(max(0, sum(1 for _ in p.open()) - 1) if p.exists() else "")
+          PY
+          )"
+            CANDIDATES="$(python3 - "${OUT_DIR}/candidate_summary.csv" <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          print(max(0, sum(1 for _ in p.open()) - 1) if p.exists() else "")
+          PY
+          )"
+            OOM_EVIDENCE="$(dmesg -T 2>/dev/null | tail -n 80 | grep -Eic 'out of memory|oom-kill|Killed process' || true)"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+              "${TS}" "" "${ATTEMPTS}" "${REJECTED}" "${CANDIDATES}" "${RSS_MB}" "${VSZ_MB}" "${ART_BYTES:-0}" "" "" "" "${FREE_MB:-}" "${OOM_EVIDENCE}" >> "${TELEMETRY_CSV}"
+            sleep 30
+          done
+          wait "${HUNTER_PID}"
+          HUNTER_EXIT="$?"
+          set -e
+
+          python3 - "${OUT_DIR}" "${HUNTER_EXIT}" <<'PY'
+          import csv, json, sys
+          from pathlib import Path
+          out = Path(sys.argv[1])
+          exit_code = int(sys.argv[2])
+          csv_path = out / "resource_telemetry.csv"
+          rows = list(csv.DictReader(csv_path.open(encoding="utf-8"))) if csv_path.exists() else []
+          def floats(name):
+              vals = []
+              for row in rows:
+                  try:
+                      vals.append(float(row.get(name) or 0))
+                  except ValueError:
+                      pass
+              return vals
+          rss = floats("process_rss_mb")
+          vsz = floats("process_vsz_mb")
+          free = floats("free_mb")
+          oom = any((row.get("any_oom_kernel_kill_evidence") or "0") not in ("", "0") for row in rows)
+          summary = {
+              "schema_version": "phase107b.resource_telemetry.v1",
+              "sample_count": len(rows),
+              "process_exit_code": exit_code,
+              "killed_by_oom_or_signal": exit_code in (137, 143) or oom,
+              "max_process_rss_mb": max(rss) if rss else None,
+              "max_process_vsz_mb": max(vsz) if vsz else None,
+              "min_free_mb": min(free) if free else None,
+              "max_local_artifact_bytes": max([int(row.get("local_artifact_bytes") or 0) for row in rows], default=0),
+              "resource_ceiling_exceeded": exit_code in (137, 143) or oom,
+              "threshold_tuning_allowed": False,
+          }
+          (out / "resource_telemetry.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+          (out / "resource_telemetry.md").write_text(
+              "# Phase 107B Resource Telemetry\n\n"
+              f"- samples: `{summary['sample_count']}`\n"
+              f"- process_exit_code: `{summary['process_exit_code']}`\n"
+              f"- killed_by_oom_or_signal: `{summary['killed_by_oom_or_signal']}`\n"
+              f"- max RSS MB: `{summary['max_process_rss_mb']}`\n"
+              f"- min free MB: `{summary['min_free_mb']}`\n"
+              f"- resource_ceiling_exceeded: `{summary['resource_ceiling_exceeded']}`\n",
+              encoding="utf-8",
+          )
+          PY
+
+          if [[ "${HUNTER_EXIT}" -eq 0 ]]; then
+            HUNTER_RUN_ID="$(python3 - "${OUT_DIR}" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p = Path(sys.argv[1]) / "hunter_summary.json"
+          print(json.loads(p.read_text()).get("run_id", "unknown") if p.exists() else "unknown")
+          PY
+          )"
+            "${BIN}" upload-phase-report-dir-r2 \
+              --config "${APP_DIR}/config/default.toml" \
+              --config-override "${APP_DIR}/config/local.toml" \
+              --env-file "${ENV_FILE}" \
+              --phase-prefix phase107b_material_candidate_hunter \
+              --run-or-mint "${HUNTER_RUN_ID}" \
+              --local-output-dir "${OUT_DIR}" \
+              --verify
+          fi
+          exit "${HUNTER_EXIT}"
           EOF
 
       - name: Download Phase 107B material hunter reports from VPS
