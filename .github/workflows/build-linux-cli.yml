@@ -896,6 +896,57 @@ jobs:
             "${BIN}" validate-edge-mode "${VALIDATE_CONFIG[@]}" || true
           } > "${OUT_DIR}/workflow_preflight.md"
 
+          "${BIN}" disk-preflight "${VALIDATE_CONFIG[@]}" > "${OUT_DIR}/safety_disk_preflight.json" || true
+          "${BIN}" validate-vps-edge-only-footprint "${VALIDATE_CONFIG[@]}" > "${OUT_DIR}/safety_edge_footprint.json" || true
+          "${BIN}" validate-stream-only "${VALIDATE_CONFIG[@]}" > "${OUT_DIR}/safety_stream_only.json" || true
+          "${BIN}" validate-edge-mode "${VALIDATE_CONFIG[@]}" > "${OUT_DIR}/safety_edge_mode.json" || true
+
+          OUT_DIR="${OUT_DIR}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          out_dir = Path(os.environ["OUT_DIR"])
+          disk = json.loads((out_dir / "safety_disk_preflight.json").read_text(encoding="utf-8"))
+          footprint = json.loads((out_dir / "safety_edge_footprint.json").read_text(encoding="utf-8"))
+          stream_only = json.loads((out_dir / "safety_stream_only.json").read_text(encoding="utf-8"))
+          edge_mode = json.loads((out_dir / "safety_edge_mode.json").read_text(encoding="utf-8"))
+
+          disk_summary = disk.get("summary", {})
+          failures = []
+          if disk_summary.get("critical") or disk_summary.get("emergency") or disk_summary.get("pre_cycle_blocked"):
+              failures.append(
+                  "disk_preflight_failed:"
+                  f" free_mb={disk_summary.get('free_mb')}"
+                  f" pre_cycle_blocked={disk_summary.get('pre_cycle_blocked')}"
+              )
+          if footprint.get("passed") is not True:
+              failures.append("edge_only_footprint_failed")
+          if stream_only.get("passed") is not True:
+              failures.append("stream_only_validation_failed")
+          if edge_mode.get("passed") is not True:
+              failures.append("edge_mode_validation_failed")
+
+          result = {
+              "phase": "phase107b",
+              "safety_preflight_passed": not failures,
+              "failures": failures,
+              "disk_free_mb": disk_summary.get("free_mb"),
+              "disk_pre_cycle_blocked": disk_summary.get("pre_cycle_blocked"),
+              "edge_only_footprint_passed": footprint.get("passed"),
+              "stream_only_passed": stream_only.get("passed"),
+              "edge_mode_passed": edge_mode.get("passed"),
+          }
+          (out_dir / "safety_preflight_gate.json").write_text(
+              json.dumps(result, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          if failures:
+              print("::error::Phase 107B safety preflight failed: " + "; ".join(failures))
+              sys.exit(1)
+          PY
+
           if [[ -f "${LOCK_PATH}" ]]; then
             export LOCK_PATH
             python3 - <<'PY' > "${OUT_DIR}/workflow_preflight_lock.json"
