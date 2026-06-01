@@ -1307,14 +1307,27 @@ jobs:
             local reason="$1"
             local code="$2"
             trap - TERM INT HUP
+            finalize_interrupted "${reason}"
             if [[ -n "${HUNTER_PID:-}" ]] && kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
               kill -INT "${HUNTER_PID}" >/dev/null 2>&1 || true
+              for _ in $(seq 1 12); do
+                if ! kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 5
+              done
+              if kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
+                kill -TERM "${HUNTER_PID}" >/dev/null 2>&1 || true
+                sleep 5
+              fi
+              if kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
+                kill -KILL "${HUNTER_PID}" >/dev/null 2>&1 || true
+              fi
               wait "${HUNTER_PID}" >/dev/null 2>&1 || true
             fi
             if [[ -n "${HEARTBEAT_PID:-}" ]] && kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
               kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
             fi
-            finalize_interrupted "${reason}"
             exit "${code}"
           }
           trap 'handle_signal sigterm 143' TERM
@@ -1433,6 +1446,16 @@ jobs:
             fi
             sleep 5
           done
+          if sudo systemctl is-active --quiet "${UNIT}"; then
+            echo "::warning::Material hunter service still active after graceful SIGINT; escalating to SIGTERM"
+            sudo systemctl kill --kill-whom=all --signal=SIGTERM "${UNIT}" || true
+            sleep 10
+          fi
+          if sudo systemctl is-active --quiet "${UNIT}"; then
+            echo "::warning::Material hunter service still active after SIGTERM; escalating to SIGKILL"
+            sudo systemctl kill --kill-whom=all --signal=SIGKILL "${UNIT}" || true
+            sleep 5
+          fi
           sudo systemctl status "${UNIT}" --no-pager || true
           EOF
 
