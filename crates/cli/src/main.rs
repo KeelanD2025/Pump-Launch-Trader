@@ -38670,21 +38670,28 @@ async fn phase107f_upload_r2_checkpoint(
     let health_dir = output_dir.join("health");
     fs::create_dir_all(&health_dir)?;
     let now = OffsetDateTime::now_utc();
-    let result = upload_phase_report_dir_to_r2(
+    let upload_result = upload_phase_report_dir_to_r2(
         loaded,
         output_dir,
         "phase107b_material_candidate_hunter_checkpoint",
         run_id,
         verify_r2,
     )
-    .await?;
-    let verified = result["verified"].as_bool().unwrap_or(false);
+    .await;
+    let (verified, details, upload_error) = match upload_result {
+        Ok(result) => (
+            result["verified"].as_bool().unwrap_or(false),
+            result["failed_files"].to_string(),
+            None,
+        ),
+        Err(error) => (false, error.to_string(), Some(error.to_string())),
+    };
     let status_line = format!(
         "{},r2_checkpoint,{},{},{}\n",
         now,
         verified,
         csv_field(reason),
-        csv_field(result["failed_files"].to_string().as_str())
+        csv_field(&details)
     );
     let checkpoint_path = health_dir.join("checkpoint_status.csv");
     if !checkpoint_path.exists() {
@@ -38715,6 +38722,7 @@ async fn phase107f_upload_r2_checkpoint(
                 "run_id": run_id,
                 "blocker_class": "r2_checkpoint_failed",
                 "reason": reason,
+                "sanitized_error": upload_error,
                 "threshold_tuning_allowed": false,
                 "generated_at": now,
             }),
@@ -38861,6 +38869,37 @@ async fn material_candidate_hunter_command(
             phase107f_upload_r2_checkpoint(loaded, &output_dir, &run_id, verify_r2, "startup")
                 .await?;
         if !verified {
+            let interrupted_summary = json!({
+                "schema_version": "phase107f.hunter_summary_interrupted.v1",
+                "run_id": run_id,
+                "interruption_reason": "r2_checkpoint_failed_startup",
+                "last_attempt_index": 0,
+                "last_tracked_mint": "",
+                "attempted_launches": 0,
+                "rejected_count": 0,
+                "candidate_count": 0,
+                "partial_outputs_r2_verified": false,
+                "counted_phase107b_result": false,
+                "off_vps_candidate_replay_allowed": false,
+                "threshold_tuning_allowed": false,
+                "generated_at": OffsetDateTime::now_utc(),
+            });
+            write_quant_json_md(
+                &output_dir,
+                "hunter_summary_interrupted",
+                &interrupted_summary,
+                format!(
+                    "# Phase 107F Hunter Interrupted\n\n- run_id: `{run_id}`\n- interruption_reason: `r2_checkpoint_failed_startup`\n- counted_phase107b_result: `false`\n"
+                ),
+            )?;
+            write_quant_json_md(
+                &output_dir,
+                "countability_decision",
+                &interrupted_summary,
+                format!(
+                    "# Phase 107B Countability Decision\n\n- counted_phase107b_result: `false`\n- interruption_reason: `r2_checkpoint_failed_startup`\n- threshold_tuning_allowed: `false`\n"
+                ),
+            )?;
             bail!("material-candidate-hunter startup R2 checkpoint failed");
         }
     }
