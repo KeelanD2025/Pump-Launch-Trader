@@ -561,6 +561,7 @@ jobs:
             APP_DIR="${APP_DIR}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
+          cd "${APP_DIR}"
           BIN="${APP_DIR}/target/release/cli"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
@@ -1448,10 +1449,10 @@ jobs:
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
-	          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
-	          set -euo pipefail
-	          cd "${APP_DIR}"
-	          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          cd "${APP_DIR}"
+          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
           if [[ -z "${RUN_ID}" && -f "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" ]]; then
             RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
           fi
@@ -1476,10 +1477,10 @@ jobs:
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
-	          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
-	          set -euo pipefail
-	          cd "${APP_DIR}"
-	          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          cd "${APP_DIR}"
+          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
           if [[ -z "${RUN_ID}" && -f "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" ]]; then
             RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
           fi
