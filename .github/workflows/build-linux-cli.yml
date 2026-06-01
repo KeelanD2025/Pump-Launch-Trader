@@ -1257,6 +1257,7 @@ jobs:
           APP_DIR="${APP_DIR}"
           BIN="${APP_DIR}/target/release/cli"
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          cd "${APP_DIR}"
           RUN_ID="material-candidate-hunter-$(date +%s%N)"
           HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
           HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
