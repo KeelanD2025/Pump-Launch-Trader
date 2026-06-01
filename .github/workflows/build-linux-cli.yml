@@ -1283,10 +1283,45 @@ jobs:
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}"
           HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}"
           HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}"
+          mkdir -p "${OUT_DIR}"
+          exec >> "${OUT_DIR}/service.log" 2>&1
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) starting material hunter service wrapper for ${RUN_ID}"
           set -a
           source "${ENV_FILE}"
           set +a
           printf 'timestamp,process_rss_mb,process_vsz_mb,local_artifact_bytes,free_mb,any_oom_kernel_kill_evidence\n' > "${OUT_DIR}/resource_telemetry.csv"
+          write_service_exit_status() {
+            local status="$1"
+            local reason="$2"
+            local finalization_written="$3"
+            python3 - "${OUT_DIR}" "${RUN_ID}" "${status}" "${reason}" "${finalization_written}" <<'PY'
+          import json, sys
+          from pathlib import Path
+          from datetime import datetime, timezone
+          out=Path(sys.argv[1]); run_id=sys.argv[2]; status=int(sys.argv[3]); reason=sys.argv[4]
+          finalization_written=sys.argv[5].lower()=="true"
+          payload={
+            "schema_version":"phase107e.service_exit_status.v1",
+            "run_id":run_id,
+            "hunter_exit_status":status,
+            "service_exit_reason":reason,
+            "finalization_written_by_wrapper":finalization_written,
+            "countability_decision_exists":(out/"countability_decision.json").exists(),
+            "hunter_summary_exists":(out/"hunter_summary.json").exists(),
+            "hunter_summary_interrupted_exists":(out/"hunter_summary_interrupted.json").exists(),
+            "threshold_tuning_allowed":False,
+            "generated_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+          }
+          (out/"service_exit_status.json").write_text(json.dumps(payload,indent=2)+"\n")
+          (out/"service_exit_status.md").write_text(
+              "# Phase 107E Service Exit Status\n\n"
+              f"- run_id: `{run_id}`\n"
+              f"- hunter_exit_status: `{status}`\n"
+              f"- service_exit_reason: `{reason}`\n"
+              f"- finalization_written_by_wrapper: `{str(finalization_written).lower()}`\n"
+          )
+          PY
+          }
           finalize_interrupted() {
             local reason="$1"
             python3 - "${OUT_DIR}" "${RUN_ID}" "${reason}" <<'PY'
@@ -1311,6 +1346,15 @@ jobs:
           (out/"countability_decision.json").write_text(json.dumps(summary,indent=2)+"\n")
           PY
             "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107b_material_candidate_hunter --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify || true
+          }
+          ensure_finalization_or_write_interrupted() {
+            local reason="$1"
+            if [[ ! -f "${OUT_DIR}/countability_decision.json" && ! -f "${OUT_DIR}/hunter_summary_interrupted.json" && ! -f "${OUT_DIR}/hunter_summary.json" ]]; then
+              finalize_interrupted "${reason}"
+              return 0
+            fi
+            "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107b_material_candidate_hunter --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify || true
+            return 1
           }
           handle_signal() {
             local reason="$1"
@@ -1337,6 +1381,7 @@ jobs:
             if [[ -n "${HEARTBEAT_PID:-}" ]] && kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
               kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
             fi
+            write_service_exit_status "${code}" "${reason}" "true"
             exit "${code}"
           }
           trap 'handle_signal sigterm 143' TERM
@@ -1364,9 +1409,24 @@ jobs:
           HEARTBEAT_PID="$!"
           "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --run-id "${RUN_ID}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches "${HUNTER_MAX_ATTEMPTS}" --target-material-candidates "${HUNTER_TARGET_CANDIDATES}" --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
           HUNTER_PID="$!"
+          set +e
           wait "${HUNTER_PID}"
           STATUS="$?"
+          set -e
           kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+          if [[ "${STATUS}" -ne 0 ]]; then
+            if ensure_finalization_or_write_interrupted "hunter_exit_${STATUS}"; then
+              write_service_exit_status "${STATUS}" "hunter_nonzero_exit_missing_finalization" "true"
+            else
+              write_service_exit_status "${STATUS}" "hunter_nonzero_exit_existing_finalization" "false"
+            fi
+            exit "${STATUS}"
+          fi
+          if ensure_finalization_or_write_interrupted "hunter_exit_zero_missing_final_artifacts"; then
+            write_service_exit_status "1" "hunter_exit_zero_missing_final_artifacts" "true"
+            exit 1
+          fi
+          write_service_exit_status "${STATUS}" "hunter_exit_with_final_artifacts" "false"
           exit "${STATUS}"
           EOS
           chmod +x "${OUT_DIR}/hunter_service_wrapper.sh"
