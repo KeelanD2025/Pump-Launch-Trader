@@ -930,6 +930,13 @@ jobs:
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          # GitHub-hosted jobs are capped near 6h. Keep the synchronous SSH
+          # hunter comfortably below that ceiling so final artifacts can be
+          # uploaded instead of losing countability to workflow cancellation.
+          if [[ "${HUNTER_DURATION_SECONDS}" -gt 19800 ]]; then
+            echo "::warning::Clamping material hunter duration from ${HUNTER_DURATION_SECONDS}s to 19800s for GitHub job timeout budget"
+            HUNTER_DURATION_SECONDS=19800
+          fi
 
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=1200 \
             -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
