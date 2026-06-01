@@ -40654,7 +40654,16 @@ fn material_hunter_watchdog_command(
     let mut blockers = Vec::<String>::new();
 
     let heartbeat = if heartbeat_path.exists() {
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(&heartbeat_path)?)?;
+        let value: serde_json::Value = match fs::read(&heartbeat_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(value) => value,
+            None => {
+                blockers.push("heartbeat_unreadable".to_owned());
+                json!({})
+            }
+        };
         if value["run_id"].as_str() != Some(run_id) {
             blockers.push("run_id_mismatch".to_owned());
         }
