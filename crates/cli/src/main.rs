@@ -40852,7 +40852,17 @@ fn material_hunter_watchdog_command(
         );
     }
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&status_value)?);
+        match serde_json::to_string_pretty(&status_value) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => {
+                eprintln!("warning: failed to render watchdog JSON: {error}");
+                let run_id_json = serde_json::to_string(run_id)
+                    .unwrap_or_else(|_| "\"<unrenderable>\"".to_owned());
+                println!(
+                    "{{\"schema_version\":\"phase107f.material_hunter_watchdog.v1\",\"run_id\":{run_id_json},\"ok\":false,\"blockers\":[\"watchdog_json_render_failed\"],\"threshold_tuning_allowed\":false}}"
+                );
+            }
+        }
     } else {
         println!(
             "material-hunter-watchdog run_id={} ok={} blockers={}",

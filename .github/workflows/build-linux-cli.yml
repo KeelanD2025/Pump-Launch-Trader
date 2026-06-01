@@ -1408,7 +1408,7 @@ jobs:
             echo "::error::Material hunter failed startup sentinel: missing health heartbeat or attempt ledger"
             exit 1
           fi
-          "${BIN}" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --fail-fast-check --json
+          sudo -E "${BIN}" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --fail-fast-check --json
           for _ in $(seq 1 300); do
             if [[ -f "${OUT_DIR}/health/last_checkpoint.json" ]] && python3 - "${OUT_DIR}/health/last_checkpoint.json" <<'PY'
           import json, sys
@@ -1459,7 +1459,7 @@ jobs:
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
           OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
           sudo systemctl status "${UNIT}" --no-pager || true
-          "${APP_DIR}/target/release/cli" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --status --json || true
+          sudo -E "${APP_DIR}/target/release/cli" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --status --json || true
           cat "${OUT_DIR}/progress_heartbeat.json" 2>/dev/null || true
           cat "${OUT_DIR}/health/heartbeat.json" 2>/dev/null || true
           EOF
@@ -1512,7 +1512,7 @@ jobs:
             echo "::error::Material hunter finalization missing countability_decision.json and hunter_summary_interrupted.json"
             exit 1
           fi
-          "${APP_DIR}/target/release/cli" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --status --json || true
+          sudo -E "${APP_DIR}/target/release/cli" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --status --json || true
           sudo systemctl status "${UNIT}" --no-pager || true
           EOF
 
