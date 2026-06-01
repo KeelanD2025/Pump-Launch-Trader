@@ -1407,7 +1407,30 @@ jobs:
             exit 1
           fi
           "${BIN}" material-hunter-watchdog --run-id "${RUN_ID}" --output-dir "${APP_DIR}/data/reports/phase107b_material_candidate_hunter" --fail-fast-check --json
-          "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107e_hunter_orchestration --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify
+          for _ in $(seq 1 300); do
+            if [[ -f "${OUT_DIR}/health/last_checkpoint.json" ]] && python3 - "${OUT_DIR}/health/last_checkpoint.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          raise SystemExit(0 if data.get("r2_checkpoint_verified") is True else 1)
+          PY
+            then
+              break
+            fi
+            sleep 1
+          done
+          if [[ ! -f "${OUT_DIR}/health/last_checkpoint.json" ]]; then
+            echo "::error::Material hunter startup R2 checkpoint did not appear within 300s"
+            exit 1
+          fi
+          python3 - "${OUT_DIR}/health/last_checkpoint.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if data.get("r2_checkpoint_verified") is not True:
+              print("::error::Material hunter startup R2 checkpoint was not verified")
+              raise SystemExit(1)
+          PY
           echo "${RUN_ID}"
           EOF
 
