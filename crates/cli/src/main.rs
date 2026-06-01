@@ -40779,21 +40779,29 @@ fn material_hunter_watchdog_command(
         "threshold_tuning_allowed": false,
         "generated_at": OffsetDateTime::now_utc(),
     });
-    let report_dir = PathBuf::from("research_output/phase107f_hunter_health_sentinels");
-    fs::create_dir_all(&report_dir)?;
-    write_quant_json_md(
-        &report_dir,
-        "watchdog_status",
-        &status_value,
-        format!(
-            "# Phase 107F Hunter Watchdog\n\n- run_id: `{run_id}`\n- ok: `{}`\n- blockers: `{}`\n",
-            status_value["ok"],
-            status_value["blockers"]
-                .as_array()
-                .map(|items| items.len())
-                .unwrap_or(0)
-        ),
-    )?;
+    let watchdog_markdown = format!(
+        "# Phase 107F Hunter Watchdog\n\n- run_id: `{run_id}`\n- ok: `{}`\n- blockers: `{}`\n",
+        status_value["ok"],
+        status_value["blockers"]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or(0)
+    );
+    let local_report_dir = PathBuf::from("research_output/phase107f_hunter_health_sentinels");
+    let health_report_dir = run_dir.join("health");
+    for report_dir in [&local_report_dir, &health_report_dir] {
+        if let Err(error) = write_quant_json_md(
+            report_dir,
+            "watchdog_status",
+            &status_value,
+            watchdog_markdown.clone(),
+        ) {
+            eprintln!(
+                "warning: failed to write watchdog status report at {}: {error}",
+                report_dir.display()
+            );
+        }
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&status_value)?);
     } else {
