@@ -208,7 +208,7 @@ jobs:
 
   deploy-to-vps:
     name: Deploy prebuilt CLI to VPS
-    if: ${{ github.event.inputs.deploy_to_vps == 'true' }}
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' }}
     needs: build-linux-cli
     runs-on: ubuntu-22.04
 
@@ -223,6 +223,7 @@ jobs:
           path: dist
 
       - name: Verify artifact checksum
+        if: ${{ github.event.inputs.deploy_to_vps == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -248,6 +249,7 @@ jobs:
           ssh-keyscan -p "${PORT}" -H "${VPS_HOST}" >> ~/.ssh/known_hosts
 
       - name: Stage CLI artifact on VPS
+        if: ${{ github.event.inputs.deploy_to_vps == 'true' }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -264,6 +266,7 @@ jobs:
           scp -P "${PORT}" deploy/systemd/pump-launch-quant-edge-once.service "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/pump-launch-quant-edge-once.service.new"
 
       - name: Install and validate prebuilt CLI on VPS
+        if: ${{ github.event.inputs.deploy_to_vps == 'true' }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
