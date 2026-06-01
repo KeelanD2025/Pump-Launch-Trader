@@ -93,6 +93,16 @@ on:
         required: false
         default: "28800"
         type: string
+      material_hunter_max_attempted_launches:
+        description: Material hunter max attempted launches
+        required: false
+        default: "50"
+        type: string
+      material_hunter_target_candidates:
+        description: Material hunter target material candidates
+        required: false
+        default: "5"
+        type: string
 
 permissions:
   contents: read
@@ -955,12 +965,16 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
           HUNTER_DURATION_SECONDS: ${{ github.event.inputs.material_hunter_duration_seconds }}
+          HUNTER_MAX_ATTEMPTS: ${{ github.event.inputs.material_hunter_max_attempted_launches }}
+          HUNTER_TARGET_CANDIDATES: ${{ github.event.inputs.material_hunter_target_candidates }}
           RUN_MATERIAL_HUNTER_SLICE: ${{ github.event.inputs.run_material_candidate_hunter_slice }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
           if [[ "${RUN_MATERIAL_HUNTER_SLICE:-false}" == "true" && "${HUNTER_DURATION_SECONDS}" -gt 5400 ]]; then
             echo "::warning::Clamping material hunter slice duration from ${HUNTER_DURATION_SECONDS}s to 5400s"
             HUNTER_DURATION_SECONDS=5400
@@ -975,10 +989,12 @@ jobs:
 
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=1200 \
             -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
-            APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" 'bash -se' <<'EOF'
+            APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}" HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
           BIN="${APP_DIR}/target/release/cli"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
@@ -1099,8 +1115,8 @@ jobs:
             --config-override "${APP_DIR}/config/local.toml" \
             --env-file "${ENV_FILE}" \
             --duration-seconds "${HUNTER_DURATION_SECONDS}" \
-            --max-attempted-launches 50 \
-            --target-material-candidates 5 \
+            --max-attempted-launches "${HUNTER_MAX_ATTEMPTS}" \
+            --target-material-candidates "${HUNTER_TARGET_CANDIDATES}" \
             --max-concurrent-tracked-mints 3 \
             --no-live-trading \
             --no-rpc \
@@ -1219,6 +1235,8 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
           HUNTER_DURATION_SECONDS: ${{ github.event.inputs.material_hunter_duration_seconds }}
+          HUNTER_MAX_ATTEMPTS: ${{ github.event.inputs.material_hunter_max_attempted_launches }}
+          HUNTER_TARGET_CANDIDATES: ${{ github.event.inputs.material_hunter_target_candidates }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
@@ -1226,12 +1244,14 @@ jobs:
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
             -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
-            APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" 'bash -se' <<'EOF'
+            APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}" HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
           BIN="${APP_DIR}/target/release/cli"
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
           RUN_ID="material-candidate-hunter-$(date +%s%N)"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
           OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
           LATEST_FILE="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id"
@@ -1252,6 +1272,8 @@ jobs:
           OUT_DIR="${OUT_DIR}"
           RUN_ID="${RUN_ID}"
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}"
           set -a
           source "${ENV_FILE}"
           set +a
@@ -1304,7 +1326,7 @@ jobs:
           }
           heartbeat_loop &
           HEARTBEAT_PID="$!"
-          "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches 50 --target-material-candidates 5 --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
+          "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches "${HUNTER_MAX_ATTEMPTS}" --target-material-candidates "${HUNTER_TARGET_CANDIDATES}" --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
           HUNTER_PID="$!"
           wait "${HUNTER_PID}"
           STATUS="$?"
@@ -1324,7 +1346,20 @@ jobs:
           - output_dir: \`${OUT_DIR}\`
           EOS
 
-          systemd-run --unit="${UNIT}" --property=WorkingDirectory="${APP_DIR}" --property=KillSignal=SIGINT --property=TimeoutStopSec=120 --property=Restart=no "${OUT_DIR}/hunter_service_wrapper.sh"
+          systemd-run --unit="${UNIT}" \
+            --property=WorkingDirectory="${APP_DIR}" \
+            --property=KillSignal=SIGINT \
+            --property=TimeoutStopSec=120 \
+            --property=Restart=no \
+            --setenv=APP_DIR="${APP_DIR}" \
+            --setenv=BIN="${BIN}" \
+            --setenv=ENV_FILE="${ENV_FILE}" \
+            --setenv=OUT_DIR="${OUT_DIR}" \
+            --setenv=RUN_ID="${RUN_ID}" \
+            --setenv=HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" \
+            --setenv=HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}" \
+            --setenv=HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" \
+            "${OUT_DIR}/hunter_service_wrapper.sh"
           sleep 3
           systemctl is-active "${UNIT}"
           "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107e_hunter_orchestration --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify
