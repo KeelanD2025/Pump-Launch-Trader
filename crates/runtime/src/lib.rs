@@ -54,8 +54,10 @@ pub use fixtures::{
 pub use live_source::{
     DeshredCapability, DeshredProviderSmokeOptions, DeshredProviderSmokeSummary,
     FreshLaunchCanaryLiveOptions, FreshLaunchCanaryLiveSummary, GeyserProviderSmokeOptions,
-    GeyserProviderSmokeSummary, collect_fresh_launch_canary_events, inspect_deshred_capability,
-    smoke_deshred_provider, smoke_geyser_provider,
+    GeyserProviderSmokeSummary, MaterialHunterStreamAction, MaterialHunterStreamOptions,
+    MaterialHunterStreamSummary, collect_fresh_launch_canary_events, inspect_deshred_capability,
+    run_material_hunter_stream, run_material_hunter_stream_with_progress, smoke_deshred_provider,
+    smoke_geyser_provider,
 };
 use live_source::{
     DeshredStreamConnector, GeyserEventNormalizer, GeyserStreamConnector, RealDeshredConnector,

@@ -814,11 +814,36 @@ pub struct FreshLaunchCanaryLiveSummary {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MaterialHunterStreamOptions {
+    pub duration_seconds: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MaterialHunterStreamSummary {
+    pub provider_status: String,
+    pub connected: bool,
+    pub duration_seconds: u64,
+    pub transaction_updates: u64,
+    pub account_updates: u64,
+    pub slot_updates: u64,
+    pub normalized_events: u64,
+    pub pump_create_decoded: u64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialHunterStreamAction {
+    Continue,
+    Stop,
+}
+
 fn should_retain_fresh_launch_event(
     event: &NormalizedEvent,
     retain_only_tracked_mints: bool,
     tracked_mints: &HashSet<String>,
     tracked_launch_slots: &HashSet<u64>,
+    tracked_related_signatures: &HashSet<String>,
 ) -> bool {
     if !retain_only_tracked_mints {
         return true;
@@ -827,12 +852,197 @@ fn should_retain_fresh_launch_event(
         EventPayload::TokenCreated(payload) => {
             payload.status != TransactionStatus::Failed && tracked_mints.contains(&payload.mint.0)
         }
-        EventPayload::ObservedTransaction(_) => tracked_launch_slots.contains(&event.meta.slot),
+        EventPayload::ObservedTransaction(payload) => {
+            tracked_launch_slots.contains(&event.meta.slot)
+                || payload
+                    .signature_hint
+                    .as_ref()
+                    .map(|signature| tracked_related_signatures.contains(signature))
+                    .unwrap_or(false)
+                || (payload
+                    .program_ids
+                    .iter()
+                    .any(|program| program == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+                    && tracked_launch_slots.iter().any(|launch_slot| {
+                        event.meta.slot >= *launch_slot
+                            && event.meta.slot <= launch_slot.saturating_add(64)
+                    }))
+        }
         _ => event
             .mint()
             .map(|mint| tracked_mints.contains(&mint.0))
             .unwrap_or(false),
     }
+}
+
+pub async fn run_material_hunter_stream<F>(
+    loaded: &LoadedConfig,
+    options: MaterialHunterStreamOptions,
+    on_event: F,
+) -> Result<MaterialHunterStreamSummary>
+where
+    F: FnMut(NormalizedEvent, &MaterialHunterStreamSummary) -> Result<MaterialHunterStreamAction>,
+{
+    run_material_hunter_stream_with_progress(loaded, options, on_event, |_summary| {
+        Ok(MaterialHunterStreamAction::Continue)
+    })
+    .await
+}
+
+pub async fn run_material_hunter_stream_with_progress<F, P>(
+    loaded: &LoadedConfig,
+    options: MaterialHunterStreamOptions,
+    on_event: F,
+    on_progress: P,
+) -> Result<MaterialHunterStreamSummary>
+where
+    F: FnMut(NormalizedEvent, &MaterialHunterStreamSummary) -> Result<MaterialHunterStreamAction>,
+    P: FnMut(&MaterialHunterStreamSummary) -> Result<MaterialHunterStreamAction>,
+{
+    run_material_hunter_stream_with_connector(
+        loaded,
+        options,
+        Arc::new(RealGeyserConnector),
+        on_event,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn run_material_hunter_stream_with_connector<F, P>(
+    loaded: &LoadedConfig,
+    options: MaterialHunterStreamOptions,
+    connector: Arc<dyn GeyserStreamConnector>,
+    mut on_event: F,
+    mut on_progress: P,
+) -> Result<MaterialHunterStreamSummary>
+where
+    F: FnMut(NormalizedEvent, &MaterialHunterStreamSummary) -> Result<MaterialHunterStreamAction>,
+    P: FnMut(&MaterialHunterStreamSummary) -> Result<MaterialHunterStreamAction>,
+{
+    let config = loaded.config.geyser.clone();
+    let mut summary = MaterialHunterStreamSummary {
+        provider_status: "not_attempted".to_owned(),
+        duration_seconds: options.duration_seconds.max(1),
+        ..MaterialHunterStreamSummary::default()
+    };
+    if !geyser_endpoint_configured(&config) {
+        summary.provider_status = "not_attempted_missing_endpoint".to_owned();
+        summary
+            .errors
+            .push("geyser endpoint is not configured".to_owned());
+        return Err(anyhow!("geyser endpoint is not configured"));
+    }
+
+    let mut normalizer = GeyserEventNormalizer::from_loaded(loaded)?;
+    let mut ingest = GeyserIngestService::new(config.clone());
+    let request = ingest.proto_subscription_request();
+    let mut stream = match connector.connect_and_subscribe(&config, request).await {
+        Ok(stream) => {
+            summary.provider_status = "connected".to_owned();
+            summary.connected = true;
+            stream
+        }
+        Err(error) => {
+            if let Some(status) = error.downcast_ref::<Status>() {
+                summary.provider_status = match status.code() {
+                    tonic::Code::Unimplemented => "unsupported".to_owned(),
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                        "auth_rejected".to_owned()
+                    }
+                    _ => "connection_failed".to_owned(),
+                };
+                summary.errors.push(status.to_string());
+            } else {
+                summary.provider_status = "connection_failed".to_owned();
+                summary.errors.push(error.to_string());
+            }
+            return Err(anyhow!(summary.errors.join("; ")));
+        }
+    };
+
+    let deadline =
+        tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
+    let mut last_progress_tick = tokio::time::Instant::now();
+    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+        summary.provider_status = "stopped_by_hunter".to_owned();
+        return Ok(summary);
+    }
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let poll_window = remaining.min(StdDuration::from_millis(250));
+        if poll_window.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(poll_window, stream.next()).await {
+            Ok(Some(Ok(update))) => {
+                match update.update_oneof.as_ref() {
+                    Some(UpdateOneof::Transaction(_)) | Some(UpdateOneof::TransactionStatus(_)) => {
+                        summary.transaction_updates = summary.transaction_updates.saturating_add(1);
+                    }
+                    Some(UpdateOneof::Account(_)) => {
+                        summary.account_updates = summary.account_updates.saturating_add(1);
+                    }
+                    Some(UpdateOneof::Slot(_)) => {
+                        summary.slot_updates = summary.slot_updates.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                    summary.provider_status = "stopped_by_hunter".to_owned();
+                    return Ok(summary);
+                }
+                last_progress_tick = tokio::time::Instant::now();
+                let outputs = ingest.process_subscribe_update(update, monotonic_now_ns());
+                let normalized = outputs
+                    .into_iter()
+                    .flat_map(|output| normalizer.normalize_output(output))
+                    .collect::<Vec<_>>();
+                for event in normalized {
+                    if matches!(&event.payload, EventPayload::TokenCreated(payload) if payload.status != TransactionStatus::Failed)
+                    {
+                        summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
+                    }
+                    summary.normalized_events = summary.normalized_events.saturating_add(1);
+                    if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
+                        summary.provider_status = "stopped_by_hunter".to_owned();
+                        return Ok(summary);
+                    }
+                }
+            }
+            Ok(Some(Err(status))) => {
+                summary.provider_status = match status.code() {
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                        "auth_rejected".to_owned()
+                    }
+                    tonic::Code::Unimplemented => "unsupported".to_owned(),
+                    _ => "stream_error".to_owned(),
+                };
+                summary.errors.push(status.to_string());
+                return Err(anyhow!(summary.errors.join("; ")));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if last_progress_tick.elapsed() >= StdDuration::from_secs(30) {
+                    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                        summary.provider_status = "stopped_by_hunter".to_owned();
+                        return Ok(summary);
+                    }
+                    last_progress_tick = tokio::time::Instant::now();
+                }
+                continue;
+            }
+        }
+    }
+    if summary.transaction_updates + summary.account_updates + summary.slot_updates == 0 {
+        summary.provider_status = "connected_zero_updates".to_owned();
+    } else if summary.pump_create_decoded == 0 {
+        summary.provider_status = "no_launch_detected".to_owned();
+    } else {
+        summary.provider_status = "completed".to_owned();
+    }
+    let _ = on_progress(&summary)?;
+    Ok(summary)
 }
 
 pub async fn collect_fresh_launch_canary_events(
@@ -899,6 +1109,7 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
     let mut launches_seen = 0usize;
     let mut tracked_mints = HashSet::<String>::new();
     let mut tracked_launch_slots = HashSet::<u64>::new();
+    let mut tracked_related_signatures = HashSet::<String>::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let poll_window = remaining.min(StdDuration::from_millis(250));
@@ -932,6 +1143,9 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
                             if tracked_mints.len() < options.max_launches.max(1) {
                                 tracked_mints.insert(payload.mint.0.clone());
                                 tracked_launch_slots.insert(event.meta.slot);
+                                if let Some(signature) = event.signature() {
+                                    tracked_related_signatures.insert(signature.to_owned());
+                                }
                             }
                             if summary.tracked_mint.is_none() {
                                 summary.tracked_mint = Some(payload.mint.to_string());
@@ -939,11 +1153,21 @@ pub async fn collect_fresh_launch_canary_events_with_connector(
                         }
                     }
                     summary.normalized_events = summary.normalized_events.saturating_add(1);
+                    if event
+                        .mint()
+                        .map(|mint| tracked_mints.contains(&mint.0))
+                        .unwrap_or(false)
+                    {
+                        if let Some(signature) = event.signature() {
+                            tracked_related_signatures.insert(signature.to_owned());
+                        }
+                    }
                     if should_retain_fresh_launch_event(
                         &event,
                         options.retain_only_tracked_mints,
                         &tracked_mints,
                         &tracked_launch_slots,
+                        &tracked_related_signatures,
                     ) {
                         summary.retained_events = summary.retained_events.saturating_add(1);
                         events.push(event);
@@ -2322,7 +2546,8 @@ mod tests {
             &unrelated,
             false,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &HashSet::new()
         ));
     }
 
@@ -2330,8 +2555,10 @@ mod tests {
     fn fresh_launch_retention_keeps_tracked_mints_and_launch_slot_only() {
         let tracked_mints = HashSet::from(["tracked-mint".to_owned()]);
         let tracked_launch_slots = HashSet::from([123_u64]);
+        let tracked_related_signatures = HashSet::from(["buy-sig".to_owned()]);
         let create = test_create_event("tracked-mint", 123, TransactionStatus::Success);
         let same_slot_observed = test_observed_transaction(123, "same-slot");
+        let early_buy_observed = test_observed_transaction(124, "buy-sig");
         let other_create = test_create_event("other-mint", 124, TransactionStatus::Success);
         let failed_create = test_create_event("tracked-mint", 123, TransactionStatus::Failed);
         let unrelated_observed = test_observed_transaction(124, "unrelated");
@@ -2340,31 +2567,43 @@ mod tests {
             &create,
             true,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &tracked_related_signatures
         ));
         assert!(should_retain_fresh_launch_event(
             &same_slot_observed,
             true,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &tracked_related_signatures
+        ));
+        assert!(should_retain_fresh_launch_event(
+            &early_buy_observed,
+            true,
+            &tracked_mints,
+            &tracked_launch_slots,
+            &tracked_related_signatures
         ));
         assert!(!should_retain_fresh_launch_event(
             &other_create,
             true,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &tracked_related_signatures
         ));
         assert!(!should_retain_fresh_launch_event(
             &failed_create,
             true,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &tracked_related_signatures
         ));
         assert!(!should_retain_fresh_launch_event(
             &unrelated_observed,
             true,
             &tracked_mints,
-            &tracked_launch_slots
+            &tracked_launch_slots,
+            &tracked_related_signatures
         ));
     }
 
@@ -3030,6 +3269,46 @@ mod tests {
         assert_eq!(summary.provider_status, "updates_received");
         assert!(summary.slot_updates > 0);
         assert!(summary.transaction_updates > 0);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_progress_callback_fires_on_raw_provider_updates() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch {
+                updates: vec![Ok(update_wrap(
+                    yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                        SubscribeUpdateSlot {
+                            slot: 77,
+                            parent: Some(76),
+                            status: SlotStatus::SlotProcessed as i32,
+                            dead_error: None,
+                        },
+                    ),
+                ))],
+            }])),
+        };
+        let progress_calls = Arc::new(std::sync::Mutex::new(0usize));
+        let progress_calls_for_cb = progress_calls.clone();
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            move |summary| {
+                assert!(summary.connected);
+                *progress_calls_for_cb.lock().expect("progress lock") += 1;
+                Ok(MaterialHunterStreamAction::Continue)
+            },
+        )
+        .await
+        .expect("material hunter summary");
+        assert_eq!(summary.provider_status, "no_launch_detected");
+        assert!(summary.slot_updates > 0);
+        assert!(*progress_calls.lock().expect("progress lock") >= 2);
     }
 
     #[tokio::test]

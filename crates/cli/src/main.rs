@@ -28,9 +28,10 @@ use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
-    LiveRunOptions, RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor,
-    build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
-    collect_fresh_launch_canary_events, load_fixture_spec, smoke_deshred_provider,
+    LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamSummary, RuntimeMode,
+    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
+    builtin_fixture_suite, builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events,
+    load_fixture_spec, run_material_hunter_stream_with_progress, smoke_deshred_provider,
     smoke_geyser_provider, write_report,
 };
 use rust_decimal::Decimal;
@@ -48,7 +49,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::str::FromStr;
-use std::time::Instant;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Instant, SystemTime};
 use storage::{
     ArtifactMetadata, ArtifactType, DatasetKind, RunKind, RunRole, StorageEngine, StorageLayout,
     StoredRecord,
@@ -1356,6 +1361,25 @@ enum Command {
             default_value = "research_output/phase107b_material_candidate_hunter"
         )]
         output_dir: String,
+    },
+    MaterialHunterWatchdog {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(
+            long,
+            default_value = "research_output/phase107b_material_candidate_hunter"
+        )]
+        output_dir: String,
+        #[arg(long)]
+        status: bool,
+        #[arg(long)]
+        fail_fast_check: bool,
+        #[arg(long, default_value_t = 0)]
+        wait_seconds: u64,
+        #[arg(long)]
+        json: bool,
     },
     RunQuantDiagnostics {
         #[arg(long)]
@@ -4655,6 +4679,23 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::MaterialHunterWatchdog {
+            run_id,
+            campaign_id,
+            output_dir,
+            status,
+            fail_fast_check,
+            wait_seconds,
+            json,
+        } => material_hunter_watchdog_command(
+            &run_id,
+            campaign_id.as_deref(),
+            &output_dir,
+            status,
+            fail_fast_check,
+            wait_seconds,
+            json,
+        ),
         Command::RunQuantDiagnostics {
             source_run_id,
             derived_run_id,
@@ -38409,6 +38450,296 @@ async fn live_risk_canary_command(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct Phase107fActiveMint {
+    mint: String,
+    create: NormalizedEvent,
+    events: Vec<NormalizedEvent>,
+    related_signatures: BTreeSet<String>,
+    attempt_index: usize,
+    finalized: bool,
+    candidate_300_written: bool,
+    candidate_900_written: bool,
+    candidate_1800_written: bool,
+}
+
+impl Phase107fActiveMint {
+    fn new(mint: String, create: NormalizedEvent, attempt_index: usize) -> Self {
+        let mut related_signatures = BTreeSet::new();
+        if let Some(signature) = event_signature_string(&create) {
+            related_signatures.insert(signature);
+        }
+        Self {
+            mint,
+            create: create.clone(),
+            events: vec![create],
+            related_signatures,
+            attempt_index,
+            finalized: false,
+            candidate_300_written: false,
+            candidate_900_written: false,
+            candidate_1800_written: false,
+        }
+    }
+
+    fn push_if_related(&mut self, event: &NormalizedEvent) {
+        if phase107f_event_related_to_active_mint(self, event) {
+            if let Some(signature) = event_signature_string(event) {
+                self.related_signatures.insert(signature);
+            }
+            self.events.push(event.clone());
+        }
+    }
+}
+
+fn phase107f_event_related_to_active_mint(
+    active: &Phase107fActiveMint,
+    event: &NormalizedEvent,
+) -> bool {
+    if event_mint_string(event).as_deref() == Some(active.mint.as_str()) {
+        return true;
+    }
+    match &event.payload {
+        EventPayload::ObservedTransaction(payload) => {
+            payload
+                .signature_hint
+                .as_ref()
+                .map(|signature| active.related_signatures.contains(signature))
+                .unwrap_or(false)
+                || event.meta.slot == active.create.meta.slot
+                || (payload
+                    .program_ids
+                    .iter()
+                    .any(|program| program == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+                    && event.meta.slot >= active.create.meta.slot
+                    && event.meta.slot <= active.create.meta.slot.saturating_add(64))
+        }
+        _ => false,
+    }
+}
+
+fn phase107f_write_health(
+    health_dir: &Path,
+    run_id: &str,
+    current_state: &str,
+    summary: &MaterialHunterStreamSummary,
+    attempted_launches: usize,
+    active_tracked_mints: usize,
+    rejected_count: usize,
+    candidate_count: usize,
+    safe_to_continue: bool,
+    blocker_reason: &str,
+) -> Result<()> {
+    fs::create_dir_all(health_dir)?;
+    let now = OffsetDateTime::now_utc();
+    let checkpoint_state_path = health_dir.join("last_checkpoint.json");
+    let checkpoint_state = fs::read(&checkpoint_state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let heartbeat = json!({
+        "schema_version": "phase107f.material_hunter_heartbeat.v1",
+        "run_id": run_id,
+        "campaign_id": run_id,
+        "slice_id": run_id,
+        "service_pid": std::process::id(),
+        "binary_commit": option_env!("GITHUB_SHA").unwrap_or("unknown"),
+        "started_at": "",
+        "last_update_at": now,
+        "current_state": current_state,
+        "attempted_launches": attempted_launches,
+        "active_tracked_mints": active_tracked_mints,
+        "rejected_count": rejected_count,
+        "candidate_count": candidate_count,
+        "last_seen_provider_update_at": if summary.transaction_updates + summary.account_updates + summary.slot_updates > 0 { now.to_string() } else { String::new() },
+        "last_seen_pump_update_at": if summary.pump_create_decoded > 0 { now.to_string() } else { String::new() },
+        "last_attempt_ledger_flush_at": now,
+        "last_artifact_write_at": now,
+        "last_r2_checkpoint_at": checkpoint_state["last_r2_checkpoint_at"].as_str().unwrap_or(""),
+        "r2_checkpoint_verified": checkpoint_state["r2_checkpoint_verified"].as_bool().unwrap_or(false),
+        "free_mb": phase107f_free_mb(health_dir).unwrap_or(0),
+        "rss_mb": phase107f_current_rss_mb().unwrap_or(0),
+        "retained_events_count": 0,
+        "retained_transaction_fingerprint_count": 0,
+        "provider_updates": summary.transaction_updates + summary.account_updates + summary.slot_updates,
+        "pump_updates": summary.pump_create_decoded,
+        "safe_to_continue": safe_to_continue,
+        "blocker_reason": blocker_reason,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+    });
+    fs::write(
+        health_dir.join("heartbeat.json"),
+        serde_json::to_string_pretty(&heartbeat)?,
+    )?;
+    fs::write(
+        health_dir.join("heartbeat.md"),
+        format!(
+            "# Phase 107F Hunter Heartbeat\n\n- run_id: `{run_id}`\n- current_state: `{current_state}`\n- attempted_launches: `{attempted_launches}`\n- active_tracked_mints: `{active_tracked_mints}`\n- safe_to_continue: `{safe_to_continue}`\n- blocker_reason: `{blocker_reason}`\n"
+        ),
+    )?;
+    let provider_path = health_dir.join("provider_liveness.csv");
+    if !provider_path.exists() {
+        fs::write(
+            &provider_path,
+            "timestamp,provider_updates,pump_updates,provider_status,safe_to_continue,blocker_reason\n",
+        )?;
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(&provider_path)?
+        .write_all(
+            format!(
+                "{},{},{},{},{},{}\n",
+                now,
+                summary.transaction_updates + summary.account_updates + summary.slot_updates,
+                summary.pump_create_decoded,
+                csv_field(&summary.provider_status),
+                safe_to_continue,
+                csv_field(blocker_reason)
+            )
+            .as_bytes(),
+        )?;
+    let sentinel_path = health_dir.join("sentinel_status.csv");
+    if !sentinel_path.exists() {
+        fs::write(
+            &sentinel_path,
+            "timestamp,sentinel,safe_to_continue,blocker_reason\n",
+        )?;
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(&sentinel_path)?
+        .write_all(
+            format!(
+                "{},heartbeat,{},{}\n",
+                now,
+                safe_to_continue,
+                csv_field(blocker_reason)
+            )
+            .as_bytes(),
+        )?;
+    let checkpoint_path = health_dir.join("checkpoint_status.csv");
+    if !checkpoint_path.exists() {
+        fs::write(
+            &checkpoint_path,
+            "timestamp,checkpoint_type,verified,reason,details\n",
+        )?;
+    }
+    Ok(())
+}
+
+fn phase107f_current_rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        let kb = status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })?;
+        Some(kb / 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn phase107f_free_mb(path: &Path) -> Option<u64> {
+    let output = ProcessCommand::new("df")
+        .arg("-Pm")
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+async fn phase107f_upload_r2_checkpoint(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    run_id: &str,
+    verify_r2: bool,
+    reason: &str,
+) -> Result<bool> {
+    let health_dir = output_dir.join("health");
+    fs::create_dir_all(&health_dir)?;
+    let now = OffsetDateTime::now_utc();
+    let result = upload_phase_report_dir_to_r2(
+        loaded,
+        output_dir,
+        "phase107b_material_candidate_hunter_checkpoint",
+        run_id,
+        verify_r2,
+    )
+    .await?;
+    let verified = result["verified"].as_bool().unwrap_or(false);
+    let status_line = format!(
+        "{},r2_checkpoint,{},{},{}\n",
+        now,
+        verified,
+        csv_field(reason),
+        csv_field(result["failed_files"].to_string().as_str())
+    );
+    let checkpoint_path = health_dir.join("checkpoint_status.csv");
+    if !checkpoint_path.exists() {
+        fs::write(
+            &checkpoint_path,
+            "timestamp,checkpoint_type,verified,reason,details\n",
+        )?;
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(&checkpoint_path)?
+        .write_all(status_line.as_bytes())?;
+    fs::write(
+        health_dir.join("last_checkpoint.json"),
+        serde_json::to_vec_pretty(&json!({
+            "last_r2_checkpoint_at": now,
+            "r2_checkpoint_verified": verified,
+            "reason": reason,
+            "threshold_tuning_allowed": false,
+        }))?,
+    )?;
+    if !verified {
+        write_quant_json_md(
+            output_dir,
+            "early_failure_blocker",
+            &json!({
+                "schema_version": "phase107f.early_failure_blocker.v1",
+                "run_id": run_id,
+                "blocker_class": "r2_checkpoint_failed",
+                "reason": reason,
+                "threshold_tuning_allowed": false,
+                "generated_at": now,
+            }),
+            format!(
+                "# Phase 107F Early Failure Blocker\n\n- run_id: `{run_id}`\n- blocker_class: `r2_checkpoint_failed`\n- reason: `{reason}`\n"
+            ),
+        )?;
+    }
+    Ok(verified)
+}
+
+fn phase107f_upload_r2_checkpoint_blocking(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    run_id: &str,
+    verify_r2: bool,
+    reason: &str,
+) -> Result<bool> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(phase107f_upload_r2_checkpoint(
+            loaded, output_dir, run_id, verify_r2, reason,
+        ))
+    })
+}
+
 async fn material_candidate_hunter_command(
     loaded: &LoadedConfig,
     duration_seconds: u64,
@@ -38469,42 +38800,6 @@ async fn material_candidate_hunter_command(
         ),
     )?;
 
-    let (summary, all_events) = collect_fresh_launch_canary_events(
-        loaded,
-        FreshLaunchCanaryLiveOptions {
-            duration_seconds,
-            max_launches: max_attempted_launches.max(1),
-            stop_when_max_launches_seen: false,
-            retain_only_tracked_mints: true,
-        },
-    )
-    .await?;
-    if summary.transaction_updates + summary.account_updates + summary.slot_updates == 0 {
-        bail!(
-            "material-candidate-hunter provider stream emitted zero updates; provider_status={}",
-            summary.provider_status
-        );
-    }
-
-    let mut creates = all_events
-        .iter()
-        .filter(|event| is_successful_launch_create(event))
-        .cloned()
-        .collect::<Vec<_>>();
-    creates.sort_by_key(|event| {
-        (
-            event.meta.received_at_wall_time,
-            event.meta.slot,
-            event.meta.event_id.0,
-        )
-    });
-    creates.truncate(max_attempted_launches.max(1));
-    let collection_end_at = all_events
-        .iter()
-        .map(|event| event.meta.received_at_wall_time)
-        .max()
-        .unwrap_or_else(OffsetDateTime::now_utc);
-
     let risk_engine = DiagnosticRiskEngine::default();
     let mut attempt_rows = Vec::<serde_json::Value>::new();
     let mut rejected_rows = Vec::<serde_json::Value>::new();
@@ -38516,133 +38811,541 @@ async fn material_candidate_hunter_command(
     let mut rejected_dead = 0u64;
     let mut rejected_inconclusive = 0u64;
     let mut provider_confirmed_bundle_count = 0u64;
+    let mut active_mints = BTreeMap::<String, Phase107fActiveMint>::new();
+    let mut finalized_mints = BTreeSet::<String>::new();
+    let health_dir = output_dir.join("health");
+    fs::create_dir_all(&health_dir)?;
+    phase107b_write_incremental_checkpoint(
+        &output_dir,
+        &run_id,
+        &attempt_rows,
+        &rejected_rows,
+        &candidate_rows,
+        &unavailable_rows,
+    )?;
+    phase107f_write_health(
+        &health_dir,
+        &run_id,
+        "startup",
+        &MaterialHunterStreamSummary::default(),
+        attempt_rows.len(),
+        active_mints.len(),
+        rejected_rows.len(),
+        candidate_rows.len(),
+        true,
+        "",
+    )?;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            interrupted.store(true, Ordering::SeqCst);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let interrupted = interrupted.clone();
+        tokio::spawn(async move {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                signal.recv().await;
+                interrupted.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    let last_r2_checkpoint_at = Arc::new(std::sync::Mutex::new(Instant::now()));
+    if upload_r2 {
+        let verified =
+            phase107f_upload_r2_checkpoint(loaded, &output_dir, &run_id, verify_r2, "startup")
+                .await?;
+        if !verified {
+            bail!("material-candidate-hunter startup R2 checkpoint failed");
+        }
+    }
 
-    for (attempt_index, create) in creates.iter().enumerate() {
-        let mint = event_mint_string(create).ok_or_else(|| anyhow!("create event missing mint"))?;
-        let scoped_events = phase107b_scoped_events_for_mint(&mint, create, &all_events);
+    let progress_counts = Arc::new(std::sync::Mutex::new((0usize, 0usize, 0usize, 0usize)));
+    let interrupted_for_stream = interrupted.clone();
+    let progress_counts_for_events = progress_counts.clone();
+    let progress_counts_for_progress = progress_counts.clone();
+    let health_dir_for_progress = health_dir.clone();
+    let run_id_for_progress = run_id.clone();
+    let output_dir_for_progress = output_dir.clone();
+    let interrupted_for_progress = interrupted.clone();
+    let last_r2_checkpoint_for_events = last_r2_checkpoint_at.clone();
+    let last_r2_checkpoint_for_progress = last_r2_checkpoint_at.clone();
+    let stream_summary = run_material_hunter_stream_with_progress(
+        loaded,
+        runtime::MaterialHunterStreamOptions { duration_seconds },
+        |event, summary| {
+            if interrupted_for_stream.load(Ordering::SeqCst) {
+                return Ok(MaterialHunterStreamAction::Stop);
+            }
+            if let Ok(mut counts) = progress_counts_for_events.lock() {
+                *counts = (
+                    attempt_rows.len(),
+                    active_mints.len(),
+                    rejected_rows.len(),
+                    candidate_rows.len(),
+                );
+            }
+            phase107f_write_health(
+                &health_dir,
+                &run_id,
+                "streaming",
+                summary,
+                attempt_rows.len(),
+                active_mints.len(),
+                rejected_rows.len(),
+                candidate_rows.len(),
+                true,
+                "",
+            )?;
+
+            if is_successful_launch_create(&event)
+                && attempt_rows.len() < max_attempted_launches.max(1)
+                && !event_mint_string(&event)
+                    .map(|mint| finalized_mints.contains(&mint) || active_mints.contains_key(&mint))
+                    .unwrap_or(false)
+            {
+                if active_mints.len() < max_concurrent_tracked_mints {
+                    let mint = event_mint_string(&event)
+                        .ok_or_else(|| anyhow!("create event missing mint"))?;
+                    let attempt_index = attempt_rows.len() + 1;
+                    active_mints.insert(
+                        mint.clone(),
+                        Phase107fActiveMint::new(mint.clone(), event.clone(), attempt_index),
+                    );
+                    attempt_rows.push(json!({
+                        "attempt_index": attempt_index,
+                        "mint": mint,
+                        "run_id": run_id,
+                        "launch_timestamp": event_received_ts(&event),
+                        "tracked_until_seconds": 0,
+                        "final_state": "tracking_early",
+                        "rejection_or_promotion_reason": "live_attempt_discovered",
+                        "early_warning_families": "",
+                        "rug_like_outcome_by_300s": false,
+                        "survived_300s": false,
+                        "survived_900s": false,
+                        "survived_1800s": false,
+                        "holder_rpc_used": false,
+                        "rpc_mint_supply_canonical": false,
+                        "r2_verified": false,
+                        "local_artifact_size_bytes": phase107b_dir_size_bytes(&output_dir).unwrap_or(0),
+                        "promoted_to_candidate_dataset": false,
+                        "tombstone_written": false,
+                    }));
+                    phase107b_write_incremental_checkpoint(
+                        &output_dir,
+                        &run_id,
+                        &attempt_rows,
+                        &rejected_rows,
+                        &candidate_rows,
+                        &unavailable_rows,
+                    )?;
+                }
+            }
+
+            for active in active_mints.values_mut() {
+                active.push_if_related(&event);
+            }
+
+            let mut finalized_now = Vec::<String>::new();
+            for (mint, active) in active_mints.iter_mut() {
+                if active.finalized || active.events.is_empty() {
+                    continue;
+                }
+                let observed_horizon_seconds = active
+                    .events
+                    .iter()
+                    .map(|event| {
+                        (event.meta.received_at_wall_time - active.create.meta.received_at_wall_time)
+                            .whole_seconds()
+                            .max(0) as u64
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if observed_horizon_seconds < 15 {
+                    continue;
+                }
+                let analysis = phase107b_analyze_token(
+                    loaded,
+                    &risk_engine,
+                    &run_id,
+                    mint,
+                    &active.create,
+                    &active.events,
+                    observed_horizon_seconds,
+                    event.meta.received_at_wall_time,
+                )?;
+                let decision = phase107b_decide_token(
+                    &analysis.post_event_rows,
+                    &analysis.early_rule_rows,
+                    analysis.observed_horizon_seconds,
+                );
+                let final_candidate_horizon = duration_seconds.min(1800).max(300);
+                let should_finalize = decision.final_state == "early_rejected_dead"
+                    || (decision.promoted && observed_horizon_seconds >= final_candidate_horizon)
+                    || (observed_horizon_seconds >= 300
+                        && decision.final_state.starts_with("early_rejected"));
+                if !should_finalize && !decision.promoted {
+                    continue;
+                }
+                if decision.provider_confirmed_bundle {
+                    provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
+                }
+                if decision.final_state.starts_with("early_rejected") {
+                    if decision.final_state == "early_rejected_dead" {
+                        rejected_dead = rejected_dead.saturating_add(1);
+                    } else {
+                        rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+                    }
+                    rejected_rows.push(json!({
+                        "mint": mint,
+                        "run_id": run_id,
+                        "final_state": decision.final_state,
+                        "rejection_class": decision.reason,
+                        "stop_tracking_at_seconds": decision.tracked_until_seconds,
+                        "early_warning_families": decision.early_warning_families.join("|"),
+                        "holder_rpc_used": false,
+                        "threshold_tuning_allowed": false,
+                    }));
+                    phase107b_write_rejected_token(
+                        &output_dir,
+                        &run_id,
+                        mint,
+                        &active.create,
+                        &decision,
+                        &analysis,
+                    )?;
+                } else if decision.promoted {
+                    let mut wrote_candidate_checkpoint = false;
+                    if decision.survived_300 && !active.candidate_300_written {
+                        candidates_300 = candidates_300.saturating_add(1);
+                        active.candidate_300_written = true;
+                        wrote_candidate_checkpoint = true;
+                    }
+                    if decision.survived_900 && !active.candidate_900_written {
+                        candidates_900 = candidates_900.saturating_add(1);
+                        active.candidate_900_written = true;
+                        wrote_candidate_checkpoint = true;
+                    }
+                    if decision.survived_1800 && !active.candidate_1800_written {
+                        candidates_1800 = candidates_1800.saturating_add(1);
+                        active.candidate_1800_written = true;
+                        wrote_candidate_checkpoint = true;
+                    }
+                    let candidate_row = json!({
+                        "mint": mint,
+                        "run_id": run_id,
+                        "final_state": if should_finalize { decision.final_state.clone() } else { format!("{}_checkpoint", decision.final_state) },
+                        "promotion_reason": decision.reason,
+                        "survived_300s": decision.survived_300,
+                        "survived_900s": decision.survived_900,
+                        "survived_1800s": decision.survived_1800,
+                        "risk_timeline_rows": analysis.risk_timeline_rows.len(),
+                        "pre_entry_risk_feature_rows": analysis.pre_entry_rows.len(),
+                        "post_event_label_rows": analysis.post_event_rows.len(),
+                        "holder_rpc_used": false,
+                        "rpc_mint_supply_canonical": false,
+                    });
+                    if let Some(existing) = candidate_rows
+                        .iter_mut()
+                        .find(|row| row["mint"].as_str() == Some(mint.as_str()))
+                    {
+                        *existing = candidate_row;
+                    } else {
+                        candidate_rows.push(candidate_row);
+                    }
+                    if wrote_candidate_checkpoint || should_finalize {
+                        phase107b_write_candidate_token(
+                            &output_dir,
+                            &run_id,
+                            mint,
+                            &active.create,
+                            &decision,
+                            &analysis,
+                        )?;
+                    }
+                }
+                for reason in &analysis.unavailable_reasons {
+                    unavailable_rows.push(json!({
+                        "mint": mint,
+                        "run_id": run_id,
+                        "unavailable_reason": reason,
+                    }));
+                }
+                if let Some(row) = attempt_rows
+                    .iter_mut()
+                    .find(|row| row["attempt_index"].as_u64() == Some(active.attempt_index as u64))
+                {
+                    if let Some(map) = row.as_object_mut() {
+                        map.insert("tracked_until_seconds".to_owned(), json!(decision.tracked_until_seconds));
+                        map.insert("final_state".to_owned(), json!(decision.final_state));
+                        map.insert("rejection_or_promotion_reason".to_owned(), json!(decision.reason));
+                        map.insert(
+                            "early_warning_families".to_owned(),
+                            json!(decision.early_warning_families.join("|")),
+                        );
+                        map.insert("rug_like_outcome_by_300s".to_owned(), json!(decision.rug_like_by_300));
+                        map.insert("survived_300s".to_owned(), json!(decision.survived_300));
+                        map.insert("survived_900s".to_owned(), json!(decision.survived_900));
+                        map.insert("survived_1800s".to_owned(), json!(decision.survived_1800));
+                        map.insert(
+                            "local_artifact_size_bytes".to_owned(),
+                            json!(phase107b_dir_size_bytes(&output_dir).unwrap_or(0)),
+                        );
+                        map.insert("promoted_to_candidate_dataset".to_owned(), json!(decision.promoted && should_finalize));
+                        map.insert("tombstone_written".to_owned(), json!(!decision.promoted && should_finalize));
+                    }
+                }
+                if should_finalize {
+                    active.finalized = true;
+                    finalized_now.push(mint.clone());
+                }
+            }
+            for mint in finalized_now {
+                active_mints.remove(&mint);
+                finalized_mints.insert(mint);
+            }
+            phase107b_write_incremental_checkpoint(
+                &output_dir,
+                &run_id,
+                &attempt_rows,
+                &rejected_rows,
+                &candidate_rows,
+                &unavailable_rows,
+            )?;
+            if upload_r2 {
+                let due = last_r2_checkpoint_for_events
+                    .lock()
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(300))
+                    .unwrap_or(true);
+                if due {
+                    let verified = phase107f_upload_r2_checkpoint_blocking(
+                        loaded,
+                        &output_dir,
+                        &run_id,
+                        verify_r2,
+                        "event_checkpoint",
+                    )?;
+                    if let Ok(mut last) = last_r2_checkpoint_for_events.lock() {
+                        *last = Instant::now();
+                    }
+                    if !verified {
+                        interrupted_for_stream.store(true, Ordering::SeqCst);
+                        return Ok(MaterialHunterStreamAction::Stop);
+                    }
+                }
+            }
+
+            let candidate_total = if duration_seconds >= 1800 {
+                candidates_1800
+            } else if duration_seconds >= 900 {
+                candidates_900
+            } else {
+                candidates_300
+            } as usize;
+            if candidate_total >= target_material_candidates
+                || (attempt_rows.len() >= max_attempted_launches.max(1) && active_mints.is_empty())
+            {
+                return Ok(MaterialHunterStreamAction::Stop);
+            }
+            Ok(MaterialHunterStreamAction::Continue)
+        },
+        |summary| {
+            let (attempted, active, rejected, candidates) = progress_counts_for_progress
+                .lock()
+                .map(|counts| *counts)
+                .unwrap_or_default();
+            let interrupted_now = interrupted_for_progress.load(Ordering::SeqCst);
+            phase107f_write_health(
+                &health_dir_for_progress,
+                &run_id_for_progress,
+                if interrupted_now { "interrupt_requested" } else { "provider_progress" },
+                summary,
+                attempted,
+                active,
+                rejected,
+                candidates,
+                !interrupted_now,
+                if interrupted_now { "signal_interrupted" } else { "" },
+            )?;
+            if upload_r2 {
+                let due = last_r2_checkpoint_for_progress
+                    .lock()
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(300))
+                    .unwrap_or(true);
+                if due {
+                    let verified = phase107f_upload_r2_checkpoint_blocking(
+                        loaded,
+                        &output_dir_for_progress,
+                        &run_id_for_progress,
+                        verify_r2,
+                        "progress_checkpoint",
+                    )?;
+                    if let Ok(mut last) = last_r2_checkpoint_for_progress.lock() {
+                        *last = Instant::now();
+                    }
+                    if !verified {
+                        interrupted_for_progress.store(true, Ordering::SeqCst);
+                        return Ok(MaterialHunterStreamAction::Stop);
+                    }
+                }
+            }
+            if interrupted_now {
+                return Ok(MaterialHunterStreamAction::Stop);
+            }
+            Ok(MaterialHunterStreamAction::Continue)
+        },
+    )
+    .await?;
+    let interrupted_run = interrupted.load(Ordering::SeqCst);
+
+    if !interrupted_run
+        && stream_summary.transaction_updates
+            + stream_summary.account_updates
+            + stream_summary.slot_updates
+            == 0
+    {
+        phase107f_write_health(
+            &health_dir,
+            &run_id,
+            "provider_zero_updates",
+            &stream_summary,
+            attempt_rows.len(),
+            active_mints.len(),
+            rejected_rows.len(),
+            candidate_rows.len(),
+            false,
+            "provider_zero_updates",
+        )?;
+        bail!(
+            "material-candidate-hunter provider stream emitted zero updates; provider_status={}",
+            stream_summary.provider_status
+        );
+    } else if !interrupted_run
+        && stream_summary.transaction_updates
+            + stream_summary.account_updates
+            + stream_summary.slot_updates
+            > 0
+        && stream_summary.pump_create_decoded == 0
+    {
+        phase107f_write_health(
+            &health_dir,
+            &run_id,
+            "no_launches_seen_but_stream_alive",
+            &stream_summary,
+            attempt_rows.len(),
+            active_mints.len(),
+            rejected_rows.len(),
+            candidate_rows.len(),
+            true,
+            "no_launches_seen_but_stream_alive",
+        )?;
+    }
+
+    for (_mint, active) in active_mints.iter() {
+        let observed_horizon_seconds = active
+            .events
+            .iter()
+            .map(|event| {
+                (event.meta.received_at_wall_time - active.create.meta.received_at_wall_time)
+                    .whole_seconds()
+                    .max(0) as u64
+            })
+            .max()
+            .unwrap_or(0);
         let analysis = phase107b_analyze_token(
             loaded,
             &risk_engine,
             &run_id,
-            &mint,
-            create,
-            &scoped_events,
-            duration_seconds,
-            collection_end_at,
+            &active.mint,
+            &active.create,
+            &active.events,
+            observed_horizon_seconds,
+            OffsetDateTime::now_utc(),
         )?;
-
-        let decision = phase107b_decide_token(
-            &analysis.post_event_rows,
-            &analysis.early_rule_rows,
-            analysis.observed_horizon_seconds,
-        );
-        if decision.provider_confirmed_bundle {
-            provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
-        }
-        if decision.final_state.starts_with("early_rejected") {
-            if decision.final_state == "early_rejected_dead" {
-                rejected_dead = rejected_dead.saturating_add(1);
+        let decision = Phase107bDecision {
+            final_state: if interrupted_run {
+                "terminal_inconclusive".to_owned()
             } else {
-                rejected_inconclusive = rejected_inconclusive.saturating_add(1);
-            }
-            rejected_rows.push(json!({
-                "mint": mint,
-                "run_id": run_id,
-                "final_state": decision.final_state,
-                "rejection_class": decision.reason,
-                "stop_tracking_at_seconds": decision.tracked_until_seconds,
-                "early_warning_families": decision.early_warning_families.join("|"),
-                "holder_rpc_used": false,
-                "threshold_tuning_allowed": false,
-            }));
-            phase107b_write_rejected_token(
-                &output_dir,
-                &run_id,
-                &mint,
-                create,
-                &decision,
-                &analysis,
-            )?;
-        } else if decision.promoted {
-            candidates_300 += decision.survived_300 as u64;
-            candidates_900 += decision.survived_900 as u64;
-            candidates_1800 += decision.survived_1800 as u64;
-            candidate_rows.push(json!({
-                "mint": mint,
-                "run_id": run_id,
-                "final_state": decision.final_state,
-                "promotion_reason": decision.reason,
-                "survived_300s": decision.survived_300,
-                "survived_900s": decision.survived_900,
-                "survived_1800s": decision.survived_1800,
-                "risk_timeline_rows": analysis.risk_timeline_rows.len(),
-                "pre_entry_risk_feature_rows": analysis.pre_entry_rows.len(),
-                "post_event_label_rows": analysis.post_event_rows.len(),
-                "holder_rpc_used": false,
-                "rpc_mint_supply_canonical": false,
-            }));
-            phase107b_write_candidate_token(
-                &output_dir,
-                &run_id,
-                &mint,
-                create,
-                &decision,
-                &analysis,
-            )?;
-        } else {
-            rejected_inconclusive = rejected_inconclusive.saturating_add(1);
-            phase107b_write_rejected_token(
-                &output_dir,
-                &run_id,
-                &mint,
-                create,
-                &decision,
-                &analysis,
-            )?;
-        }
-
-        for reason in &analysis.unavailable_reasons {
-            unavailable_rows.push(json!({
-                "mint": mint,
-                "run_id": run_id,
-                "unavailable_reason": reason,
-            }));
-        }
-
-        attempt_rows.push(json!({
-            "attempt_index": attempt_index + 1,
-            "mint": mint,
-            "run_id": run_id,
-            "launch_timestamp": event_received_ts(create),
-            "tracked_until_seconds": decision.tracked_until_seconds,
-            "final_state": decision.final_state,
-            "rejection_or_promotion_reason": decision.reason,
-            "early_warning_families": decision.early_warning_families.join("|"),
-            "rug_like_outcome_by_300s": decision.rug_like_by_300,
-            "survived_300s": decision.survived_300,
-            "survived_900s": decision.survived_900,
-            "survived_1800s": decision.survived_1800,
-            "holder_rpc_used": false,
-            "rpc_mint_supply_canonical": false,
-            "r2_verified": false,
-            "local_artifact_size_bytes": phase107b_dir_size_bytes(&output_dir).unwrap_or(0),
-            "promoted_to_candidate_dataset": decision.promoted,
-            "tombstone_written": decision.final_state.starts_with("early_rejected") || !decision.promoted,
-        }));
-        phase107b_write_incremental_checkpoint(
+                "terminal_inconclusive".to_owned()
+            },
+            reason: if interrupted_run {
+                "signal_interrupted_active_mint_finalized_inconclusive".to_owned()
+            } else {
+                "stream_slice_completed_before_terminal_gate".to_owned()
+            },
+            tracked_until_seconds: observed_horizon_seconds,
+            early_warning_families: analysis
+                .early_rule_rows
+                .iter()
+                .filter(|row| row["rule_fired"].as_bool().unwrap_or(false))
+                .filter_map(|row| row["rule_id"].as_str().map(str::to_owned))
+                .collect(),
+            rug_like_by_300: false,
+            survived_300: false,
+            survived_900: false,
+            survived_1800: false,
+            promoted: false,
+            provider_confirmed_bundle: false,
+        };
+        rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+        phase107b_write_rejected_token(
             &output_dir,
             &run_id,
-            &attempt_rows,
-            &rejected_rows,
-            &candidate_rows,
-            &unavailable_rows,
+            &active.mint,
+            &active.create,
+            &decision,
+            &analysis,
         )?;
-
-        if candidates_1800.max(candidates_900).max(candidates_300)
-            >= target_material_candidates as u64
-        {
-            break;
-        }
+        rejected_rows.push(json!({
+            "mint": active.mint,
+            "run_id": run_id,
+            "final_state": decision.final_state,
+            "rejection_class": decision.reason,
+            "stop_tracking_at_seconds": decision.tracked_until_seconds,
+            "early_warning_families": decision.early_warning_families.join("|"),
+            "holder_rpc_used": false,
+            "threshold_tuning_allowed": false,
+        }));
+    }
+    phase107b_write_incremental_checkpoint(
+        &output_dir,
+        &run_id,
+        &attempt_rows,
+        &rejected_rows,
+        &candidate_rows,
+        &unavailable_rows,
+    )?;
+    if interrupted_run {
+        let interrupted_summary = json!({
+            "schema_version": "phase107f.hunter_summary_interrupted.v1",
+            "run_id": run_id,
+            "interruption_reason": "signal_interrupted",
+            "last_attempt_index": attempt_rows.len(),
+            "last_tracked_mint": attempt_rows.last().and_then(|row| row["mint"].as_str()).unwrap_or(""),
+            "attempted_launches": attempt_rows.len(),
+            "rejected_count": rejected_rows.len(),
+            "candidate_count": candidate_rows.len(),
+            "partial_outputs_r2_verified": false,
+            "counted_phase107b_result": false,
+            "off_vps_candidate_replay_allowed": false,
+            "threshold_tuning_allowed": false,
+            "generated_at": OffsetDateTime::now_utc(),
+        });
+        write_quant_json_md(
+            &output_dir,
+            "hunter_summary_interrupted",
+            &interrupted_summary,
+            format!(
+                "# Phase 107F Hunter Interrupted\n\n- run_id: `{run_id}`\n- attempted launches: `{}`\n- counted_phase107b_result: `false`\n",
+                attempt_rows.len()
+            ),
+        )?;
     }
 
     write_json_rows_csv(
@@ -38729,7 +39432,8 @@ async fn material_candidate_hunter_command(
         "binary_malicious_labels_emitted": false,
         "threshold_tuning_allowed": false,
         "formal_backtesting_allowed": false,
-        "ready_for_off_vps_candidate_replay": !candidate_rows.is_empty(),
+        "interrupted_run": interrupted_run,
+        "ready_for_off_vps_candidate_replay": !interrupted_run && !candidate_rows.is_empty(),
         "ready_for_large_strategy_dataset": false,
     });
     write_quant_json_md(
@@ -38753,7 +39457,7 @@ async fn material_candidate_hunter_command(
     let manifest = json!({
         "schema_version": "phase107b.material_candidate_hunter_manifest.v1",
         "phase": "phase107b_replacement_after_retention_fix",
-        "fix_commit": "06213b3",
+        "binary_commit": option_env!("GITHUB_SHA").unwrap_or("unknown"),
         "housekeeping_passed_before_hunter": true,
         "attempted_launches": attempted_launches,
         "rejected_dead_count": rejected_dead,
@@ -38765,11 +39469,11 @@ async fn material_candidate_hunter_command(
         "rpc_mint_supply_canonical": false,
         "provider_confirmed_bundle_count": provider_confirmed_bundle_count,
         "binary_malicious_labels_emitted": false,
-        "process_exit_code": 0,
-        "killed_by_oom_or_signal": false,
+        "process_exit_code": if interrupted_run { 130 } else { 0 },
+        "killed_by_oom_or_signal": interrupted_run,
         "resource_telemetry_available": output_dir.join("resource_telemetry.csv").exists(),
         "threshold_tuning_allowed": false,
-        "ready_for_off_vps_candidate_replay": !candidate_rows.is_empty(),
+        "ready_for_off_vps_candidate_replay": !interrupted_run && !candidate_rows.is_empty(),
         "generated_at": OffsetDateTime::now_utc(),
     });
     write_quant_json_md(
@@ -38852,19 +39556,101 @@ async fn material_candidate_hunter_command(
                 &attempt_rows,
             )?;
         }
+        let final_artifacts_exist = phase107b_required_final_artifacts_exist(&output_dir);
+        let attempt_ledger_row_count_matches =
+            phase107b_csv_data_row_count(&output_dir.join("attempt_ledger.csv"))
+                .map(|rows| rows == attempted_launches as usize)
+                .unwrap_or(false);
+        let rejected_summary_reconciles =
+            phase107b_csv_data_row_count(&output_dir.join("rejected_summary.csv"))
+                .map(|rows| rows == rejected_rows.len())
+                .unwrap_or(false);
+        let candidate_summary_reconciles =
+            phase107b_csv_data_row_count(&output_dir.join("candidate_summary.csv"))
+                .map(|rows| rows == candidate_rows.len())
+                .unwrap_or(false);
+        let rejected_tombstones_exist = rejected_rows.iter().all(|row| {
+            row["mint"]
+                .as_str()
+                .map(|mint| {
+                    output_dir
+                        .join("rejected")
+                        .join(mint)
+                        .join("dead_token_tombstone.json")
+                        .exists()
+                })
+                .unwrap_or(false)
+        });
+        let candidate_artifacts_exist = candidate_rows.iter().all(|row| {
+            row["mint"]
+                .as_str()
+                .map(|mint| {
+                    let dir = output_dir.join("candidates").join(mint);
+                    [
+                        "token_summary.json",
+                        "risk_timeline.csv",
+                        "early_feature_timeline.csv",
+                        "pre_entry_risk_features.csv",
+                        "post_event_risk_labels.csv",
+                        "bundle_like_evidence.csv",
+                        "rug_dump_evidence.csv",
+                    ]
+                    .iter()
+                    .all(|relative| dir.join(relative).exists())
+                })
+                .unwrap_or(false)
+        });
+        let no_dead_token_promoted = attempt_rows.iter().all(|row| {
+            let final_state = row["final_state"].as_str().unwrap_or("");
+            let promoted = row["promoted_to_candidate_dataset"]
+                .as_bool()
+                .unwrap_or(false);
+            !(final_state.starts_with("early_rejected") && promoted)
+        });
+        let latest_checkpoint_verified =
+            fs::read(output_dir.join("health").join("last_checkpoint.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value["r2_checkpoint_verified"].as_bool())
+                .unwrap_or(false);
+        let hard_invariants_passed = no_live_trading
+            && no_rpc
+            && manifest["rpc_mint_supply_canonical"].as_bool() == Some(false)
+            && manifest["binary_malicious_labels_emitted"].as_bool() == Some(false)
+            && attempt_ledger_row_count_matches
+            && rejected_summary_reconciles
+            && candidate_summary_reconciles
+            && rejected_tombstones_exist
+            && candidate_artifacts_exist
+            && no_dead_token_promoted;
+        let counted_phase107b_result = r2_upload["verified"].as_bool().unwrap_or(false)
+            && final_artifacts_exist
+            && hard_invariants_passed
+            && latest_checkpoint_verified
+            && attempted_launches > 0
+            && !interrupted_run;
         let countability = json!({
             "schema_version": "phase107b.countability_decision.v1",
             "phase": "phase107b_replacement_after_retention_fix",
-            "counted_phase107b_result": r2_upload["verified"].as_bool().unwrap_or(false),
-            "hunter_exited_normally": true,
-            "process_exit_code": 0,
-            "final_artifacts_exist": true,
+            "counted_phase107b_result": counted_phase107b_result,
+            "hunter_exited_normally": !interrupted_run,
+            "interrupted_run": interrupted_run,
+            "process_exit_code": if interrupted_run { 130 } else { 0 },
+            "final_artifacts_exist": final_artifacts_exist,
+            "attempt_ledger_row_count_matches": attempt_ledger_row_count_matches,
+            "attempted_launches_nonzero": attempted_launches > 0,
+            "rejected_summary_reconciles": rejected_summary_reconciles,
+            "candidate_summary_reconciles": candidate_summary_reconciles,
+            "rejected_tombstones_exist": rejected_tombstones_exist,
+            "candidate_artifacts_exist": candidate_artifacts_exist,
+            "no_dead_token_promoted": no_dead_token_promoted,
+            "latest_r2_checkpoint_verified": latest_checkpoint_verified,
             "r2_verified": r2_upload["verified"].as_bool().unwrap_or(false),
             "resource_telemetry_has_critical_failure": false,
-            "hard_invariants_passed": true,
-            "partial_outputs_audit_only": false,
+            "hard_invariants_passed": hard_invariants_passed,
+            "partial_outputs_audit_only": !counted_phase107b_result,
             "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
-            "off_vps_candidate_replay_allowed": r2_upload["verified"].as_bool().unwrap_or(false) && !candidate_rows.is_empty(),
+            "off_vps_candidate_replay_allowed": counted_phase107b_result && !candidate_rows.is_empty(),
             "formal_backtesting_allowed": false,
             "threshold_tuning_allowed": false,
             "generated_at": OffsetDateTime::now_utc(),
@@ -39039,6 +39825,23 @@ fn phase107b_write_incremental_checkpoint(
             "rejected_count": rejected_rows.len(),
             "holder_rpc_used": false,
             "rpc_mint_supply_canonical": false,
+            "threshold_tuning_allowed": false,
+            "updated_at": OffsetDateTime::now_utc(),
+        }))?,
+    )?;
+    fs::write(
+        output_dir.join("progress_manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "phase107f.progress_manifest.v1",
+            "run_id": run_id,
+            "attempt_ledger_exists": output_dir.join("attempt_ledger.csv").exists(),
+            "attempts_written": attempt_rows.len(),
+            "candidate_count": candidate_rows.len(),
+            "rejected_count": rejected_rows.len(),
+            "countability_decision_partial_exists": output_dir.join("countability_decision_partial.json").exists(),
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "binary_malicious_labels_emitted": false,
             "threshold_tuning_allowed": false,
             "updated_at": OffsetDateTime::now_utc(),
         }))?,
@@ -39796,6 +40599,212 @@ fn phase107b_dir_size_bytes(path: &Path) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+fn phase107b_required_final_artifacts_exist(output_dir: &Path) -> bool {
+    [
+        "hunter_summary.json",
+        "attempt_ledger.csv",
+        "rejected_summary.csv",
+        "candidate_summary.csv",
+        "unavailable_reason_summary.csv",
+        "manifest.json",
+        "r2_upload_result.json",
+    ]
+    .iter()
+    .all(|relative| output_dir.join(relative).exists())
+}
+
+fn phase107b_csv_data_row_count(path: &Path) -> Result<usize> {
+    let text = fs::read_to_string(path)?;
+    Ok(text
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count())
+}
+
+fn material_hunter_watchdog_command(
+    run_id: &str,
+    campaign_id: Option<&str>,
+    output_dir: &str,
+    _status: bool,
+    fail_fast_check: bool,
+    wait_seconds: u64,
+    json_output: bool,
+) -> Result<()> {
+    if wait_seconds > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(wait_seconds));
+    }
+    let base = PathBuf::from(output_dir);
+    let run_dir = if base.join(run_id).is_dir() {
+        base.join(run_id)
+    } else {
+        base
+    };
+    let health_dir = run_dir.join("health");
+    let heartbeat_path = health_dir.join("heartbeat.json");
+    let provider_liveness_path = health_dir.join("provider_liveness.csv");
+    let sentinel_status_path = health_dir.join("sentinel_status.csv");
+    let checkpoint_status_path = health_dir.join("checkpoint_status.csv");
+    let progress_manifest_path = run_dir.join("progress_manifest.json");
+    let attempt_ledger_path = run_dir.join("attempt_ledger.csv");
+    let countability_path = run_dir.join("countability_decision.json");
+    let interrupted_path = run_dir.join("hunter_summary_interrupted.json");
+    let mut blockers = Vec::<String>::new();
+
+    let heartbeat = if heartbeat_path.exists() {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&heartbeat_path)?)?;
+        if value["run_id"].as_str() != Some(run_id) {
+            blockers.push("run_id_mismatch".to_owned());
+        }
+        if let Some(campaign_id) = campaign_id {
+            if value["campaign_id"].as_str() != Some(campaign_id) {
+                blockers.push("campaign_id_mismatch".to_owned());
+            }
+        }
+        let stale = heartbeat_path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|age| age.as_secs() > 120)
+            .unwrap_or(false);
+        if stale {
+            blockers.push("heartbeat_stale".to_owned());
+        }
+        if value["safe_to_continue"].as_bool() == Some(false) {
+            blockers.push(
+                value["blocker_reason"]
+                    .as_str()
+                    .unwrap_or("heartbeat_blocker")
+                    .to_owned(),
+            );
+        }
+        Some(value)
+    } else {
+        blockers.push("heartbeat_missing".to_owned());
+        None
+    };
+    if !attempt_ledger_path.exists() {
+        blockers.push("attempt_ledger_missing".to_owned());
+    }
+    if let Some(heartbeat) = &heartbeat {
+        if heartbeat["provider_updates"].as_u64().unwrap_or(0) == 0 && wait_seconds >= 120 {
+            blockers.push("provider_zero_updates".to_owned());
+        }
+        if heartbeat["provider_updates"].as_u64().unwrap_or(0) > 0
+            && heartbeat["pump_updates"].as_u64().unwrap_or(0) == 0
+            && wait_seconds >= 900
+        {
+            blockers.push("no_launches_seen_but_stream_alive".to_owned());
+        } else if heartbeat["provider_updates"].as_u64().unwrap_or(0) > 0
+            && heartbeat["pump_updates"].as_u64().unwrap_or(0) == 0
+            && wait_seconds >= 300
+        {
+            blockers.push("pump_updates_missing".to_owned());
+        }
+        if heartbeat["r2_checkpoint_verified"].as_bool() == Some(false) && wait_seconds >= 300 {
+            blockers.push("r2_checkpoint_stale".to_owned());
+        }
+        if heartbeat["rss_mb"].as_u64().unwrap_or(0) >= 768 {
+            blockers.push("resource_memory_ceiling_exceeded".to_owned());
+        }
+        if heartbeat["free_mb"].as_u64().unwrap_or(u64::MAX) < 2048 {
+            blockers.push("resource_disk_ceiling_exceeded".to_owned());
+        }
+    }
+    if !progress_manifest_path.exists() {
+        blockers.push("progress_manifest_missing".to_owned());
+    }
+    if checkpoint_status_path.exists()
+        && fs::read_to_string(&checkpoint_status_path)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains(",false,"))
+    {
+        blockers.push("r2_checkpoint_failed".to_owned());
+    } else if !checkpoint_status_path.exists() && wait_seconds >= 300 {
+        blockers.push("r2_checkpoint_stale".to_owned());
+    }
+    if sentinel_status_path.exists()
+        && fs::read_to_string(&sentinel_status_path)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains(",false,"))
+    {
+        blockers.push("sentinel_blocker_recorded".to_owned());
+    }
+    let service_finalized = countability_path.exists() || interrupted_path.exists();
+    if !service_finalized
+        && heartbeat_path.exists()
+        && heartbeat_path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|age| age.as_secs() > 120)
+            .unwrap_or(false)
+    {
+        blockers.push("service_dead_without_finalization".to_owned());
+    }
+    if fail_fast_check && wait_seconds >= 300 && !service_finalized {
+        blockers.push("finalization_missing".to_owned());
+    }
+    let status_value = json!({
+        "schema_version": "phase107f.material_hunter_watchdog.v1",
+        "run_id": run_id,
+        "campaign_id": campaign_id.unwrap_or(run_id),
+        "run_dir": run_dir,
+        "heartbeat_exists": heartbeat_path.exists(),
+        "provider_liveness_exists": provider_liveness_path.exists(),
+        "sentinel_status_exists": sentinel_status_path.exists(),
+        "checkpoint_status_exists": checkpoint_status_path.exists(),
+        "progress_manifest_exists": progress_manifest_path.exists(),
+        "attempt_ledger_exists": attempt_ledger_path.exists(),
+        "countability_decision_exists": countability_path.exists(),
+        "hunter_summary_interrupted_exists": interrupted_path.exists(),
+        "service_finalized": service_finalized,
+        "blockers": blockers,
+        "ok": blockers.is_empty(),
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    let report_dir = PathBuf::from("research_output/phase107f_hunter_health_sentinels");
+    fs::create_dir_all(&report_dir)?;
+    write_quant_json_md(
+        &report_dir,
+        "watchdog_status",
+        &status_value,
+        format!(
+            "# Phase 107F Hunter Watchdog\n\n- run_id: `{run_id}`\n- ok: `{}`\n- blockers: `{}`\n",
+            status_value["ok"],
+            status_value["blockers"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or(0)
+        ),
+    )?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&status_value)?);
+    } else {
+        println!(
+            "material-hunter-watchdog run_id={} ok={} blockers={}",
+            run_id,
+            status_value["ok"],
+            status_value["blockers"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or(0)
+        );
+    }
+    if fail_fast_check && !status_value["ok"].as_bool().unwrap_or(false) {
+        bail!(
+            "material hunter watchdog failed: {}",
+            status_value["blockers"]
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50693,5 +51702,57 @@ mod tests {
         );
         assert_eq!(policy["phase_trains_or_tunes"], false);
         assert_eq!(policy["threshold_tuning_allowed"], false);
+    }
+
+    #[test]
+    fn phase107f_startup_checkpoint_writes_attempt_ledger_header() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107b_write_incremental_checkpoint(temp.path(), "run", &[], &[], &[], &[])
+            .expect("checkpoint");
+        let ledger = fs::read_to_string(temp.path().join("attempt_ledger.csv")).expect("ledger");
+        assert!(ledger.starts_with("attempt_index,mint,run_id"));
+        assert_eq!(ledger.lines().count(), 1);
+    }
+
+    #[test]
+    fn phase107f_health_heartbeat_is_written_by_cli() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107f_write_health(
+            temp.path(),
+            "run",
+            "startup",
+            &MaterialHunterStreamSummary::default(),
+            0,
+            0,
+            0,
+            0,
+            true,
+            "",
+        )
+        .expect("health");
+        let heartbeat: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("heartbeat.json")).expect("read"))
+                .expect("json");
+        assert_eq!(heartbeat["run_id"], "run");
+        assert_eq!(heartbeat["current_state"], "startup");
+        assert_eq!(heartbeat["safe_to_continue"], true);
+    }
+
+    #[test]
+    fn phase107f_countability_requires_real_final_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(!phase107b_required_final_artifacts_exist(temp.path()));
+        for name in [
+            "hunter_summary.json",
+            "attempt_ledger.csv",
+            "rejected_summary.csv",
+            "candidate_summary.csv",
+            "unavailable_reason_summary.csv",
+            "manifest.json",
+            "r2_upload_result.json",
+        ] {
+            fs::write(temp.path().join(name), "{}").expect("write");
+        }
+        assert!(phase107b_required_final_artifacts_exist(temp.path()));
     }
 }

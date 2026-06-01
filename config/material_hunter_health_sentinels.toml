@@ -1,0 +1,45 @@
+[startup]
+service_pid_visible_within_seconds = 30
+service_heartbeat_within_seconds = 60
+attempt_ledger_file_created_within_seconds = 60
+run_id_consistency_within_seconds = 60
+resource_telemetry_within_seconds = 60
+r2_smoke_checkpoint_within_seconds = 120
+
+[provider]
+provider_updates_within_seconds = 120
+pump_program_updates_warning_seconds = 300
+pump_program_updates_hard_stop_seconds = 900
+no_launch_classification_seconds = 900
+
+[checkpoint]
+checkpoint_interval_seconds = 300
+checkpoint_verify_required = true
+max_checkpoint_failures = 1
+
+[resource]
+heartbeat_flush_seconds = 30
+resource_telemetry_flush_seconds = 30
+partial_summary_flush_seconds = 60
+rss_warning_mb = 512
+rss_hard_stop_mb = 768
+free_disk_warning_mb = 2500
+free_disk_hard_stop_mb = 2048
+
+[blocker_classes]
+service_start_failed = true
+run_id_mismatch = true
+heartbeat_missing = true
+heartbeat_stale = true
+attempt_ledger_missing = true
+provider_zero_updates = true
+pump_updates_missing = true
+no_launches_seen_but_stream_alive = true
+artifact_write_failed = true
+r2_checkpoint_failed = true
+resource_memory_ceiling_exceeded = true
+resource_disk_ceiling_exceeded = true
+state_progress_stalled = true
+finalization_failed = true
+unknown = true
+
