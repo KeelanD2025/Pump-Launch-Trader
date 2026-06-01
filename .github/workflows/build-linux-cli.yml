@@ -1303,9 +1303,23 @@ jobs:
           PY
             "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107b_material_candidate_hunter --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify || true
           }
-          trap 'finalize_interrupted sigterm; exit 143' TERM
-          trap 'finalize_interrupted sigint; exit 130' INT
-          trap 'finalize_interrupted sighup; exit 129' HUP
+          handle_signal() {
+            local reason="$1"
+            local code="$2"
+            trap - TERM INT HUP
+            if [[ -n "${HUNTER_PID:-}" ]] && kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
+              kill -INT "${HUNTER_PID}" >/dev/null 2>&1 || true
+              wait "${HUNTER_PID}" >/dev/null 2>&1 || true
+            fi
+            if [[ -n "${HEARTBEAT_PID:-}" ]] && kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+              kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+            fi
+            finalize_interrupted "${reason}"
+            exit "${code}"
+          }
+          trap 'handle_signal sigterm 143' TERM
+          trap 'handle_signal sigint 130' INT
+          trap 'handle_signal sighup 129' HUP
           heartbeat_loop() {
             while true; do
               TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1349,6 +1363,7 @@ jobs:
           sudo systemd-run --unit="${UNIT}" \
             --property=WorkingDirectory="${APP_DIR}" \
             --property=KillSignal=SIGINT \
+            --property=KillMode=process \
             --property=TimeoutStopSec=120 \
             --property=Restart=no \
             --setenv=APP_DIR="${APP_DIR}" \
@@ -1411,8 +1426,13 @@ jobs:
             RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
           fi
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
-          sudo systemctl kill --signal=SIGINT "${UNIT}" || true
-          sleep 5
+          sudo systemctl kill --kill-whom=main --signal=SIGINT "${UNIT}" || true
+          for _ in $(seq 1 24); do
+            if ! sudo systemctl is-active --quiet "${UNIT}"; then
+              break
+            fi
+            sleep 5
+          done
           sudo systemctl status "${UNIT}" --no-pager || true
           EOF
 
