@@ -1258,7 +1258,7 @@ jobs:
           mkdir -p "${OUT_DIR}"
           printf '%s\n' "${RUN_ID}" > "${LATEST_FILE}"
 
-          if systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
+          if sudo systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
             echo "::error::A material hunter service is already active; refusing overlap"
             exit 1
           fi
@@ -1346,7 +1346,7 @@ jobs:
           - output_dir: \`${OUT_DIR}\`
           EOS
 
-          systemd-run --unit="${UNIT}" \
+          sudo systemd-run --unit="${UNIT}" \
             --property=WorkingDirectory="${APP_DIR}" \
             --property=KillSignal=SIGINT \
             --property=TimeoutStopSec=120 \
@@ -1361,7 +1361,7 @@ jobs:
             --setenv=HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" \
             "${OUT_DIR}/hunter_service_wrapper.sh"
           sleep 3
-          systemctl is-active "${UNIT}"
+          sudo systemctl is-active "${UNIT}"
           "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107e_hunter_orchestration --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify
           echo "${RUN_ID}"
           EOF
@@ -1387,7 +1387,7 @@ jobs:
           fi
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
           OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
-          systemctl status "${UNIT}" --no-pager || true
+          sudo systemctl status "${UNIT}" --no-pager || true
           cat "${OUT_DIR}/progress_heartbeat.json" 2>/dev/null || true
           EOF
 
@@ -1411,9 +1411,9 @@ jobs:
             RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
           fi
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
-          systemctl kill --signal=SIGINT "${UNIT}" || true
+          sudo systemctl kill --signal=SIGINT "${UNIT}" || true
           sleep 5
-          systemctl status "${UNIT}" --no-pager || true
+          sudo systemctl status "${UNIT}" --no-pager || true
           EOF
 
       - name: Download Phase 107B material hunter reports from VPS
@@ -1424,6 +1424,9 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          MATERIAL_HUNTER_RUN_ID: ${{ github.event.inputs.material_hunter_run_id }}
+          RUN_MATERIAL_HUNTER: ${{ github.event.inputs.run_material_hunter }}
+          SERVICE_MODE: ${{ github.event.inputs.start_material_candidate_hunter_service == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
@@ -1432,12 +1435,29 @@ jobs:
           rm -rf "${LOCAL_HUNTER_DIR}"
           mkdir -p "${LOCAL_HUNTER_DIR}"
           ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
-            APP_DIR="${APP_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_HUNTER_DIR}"
+            APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" RUN_MATERIAL_HUNTER="${RUN_MATERIAL_HUNTER}" SERVICE_MODE="${SERVICE_MODE}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_HUNTER_DIR}"
           set -euo pipefail
           REPORT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter"
           if [[ ! -d "${REPORT_DIR}" ]]; then
             echo "phase107b material hunter report directory not found: ${REPORT_DIR}" >&2
             exit 1
+          fi
+          if [[ "${SERVICE_MODE}" == "true" && "${RUN_MATERIAL_HUNTER}" != "true" ]]; then
+            RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
+            if [[ -z "${RUN_ID}" && -f "${REPORT_DIR}/latest_run_id" ]]; then
+              RUN_ID="$(cat "${REPORT_DIR}/latest_run_id")"
+            fi
+            if [[ -n "${RUN_ID}" && -d "${REPORT_DIR}/${RUN_ID}" ]]; then
+              tmp="$(mktemp -d)"
+              mkdir -p "${tmp}/${RUN_ID}"
+              cp -a "${REPORT_DIR}/${RUN_ID}/." "${tmp}/${RUN_ID}/"
+              if [[ -f "${REPORT_DIR}/latest_run_id" ]]; then
+                cp "${REPORT_DIR}/latest_run_id" "${tmp}/latest_run_id"
+              fi
+              tar -czf - -C "${tmp}" .
+              rm -rf "${tmp}"
+              exit 0
+            fi
           fi
           tar -czf - -C "${REPORT_DIR}" .
           EOF
