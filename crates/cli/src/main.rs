@@ -38622,6 +38622,14 @@ async fn material_candidate_hunter_command(
             "promoted_to_candidate_dataset": decision.promoted,
             "tombstone_written": decision.final_state.starts_with("early_rejected") || !decision.promoted,
         }));
+        phase107b_write_incremental_checkpoint(
+            &output_dir,
+            &run_id,
+            &attempt_rows,
+            &rejected_rows,
+            &candidate_rows,
+            &unavailable_rows,
+        )?;
 
         if candidates_1800.max(candidates_900).max(candidates_300)
             >= target_material_candidates as u64
@@ -38918,6 +38926,117 @@ struct Phase107bDecision {
     survived_1800: bool,
     promoted: bool,
     provider_confirmed_bundle: bool,
+}
+
+fn phase107b_write_incremental_checkpoint(
+    output_dir: &Path,
+    run_id: &str,
+    attempt_rows: &[serde_json::Value],
+    rejected_rows: &[serde_json::Value],
+    candidate_rows: &[serde_json::Value],
+    unavailable_rows: &[serde_json::Value],
+) -> Result<()> {
+    write_json_rows_csv(
+        &output_dir.join("attempt_ledger.csv"),
+        &[
+            "attempt_index",
+            "mint",
+            "run_id",
+            "launch_timestamp",
+            "tracked_until_seconds",
+            "final_state",
+            "rejection_or_promotion_reason",
+            "early_warning_families",
+            "rug_like_outcome_by_300s",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+            "r2_verified",
+            "local_artifact_size_bytes",
+            "promoted_to_candidate_dataset",
+            "tombstone_written",
+        ],
+        attempt_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("rejected_summary_partial.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "rejection_class",
+            "stop_tracking_at_seconds",
+            "early_warning_families",
+            "holder_rpc_used",
+            "threshold_tuning_allowed",
+        ],
+        rejected_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("candidate_summary_partial.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "promotion_reason",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "risk_timeline_rows",
+            "pre_entry_risk_feature_rows",
+            "post_event_label_rows",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+        ],
+        candidate_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("unavailable_reason_summary_partial.csv"),
+        &["mint", "run_id", "unavailable_reason"],
+        unavailable_rows,
+    )?;
+    let partial = json!({
+        "schema_version": "phase107e.countability_decision_partial.v1",
+        "run_id": run_id,
+        "attempts_written": attempt_rows.len(),
+        "candidate_count": candidate_rows.len(),
+        "rejected_count": rejected_rows.len(),
+        "counted_phase107b_result": false,
+        "partial_outputs_audit_only": true,
+        "off_vps_candidate_replay_allowed": false,
+        "threshold_tuning_allowed": false,
+        "updated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("countability_decision_partial.json"),
+        serde_json::to_vec_pretty(&partial)?,
+    )?;
+    write_report(
+        &output_dir.join("progress_heartbeat.md"),
+        &format!(
+            "# Phase 107E Hunter Progress\n\n- run_id: `{run_id}`\n- attempts_written: `{}`\n- candidates: `{}`\n- rejected: `{}`\n- counted_phase107b_result: `false`\n",
+            attempt_rows.len(),
+            candidate_rows.len(),
+            rejected_rows.len()
+        ),
+    )?;
+    fs::write(
+        output_dir.join("progress_heartbeat.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "phase107e.progress_heartbeat.v1",
+            "run_id": run_id,
+            "attempts_written": attempt_rows.len(),
+            "candidate_count": candidate_rows.len(),
+            "rejected_count": rejected_rows.len(),
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "threshold_tuning_allowed": false,
+            "updated_at": OffsetDateTime::now_utc(),
+        }))?,
+    )?;
+    Ok(())
 }
 
 fn phase107b_scoped_events_for_mint(

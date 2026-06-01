@@ -1,0 +1,26 @@
+schema_version = "phase107e.material_hunter_orchestration.v1"
+
+[orchestration]
+github_owns_long_process = false
+vps_systemd_owns_long_process = true
+service_prefix = "pump-launch-quant-material-hunter"
+heartbeat_interval_seconds = 30
+resource_telemetry_interval_seconds = 30
+checkpoint_upload_interval_seconds = 300
+timeout_stop_seconds = 120
+kill_signal = "SIGINT"
+restart_policy = "no"
+
+[slice]
+max_wall_clock_seconds_per_slice = 5400
+max_attempted_launches_per_slice = 15
+max_material_candidates_per_slice = 2
+campaign_target_attempted_launches = 50
+campaign_target_material_candidates = 5
+
+[safety]
+live_trading_enabled = false
+holder_rpc_enabled = false
+rpc_mint_supply_canonical = false
+threshold_tuning_allowed = false
+binary_malicious_labels_allowed = false

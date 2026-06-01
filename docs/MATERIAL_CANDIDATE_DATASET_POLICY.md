@@ -19,3 +19,15 @@ Phase 107B separates live hunter evidence from strategy datasets.
 
 A token may be promoted only after it survives early death/rug-like gates with time-safety intact. A rejected token must not be written into the material candidate dataset, but its tombstone remains available for later calibration.
 
+## Phase 107E Countability Boundary
+
+- GitHub workflow success is not enough to count a hunter run.
+- A slice/run is counted only when `countability_decision.json` says
+  `counted_phase107b_result=true`, final artifacts exist, R2 verification passes,
+  and hard invariants pass.
+- Interrupted or cancelled slices are audit-only unless their finalized
+  countability report explicitly says otherwise.
+- Off-VPS candidate replay is allowed only for candidate mints from counted
+  slices/runs.
+- Campaign manifests aggregate counted slices only; failed and interrupted
+  slices remain separate calibration/audit evidence.

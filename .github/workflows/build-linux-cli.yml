@@ -29,10 +29,40 @@ on:
         default: false
         type: boolean
       run_material_hunter:
-        description: Run bounded Phase 107B material-candidate hunter after deploy
+        description: Run bounded Phase 107B material-candidate hunter synchronously after deploy
         required: false
         default: false
         type: boolean
+      start_material_candidate_hunter_service:
+        description: Start VPS-owned Phase 107E material hunter service and exit
+        required: false
+        default: false
+        type: boolean
+      check_material_candidate_hunter_status:
+        description: Check VPS-owned material hunter service status
+        required: false
+        default: false
+        type: boolean
+      stop_material_candidate_hunter_service:
+        description: Stop VPS-owned material hunter service gracefully
+        required: false
+        default: false
+        type: boolean
+      collect_material_candidate_hunter_artifacts:
+        description: Collect current/final VPS material hunter artifacts
+        required: false
+        default: false
+        type: boolean
+      run_material_candidate_hunter_slice:
+        description: Run a short checkpointed material hunter slice
+        required: false
+        default: false
+        type: boolean
+      material_hunter_run_id:
+        description: Existing material hunter run id for status/stop/collect
+        required: false
+        default: ""
+        type: string
       run_housekeeping_only:
         description: Run mandatory VPS pre-run housekeeping without starting collection
         required: false
@@ -330,7 +360,7 @@ jobs:
           EOF
 
       - name: Run mandatory VPS pre-run housekeeping
-        if: ${{ github.event.inputs.run_smoke == 'true' || github.event.inputs.run_live_canary == 'true' || github.event.inputs.run_risk_canary == 'true' || github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
+        if: ${{ github.event.inputs.run_smoke == 'true' || github.event.inputs.run_live_canary == 'true' || github.event.inputs.run_risk_canary == 'true' || github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_material_candidate_hunter_slice == 'true' || github.event.inputs.start_material_candidate_hunter_service == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -917,7 +947,7 @@ jobs:
           if-no-files-found: error
 
       - name: Run Phase 107B material candidate hunter on VPS
-        if: ${{ github.event.inputs.run_material_hunter == 'true' }}
+        if: ${{ github.event.inputs.run_material_hunter == 'true' || github.event.inputs.run_material_candidate_hunter_slice == 'true' }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -925,11 +955,16 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
           HUNTER_DURATION_SECONDS: ${{ github.event.inputs.material_hunter_duration_seconds }}
+          RUN_MATERIAL_HUNTER_SLICE: ${{ github.event.inputs.run_material_candidate_hunter_slice }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
           HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          if [[ "${RUN_MATERIAL_HUNTER_SLICE:-false}" == "true" && "${HUNTER_DURATION_SECONDS}" -gt 5400 ]]; then
+            echo "::warning::Clamping material hunter slice duration from ${HUNTER_DURATION_SECONDS}s to 5400s"
+            HUNTER_DURATION_SECONDS=5400
+          fi
           # GitHub-hosted jobs are capped near 6h. Keep the synchronous SSH
           # hunter comfortably below that ceiling so final artifacts can be
           # uploaded instead of losing countability to workflow cancellation.
@@ -1175,8 +1210,179 @@ jobs:
           exit "${HUNTER_EXIT}"
           EOF
 
+      - name: Start Phase 107E material hunter service on VPS
+        if: ${{ github.event.inputs.start_material_candidate_hunter_service == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          HUNTER_DURATION_SECONDS: ${{ github.event.inputs.material_hunter_duration_seconds }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+            -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          RUN_ID="material-candidate-hunter-$(date +%s%N)"
+          UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
+          OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
+          LATEST_FILE="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id"
+          mkdir -p "${OUT_DIR}"
+          printf '%s\n' "${RUN_ID}" > "${LATEST_FILE}"
+
+          if systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
+            echo "::error::A material hunter service is already active; refusing overlap"
+            exit 1
+          fi
+
+          cat > "${OUT_DIR}/hunter_service_wrapper.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${BIN}"
+          ENV_FILE="${ENV_FILE}"
+          OUT_DIR="${OUT_DIR}"
+          RUN_ID="${RUN_ID}"
+          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}"
+          set -a
+          source "${ENV_FILE}"
+          set +a
+          printf 'timestamp,process_rss_mb,process_vsz_mb,local_artifact_bytes,free_mb,any_oom_kernel_kill_evidence\n' > "${OUT_DIR}/resource_telemetry.csv"
+          finalize_interrupted() {
+            local reason="$1"
+            python3 - "${OUT_DIR}" "${RUN_ID}" "${reason}" <<'PY'
+          import json, sys
+          from pathlib import Path
+          from datetime import datetime, timezone
+          out=Path(sys.argv[1]); run_id=sys.argv[2]; reason=sys.argv[3]
+          summary={
+            "schema_version":"phase107e.hunter_summary_interrupted.v1",
+            "run_id":run_id,
+            "interruption_reason":reason,
+            "counted_phase107b_result":False,
+            "partial_outputs_audit_only":True,
+            "off_vps_candidate_replay_allowed":False,
+            "holder_rpc_used":False,
+            "rpc_mint_supply_canonical":False,
+            "threshold_tuning_allowed":False,
+            "generated_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+          }
+          (out/"hunter_summary_interrupted.json").write_text(json.dumps(summary,indent=2)+"\n")
+          (out/"hunter_summary_interrupted.md").write_text("# Phase 107E Interrupted Hunter\n\n- run_id: `"+run_id+"`\n- interruption_reason: `"+reason+"`\n- counted_phase107b_result: `false`\n")
+          (out/"countability_decision.json").write_text(json.dumps(summary,indent=2)+"\n")
+          PY
+            "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107b_material_candidate_hunter --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify || true
+          }
+          trap 'finalize_interrupted sigterm; exit 143' TERM
+          trap 'finalize_interrupted sigint; exit 130' INT
+          trap 'finalize_interrupted sighup; exit 129' HUP
+          heartbeat_loop() {
+            while true; do
+              TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              FREE_MB="$(df -Pm "${APP_DIR}" | awk 'NR==2 {print $4}')"
+              ART_BYTES="$(du -sb "${OUT_DIR}" 2>/dev/null | awk '{print $1}')"
+              printf '{"schema_version":"phase107e.progress_heartbeat.v1","run_id":"%s","timestamp":"%s","free_mb":%s,"local_artifact_bytes":%s,"holder_rpc_used":false,"rpc_mint_supply_canonical":false,"threshold_tuning_allowed":false}\n' "${RUN_ID}" "${TS}" "${FREE_MB:-0}" "${ART_BYTES:-0}" > "${OUT_DIR}/progress_heartbeat.json"
+              printf '# Phase 107E Hunter Heartbeat\n\n- run_id: `%s`\n- timestamp: `%s`\n- free_mb: `%s`\n' "${RUN_ID}" "${TS}" "${FREE_MB:-}" > "${OUT_DIR}/progress_heartbeat.md"
+              if [[ -n "${HUNTER_PID:-}" ]] && kill -0 "${HUNTER_PID}" >/dev/null 2>&1; then
+                RSS_KB="$(ps -o rss= -p "${HUNTER_PID}" 2>/dev/null | awk '{print $1}')"
+                VSZ_KB="$(ps -o vsz= -p "${HUNTER_PID}" 2>/dev/null | awk '{print $1}')"
+                RSS_MB="$(awk -v kb="${RSS_KB:-0}" 'BEGIN { printf "%.2f", kb / 1024 }')"
+                VSZ_MB="$(awk -v kb="${VSZ_KB:-0}" 'BEGIN { printf "%.2f", kb / 1024 }')"
+                OOM="$(dmesg -T 2>/dev/null | tail -n 80 | grep -Eic 'out of memory|oom-kill|Killed process' || true)"
+                printf '%s,%s,%s,%s,%s,%s\n' "${TS}" "${RSS_MB}" "${VSZ_MB}" "${ART_BYTES:-0}" "${FREE_MB:-}" "${OOM}" >> "${OUT_DIR}/resource_telemetry.csv"
+              fi
+              sleep 30
+            done
+          }
+          heartbeat_loop &
+          HEARTBEAT_PID="$!"
+          "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches 50 --target-material-candidates 5 --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
+          HUNTER_PID="$!"
+          wait "${HUNTER_PID}"
+          STATUS="$?"
+          kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+          exit "${STATUS}"
+          EOS
+          chmod +x "${OUT_DIR}/hunter_service_wrapper.sh"
+
+          cat > "${OUT_DIR}/service_start.json" <<EOS
+          {"schema_version":"phase107e.service_start.v1","run_id":"${RUN_ID}","unit":"${UNIT}","output_dir":"${OUT_DIR}","live_trading_enabled":false,"holder_rpc_used":false,"threshold_tuning_allowed":false}
+          EOS
+          cat > "${OUT_DIR}/service_start.md" <<EOS
+          # Phase 107E Service Start
+
+          - run_id: \`${RUN_ID}\`
+          - unit: \`${UNIT}\`
+          - output_dir: \`${OUT_DIR}\`
+          EOS
+
+          systemd-run --unit="${UNIT}" --property=WorkingDirectory="${APP_DIR}" --property=KillSignal=SIGINT --property=TimeoutStopSec=120 --property=Restart=no "${OUT_DIR}/hunter_service_wrapper.sh"
+          sleep 3
+          systemctl is-active "${UNIT}"
+          "${BIN}" upload-phase-report-dir-r2 --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --phase-prefix phase107e_hunter_orchestration --run-or-mint "${RUN_ID}" --local-output-dir "${OUT_DIR}" --verify
+          echo "${RUN_ID}"
+          EOF
+
+      - name: Check Phase 107E material hunter service status
+        if: ${{ github.event.inputs.check_material_candidate_hunter_status == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          MATERIAL_HUNTER_RUN_ID: ${{ github.event.inputs.material_hunter_run_id }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
+          if [[ -z "${RUN_ID}" && -f "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" ]]; then
+            RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
+          fi
+          UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
+          OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
+          systemctl status "${UNIT}" --no-pager || true
+          cat "${OUT_DIR}/progress_heartbeat.json" 2>/dev/null || true
+          EOF
+
+      - name: Stop Phase 107E material hunter service
+        if: ${{ github.event.inputs.stop_material_candidate_hunter_service == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          MATERIAL_HUNTER_RUN_ID: ${{ github.event.inputs.material_hunter_run_id }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" MATERIAL_HUNTER_RUN_ID="${MATERIAL_HUNTER_RUN_ID}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          RUN_ID="${MATERIAL_HUNTER_RUN_ID}"
+          if [[ -z "${RUN_ID}" && -f "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" ]]; then
+            RUN_ID="$(cat "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id")"
+          fi
+          UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
+          systemctl kill --signal=SIGINT "${UNIT}" || true
+          sleep 5
+          systemctl status "${UNIT}" --no-pager || true
+          EOF
+
       - name: Download Phase 107B material hunter reports from VPS
-        if: ${{ always() && github.event.inputs.run_material_hunter == 'true' }}
+        if: ${{ always() && (github.event.inputs.run_material_hunter == 'true' || github.event.inputs.start_material_candidate_hunter_service == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true') }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -1202,7 +1408,7 @@ jobs:
           EOF
 
       - name: Upload Phase 107B material hunter reports
-        if: ${{ always() && github.event.inputs.run_material_hunter == 'true' }}
+        if: ${{ always() && (github.event.inputs.run_material_hunter == 'true' || github.event.inputs.start_material_candidate_hunter_service == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: phase107b-material-candidate-hunter
