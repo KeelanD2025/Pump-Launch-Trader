@@ -14171,6 +14171,18 @@ fn housekeeping_cleanup_candidates(
         .join("reports");
     let mut rows = Vec::<serde_json::Value>::new();
 
+    let repo_research_output = workspace_root.join("research_output");
+    if repo_research_output.exists() {
+        rows.push(housekeeping_candidate(
+            "edge_repo_research_output_dir",
+            &repo_research_output,
+            true,
+            "repo_root_research_output_is_forbidden_on_edge_vps_reports_must_live_under_data_reports_or_r2",
+            false,
+            "",
+        ));
+    }
+
     for path in collect_dev_shm_build_dirs() {
         rows.push(housekeeping_candidate(
             "stale_dev_shm_build_dir",
@@ -14373,6 +14385,7 @@ fn remove_path_safely(workspace_root: &Path, path: &Path) -> Result<()> {
     let allowed_roots = [
         workspace_root.join("target"),
         workspace_root.join("data"),
+        workspace_root.join("research_output"),
         PathBuf::from("/dev/shm"),
     ];
     if !allowed_roots.iter().any(|root| path.starts_with(root)) {
@@ -40826,20 +40839,17 @@ fn material_hunter_watchdog_command(
             .map(|items| items.len())
             .unwrap_or(0)
     );
-    let local_report_dir = PathBuf::from("research_output/phase107f_hunter_health_sentinels");
     let health_report_dir = run_dir.join("health");
-    for report_dir in [&local_report_dir, &health_report_dir] {
-        if let Err(error) = write_quant_json_md(
-            report_dir,
-            "watchdog_status",
-            &status_value,
-            watchdog_markdown.clone(),
-        ) {
-            eprintln!(
-                "warning: failed to write watchdog status report at {}: {error}",
-                report_dir.display()
-            );
-        }
+    if let Err(error) = write_quant_json_md(
+        &health_report_dir,
+        "watchdog_status",
+        &status_value,
+        watchdog_markdown,
+    ) {
+        eprintln!(
+            "warning: failed to write watchdog status report at {}: {error}",
+            health_report_dir.display()
+        );
     }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&status_value)?);
@@ -50750,6 +50760,22 @@ mod tests {
 
         assert!(remove_path_safely(&dir, &open).is_err());
         assert!(open.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeeping_can_remove_forbidden_edge_research_output() {
+        let dir = temp_test_dir("housekeeping_edge_research_output");
+        let report = dir
+            .join("research_output")
+            .join("phase107f_hunter_health_sentinels")
+            .join("watchdog_status.json");
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::write(&report, "{}").unwrap();
+
+        remove_path_safely(&dir, &dir.join("research_output")).unwrap();
+
+        assert!(!dir.join("research_output").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
