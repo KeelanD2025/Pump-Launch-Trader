@@ -1122,6 +1122,7 @@ jobs:
             --no-rpc \
             --upload-r2 \
             --verify-r2 \
+            --run-id "material-candidate-hunter-$(date +%s%N)" \
             --output-dir "${OUT_DIR}" &
           HUNTER_PID="$!"
           while kill -0 "${HUNTER_PID}" >/dev/null 2>&1; do
@@ -1353,7 +1354,7 @@ jobs:
           }
           heartbeat_loop &
           HEARTBEAT_PID="$!"
-          "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches "${HUNTER_MAX_ATTEMPTS}" --target-material-candidates "${HUNTER_TARGET_CANDIDATES}" --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
+          "${BIN}" material-candidate-hunter --config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml" --env-file "${ENV_FILE}" --run-id "${RUN_ID}" --duration-seconds "${HUNTER_DURATION_SECONDS}" --max-attempted-launches "${HUNTER_MAX_ATTEMPTS}" --target-material-candidates "${HUNTER_TARGET_CANDIDATES}" --max-concurrent-tracked-mints 3 --no-live-trading --no-rpc --upload-r2 --verify-r2 --output-dir "${OUT_DIR}" &
           HUNTER_PID="$!"
           wait "${HUNTER_PID}"
           STATUS="$?"

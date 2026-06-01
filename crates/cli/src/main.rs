@@ -1333,6 +1333,8 @@ enum Command {
     MaterialCandidateHunter {
         #[arg(long)]
         env_file: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long, default_value_t = 28800)]
         duration_seconds: u64,
         #[arg(long, default_value_t = 50)]
@@ -4626,6 +4628,7 @@ async fn main() -> Result<()> {
         }
         Command::MaterialCandidateHunter {
             env_file,
+            run_id,
             duration_seconds,
             max_attempted_launches,
             target_material_candidates,
@@ -4648,6 +4651,7 @@ async fn main() -> Result<()> {
                 upload_r2,
                 verify_r2,
                 &output_dir,
+                run_id,
             )
             .await
         }
@@ -38416,6 +38420,7 @@ async fn material_candidate_hunter_command(
     upload_r2: bool,
     verify_r2: bool,
     output_dir: &str,
+    run_id: Option<String>,
 ) -> Result<()> {
     if !no_live_trading {
         bail!("material-candidate-hunter refuses to run unless --no-live-trading is set");
@@ -38431,10 +38436,12 @@ async fn material_candidate_hunter_command(
 
     let output_dir = PathBuf::from(output_dir);
     fs::create_dir_all(&output_dir)?;
-    let run_id = format!(
-        "material-candidate-hunter-{}",
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    );
+    let run_id = run_id.unwrap_or_else(|| {
+        format!(
+            "material-candidate-hunter-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        )
+    });
     let preflight = json!({
         "schema_version": "phase107b.preflight.v1",
         "run_id": run_id,
