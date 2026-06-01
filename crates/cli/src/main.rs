@@ -40703,6 +40703,7 @@ fn material_hunter_watchdog_command(
     let attempt_ledger_path = run_dir.join("attempt_ledger.csv");
     let countability_path = run_dir.join("countability_decision.json");
     let interrupted_path = run_dir.join("hunter_summary_interrupted.json");
+    let service_finalized = countability_path.exists() || interrupted_path.exists();
     let mut blockers = Vec::<String>::new();
 
     let heartbeat = if heartbeat_path.exists() {
@@ -40731,7 +40732,7 @@ fn material_hunter_watchdog_command(
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .map(|age| age.as_secs() > 120)
             .unwrap_or(false);
-        if stale {
+        if stale && !service_finalized {
             blockers.push("heartbeat_stale".to_owned());
         }
         if value["safe_to_continue"].as_bool() == Some(false) {
@@ -40796,7 +40797,6 @@ fn material_hunter_watchdog_command(
     {
         blockers.push("sentinel_blocker_recorded".to_owned());
     }
-    let service_finalized = countability_path.exists() || interrupted_path.exists();
     if !service_finalized
         && heartbeat_path.exists()
         && heartbeat_path
