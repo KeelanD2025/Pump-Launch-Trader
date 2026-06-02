@@ -1340,11 +1340,11 @@ enum Command {
         env_file: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
-        #[arg(long, default_value_t = 28800)]
+        #[arg(long, default_value_t = 5400)]
         duration_seconds: u64,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 15)]
         max_attempted_launches: usize,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 2)]
         target_material_candidates: usize,
         #[arg(long, default_value_t = 3)]
         max_concurrent_tracked_mints: usize,
@@ -1378,6 +1378,20 @@ enum Command {
         fail_fast_check: bool,
         #[arg(long, default_value_t = 0)]
         wait_seconds: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    MaterialHunterPreflight {
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        artifact_dir: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    ValidateMaterialHunterArtifacts {
+        #[arg(long)]
+        output_dir: String,
         #[arg(long)]
         json: bool,
     },
@@ -4696,6 +4710,14 @@ async fn main() -> Result<()> {
             wait_seconds,
             json,
         ),
+        Command::MaterialHunterPreflight {
+            offline,
+            artifact_dir,
+            json,
+        } => material_hunter_preflight_command(&loaded, offline, artifact_dir.as_deref(), json),
+        Command::ValidateMaterialHunterArtifacts { output_dir, json } => {
+            validate_material_hunter_artifacts_command(&output_dir, json)
+        }
         Command::RunQuantDiagnostics {
             source_run_id,
             derived_run_id,
@@ -28361,11 +28383,11 @@ fn write_quant_json_md<T: Serialize + ?Sized>(
     markdown: String,
 ) -> Result<()> {
     fs::create_dir_all(output_dir)?;
-    fs::write(
-        output_dir.join(format!("{stem}.json")),
-        serde_json::to_vec_pretty(payload)?,
+    atomic_write_path(
+        &output_dir.join(format!("{stem}.json")),
+        &serde_json::to_vec_pretty(payload)?,
     )?;
-    write_report(output_dir.join(format!("{stem}.md")), &markdown)?;
+    atomic_write_path(&output_dir.join(format!("{stem}.md")), markdown.as_bytes())?;
     Ok(())
 }
 
@@ -28391,7 +28413,7 @@ fn write_csv_file(path: &Path, header: &[&str], rows: &[Vec<String>]) -> Result<
         );
         output.push('\n');
     }
-    fs::write(path, output)?;
+    atomic_write_path(path, output.as_bytes())?;
     Ok(())
 }
 
@@ -40998,6 +41020,452 @@ fn phase107b_demote_rejected_candidate_rows(
     });
 }
 
+fn phase107f_json_bool(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+}
+
+fn phase107f_json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value.get(key).and_then(|item| item.as_u64()).unwrap_or(0)
+}
+
+fn phase107f_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty() && *item != "null")
+        .map(ToOwned::to_owned)
+}
+
+fn phase107f_read_json_value(path: &Path) -> Result<Option<serde_json::Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse JSON artifact {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn phase107f_read_csv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(header_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let headers = header_line
+        .split(',')
+        .map(|header| header.trim().to_owned())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut row = BTreeMap::new();
+        for (header, value) in headers.iter().zip(line.split(',')) {
+            row.insert(header.clone(), value.trim().to_owned());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn phase107f_row_bool(row: &BTreeMap<String, String>, key: &str) -> bool {
+    row.get(key)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+fn phase107f_row_value<'a>(row: &'a BTreeMap<String, String>, key: &str) -> &'a str {
+    row.get(key).map(String::as_str).unwrap_or("")
+}
+
+fn phase107f_non_countable_blocker_classes() -> BTreeSet<&'static str> {
+    [
+        "provider_lagged_data_loss",
+        "provider_reconnect_exhausted",
+        "provider_stream_closed_before_deadline",
+        "provider_progress_stalled",
+        "pump_progress_stalled",
+        "auth_rejected",
+        "permission_denied",
+        "unsupported_provider",
+        "unsupported",
+        "provider_connect_failed",
+        "connection_failed",
+        "provider_first_update_timeout",
+        "provider_zero_updates_timeout",
+        "provider_decode_error_limit_exceeded",
+        "provider_malformed_update_limit_exceeded",
+        "provider_slot_regression",
+        "provider_duplicate_update_overflow",
+        "provider_backpressure_detected",
+        "signal_interrupted",
+        "systemd_timeout",
+        "startup_sentinel_failed",
+        "watchdog_failed",
+        "r2_checkpoint_failed",
+        "r2_final_upload_failed",
+        "disk_space_low",
+        "artifact_write_failed",
+        "config_invalid",
+        "env_missing",
+        "unknown_structured_blocker",
+        "stream_runtime_error",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<serde_json::Value> {
+    let mut blockers = Vec::<String>::new();
+    let countability_path = output_dir.join("countability_decision.json");
+    let countability = match phase107f_read_json_value(&countability_path)? {
+        Some(value) => value,
+        None => {
+            blockers.push("countability_decision_missing".to_owned());
+            json!({})
+        }
+    };
+    let hunter_summary = phase107f_read_json_value(&output_dir.join("hunter_summary.json"))?;
+    let interrupted_summary =
+        phase107f_read_json_value(&output_dir.join("hunter_summary_interrupted.json"))?;
+    let manifest = phase107f_read_json_value(&output_dir.join("manifest.json"))?;
+    let service_exit = phase107f_read_json_value(&output_dir.join("service_exit_status.json"))?;
+    let candidate_rows = phase107f_read_csv_rows(&output_dir.join("candidate_summary.csv"))?;
+    let rejected_rows = phase107f_read_csv_rows(&output_dir.join("rejected_summary.csv"))?;
+    let attempt_rows = phase107f_read_csv_rows(&output_dir.join("attempt_ledger.csv"))?;
+
+    let counted = phase107f_json_bool(&countability, "counted_phase107b_result");
+    let replay_allowed = phase107f_json_bool(&countability, "off_vps_candidate_replay_allowed");
+    let ready_for_replay = phase107f_json_bool(&countability, "ready_for_off_vps_candidate_replay");
+    let provider_data_loss_seen = phase107f_json_bool(&countability, "provider_data_loss_seen")
+        || hunter_summary
+            .as_ref()
+            .map(|value| phase107f_json_bool(value, "provider_data_loss_seen"))
+            .unwrap_or(false)
+        || interrupted_summary
+            .as_ref()
+            .map(|value| phase107f_json_bool(value, "provider_data_loss_seen"))
+            .unwrap_or(false);
+    let provider_blocker_class = phase107f_json_string(&countability, "provider_blocker_class")
+        .or_else(|| {
+            hunter_summary
+                .as_ref()
+                .and_then(|value| phase107f_json_string(value, "provider_blocker_class"))
+        })
+        .or_else(|| {
+            interrupted_summary
+                .as_ref()
+                .and_then(|value| phase107f_json_string(value, "provider_blocker_class"))
+        });
+    let interrupted_run =
+        phase107f_json_bool(&countability, "interrupted_run") || interrupted_summary.is_some();
+    let partial_audit_only = phase107f_json_bool(&countability, "partial_outputs_audit_only")
+        || interrupted_summary
+            .as_ref()
+            .map(|value| phase107f_json_bool(value, "partial_outputs_audit_only"))
+            .unwrap_or(false);
+
+    if service_exit.is_none()
+        && (countability_path.exists() || hunter_summary.is_some() || interrupted_summary.is_some())
+    {
+        blockers.push("service_exit_status_missing_for_finished_slice".to_owned());
+    }
+    if counted && provider_data_loss_seen {
+        blockers.push("counted_provider_data_loss_seen".to_owned());
+    }
+    if counted && provider_blocker_class.is_some() {
+        blockers.push("counted_provider_blocker_class_present".to_owned());
+    }
+    if let Some(class) = provider_blocker_class.as_deref() {
+        if phase107f_non_countable_blocker_classes().contains(class) {
+            if counted {
+                blockers.push(format!("non_countable_blocker_counted:{class}"));
+            }
+            if !partial_audit_only {
+                blockers.push(format!("non_countable_blocker_not_audit_only:{class}"));
+            }
+            if replay_allowed || ready_for_replay {
+                blockers.push(format!("non_countable_blocker_replay_enabled:{class}"));
+            }
+        }
+    }
+    if phase107f_json_bool(&countability, "formal_backtesting_allowed") {
+        blockers.push("formal_backtesting_allowed_true".to_owned());
+    }
+    if phase107f_json_bool(&countability, "threshold_tuning_allowed") {
+        blockers.push("threshold_tuning_allowed_true".to_owned());
+    }
+    if phase107f_json_bool(&countability, "live_trading_enabled") {
+        blockers.push("live_trading_enabled_true".to_owned());
+    }
+    if phase107f_json_bool(&countability, "holder_rpc_enabled")
+        || phase107f_json_bool(&countability, "holder_rpc_used")
+    {
+        blockers.push("holder_rpc_enabled_or_used_true".to_owned());
+    }
+    if replay_allowed && phase107f_json_u64(&countability, "replay_eligible_candidate_count") == 0 {
+        blockers.push("replay_allowed_without_replay_eligible_candidate".to_owned());
+    }
+    if ready_for_replay && !replay_allowed {
+        blockers.push("ready_for_replay_without_replay_allowed".to_owned());
+    }
+
+    let mut replay_eligible_mints = BTreeSet::<String>::new();
+    let mut checkpoint_count = 0u64;
+    let mut replay_eligible_count = 0u64;
+    for row in &candidate_rows {
+        let state = phase107f_row_value(row, "final_state");
+        let replay_eligible = phase107f_row_bool(row, "replay_eligible");
+        let checkpoint =
+            phase107f_row_bool(row, "candidate_checkpoint") || state.ends_with("_checkpoint");
+        if checkpoint {
+            checkpoint_count = checkpoint_count.saturating_add(1);
+            if replay_eligible {
+                blockers.push(format!(
+                    "candidate_checkpoint_replay_eligible:{}",
+                    phase107f_row_value(row, "mint")
+                ));
+            }
+        }
+        if replay_eligible {
+            replay_eligible_count = replay_eligible_count.saturating_add(1);
+            if let Some(mint) = row.get("mint").filter(|mint| !mint.is_empty()) {
+                replay_eligible_mints.insert(mint.clone());
+            }
+        }
+    }
+    if phase107f_json_u64(&countability, "candidate_checkpoint_count") != checkpoint_count {
+        blockers.push("candidate_checkpoint_count_mismatch".to_owned());
+    }
+    if phase107f_json_u64(&countability, "replay_eligible_candidate_count") != replay_eligible_count
+    {
+        blockers.push("replay_eligible_candidate_count_mismatch".to_owned());
+    }
+    if replay_allowed != (counted && replay_eligible_count > 0) {
+        blockers.push("replay_allowed_formula_mismatch".to_owned());
+    }
+    if ready_for_replay != (counted && replay_eligible_count > 0) {
+        blockers.push("ready_for_replay_formula_mismatch".to_owned());
+    }
+    if interrupted_run && replay_eligible_count > 0 {
+        blockers.push("interrupted_run_has_replay_eligible_candidate".to_owned());
+    }
+    for row in rejected_rows.iter().chain(attempt_rows.iter()) {
+        let mint = phase107f_row_value(row, "mint");
+        let state = phase107f_row_value(row, "final_state");
+        if state == "terminal_inconclusive" && replay_eligible_mints.contains(mint) {
+            blockers.push(format!(
+                "terminal_inconclusive_replay_eligible_conflict:{mint}"
+            ));
+        }
+    }
+    if let Some(manifest) = &manifest {
+        if phase107f_json_bool(manifest, "off_vps_candidate_replay_allowed") != replay_allowed {
+            blockers.push("manifest_replay_allowed_mismatch".to_owned());
+        }
+        if phase107f_json_bool(manifest, "ready_for_off_vps_candidate_replay") != ready_for_replay {
+            blockers.push("manifest_ready_for_replay_mismatch".to_owned());
+        }
+    }
+
+    Ok(json!({
+        "schema_version": "phase107f.material_hunter_artifact_consistency.v1",
+        "output_dir": output_dir,
+        "ok": blockers.is_empty(),
+        "blockers": blockers,
+        "counted_phase107b_result": counted,
+        "provider_data_loss_seen": provider_data_loss_seen,
+        "provider_blocker_class": provider_blocker_class,
+        "interrupted_run": interrupted_run,
+        "partial_outputs_audit_only": partial_audit_only,
+        "candidate_checkpoint_count": checkpoint_count,
+        "replay_eligible_candidate_count": replay_eligible_count,
+        "off_vps_candidate_replay_allowed": replay_allowed,
+        "ready_for_off_vps_candidate_replay": ready_for_replay,
+        "service_exit_status_exists": service_exit.is_some(),
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    }))
+}
+
+fn validate_material_hunter_artifacts_command(output_dir: &str, json_output: bool) -> Result<()> {
+    let report = validate_material_hunter_artifact_consistency(Path::new(output_dir))?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "material hunter artifact consistency ok={} blockers={}",
+            report["ok"],
+            report["blockers"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or(0)
+        );
+    }
+    if !report["ok"].as_bool().unwrap_or(false) {
+        bail!(
+            "material hunter artifact consistency failed: {}",
+            report["blockers"]
+        );
+    }
+    Ok(())
+}
+
+fn phase107f_static_preflight_report(
+    loaded: &LoadedConfig,
+    artifact_dir: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let mut blockers = Vec::<String>::new();
+    let stream_only = loaded.stream_only_validation_summary();
+    if !stream_only.passed {
+        blockers.push(format!(
+            "stream_only_validation_failed:{}",
+            stream_only.violations.join(";")
+        ));
+    }
+    if stream_only.holder_rpc_calls_allowed || stream_only.top_holder_rpc_calls_allowed {
+        blockers.push("holder_rpc_allowed_by_config".to_owned());
+    }
+    if stream_only.live_execution_enabled
+        || stream_only.send_rpc_allowed
+        || stream_only.use_rpc_send
+    {
+        blockers.push("live_trading_or_send_rpc_enabled".to_owned());
+    }
+
+    let repo_root = std::env::current_dir()
+        .ok()
+        .filter(|path| path.join(".github/workflows/build-linux-cli.yml").exists())
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let orchestration_path = repo_root.join("config/material_hunter_orchestration.toml");
+    let sentinels_path = repo_root.join("config/material_hunter_health_sentinels.toml");
+    let workflow_path = repo_root.join(".github/workflows/build-linux-cli.yml");
+    let orchestration = fs::read_to_string(&orchestration_path)
+        .with_context(|| format!("read {}", orchestration_path.display()))?;
+    let sentinels = fs::read_to_string(&sentinels_path)
+        .with_context(|| format!("read {}", sentinels_path.display()))?;
+    let workflow = fs::read_to_string(&workflow_path)
+        .with_context(|| format!("read {}", workflow_path.display()))?;
+
+    for required in [
+        "github_owns_long_process = false",
+        "vps_systemd_owns_long_process = true",
+        "max_wall_clock_seconds_per_slice = 5400",
+        "max_attempted_launches_per_slice = 15",
+        "max_material_candidates_per_slice = 2",
+        "live_trading_enabled = false",
+        "holder_rpc_enabled = false",
+        "rpc_mint_supply_canonical = false",
+        "threshold_tuning_allowed = false",
+    ] {
+        if !orchestration.contains(required) {
+            blockers.push(format!("orchestration_policy_missing:{required}"));
+        }
+    }
+    for required in [
+        "provider_updates_within_seconds = 120",
+        "checkpoint_interval_seconds = 300",
+        "max_checkpoint_failures = 1",
+        "rss_hard_stop_mb = 768",
+        "free_disk_hard_stop_mb = 2048",
+    ] {
+        if !sentinels.contains(required) {
+            blockers.push(format!("health_sentinel_missing:{required}"));
+        }
+    }
+    for required in [
+        "default: \"5400\"",
+        "default: \"15\"",
+        "default: \"2\"",
+        "A material hunter service is already active; refusing overlap",
+        "--property=RuntimeMaxSec=\"${SERVICE_RUNTIME_MAX_SEC}\"",
+        "\"requested_duration_seconds\"",
+        "\"effective_duration_seconds\"",
+        "\"requested_max_attempted_launches\"",
+        "\"effective_max_attempted_launches\"",
+        "\"requested_target_candidates\"",
+        "\"effective_target_candidates\"",
+        "Foreground material-candidate hunter execution is disabled",
+    ] {
+        if !workflow.contains(required) {
+            blockers.push(format!("workflow_guard_missing:{required}"));
+        }
+    }
+    if let (Some(overlap_idx), Some(write_idx)) = (
+        workflow.find("A material hunter service is already active; refusing overlap"),
+        workflow.find("printf '%s\\n' \"${RUN_ID}\" > \"${LATEST_FILE}\""),
+    ) {
+        if write_idx < overlap_idx {
+            blockers.push("latest_run_id_written_before_overlap_guard".to_owned());
+        }
+    } else {
+        blockers.push("latest_run_id_or_overlap_guard_static_check_missing".to_owned());
+    }
+    if !workflow.contains("sudo -E \"${BIN}\" material-hunter-watchdog") {
+        blockers.push("workflow_watchdog_startup_check_missing".to_owned());
+    }
+    if !workflow.contains("health/last_checkpoint.json") {
+        blockers.push("workflow_startup_r2_checkpoint_check_missing".to_owned());
+    }
+
+    let artifact_consistency = if let Some(artifact_dir) = artifact_dir {
+        let report = validate_material_hunter_artifact_consistency(artifact_dir)?;
+        if !report["ok"].as_bool().unwrap_or(false) {
+            blockers.push("artifact_consistency_failed".to_owned());
+        }
+        Some(report)
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "schema_version": "phase107f.material_hunter_preflight.v1",
+        "offline": true,
+        "stream_only_passed": stream_only.passed,
+        "stream_only_violations": stream_only.violations,
+        "artifact_consistency": artifact_consistency,
+        "blockers": blockers,
+        "ok": blockers.is_empty(),
+        "threshold_tuning_allowed": false,
+        "formal_backtesting_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    }))
+}
+
+fn material_hunter_preflight_command(
+    loaded: &LoadedConfig,
+    _offline: bool,
+    artifact_dir: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let artifact_dir = artifact_dir.map(Path::new);
+    let report = phase107f_static_preflight_report(loaded, artifact_dir)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "material hunter preflight ok={} blockers={}",
+            report["ok"],
+            report["blockers"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or(0)
+        );
+    }
+    if !report["ok"].as_bool().unwrap_or(false) {
+        bail!("material hunter preflight failed: {}", report["blockers"]);
+    }
+    Ok(())
+}
+
 fn material_hunter_watchdog_command(
     run_id: &str,
     campaign_id: Option<&str>,
@@ -52420,5 +52888,171 @@ mod tests {
             fs::write(temp.path().join(name), "{}").expect("write");
         }
         assert!(phase107b_required_final_artifacts_exist(temp.path()));
+    }
+
+    #[test]
+    fn phase107f_artifact_consistency_rejects_provider_blocker_counted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_blocker_class": "provider_lagged_data_loss",
+                "provider_data_loss_seen": true,
+                "partial_outputs_audit_only": false,
+                "off_vps_candidate_replay_allowed": true,
+                "ready_for_off_vps_candidate_replay": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\n",
+        )
+        .expect("candidates");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        let blockers = report["blockers"].to_string();
+        assert!(blockers.contains("counted_provider_data_loss_seen"));
+        assert!(blockers.contains("non_countable_blocker_counted"));
+        assert!(blockers.contains("replay_allowed_without_replay_eligible_candidate"));
+    }
+
+    #[test]
+    fn phase107f_artifact_consistency_rejects_checkpoint_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": false,
+                "off_vps_candidate_replay_allowed": true,
+                "ready_for_off_vps_candidate_replay": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 1,
+                "replay_eligible_candidate_count": 1,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\nmint-a,survived_300s_candidate_checkpoint,true,true\n",
+        )
+        .expect("candidates");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("candidate_checkpoint_replay_eligible:mint-a")
+        );
+    }
+
+    #[test]
+    fn phase107f_artifact_consistency_rejects_terminal_inconclusive_replay_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": false,
+                "off_vps_candidate_replay_allowed": true,
+                "ready_for_off_vps_candidate_replay": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 1,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\nmint-a,material_candidate_1800s,false,true\n",
+        )
+        .expect("candidates");
+        fs::write(
+            temp.path().join("rejected_summary.csv"),
+            "mint,final_state,rejection_class\nmint-a,terminal_inconclusive,signal_interrupted_active_mint_finalized_inconclusive\n",
+        )
+        .expect("rejected");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("terminal_inconclusive_replay_eligible_conflict:mint-a")
+        );
+    }
+
+    #[test]
+    fn phase107f_artifact_consistency_accepts_non_replayable_counted_slice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": false,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 1,
+                "replay_eligible_candidate_count": 0,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\nmint-a,survived_300s_candidate_checkpoint,true,false\n",
+        )
+        .expect("candidates");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], true);
+    }
+
+    #[test]
+    fn phase107f_material_hunter_preflight_static_gate_passes() {
+        let loaded = load_default_config_for_test();
+        let report = phase107f_static_preflight_report(&loaded, None).expect("preflight report");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["threshold_tuning_allowed"], false);
+        assert_eq!(report["live_trading_enabled"], false);
+        assert_eq!(report["holder_rpc_enabled"], false);
     }
 }
