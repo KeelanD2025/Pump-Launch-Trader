@@ -83,6 +83,31 @@ on:
         required: false
         default: false
         type: boolean
+      run_provider_health_probe:
+        description: Run provider-health-probe on VPS without starting material hunter
+        required: false
+        default: false
+        type: boolean
+      provider_health_probe_duration_seconds:
+        description: Provider health probe duration in seconds
+        required: false
+        default: "900"
+        type: string
+      provider_health_probe_max_updates:
+        description: Optional provider health probe max updates proof stop
+        required: false
+        default: ""
+        type: string
+      provider_health_probe_output_dir:
+        description: Optional provider health probe parent output directory on VPS
+        required: false
+        default: ""
+        type: string
+      provider_health_probe_upload_r2:
+        description: Upload provider health probe reports to R2
+        required: false
+        default: false
+        type: boolean
       smoke_duration_seconds:
         description: Edge-only smoke/canary duration in seconds
         required: false
@@ -208,7 +233,7 @@ jobs:
 
   deploy-to-vps:
     name: Deploy prebuilt CLI to VPS
-    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' }}
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' }}
     needs: build-linux-cli
     runs-on: ubuntu-22.04
 
@@ -693,6 +718,236 @@ jobs:
         with:
           name: phase100-provider-unblock
           path: phase100-provider-unblock
+          if-no-files-found: error
+
+      - name: Run provider health probe on VPS
+        if: ${{ github.event.inputs.run_provider_health_probe == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          PROBE_DURATION_SECONDS: ${{ github.event.inputs.provider_health_probe_duration_seconds }}
+          PROBE_MAX_UPDATES: ${{ github.event.inputs.provider_health_probe_max_updates }}
+          PROBE_OUTPUT_DIR: ${{ github.event.inputs.provider_health_probe_output_dir }}
+          PROBE_UPLOAD_R2: ${{ github.event.inputs.provider_health_probe_upload_r2 }}
+          EXPECTED_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          PROBE_DURATION_SECONDS="${PROBE_DURATION_SECONDS:-900}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+            -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" PROBE_DURATION_SECONDS="${PROBE_DURATION_SECONDS}" PROBE_MAX_UPDATES="${PROBE_MAX_UPDATES}" PROBE_OUTPUT_DIR="${PROBE_OUTPUT_DIR}" PROBE_UPLOAD_R2="${PROBE_UPLOAD_R2}" EXPECTED_COMMIT_SHA="${EXPECTED_COMMIT_SHA}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+          PROBE_PARENT="${PROBE_OUTPUT_DIR:-${APP_DIR}/data/reports/provider_health_probe}"
+          mkdir -p "${PROBE_PARENT}"
+
+          if sudo systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
+            echo "::error::A material hunter service is active; refusing provider probe overlap"
+            exit 1
+          fi
+
+          if [[ -f "${ENV_FILE}" ]]; then
+            set -a
+            source "${ENV_FILE}"
+            set +a
+          else
+            echo "::error::VPS env file not found at ${ENV_FILE}"
+            exit 1
+          fi
+
+          if [[ -f "${APP_DIR}/target/release/build_info.json" ]]; then
+            DEPLOYED_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("git_sha",""))' "${APP_DIR}/target/release/build_info.json")"
+          else
+            DEPLOYED_COMMIT=""
+          fi
+          echo "provider-health-probe deployed_commit=${DEPLOYED_COMMIT}"
+          echo "provider-health-probe expected_commit=${EXPECTED_COMMIT_SHA}"
+          if [[ -z "${DEPLOYED_COMMIT}" || "${DEPLOYED_COMMIT}" != "${EXPECTED_COMMIT_SHA}" ]]; then
+            echo "::error::Deployed CLI commit mismatch for provider health probe"
+            exit 1
+          fi
+
+          PROBE_CMD=("${BIN}" provider-health-probe "${VALIDATE_CONFIG[@]}" --duration-seconds "${PROBE_DURATION_SECONDS}" --report-dir "${PROBE_PARENT}" --json)
+          if [[ -n "${PROBE_MAX_UPDATES}" ]]; then
+            PROBE_CMD+=(--max-updates "${PROBE_MAX_UPDATES}")
+          fi
+
+          STDOUT_JSON="$(mktemp)"
+          "${PROBE_CMD[@]}" > "${STDOUT_JSON}"
+          PROBE_RUN_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("probe_run_id",""))' "${STDOUT_JSON}")"
+          if [[ -z "${PROBE_RUN_ID}" ]]; then
+            echo "::error::provider-health-probe did not emit probe_run_id"
+            cat "${STDOUT_JSON}"
+            exit 1
+          fi
+          PROBE_DIR="${PROBE_PARENT}/${PROBE_RUN_ID}"
+          cp "${STDOUT_JSON}" "${PROBE_DIR}/provider_health_probe_stdout.json"
+          printf '%s\n' "${PROBE_RUN_ID}" > "${PROBE_PARENT}/latest_probe_run_id"
+
+          for required in provider_health_probe_summary.json provider_health_probe_liveness.csv provider_health_probe_exit_status.json; do
+            if [[ ! -f "${PROBE_DIR}/${required}" ]]; then
+              echo "::error::provider-health-probe missing required artifact ${required}"
+              exit 1
+            fi
+          done
+
+          if [[ "${PROBE_UPLOAD_R2}" == "true" ]]; then
+            "${BIN}" upload-phase-report-dir-r2 "${VALIDATE_CONFIG[@]}" \
+              --env-file "${ENV_FILE}" \
+              --phase-prefix provider_health_probe \
+              --run-or-mint "${PROBE_RUN_ID}" \
+              --local-output-dir "${PROBE_DIR}" \
+              --verify > "${PROBE_DIR}/provider_health_probe_r2_upload.json"
+          fi
+
+          python3 - "${PROBE_DIR}" "${DEPLOYED_COMMIT}" <<'PY'
+          import json, sys
+          from pathlib import Path
+          probe_dir = Path(sys.argv[1])
+          deployed_commit = sys.argv[2]
+          summary = json.loads((probe_dir / "provider_health_probe_summary.json").read_text(encoding="utf-8"))
+          exit_status = json.loads((probe_dir / "provider_health_probe_exit_status.json").read_text(encoding="utf-8"))
+          liveness = probe_dir / "provider_health_probe_liveness.csv"
+          blockers = []
+          if not liveness.exists() or liveness.stat().st_size == 0:
+              blockers.append("missing_or_empty_liveness")
+          if summary.get("acceptance_result") not in {"PASS", "BLOCK"}:
+              blockers.append("invalid_acceptance_result")
+          if exit_status.get("acceptance_result") != summary.get("acceptance_result"):
+              blockers.append("exit_status_summary_mismatch")
+          if summary.get("off_vps_candidate_replay_allowed") is not False:
+              blockers.append("probe_replay_allowed")
+          if summary.get("formal_backtesting_allowed") is not False:
+              blockers.append("probe_backtesting_allowed")
+          if summary.get("threshold_tuning_allowed") is not False:
+              blockers.append("probe_threshold_tuning_allowed")
+          result = {
+              "schema_version": "phase107.provider_health_probe_workflow_summary.v1",
+              "probe_run_id": summary.get("probe_run_id"),
+              "deployed_commit": deployed_commit,
+              "acceptance_result": summary.get("acceptance_result"),
+              "blocker_reason": summary.get("blocker_reason"),
+              "provider_status": summary.get("provider_status"),
+              "provider_blocker_class": summary.get("provider_blocker_class"),
+              "provider_data_loss_seen": summary.get("provider_data_loss_seen"),
+              "provider_update_count": summary.get("provider_update_count"),
+              "provider_update_rate_per_second": summary.get("provider_update_rate_per_second"),
+              "pump_update_count": summary.get("pump_update_count"),
+              "pump_update_rate_per_second": summary.get("pump_update_rate_per_second"),
+              "first_update_latency_ms": summary.get("first_update_latency_ms"),
+              "provider_progress_stalled": summary.get("provider_progress_stalled"),
+              "pump_progress_stalled": summary.get("pump_progress_stalled"),
+              "workflow_artifact_blockers": blockers,
+              "material_hunter_started": False,
+              "latest_run_id_modified": False,
+          }
+          (probe_dir / "provider_health_probe_workflow_summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(result, indent=2))
+          if blockers:
+              raise SystemExit(1)
+          PY
+          EOF
+
+      - name: Download provider health probe reports from VPS
+        if: ${{ always() && github.event.inputs.run_provider_health_probe == 'true' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          PROBE_OUTPUT_DIR: ${{ github.event.inputs.provider_health_probe_output_dir }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          LOCAL_PROBE_DIR="provider-health-probe"
+          rm -rf "${LOCAL_PROBE_DIR}"
+          mkdir -p "${LOCAL_PROBE_DIR}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" PROBE_OUTPUT_DIR="${PROBE_OUTPUT_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_PROBE_DIR}"
+          set -euo pipefail
+          PROBE_PARENT="${PROBE_OUTPUT_DIR:-${APP_DIR}/data/reports/provider_health_probe}"
+          if [[ ! -f "${PROBE_PARENT}/latest_probe_run_id" ]]; then
+            echo "provider health probe latest_probe_run_id not found: ${PROBE_PARENT}/latest_probe_run_id" >&2
+            exit 1
+          fi
+          PROBE_RUN_ID="$(cat "${PROBE_PARENT}/latest_probe_run_id")"
+          PROBE_DIR="${PROBE_PARENT}/${PROBE_RUN_ID}"
+          if [[ ! -d "${PROBE_DIR}" ]]; then
+            echo "provider health probe report directory not found: ${PROBE_DIR}" >&2
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          mkdir -p "${tmp}/${PROBE_RUN_ID}"
+          cp -a "${PROBE_DIR}/." "${tmp}/${PROBE_RUN_ID}/"
+          cp "${PROBE_PARENT}/latest_probe_run_id" "${tmp}/latest_probe_run_id"
+          tar -czf - -C "${tmp}" .
+          rm -rf "${tmp}"
+          EOF
+
+      - name: Summarize provider health probe
+        if: ${{ always() && github.event.inputs.run_provider_health_probe == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import json
+          from pathlib import Path
+          root = Path("provider-health-probe")
+          latest = root / "latest_probe_run_id"
+          if not latest.exists():
+              raise SystemExit("provider health probe latest_probe_run_id missing")
+          run_id = latest.read_text(encoding="utf-8").strip()
+          probe_dir = root / run_id
+          required = [
+              "provider_health_probe_summary.json",
+              "provider_health_probe_liveness.csv",
+              "provider_health_probe_exit_status.json",
+              "provider_health_probe_workflow_summary.json",
+          ]
+          missing = [name for name in required if not (probe_dir / name).exists()]
+          if missing:
+              raise SystemExit(f"provider health probe missing artifacts: {missing}")
+          summary = json.loads((probe_dir / "provider_health_probe_summary.json").read_text(encoding="utf-8"))
+          workflow = json.loads((probe_dir / "provider_health_probe_workflow_summary.json").read_text(encoding="utf-8"))
+          if workflow.get("workflow_artifact_blockers"):
+              raise SystemExit(f"provider health probe artifact blockers: {workflow['workflow_artifact_blockers']}")
+          print("## Provider Health Probe")
+          print()
+          print(f"- probe_run_id: `{run_id}`")
+          print(f"- deployed_commit: `{workflow.get('deployed_commit', '')}`")
+          print(f"- acceptance_result: `{summary.get('acceptance_result')}`")
+          print(f"- blocker_reason: `{summary.get('blocker_reason') or ''}`")
+          print(f"- provider_status: `{summary.get('provider_status')}`")
+          print(f"- provider_blocker_class: `{summary.get('provider_blocker_class') or ''}`")
+          print(f"- provider_data_loss_seen: `{summary.get('provider_data_loss_seen')}`")
+          print(f"- provider_update_count: `{summary.get('provider_update_count')}`")
+          print(f"- provider_update_rate_per_second: `{summary.get('provider_update_rate_per_second')}`")
+          print(f"- pump_update_count: `{summary.get('pump_update_count')}`")
+          print(f"- pump_update_rate_per_second: `{summary.get('pump_update_rate_per_second')}`")
+          print(f"- first_update_latency_ms: `{summary.get('first_update_latency_ms')}`")
+          print(f"- material_hunter_started: `false`")
+          print(f"- material_hunter_collection_allowed: `{'true' if summary.get('acceptance_result') == 'PASS' else 'false'}`")
+          print()
+          if summary.get("acceptance_result") == "BLOCK":
+              print("Structured provider BLOCK: material-hunter collection remains blocked; this is not a repo crash.")
+          PY
+
+      - name: Upload provider health probe reports
+        if: ${{ always() && github.event.inputs.run_provider_health_probe == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-health-probe
+          path: provider-health-probe
           if-no-files-found: error
 
       - name: Run live fresh-launch canary on VPS

@@ -28,11 +28,12 @@ use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
-    LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamSummary, RuntimeMode,
-    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
-    builtin_fixture_suite, builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events,
-    load_fixture_spec, run_material_hunter_stream_with_progress, smoke_deshred_provider,
-    smoke_geyser_provider, write_report,
+    LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
+    MaterialHunterStreamSummary, RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig,
+    Supervisor, build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
+    collect_fresh_launch_canary_events, load_fixture_spec,
+    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
+    write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -53,7 +54,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Instant, SystemTime};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 use storage::{
     ArtifactMetadata, ArtifactType, DatasetKind, RunKind, RunRole, StorageEngine, StorageLayout,
     StoredRecord,
@@ -402,6 +403,20 @@ enum Command {
         no_paper: bool,
         #[arg(long)]
         dry_run: bool,
+    },
+    ProviderHealthProbe {
+        #[arg(long, default_value_t = 900)]
+        duration_seconds: u64,
+        #[arg(long)]
+        max_updates: Option<usize>,
+        #[arg(long, default_value_t = 120)]
+        first_update_timeout_seconds: u64,
+        #[arg(long, default_value_t = 120)]
+        progress_stall_seconds: u64,
+        #[arg(long)]
+        report_dir: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     SmokeDeshredProvider {
         #[arg(long, default_value_t = 30)]
@@ -2961,6 +2976,74 @@ struct GeyserSmokeExecutionResult {
     stream_only_proof: StreamOnlyRunSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderHealthProbeLivenessRow {
+    timestamp: String,
+    provider_updates: u64,
+    pump_updates: u64,
+    provider_progress_stalled_seconds: u64,
+    pump_progress_stalled_seconds: u64,
+    provider_status: String,
+    safe_to_continue: bool,
+    blocker_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderHealthProbeSummary {
+    schema_version: String,
+    probe_run_id: String,
+    provider_name: Option<String>,
+    endpoint_configured: bool,
+    auth_configured: bool,
+    duration_seconds: u64,
+    first_update_timeout_seconds: u64,
+    progress_stall_seconds: u64,
+    provider_status: String,
+    provider_blocker_class: Option<String>,
+    provider_data_loss_seen: bool,
+    provider_lagged_data_loss: bool,
+    provider_reconnect_exhausted: bool,
+    provider_stream_closed_before_deadline: bool,
+    provider_progress_stalled: bool,
+    pump_progress_stalled: bool,
+    first_update_received: bool,
+    first_update_latency_ms: Option<u128>,
+    provider_update_count: u64,
+    pump_update_count: u64,
+    provider_update_rate_per_second: f64,
+    pump_update_rate_per_second: f64,
+    reconnect_attempts: u64,
+    provider_lagged_count: u64,
+    decode_or_malformed_counter: u64,
+    stream_completed_normally: bool,
+    acceptance_result: String,
+    blocker_reason: Option<String>,
+    no_live_orders: bool,
+    holder_rpc_used: bool,
+    rpc_mint_supply_canonical: bool,
+    off_vps_candidate_replay_allowed: bool,
+    formal_backtesting_allowed: bool,
+    threshold_tuning_allowed: bool,
+    generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderHealthProbeExitStatus {
+    schema_version: String,
+    probe_run_id: String,
+    exit_status: String,
+    acceptance_result: String,
+    blocker_reason: Option<String>,
+    provider_status: String,
+    provider_blocker_class: Option<String>,
+    provider_data_loss_seen: bool,
+    no_live_orders: bool,
+    holder_rpc_used: bool,
+    rpc_mint_supply_canonical: bool,
+    threshold_tuning_allowed: bool,
+    generated_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct SmokeGeyserCommandOptions {
     duration_seconds: u64,
@@ -4277,6 +4360,25 @@ async fn main() -> Result<()> {
                 pump_only,
                 no_paper,
                 dry_run,
+            )
+            .await
+        }
+        Command::ProviderHealthProbe {
+            duration_seconds,
+            max_updates,
+            first_update_timeout_seconds,
+            progress_stall_seconds,
+            report_dir,
+            json,
+        } => {
+            provider_health_probe_command(
+                &loaded,
+                duration_seconds,
+                max_updates,
+                first_update_timeout_seconds,
+                progress_stall_seconds,
+                report_dir.as_deref(),
+                json,
             )
             .await
         }
@@ -18522,6 +18624,395 @@ async fn smoke_geyser_provider_command(
             "geyser provider smoke failed with status {}",
             result.summary.provider_status
         ));
+    }
+    Ok(())
+}
+
+fn provider_health_total_updates(summary: &MaterialHunterStreamSummary) -> u64 {
+    summary
+        .transaction_updates
+        .saturating_add(summary.account_updates)
+        .saturating_add(summary.slot_updates)
+}
+
+fn provider_health_blocker_reason(
+    summary: &MaterialHunterStreamSummary,
+    first_update_received: bool,
+    provider_progress_stalled: bool,
+    pump_progress_stalled: bool,
+) -> Option<String> {
+    if summary.provider_data_loss_seen
+        || summary.provider_blocker_class.as_deref() == Some("provider_lagged_data_loss")
+    {
+        return Some("provider_lagged_data_loss".to_owned());
+    }
+    if summary.provider_blocker_class.as_deref() == Some("provider_reconnect_exhausted") {
+        return Some("provider_reconnect_exhausted".to_owned());
+    }
+    if summary.provider_blocker_class.as_deref() == Some("provider_stream_closed_before_deadline") {
+        return Some("provider_stream_closed_before_deadline".to_owned());
+    }
+    if provider_progress_stalled {
+        return Some("provider_progress_stalled".to_owned());
+    }
+    if pump_progress_stalled {
+        return Some("pump_progress_stalled".to_owned());
+    }
+    if !first_update_received {
+        return Some("provider_first_update_timeout".to_owned());
+    }
+    if provider_health_total_updates(summary) == 0 {
+        return Some("provider_zero_updates_timeout".to_owned());
+    }
+    if !summary.stream_completed_normally {
+        return Some(
+            summary
+                .provider_blocker_class
+                .clone()
+                .unwrap_or_else(|| "unknown_structured_blocker".to_owned()),
+        );
+    }
+    None
+}
+
+fn provider_health_csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn write_provider_health_liveness_csv(
+    path: &Path,
+    rows: &[ProviderHealthProbeLivenessRow],
+) -> Result<()> {
+    let mut body = String::from(
+        "timestamp,provider_updates,pump_updates,provider_progress_stalled_seconds,pump_progress_stalled_seconds,provider_status,safe_to_continue,blocker_reason\n",
+    );
+    for row in rows {
+        body.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            provider_health_csv_escape(&row.timestamp),
+            row.provider_updates,
+            row.pump_updates,
+            row.provider_progress_stalled_seconds,
+            row.pump_progress_stalled_seconds,
+            provider_health_csv_escape(&row.provider_status),
+            row.safe_to_continue,
+            provider_health_csv_escape(&row.blocker_reason)
+        ));
+    }
+    atomic_write_path(path, body.as_bytes())
+}
+
+fn build_provider_health_probe_artifacts(
+    probe_run_id: &str,
+    provider_name: Option<String>,
+    endpoint_configured: bool,
+    auth_configured: bool,
+    duration_seconds: u64,
+    first_update_timeout_seconds: u64,
+    progress_stall_seconds: u64,
+    summary: MaterialHunterStreamSummary,
+    elapsed_seconds: f64,
+    first_update_latency_ms: Option<u128>,
+    provider_progress_stalled: bool,
+    pump_progress_stalled: bool,
+    explicit_blocker: Option<String>,
+) -> (ProviderHealthProbeSummary, ProviderHealthProbeExitStatus) {
+    let provider_updates = provider_health_total_updates(&summary);
+    let pump_updates = summary.pump_create_decoded;
+    let first_update_received = first_update_latency_ms.is_some();
+    let blocker_reason = explicit_blocker.or_else(|| {
+        provider_health_blocker_reason(
+            &summary,
+            first_update_received,
+            provider_progress_stalled,
+            pump_progress_stalled,
+        )
+    });
+    let acceptance_result = if blocker_reason.is_some() {
+        "BLOCK"
+    } else {
+        "PASS"
+    }
+    .to_owned();
+    let generated_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let provider_lagged_data_loss = summary.provider_data_loss_seen
+        || summary.provider_blocker_class.as_deref() == Some("provider_lagged_data_loss");
+    let provider_reconnect_exhausted =
+        summary.provider_blocker_class.as_deref() == Some("provider_reconnect_exhausted");
+    let provider_stream_closed_before_deadline =
+        summary.provider_blocker_class.as_deref() == Some("provider_stream_closed_before_deadline");
+    let rate_denominator = elapsed_seconds.max(1.0);
+    let probe_summary = ProviderHealthProbeSummary {
+        schema_version: "phase107.provider_health_probe.v1".to_owned(),
+        probe_run_id: probe_run_id.to_owned(),
+        provider_name,
+        endpoint_configured,
+        auth_configured,
+        duration_seconds,
+        first_update_timeout_seconds,
+        progress_stall_seconds,
+        provider_status: summary.provider_status.clone(),
+        provider_blocker_class: summary.provider_blocker_class.clone(),
+        provider_data_loss_seen: summary.provider_data_loss_seen,
+        provider_lagged_data_loss,
+        provider_reconnect_exhausted,
+        provider_stream_closed_before_deadline,
+        provider_progress_stalled,
+        pump_progress_stalled,
+        first_update_received,
+        first_update_latency_ms,
+        provider_update_count: provider_updates,
+        pump_update_count: pump_updates,
+        provider_update_rate_per_second: provider_updates as f64 / rate_denominator,
+        pump_update_rate_per_second: pump_updates as f64 / rate_denominator,
+        reconnect_attempts: summary.reconnect_attempts,
+        provider_lagged_count: summary.provider_lagged_count,
+        decode_or_malformed_counter: summary.errors.len() as u64,
+        stream_completed_normally: summary.stream_completed_normally,
+        acceptance_result: acceptance_result.clone(),
+        blocker_reason: blocker_reason.clone(),
+        no_live_orders: true,
+        holder_rpc_used: false,
+        rpc_mint_supply_canonical: false,
+        off_vps_candidate_replay_allowed: false,
+        formal_backtesting_allowed: false,
+        threshold_tuning_allowed: false,
+        generated_at: generated_at.clone(),
+    };
+    let exit_status = ProviderHealthProbeExitStatus {
+        schema_version: "phase107.provider_health_probe_exit_status.v1".to_owned(),
+        probe_run_id: probe_run_id.to_owned(),
+        exit_status: "completed_structured".to_owned(),
+        acceptance_result,
+        blocker_reason,
+        provider_status: summary.provider_status,
+        provider_blocker_class: summary.provider_blocker_class,
+        provider_data_loss_seen: summary.provider_data_loss_seen,
+        no_live_orders: true,
+        holder_rpc_used: false,
+        rpc_mint_supply_canonical: false,
+        threshold_tuning_allowed: false,
+        generated_at,
+    };
+    (probe_summary, exit_status)
+}
+
+async fn provider_health_probe_command(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    max_updates: Option<usize>,
+    first_update_timeout_seconds: u64,
+    progress_stall_seconds: u64,
+    report_dir: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    loaded.validate_stream_only()?;
+    let duration_seconds = duration_seconds.max(1);
+    let first_update_timeout_seconds = first_update_timeout_seconds.max(1);
+    let progress_stall_seconds = progress_stall_seconds.max(1);
+    let probe_run_id = derived_run_id("provider-health-probe");
+    let report_root =
+        resolve_report_root(loaded, "provider_health_probe", &probe_run_id, report_dir);
+    fs::create_dir_all(&report_root)?;
+    let endpoint_configured = geyser_endpoint_value(loaded)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let auth_configured = env_value_present(&loaded.config.geyser.auth_token_env);
+    if let Some(endpoint) = geyser_endpoint_value(loaded) {
+        if !valid_endpoint_scheme(&endpoint) {
+            return Err(anyhow!(
+                "geyser endpoint must start with http:// or https://"
+            ));
+        }
+    }
+
+    let provider_name = (!loaded.config.provider.name.trim().is_empty())
+        .then(|| loaded.config.provider.name.clone());
+    let mut liveness_rows: Vec<ProviderHealthProbeLivenessRow> = Vec::new();
+    let mut first_update_latency_ms: Option<u128> = None;
+    let mut last_provider_update_at = Instant::now();
+    let mut last_pump_update_at = Instant::now();
+    let mut previous_provider_updates = 0u64;
+    let mut previous_pump_updates = 0u64;
+    let mut provider_progress_stalled = false;
+    let mut pump_progress_stalled = false;
+    let mut explicit_blocker = None::<String>;
+    let started = Instant::now();
+
+    let stream_summary = if !endpoint_configured {
+        let mut summary = MaterialHunterStreamSummary {
+            provider_status: "env_missing".to_owned(),
+            provider_blocker_class: Some("env_missing".to_owned()),
+            duration_seconds,
+            stream_completed_normally: false,
+            ..MaterialHunterStreamSummary::default()
+        };
+        summary
+            .errors
+            .push("geyser endpoint environment value is missing".to_owned());
+        explicit_blocker = Some("env_missing".to_owned());
+        summary
+    } else if loaded.config.geyser.auth_required && !auth_configured {
+        let mut summary = MaterialHunterStreamSummary {
+            provider_status: "env_missing".to_owned(),
+            provider_blocker_class: Some("env_missing".to_owned()),
+            duration_seconds,
+            stream_completed_normally: false,
+            ..MaterialHunterStreamSummary::default()
+        };
+        summary
+            .errors
+            .push("geyser auth environment value is missing".to_owned());
+        explicit_blocker = Some("env_missing".to_owned());
+        summary
+    } else {
+        run_material_hunter_stream_with_progress(
+            loaded,
+            MaterialHunterStreamOptions { duration_seconds },
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |summary| {
+                let provider_updates = provider_health_total_updates(summary);
+                let pump_updates = summary.pump_create_decoded;
+                let now = Instant::now();
+                if provider_updates > previous_provider_updates {
+                    if first_update_latency_ms.is_none() {
+                        first_update_latency_ms = Some(started.elapsed().as_millis());
+                    }
+                    previous_provider_updates = provider_updates;
+                    last_provider_update_at = now;
+                    provider_progress_stalled = false;
+                }
+                if pump_updates > previous_pump_updates {
+                    previous_pump_updates = pump_updates;
+                    last_pump_update_at = now;
+                    pump_progress_stalled = false;
+                }
+                if first_update_latency_ms.is_none()
+                    && started.elapsed() >= StdDuration::from_secs(first_update_timeout_seconds)
+                {
+                    explicit_blocker = Some("provider_first_update_timeout".to_owned());
+                } else if first_update_latency_ms.is_some()
+                    && last_provider_update_at.elapsed()
+                        >= StdDuration::from_secs(progress_stall_seconds)
+                {
+                    provider_progress_stalled = true;
+                    explicit_blocker = Some("provider_progress_stalled".to_owned());
+                } else if previous_pump_updates > 0
+                    && last_pump_update_at.elapsed()
+                        >= StdDuration::from_secs(progress_stall_seconds)
+                {
+                    pump_progress_stalled = true;
+                    explicit_blocker = Some("pump_progress_stalled".to_owned());
+                }
+                if summary.provider_blocker_class.is_some() || summary.provider_data_loss_seen {
+                    explicit_blocker = summary
+                        .provider_blocker_class
+                        .clone()
+                        .or_else(|| Some("provider_lagged_data_loss".to_owned()));
+                }
+                liveness_rows.push(ProviderHealthProbeLivenessRow {
+                    timestamp: OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| "unknown".to_owned()),
+                    provider_updates,
+                    pump_updates,
+                    provider_progress_stalled_seconds: summary.provider_progress_stalled_seconds,
+                    pump_progress_stalled_seconds: summary.pump_progress_stalled_seconds,
+                    provider_status: summary.provider_status.clone(),
+                    safe_to_continue: explicit_blocker.is_none(),
+                    blocker_reason: explicit_blocker.clone().unwrap_or_default(),
+                });
+                if let Some(max_updates) = max_updates {
+                    if provider_updates as usize >= max_updates {
+                        return Ok(MaterialHunterStreamAction::Stop);
+                    }
+                }
+                if explicit_blocker.is_some() {
+                    return Ok(MaterialHunterStreamAction::Stop);
+                }
+                Ok(MaterialHunterStreamAction::Continue)
+            },
+        )
+        .await?
+    };
+
+    if liveness_rows.is_empty() {
+        liveness_rows.push(ProviderHealthProbeLivenessRow {
+            timestamp: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_owned()),
+            provider_updates: provider_health_total_updates(&stream_summary),
+            pump_updates: stream_summary.pump_create_decoded,
+            provider_progress_stalled_seconds: stream_summary.provider_progress_stalled_seconds,
+            pump_progress_stalled_seconds: stream_summary.pump_progress_stalled_seconds,
+            provider_status: stream_summary.provider_status.clone(),
+            safe_to_continue: explicit_blocker.is_none()
+                && stream_summary.provider_blocker_class.is_none()
+                && !stream_summary.provider_data_loss_seen,
+            blocker_reason: explicit_blocker.clone().unwrap_or_default(),
+        });
+    }
+
+    let (summary, exit_status) = build_provider_health_probe_artifacts(
+        &probe_run_id,
+        provider_name,
+        endpoint_configured,
+        auth_configured,
+        duration_seconds,
+        first_update_timeout_seconds,
+        progress_stall_seconds,
+        stream_summary,
+        started.elapsed().as_secs_f64(),
+        first_update_latency_ms,
+        provider_progress_stalled,
+        pump_progress_stalled,
+        explicit_blocker,
+    );
+    atomic_write_path(
+        &report_root.join("provider_health_probe_summary.json"),
+        &serde_json::to_vec_pretty(&summary)?,
+    )?;
+    atomic_write_path(
+        &report_root.join("provider_health_probe_exit_status.json"),
+        &serde_json::to_vec_pretty(&exit_status)?,
+    )?;
+    write_provider_health_liveness_csv(
+        &report_root.join("provider_health_probe_liveness.csv"),
+        &liveness_rows,
+    )?;
+    write_report(
+        report_root.join("provider_health_probe_summary.md"),
+        &format!(
+            "# Provider Health Probe\n\n- probe_run_id: {}\n- acceptance_result: {}\n- blocker_reason: {}\n- provider_status: {}\n- provider_blocker_class: {}\n- provider_data_loss_seen: {}\n- provider_update_count: {}\n- pump_update_count: {}\n- first_update_received: {}\n- first_update_latency_ms: {}\n- stream_completed_normally: {}\n- no_live_orders: true\n- holder_rpc_used: false\n- rpc_mint_supply_canonical: false\n- off_vps_candidate_replay_allowed: false\n- formal_backtesting_allowed: false\n- threshold_tuning_allowed: false\n",
+            summary.probe_run_id,
+            summary.acceptance_result,
+            summary.blocker_reason.clone().unwrap_or_default(),
+            summary.provider_status,
+            summary.provider_blocker_class.clone().unwrap_or_default(),
+            summary.provider_data_loss_seen,
+            summary.provider_update_count,
+            summary.pump_update_count,
+            summary.first_update_received,
+            summary
+                .first_update_latency_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            summary.stream_completed_normally,
+        ),
+    )?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "provider-health-probe {}: {}",
+            summary.probe_run_id, summary.acceptance_result
+        );
     }
     Ok(())
 }
@@ -52630,6 +53121,107 @@ mod tests {
     }
 
     #[test]
+    fn phase107f_provider_health_probe_lag_blocks_acceptance() {
+        let summary = MaterialHunterStreamSummary {
+            provider_status: "provider_lagged_data_loss".to_owned(),
+            provider_blocker_class: Some("provider_lagged_data_loss".to_owned()),
+            provider_data_loss_seen: true,
+            provider_lagged_count: 1,
+            transaction_updates: 10,
+            stream_completed_normally: false,
+            ..MaterialHunterStreamSummary::default()
+        };
+        let (probe, exit) = build_provider_health_probe_artifacts(
+            "probe",
+            Some("provider".to_owned()),
+            true,
+            true,
+            900,
+            120,
+            120,
+            summary,
+            10.0,
+            Some(250),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(probe.acceptance_result, "BLOCK");
+        assert_eq!(
+            probe.blocker_reason.as_deref(),
+            Some("provider_lagged_data_loss")
+        );
+        assert!(probe.provider_lagged_data_loss);
+        assert!(probe.provider_data_loss_seen);
+        assert!(!probe.off_vps_candidate_replay_allowed);
+        assert!(!probe.formal_backtesting_allowed);
+        assert!(!probe.threshold_tuning_allowed);
+        assert_eq!(exit.acceptance_result, "BLOCK");
+    }
+
+    #[test]
+    fn phase107f_provider_health_probe_clean_stream_passes_acceptance() {
+        let summary = MaterialHunterStreamSummary {
+            provider_status: "completed".to_owned(),
+            transaction_updates: 25,
+            slot_updates: 5,
+            pump_create_decoded: 1,
+            stream_completed_normally: true,
+            ..MaterialHunterStreamSummary::default()
+        };
+        let (probe, _exit) = build_provider_health_probe_artifacts(
+            "probe",
+            Some("provider".to_owned()),
+            true,
+            true,
+            900,
+            120,
+            120,
+            summary,
+            30.0,
+            Some(100),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(probe.acceptance_result, "PASS");
+        assert_eq!(probe.blocker_reason, None);
+        assert_eq!(probe.provider_update_count, 30);
+        assert!(probe.first_update_received);
+        assert!(!probe.provider_progress_stalled);
+        assert!(!probe.pump_progress_stalled);
+    }
+
+    #[test]
+    fn phase107f_provider_health_probe_env_missing_is_structured_block() {
+        let summary = MaterialHunterStreamSummary {
+            provider_status: "env_missing".to_owned(),
+            provider_blocker_class: Some("env_missing".to_owned()),
+            stream_completed_normally: false,
+            ..MaterialHunterStreamSummary::default()
+        };
+        let (probe, exit) = build_provider_health_probe_artifacts(
+            "probe",
+            None,
+            false,
+            false,
+            900,
+            120,
+            120,
+            summary,
+            1.0,
+            None,
+            false,
+            false,
+            Some("env_missing".to_owned()),
+        );
+        assert_eq!(probe.acceptance_result, "BLOCK");
+        assert_eq!(probe.blocker_reason.as_deref(), Some("env_missing"));
+        assert!(!probe.first_update_received);
+        assert_eq!(exit.provider_blocker_class.as_deref(), Some("env_missing"));
+    }
+
+    #[test]
     fn phase107f_provider_lag_interrupted_countability_is_audit_only() {
         let summary = MaterialHunterStreamSummary {
             provider_status: "provider_lagged_data_loss".to_owned(),
@@ -52870,6 +53462,63 @@ mod tests {
         assert!(workflow.contains("--property=RuntimeMaxSec=\"${SERVICE_RUNTIME_MAX_SEC}\""));
         assert!(workflow.contains("\"effective_duration_seconds\""));
         assert!(workflow.contains("\"effective_max_attempted_launches\""));
+    }
+
+    #[test]
+    fn phase107f_provider_probe_mode_does_not_start_material_hunter() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        let probe_step = workflow
+            .split("- name: Run provider health probe on VPS")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("- name: Download provider health probe reports from VPS")
+                    .next()
+            })
+            .expect("provider probe step");
+        assert!(workflow.contains("run_provider_health_probe"));
+        assert!(probe_step.contains("provider-health-probe"));
+        assert!(!probe_step.contains("material-candidate-hunter"));
+        assert!(!probe_step.contains("systemd-run"));
+        assert!(!probe_step.contains("phase107b_material_candidate_hunter/latest_run_id"));
+        assert!(!probe_step.contains("${LATEST_FILE}"));
+        assert!(probe_step.contains("latest_probe_run_id"));
+    }
+
+    #[test]
+    fn phase107f_provider_probe_artifacts_are_required_and_summarized() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        let summarize_step = workflow
+            .split("- name: Summarize provider health probe")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("- name: Upload provider health probe reports")
+                    .next()
+            })
+            .expect("provider probe summarize step");
+        assert!(summarize_step.contains("provider_health_probe_summary.json"));
+        assert!(summarize_step.contains("provider_health_probe_liveness.csv"));
+        assert!(summarize_step.contains("provider_health_probe_exit_status.json"));
+        assert!(summarize_step.contains("acceptance_result"));
+        assert!(summarize_step.contains("material_hunter_collection_allowed"));
+    }
+
+    #[test]
+    fn phase107f_provider_probe_block_keeps_collection_blocked() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        assert!(
+            workflow
+                .contains("Structured provider BLOCK: material-hunter collection remains blocked")
+        );
+        assert!(workflow.contains("this is not a repo crash"));
+        assert!(workflow.contains("material_hunter_started: `false`"));
     }
 
     #[test]

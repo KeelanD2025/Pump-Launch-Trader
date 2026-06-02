@@ -6,11 +6,13 @@ This document defines the release gate before any longer material-candidate hunt
 
 - Service-owned, sequential, sliced material-candidate collection only.
 - Each slice must use mandatory VPS housekeeping, startup sentinels, watchdog checks, bounded R2 checkpoints, `RuntimeMaxSec`, final artifact collection, and artifact consistency validation.
+- Source release-gate readiness is necessary but not sufficient for live collection: provider acceptance must also pass after any provider-lagged or data-loss slice.
 
 ## Blocked Actions
 
 - Foreground material hunter runs.
 - Unsliced or full campaign collection.
+- Any material-hunter collection while provider acceptance is failing.
 - Off-VPS replay unless a normal counted slice produces `replay_eligible_candidate_count > 0` and `countability_decision.json` explicitly allows replay.
 - Formal backtesting.
 - Threshold tuning.
@@ -53,6 +55,8 @@ Provider and control-plane failures must be represented as structured non-counta
 
 Any such blocker must produce non-countable, audit-only artifacts with replay, formal backtesting, and threshold tuning disabled.
 
+`provider_lagged_data_loss` during a collection slice is a safe structural outcome when final artifacts exist, countability is false, replay is false, and R2/artifact consistency pass. It is still an operational provider-quality blocker. Longer collection must not resume after repeated `provider_lagged_data_loss` until provider acceptance passes or the Geyser endpoint/configuration is remediated. Launch caps must not be raised while provider acceptance is failing.
+
 ## Countability Rules
 
 `countability_decision.json` is the strict source of truth. A slice is counted only when final artifacts exist, R2 final verification succeeds, the latest checkpoint is verified, hard invariants pass, no provider blocker is present, no provider data loss is seen, and row counts reconcile across the attempt ledger and summaries.
@@ -90,6 +94,40 @@ Run:
 ```bash
 ./scripts/material_hunter_pre_run_gate.sh
 ```
+
+This gate is offline/source-oriented by default. It can pass while provider acceptance blocks live collection.
+
+## Provider Acceptance Gate
+
+After a provider-lagged, data-loss, reconnect-exhausted, early-closed, or progress-stalled slice, run a provider-only gate before resuming material-hunter collection:
+
+```bash
+target/release/cli provider-health-probe \
+  --config config/default.toml \
+  --config-override config/local.example.toml \
+  --duration-seconds 900 \
+  --json
+```
+
+or:
+
+```bash
+./scripts/material_hunter_provider_acceptance_gate.sh
+```
+
+In the VPS/GitHub control plane, use the workflow input `run_provider_health_probe=true`. This mode deploys/uses the selected CLI binary, confirms the deployed commit, runs `provider-health-probe`, downloads probe artifacts, and emits a GitHub summary. It must not start or stop the material-hunter service and must not modify `phase107b_material_candidate_hunter/latest_run_id`.
+
+The probe connects to the configured Geyser stream path but does not track candidates, write token artifacts, run replay, backtest, tune thresholds, or trade. It writes:
+
+- `provider_health_probe_summary.json`
+- `provider_health_probe_liveness.csv`
+- `provider_health_probe_exit_status.json`
+
+Provider acceptance is `PASS` only when provider updates arrive, the stream reaches the configured proof condition normally, no provider lag/data loss is seen, no reconnect exhaustion or early close occurs, progress does not stall, and all probe artifacts are written. Provider acceptance is `BLOCK` for `provider_lagged_data_loss`, unrecoverable data loss/corruption, reconnect exhaustion, early stream close, progress stalls, missing first update, zero provider updates, rejected credentials, unsupported endpoint, invalid/missing provider environment, or artifact-write failure.
+
+A structured provider `BLOCK` in this probe is not a repo crash. It means material-hunter collection remains blocked until provider/config remediation is complete and provider acceptance later passes. Launch caps remain blocked while provider acceptance fails.
+
+If provider acceptance blocks, do not run material-hunter collection. Recommended remediation is a higher-throughput or dedicated Geyser endpoint, an alternate provider, narrower subscription if it still preserves stream-authoritative holder metrics and fresh Pump.fun launch detection, or provider-side support investigation.
 
 By default, the gate skips workspace clippy because existing broad workspace warnings are not yet release-gate clean. To enforce clippy too:
 
