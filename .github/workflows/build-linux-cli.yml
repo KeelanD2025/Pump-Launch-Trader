@@ -91,17 +91,17 @@ on:
       material_hunter_duration_seconds:
         description: Phase 107B hunter duration in seconds
         required: false
-        default: "28800"
+        default: "5400"
         type: string
       material_hunter_max_attempted_launches:
         description: Material hunter max attempted launches
         required: false
-        default: "50"
+        default: "15"
         type: string
       material_hunter_target_candidates:
         description: Material hunter target material candidates
         required: false
-        default: "5"
+        default: "2"
         type: string
 
 permissions:
@@ -979,9 +979,9 @@ jobs:
           exit 1
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
-          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
-          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
-          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
+          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-5400}"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-15}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-2}"
           if [[ "${RUN_MATERIAL_HUNTER_SLICE:-false}" == "true" && "${HUNTER_DURATION_SECONDS}" -gt 5400 ]]; then
             echo "::warning::Clamping material hunter slice duration from ${HUNTER_DURATION_SECONDS}s to 5400s"
             HUNTER_DURATION_SECONDS=5400
@@ -999,9 +999,9 @@ jobs:
             APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}" HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" 'bash -se' <<'EOF'
           set -euo pipefail
           APP_DIR="${APP_DIR}"
-          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
-          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
-          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
+          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-5400}"
+          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-15}"
+          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-2}"
           BIN="${APP_DIR}/target/release/cli"
           VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
@@ -1249,7 +1249,7 @@ jobs:
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
-          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-28800}"
+          HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-5400}"
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
             -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
             APP_DIR="${APP_DIR}" HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS}" HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS}" HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES}" 'bash -se' <<'EOF'
@@ -1259,13 +1259,20 @@ jobs:
           ENV_FILE="/home/ubuntu/pump-launch-quant.env"
           cd "${APP_DIR}"
           RUN_ID="material-candidate-hunter-$(date +%s%N)"
-          HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-50}"
-          HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-5}"
+          REQUESTED_HUNTER_DURATION_SECONDS="${HUNTER_DURATION_SECONDS:-5400}"
+          REQUESTED_HUNTER_MAX_ATTEMPTS="${HUNTER_MAX_ATTEMPTS:-15}"
+          REQUESTED_HUNTER_TARGET_CANDIDATES="${HUNTER_TARGET_CANDIDATES:-2}"
+          HUNTER_DURATION_SECONDS="${REQUESTED_HUNTER_DURATION_SECONDS}"
+          HUNTER_MAX_ATTEMPTS="${REQUESTED_HUNTER_MAX_ATTEMPTS}"
+          HUNTER_TARGET_CANDIDATES="${REQUESTED_HUNTER_TARGET_CANDIDATES}"
+          if [[ "${HUNTER_DURATION_SECONDS}" -gt 5400 ]]; then HUNTER_DURATION_SECONDS=5400; fi
+          if [[ "${HUNTER_MAX_ATTEMPTS}" -gt 15 ]]; then HUNTER_MAX_ATTEMPTS=15; fi
+          if [[ "${HUNTER_TARGET_CANDIDATES}" -gt 2 ]]; then HUNTER_TARGET_CANDIDATES=2; fi
+          SERVICE_RUNTIME_MAX_SEC="$((HUNTER_DURATION_SECONDS + 300))"
           UNIT="pump-launch-quant-material-hunter-${RUN_ID}.service"
           OUT_DIR="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/${RUN_ID}"
           LATEST_FILE="${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id"
           mkdir -p "${OUT_DIR}"
-          printf '%s\n' "${RUN_ID}" > "${LATEST_FILE}"
 
           if sudo systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
             echo "::error::A material hunter service is already active; refusing overlap"
@@ -1432,7 +1439,7 @@ jobs:
           chmod +x "${OUT_DIR}/hunter_service_wrapper.sh"
 
           cat > "${OUT_DIR}/service_start.json" <<EOS
-          {"schema_version":"phase107e.service_start.v1","run_id":"${RUN_ID}","unit":"${UNIT}","output_dir":"${OUT_DIR}","live_trading_enabled":false,"holder_rpc_used":false,"threshold_tuning_allowed":false}
+          {"schema_version":"phase107e.service_start.v1","run_id":"${RUN_ID}","unit":"${UNIT}","output_dir":"${OUT_DIR}","requested_duration_seconds":${REQUESTED_HUNTER_DURATION_SECONDS},"effective_duration_seconds":${HUNTER_DURATION_SECONDS},"requested_max_attempted_launches":${REQUESTED_HUNTER_MAX_ATTEMPTS},"effective_max_attempted_launches":${HUNTER_MAX_ATTEMPTS},"requested_target_candidates":${REQUESTED_HUNTER_TARGET_CANDIDATES},"effective_target_candidates":${HUNTER_TARGET_CANDIDATES},"runtime_max_sec":${SERVICE_RUNTIME_MAX_SEC},"live_trading_enabled":false,"holder_rpc_used":false,"threshold_tuning_allowed":false}
           EOS
           cat > "${OUT_DIR}/service_start.md" <<EOS
           # Phase 107E Service Start
@@ -1440,6 +1447,11 @@ jobs:
           - run_id: \`${RUN_ID}\`
           - unit: \`${UNIT}\`
           - output_dir: \`${OUT_DIR}\`
+          - requested_duration_seconds: \`${REQUESTED_HUNTER_DURATION_SECONDS}\`
+          - effective_duration_seconds: \`${HUNTER_DURATION_SECONDS}\`
+          - requested_max_attempted_launches: \`${REQUESTED_HUNTER_MAX_ATTEMPTS}\`
+          - effective_max_attempted_launches: \`${HUNTER_MAX_ATTEMPTS}\`
+          - runtime_max_sec: \`${SERVICE_RUNTIME_MAX_SEC}\`
           EOS
 
           sudo systemd-run --unit="${UNIT}" \
@@ -1447,6 +1459,7 @@ jobs:
             --property=KillSignal=SIGINT \
             --property=KillMode=process \
             --property=TimeoutStopSec=120 \
+            --property=RuntimeMaxSec="${SERVICE_RUNTIME_MAX_SEC}" \
             --property=Restart=no \
             --setenv=APP_DIR="${APP_DIR}" \
             --setenv=BIN="${BIN}" \
@@ -1494,6 +1507,7 @@ jobs:
               print("::error::Material hunter startup R2 checkpoint was not verified")
               raise SystemExit(1)
           PY
+          printf '%s\n' "${RUN_ID}" > "${LATEST_FILE}"
           echo "${RUN_ID}"
           EOF
 

@@ -832,6 +832,10 @@ pub struct MaterialHunterStreamSummary {
     pub reconnect_attempts: u64,
     #[serde(default)]
     pub stream_completed_normally: bool,
+    #[serde(default)]
+    pub provider_progress_stalled_seconds: u64,
+    #[serde(default)]
+    pub pump_progress_stalled_seconds: u64,
     pub connected: bool,
     pub duration_seconds: u64,
     pub transaction_updates: u64,
@@ -977,6 +981,9 @@ where
     let request = ingest.proto_subscription_request();
     let max_attempts = config.max_reconnect_attempts.unwrap_or(10).max(1) as usize;
     let mut reconnect_attempts = 0usize;
+    let stream_started_at = tokio::time::Instant::now();
+    let mut last_provider_progress_at = stream_started_at;
+    let mut last_pump_progress_at = stream_started_at;
     if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
         summary.provider_status = "stopped_by_hunter".to_owned();
         summary.stream_completed_normally = true;
@@ -1064,6 +1071,8 @@ where
                         }
                         _ => {}
                     }
+                    last_provider_progress_at = tokio::time::Instant::now();
+                    summary.provider_progress_stalled_seconds = 0;
                     if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
                         summary.provider_status = "stopped_by_hunter".to_owned();
                         summary.stream_completed_normally = true;
@@ -1080,6 +1089,8 @@ where
                         {
                             summary.pump_create_decoded =
                                 summary.pump_create_decoded.saturating_add(1);
+                            last_pump_progress_at = tokio::time::Instant::now();
+                            summary.pump_progress_stalled_seconds = 0;
                         }
                         summary.normalized_events = summary.normalized_events.saturating_add(1);
                         if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
@@ -1117,9 +1128,28 @@ where
                     let _ = on_progress(&summary)?;
                     return Ok(summary);
                 }
-                Ok(None) => break 'streaming,
+                Ok(None) => {
+                    if tokio::time::Instant::now() < deadline {
+                        summary.provider_status =
+                            "provider_stream_closed_before_deadline".to_owned();
+                        summary.provider_blocker_class =
+                            Some("provider_stream_closed_before_deadline".to_owned());
+                        summary.stream_completed_normally = false;
+                        summary.provider_progress_stalled_seconds =
+                            last_provider_progress_at.elapsed().as_secs();
+                        summary.pump_progress_stalled_seconds =
+                            last_pump_progress_at.elapsed().as_secs();
+                        let _ = on_progress(&summary)?;
+                        return Ok(summary);
+                    }
+                    break 'streaming;
+                }
                 Err(_) => {
                     if last_progress_tick.elapsed() >= StdDuration::from_secs(30) {
+                        summary.provider_progress_stalled_seconds =
+                            last_provider_progress_at.elapsed().as_secs();
+                        summary.pump_progress_stalled_seconds =
+                            last_pump_progress_at.elapsed().as_secs();
                         if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
                             summary.provider_status = "stopped_by_hunter".to_owned();
                             summary.stream_completed_normally = true;
@@ -1145,6 +1175,8 @@ where
             summary.provider_status.as_str(),
             "connected_zero_updates" | "no_launch_detected" | "completed" | "stopped_by_hunter"
         );
+    summary.provider_progress_stalled_seconds = last_provider_progress_at.elapsed().as_secs();
+    summary.pump_progress_stalled_seconds = last_pump_progress_at.elapsed().as_secs();
     let _ = on_progress(&summary)?;
     Ok(summary)
 }
@@ -3407,14 +3439,58 @@ mod tests {
                     assert!(summary.connected);
                 }
                 *progress_calls_for_cb.lock().expect("progress lock") += 1;
+                if summary.slot_updates > 0 {
+                    return Ok(MaterialHunterStreamAction::Stop);
+                }
                 Ok(MaterialHunterStreamAction::Continue)
             },
         )
         .await
         .expect("material hunter summary");
-        assert_eq!(summary.provider_status, "no_launch_detected");
+        assert_eq!(summary.provider_status, "stopped_by_hunter");
         assert!(summary.slot_updates > 0);
         assert!(*progress_calls.lock().expect("progress lock") >= 2);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_stream_closed_before_deadline_is_non_countable() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch {
+                updates: vec![Ok(update_wrap(
+                    yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                        SubscribeUpdateSlot {
+                            slot: 78,
+                            parent: Some(77),
+                            status: SlotStatus::SlotProcessed as i32,
+                            dead_error: None,
+                        },
+                    ),
+                ))],
+            }])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 2,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("early stream close should be structured, not an error");
+        assert_eq!(
+            summary.provider_status,
+            "provider_stream_closed_before_deadline"
+        );
+        assert_eq!(
+            summary.provider_blocker_class.as_deref(),
+            Some("provider_stream_closed_before_deadline")
+        );
+        assert!(summary.slot_updates > 0);
+        assert!(!summary.stream_completed_normally);
     }
 
     #[tokio::test]
@@ -3480,7 +3556,12 @@ mod tests {
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
-            |_summary| Ok(MaterialHunterStreamAction::Continue),
+            |summary| {
+                if summary.slot_updates > 0 {
+                    return Ok(MaterialHunterStreamAction::Stop);
+                }
+                Ok(MaterialHunterStreamAction::Continue)
+            },
         )
         .await
         .expect("transient stream error should reconnect");
