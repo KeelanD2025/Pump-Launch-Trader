@@ -822,6 +822,16 @@ pub struct MaterialHunterStreamOptions {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct MaterialHunterStreamSummary {
     pub provider_status: String,
+    #[serde(default)]
+    pub provider_blocker_class: Option<String>,
+    #[serde(default)]
+    pub provider_data_loss_seen: bool,
+    #[serde(default)]
+    pub provider_lagged_count: u64,
+    #[serde(default)]
+    pub reconnect_attempts: u64,
+    #[serde(default)]
+    pub stream_completed_normally: bool,
     pub connected: bool,
     pub duration_seconds: u64,
     pub transaction_updates: u64,
@@ -836,6 +846,32 @@ pub struct MaterialHunterStreamSummary {
 pub enum MaterialHunterStreamAction {
     Continue,
     Stop,
+}
+
+fn material_hunter_status_class(status: &Status) -> (&'static str, bool, bool) {
+    let rendered = status.to_string().to_ascii_lowercase();
+    let message = status.message().to_ascii_lowercase();
+    if rendered.contains("lagged")
+        || message.contains("lagged")
+        || rendered.contains("unrecoverable data loss")
+        || message.contains("unrecoverable data loss")
+        || (rendered.contains("corruption") && rendered.contains("data loss"))
+        || (message.contains("corruption") && message.contains("data loss"))
+    {
+        return ("provider_lagged_data_loss", false, true);
+    }
+    match status.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+            ("auth_rejected", false, false)
+        }
+        tonic::Code::Unimplemented => ("unsupported", false, false),
+        tonic::Code::Unavailable
+        | tonic::Code::Unknown
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Cancelled
+        | tonic::Code::ResourceExhausted => ("transient_stream_error", true, false),
+        _ => ("stream_error", false, false),
+    }
 }
 
 fn should_retain_fresh_launch_event(
@@ -934,103 +970,165 @@ where
         return Err(anyhow!("geyser endpoint is not configured"));
     }
 
+    let deadline =
+        tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
     let mut normalizer = GeyserEventNormalizer::from_loaded(loaded)?;
     let mut ingest = GeyserIngestService::new(config.clone());
     let request = ingest.proto_subscription_request();
-    let mut stream = match connector.connect_and_subscribe(&config, request).await {
-        Ok(stream) => {
-            summary.provider_status = "connected".to_owned();
-            summary.connected = true;
-            stream
-        }
-        Err(error) => {
-            if let Some(status) = error.downcast_ref::<Status>() {
-                summary.provider_status = match status.code() {
-                    tonic::Code::Unimplemented => "unsupported".to_owned(),
-                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
-                        "auth_rejected".to_owned()
-                    }
-                    _ => "connection_failed".to_owned(),
-                };
-                summary.errors.push(status.to_string());
-            } else {
-                summary.provider_status = "connection_failed".to_owned();
-                summary.errors.push(error.to_string());
-            }
-            return Err(anyhow!(summary.errors.join("; ")));
-        }
-    };
-
-    let deadline =
-        tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
-    let mut last_progress_tick = tokio::time::Instant::now();
+    let max_attempts = config.max_reconnect_attempts.unwrap_or(10).max(1) as usize;
+    let mut reconnect_attempts = 0usize;
     if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
         summary.provider_status = "stopped_by_hunter".to_owned();
+        summary.stream_completed_normally = true;
         return Ok(summary);
     }
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let poll_window = remaining.min(StdDuration::from_millis(250));
-        if poll_window.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(poll_window, stream.next()).await {
-            Ok(Some(Ok(update))) => {
-                match update.update_oneof.as_ref() {
-                    Some(UpdateOneof::Transaction(_)) | Some(UpdateOneof::TransactionStatus(_)) => {
-                        summary.transaction_updates = summary.transaction_updates.saturating_add(1);
-                    }
-                    Some(UpdateOneof::Account(_)) => {
-                        summary.account_updates = summary.account_updates.saturating_add(1);
-                    }
-                    Some(UpdateOneof::Slot(_)) => {
-                        summary.slot_updates = summary.slot_updates.saturating_add(1);
-                    }
-                    _ => {}
-                }
+
+    'streaming: while tokio::time::Instant::now() < deadline {
+        let mut stream = match connector
+            .connect_and_subscribe(&config, request.clone())
+            .await
+        {
+            Ok(stream) => {
+                summary.provider_status = if reconnect_attempts > 0 {
+                    "reconnected".to_owned()
+                } else {
+                    "connected".to_owned()
+                };
+                summary.connected = true;
                 if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
                     summary.provider_status = "stopped_by_hunter".to_owned();
+                    summary.stream_completed_normally = true;
                     return Ok(summary);
                 }
-                last_progress_tick = tokio::time::Instant::now();
-                let outputs = ingest.process_subscribe_update(update, monotonic_now_ns());
-                let normalized = outputs
-                    .into_iter()
-                    .flat_map(|output| normalizer.normalize_output(output))
-                    .collect::<Vec<_>>();
-                for event in normalized {
-                    if matches!(&event.payload, EventPayload::TokenCreated(payload) if payload.status != TransactionStatus::Failed)
-                    {
-                        summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
-                    }
-                    summary.normalized_events = summary.normalized_events.saturating_add(1);
-                    if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
-                        summary.provider_status = "stopped_by_hunter".to_owned();
+                stream
+            }
+            Err(error) => {
+                if let Some(status) = error.downcast_ref::<Status>() {
+                    let (class, retryable, data_loss) = material_hunter_status_class(status);
+                    summary.provider_status = class.to_owned();
+                    summary.provider_blocker_class = Some(class.to_owned());
+                    summary.errors.push(status.to_string());
+                    if data_loss {
+                        summary.provider_data_loss_seen = true;
+                        summary.provider_lagged_count =
+                            summary.provider_lagged_count.saturating_add(1);
+                        let _ = on_progress(&summary)?;
                         return Ok(summary);
                     }
-                }
-            }
-            Ok(Some(Err(status))) => {
-                summary.provider_status = match status.code() {
-                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
-                        "auth_rejected".to_owned()
+                    if retryable {
+                        reconnect_attempts = reconnect_attempts.saturating_add(1);
+                        summary.reconnect_attempts = summary.reconnect_attempts.saturating_add(1);
+                        if reconnect_attempts < max_attempts {
+                            summary.provider_blocker_class = None;
+                            let _ = on_progress(&summary)?;
+                            tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts)).await;
+                            continue 'streaming;
+                        }
+                        summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                        summary.provider_blocker_class =
+                            Some("provider_reconnect_exhausted".to_owned());
+                        let _ = on_progress(&summary)?;
+                        return Ok(summary);
                     }
-                    tonic::Code::Unimplemented => "unsupported".to_owned(),
-                    _ => "stream_error".to_owned(),
-                };
-                summary.errors.push(status.to_string());
-                return Err(anyhow!(summary.errors.join("; ")));
+                } else {
+                    summary.provider_status = "connection_failed".to_owned();
+                    summary.provider_blocker_class = Some("connection_failed".to_owned());
+                    summary.errors.push(error.to_string());
+                }
+                let _ = on_progress(&summary)?;
+                return Ok(summary);
             }
-            Ok(None) => break,
-            Err(_) => {
-                if last_progress_tick.elapsed() >= StdDuration::from_secs(30) {
+        };
+
+        let mut last_progress_tick = tokio::time::Instant::now();
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let poll_window = remaining.min(StdDuration::from_millis(250));
+            if poll_window.is_zero() {
+                break 'streaming;
+            }
+            match tokio::time::timeout(poll_window, stream.next()).await {
+                Ok(Some(Ok(update))) => {
+                    reconnect_attempts = 0;
+                    match update.update_oneof.as_ref() {
+                        Some(UpdateOneof::Transaction(_))
+                        | Some(UpdateOneof::TransactionStatus(_)) => {
+                            summary.transaction_updates =
+                                summary.transaction_updates.saturating_add(1);
+                        }
+                        Some(UpdateOneof::Account(_)) => {
+                            summary.account_updates = summary.account_updates.saturating_add(1);
+                        }
+                        Some(UpdateOneof::Slot(_)) => {
+                            summary.slot_updates = summary.slot_updates.saturating_add(1);
+                        }
+                        _ => {}
+                    }
                     if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
                         summary.provider_status = "stopped_by_hunter".to_owned();
+                        summary.stream_completed_normally = true;
                         return Ok(summary);
                     }
                     last_progress_tick = tokio::time::Instant::now();
+                    let outputs = ingest.process_subscribe_update(update, monotonic_now_ns());
+                    let normalized = outputs
+                        .into_iter()
+                        .flat_map(|output| normalizer.normalize_output(output))
+                        .collect::<Vec<_>>();
+                    for event in normalized {
+                        if matches!(&event.payload, EventPayload::TokenCreated(payload) if payload.status != TransactionStatus::Failed)
+                        {
+                            summary.pump_create_decoded =
+                                summary.pump_create_decoded.saturating_add(1);
+                        }
+                        summary.normalized_events = summary.normalized_events.saturating_add(1);
+                        if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
+                            summary.provider_status = "stopped_by_hunter".to_owned();
+                            summary.stream_completed_normally = true;
+                            return Ok(summary);
+                        }
+                    }
                 }
-                continue;
+                Ok(Some(Err(status))) => {
+                    let (class, retryable, data_loss) = material_hunter_status_class(&status);
+                    summary.provider_status = class.to_owned();
+                    summary.provider_blocker_class = Some(class.to_owned());
+                    summary.errors.push(status.to_string());
+                    if data_loss {
+                        summary.provider_data_loss_seen = true;
+                        summary.provider_lagged_count =
+                            summary.provider_lagged_count.saturating_add(1);
+                        let _ = on_progress(&summary)?;
+                        return Ok(summary);
+                    }
+                    if retryable {
+                        reconnect_attempts = reconnect_attempts.saturating_add(1);
+                        summary.reconnect_attempts = summary.reconnect_attempts.saturating_add(1);
+                        if reconnect_attempts < max_attempts {
+                            summary.provider_blocker_class = None;
+                            let _ = on_progress(&summary)?;
+                            tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts)).await;
+                            continue 'streaming;
+                        }
+                        summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                        summary.provider_blocker_class =
+                            Some("provider_reconnect_exhausted".to_owned());
+                    }
+                    let _ = on_progress(&summary)?;
+                    return Ok(summary);
+                }
+                Ok(None) => break 'streaming,
+                Err(_) => {
+                    if last_progress_tick.elapsed() >= StdDuration::from_secs(30) {
+                        if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                            summary.provider_status = "stopped_by_hunter".to_owned();
+                            summary.stream_completed_normally = true;
+                            return Ok(summary);
+                        }
+                        last_progress_tick = tokio::time::Instant::now();
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -1041,6 +1139,12 @@ where
     } else {
         summary.provider_status = "completed".to_owned();
     }
+    summary.stream_completed_normally = summary.provider_blocker_class.is_none()
+        && !summary.provider_data_loss_seen
+        && matches!(
+            summary.provider_status.as_str(),
+            "connected_zero_updates" | "no_launch_detected" | "completed" | "stopped_by_hunter"
+        );
     let _ = on_progress(&summary)?;
     Ok(summary)
 }
@@ -3299,7 +3403,9 @@ mod tests {
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
             move |summary| {
-                assert!(summary.connected);
+                if summary.provider_status != "not_attempted" {
+                    assert!(summary.connected);
+                }
                 *progress_calls_for_cb.lock().expect("progress lock") += 1;
                 Ok(MaterialHunterStreamAction::Continue)
             },
@@ -3309,6 +3415,115 @@ mod tests {
         assert_eq!(summary.provider_status, "no_launch_detected");
         assert!(summary.slot_updates > 0);
         assert!(*progress_calls.lock().expect("progress lock") >= 2);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_provider_lag_is_classified_without_err() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch {
+                updates: vec![Err(
+                    "code: 'Unrecoverable data loss or corruption', message: \"lagged\"".to_owned(),
+                )],
+            }])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("lagged status should be structured, not an error");
+        assert_eq!(summary.provider_status, "provider_lagged_data_loss");
+        assert_eq!(
+            summary.provider_blocker_class.as_deref(),
+            Some("provider_lagged_data_loss")
+        );
+        assert!(summary.provider_data_loss_seen);
+        assert!(summary.provider_lagged_count > 0);
+        assert!(!summary.stream_completed_normally);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_transient_stream_error_reconnects() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.max_reconnect_attempts = Some(3);
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![
+                MockConnectorBatch {
+                    updates: vec![Err("transport reset".to_owned())],
+                },
+                MockConnectorBatch {
+                    updates: vec![Ok(update_wrap(
+                        yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                            SubscribeUpdateSlot {
+                                slot: 88,
+                                parent: Some(87),
+                                status: SlotStatus::SlotProcessed as i32,
+                                dead_error: None,
+                            },
+                        ),
+                    ))],
+                },
+            ])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("transient stream error should reconnect");
+        assert!(summary.reconnect_attempts > 0);
+        assert!(summary.slot_updates > 0);
+        assert_ne!(summary.provider_status, "stream_error");
+        assert_ne!(summary.provider_status, "provider_lagged_data_loss");
+        assert_eq!(summary.provider_blocker_class, None);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_reconnect_exhausted_is_structured_non_countable() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.max_reconnect_attempts = Some(2);
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![
+                MockConnectorBatch {
+                    updates: vec![Err("transport reset".to_owned())],
+                },
+                MockConnectorBatch {
+                    updates: vec![Err("transport reset".to_owned())],
+                },
+            ])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("reconnect exhaustion should be structured, not an error");
+        assert_eq!(summary.provider_status, "provider_reconnect_exhausted");
+        assert_eq!(
+            summary.provider_blocker_class.as_deref(),
+            Some("provider_reconnect_exhausted")
+        );
+        assert!(summary.reconnect_attempts >= 2);
+        assert!(!summary.stream_completed_normally);
     }
 
     #[tokio::test]

@@ -38927,7 +38927,7 @@ async fn material_candidate_hunter_command(
     let interrupted_for_progress = interrupted.clone();
     let last_r2_checkpoint_for_events = last_r2_checkpoint_at.clone();
     let last_r2_checkpoint_for_progress = last_r2_checkpoint_at.clone();
-    let stream_summary = run_material_hunter_stream_with_progress(
+    let stream_summary = match run_material_hunter_stream_with_progress(
         loaded,
         runtime::MaterialHunterStreamOptions { duration_seconds },
         |event, summary| {
@@ -39253,10 +39253,46 @@ async fn material_candidate_hunter_command(
             Ok(MaterialHunterStreamAction::Continue)
         },
     )
-    .await?;
-    let interrupted_run = interrupted.load(Ordering::SeqCst);
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let mut summary = MaterialHunterStreamSummary {
+                provider_status: "stream_runtime_error".to_owned(),
+                provider_blocker_class: Some("stream_runtime_error".to_owned()),
+                duration_seconds,
+                ..MaterialHunterStreamSummary::default()
+            };
+            summary.errors.push(error.to_string());
+            summary
+        }
+    };
+    let provider_blocker_class = stream_summary.provider_blocker_class.as_deref();
+    let provider_blocked_run = stream_summary.provider_data_loss_seen
+        || matches!(
+            provider_blocker_class,
+            Some(
+                "provider_lagged_data_loss"
+                    | "provider_reconnect_exhausted"
+                    | "auth_rejected"
+                    | "unsupported"
+                    | "connection_failed"
+                    | "stream_runtime_error"
+            )
+        );
+    let interruption_reason = if stream_summary.provider_data_loss_seen {
+        "provider_lagged_data_loss".to_owned()
+    } else if let Some(class) = provider_blocker_class {
+        class.to_owned()
+    } else if interrupted.load(Ordering::SeqCst) {
+        "signal_interrupted".to_owned()
+    } else {
+        String::new()
+    };
+    let interrupted_run = interrupted.load(Ordering::SeqCst) || provider_blocked_run;
 
     if !interrupted_run
+        && !provider_blocked_run
         && stream_summary.transaction_updates
             + stream_summary.account_updates
             + stream_summary.slot_updates
@@ -39279,6 +39315,7 @@ async fn material_candidate_hunter_command(
             stream_summary.provider_status
         );
     } else if !interrupted_run
+        && !provider_blocked_run
         && stream_summary.transaction_updates
             + stream_summary.account_updates
             + stream_summary.slot_updates
@@ -39321,13 +39358,9 @@ async fn material_candidate_hunter_command(
             OffsetDateTime::now_utc(),
         )?;
         let decision = Phase107bDecision {
-            final_state: if interrupted_run {
-                "terminal_inconclusive".to_owned()
-            } else {
-                "terminal_inconclusive".to_owned()
-            },
+            final_state: "terminal_inconclusive".to_owned(),
             reason: if interrupted_run {
-                "signal_interrupted_active_mint_finalized_inconclusive".to_owned()
+                format!("{interruption_reason}_active_mint_finalized_inconclusive")
             } else {
                 "stream_slice_completed_before_terminal_gate".to_owned()
             },
@@ -39377,7 +39410,10 @@ async fn material_candidate_hunter_command(
         let interrupted_summary = json!({
             "schema_version": "phase107f.hunter_summary_interrupted.v1",
             "run_id": run_id,
-            "interruption_reason": "signal_interrupted",
+            "interruption_reason": interruption_reason,
+            "provider_status": stream_summary.provider_status,
+            "provider_blocker_class": stream_summary.provider_blocker_class,
+            "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
             "last_attempt_index": attempt_rows.len(),
             "last_tracked_mint": attempt_rows.last().and_then(|row| row["mint"].as_str()).unwrap_or(""),
             "attempted_launches": attempt_rows.len(),
@@ -39385,7 +39421,10 @@ async fn material_candidate_hunter_command(
             "candidate_count": candidate_rows.len(),
             "partial_outputs_r2_verified": false,
             "counted_phase107b_result": false,
+            "partial_outputs_audit_only": true,
             "off_vps_candidate_replay_allowed": false,
+            "ready_for_off_vps_candidate_replay": false,
+            "formal_backtesting_allowed": false,
             "threshold_tuning_allowed": false,
             "generated_at": OffsetDateTime::now_utc(),
         });
@@ -39396,6 +39435,24 @@ async fn material_candidate_hunter_command(
             format!(
                 "# Phase 107F Hunter Interrupted\n\n- run_id: `{run_id}`\n- attempted launches: `{}`\n- counted_phase107b_result: `false`\n",
                 attempt_rows.len()
+            ),
+        )?;
+        let countability = phase107b_interrupted_countability_payload(
+            &run_id,
+            &interruption_reason,
+            &stream_summary,
+            attempt_rows.len(),
+            rejected_rows.len(),
+            candidate_rows.len(),
+            false,
+        );
+        write_quant_json_md(
+            &output_dir,
+            "countability_decision",
+            &countability,
+            format!(
+                "# Phase 107B Countability Decision\n\n- counted_phase107b_result: `false`\n- interruption_reason: `{}`\n- threshold_tuning_allowed: `false`\n",
+                interruption_reason
             ),
         )?;
     }
@@ -39485,6 +39542,9 @@ async fn material_candidate_hunter_command(
         "threshold_tuning_allowed": false,
         "formal_backtesting_allowed": false,
         "interrupted_run": interrupted_run,
+        "provider_status": stream_summary.provider_status,
+        "provider_blocker_class": stream_summary.provider_blocker_class,
+        "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
         "ready_for_off_vps_candidate_replay": !interrupted_run && !candidate_rows.is_empty(),
         "ready_for_large_strategy_dataset": false,
     });
@@ -39523,6 +39583,9 @@ async fn material_candidate_hunter_command(
         "binary_malicious_labels_emitted": false,
         "process_exit_code": if interrupted_run { 130 } else { 0 },
         "killed_by_oom_or_signal": interrupted_run,
+        "provider_status": stream_summary.provider_status,
+        "provider_blocker_class": stream_summary.provider_blocker_class,
+        "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
         "resource_telemetry_available": output_dir.join("resource_telemetry.csv").exists(),
         "threshold_tuning_allowed": false,
         "ready_for_off_vps_candidate_replay": !interrupted_run && !candidate_rows.is_empty(),
@@ -39687,6 +39750,10 @@ async fn material_candidate_hunter_command(
             "counted_phase107b_result": counted_phase107b_result,
             "hunter_exited_normally": !interrupted_run,
             "interrupted_run": interrupted_run,
+            "interruption_reason": if interrupted_run { interruption_reason.as_str() } else { "" },
+            "provider_status": stream_summary.provider_status,
+            "provider_blocker_class": stream_summary.provider_blocker_class,
+            "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
             "process_exit_code": if interrupted_run { 130 } else { 0 },
             "final_artifacts_exist": final_artifacts_exist,
             "attempt_ledger_row_count_matches": attempt_ledger_row_count_matches,
@@ -39703,6 +39770,7 @@ async fn material_candidate_hunter_command(
             "partial_outputs_audit_only": !counted_phase107b_result,
             "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
             "off_vps_candidate_replay_allowed": counted_phase107b_result && !candidate_rows.is_empty(),
+            "ready_for_off_vps_candidate_replay": counted_phase107b_result && !candidate_rows.is_empty(),
             "formal_backtesting_allowed": false,
             "threshold_tuning_allowed": false,
             "generated_at": OffsetDateTime::now_utc(),
@@ -39899,6 +39967,38 @@ fn phase107b_write_incremental_checkpoint(
         }))?,
     )?;
     Ok(())
+}
+
+fn phase107b_interrupted_countability_payload(
+    run_id: &str,
+    interruption_reason: &str,
+    stream_summary: &MaterialHunterStreamSummary,
+    attempt_count: usize,
+    rejected_count: usize,
+    candidate_count: usize,
+    partial_r2_verified: bool,
+) -> serde_json::Value {
+    json!({
+        "schema_version": "phase107b.countability_decision.v1",
+        "run_id": run_id,
+        "counted_phase107b_result": false,
+        "hunter_exited_normally": false,
+        "interrupted_run": true,
+        "interruption_reason": interruption_reason,
+        "provider_status": stream_summary.provider_status,
+        "provider_blocker_class": stream_summary.provider_blocker_class,
+        "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
+        "attempted_launches": attempt_count,
+        "rejected_count": rejected_count,
+        "candidate_count": candidate_count,
+        "partial_outputs_r2_verified": partial_r2_verified,
+        "partial_outputs_audit_only": true,
+        "off_vps_candidate_replay_allowed": false,
+        "ready_for_off_vps_candidate_replay": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    })
 }
 
 fn phase107b_scoped_events_for_mint(
@@ -51828,6 +51928,61 @@ mod tests {
         assert_eq!(heartbeat["run_id"], "run");
         assert_eq!(heartbeat["current_state"], "startup");
         assert_eq!(heartbeat["safe_to_continue"], true);
+    }
+
+    #[test]
+    fn phase107f_provider_lag_interrupted_countability_is_audit_only() {
+        let summary = MaterialHunterStreamSummary {
+            provider_status: "provider_lagged_data_loss".to_owned(),
+            provider_blocker_class: Some("provider_lagged_data_loss".to_owned()),
+            provider_data_loss_seen: true,
+            provider_lagged_count: 1,
+            ..MaterialHunterStreamSummary::default()
+        };
+        let payload = phase107b_interrupted_countability_payload(
+            "run",
+            "provider_lagged_data_loss",
+            &summary,
+            3,
+            2,
+            0,
+            true,
+        );
+        assert_eq!(payload["counted_phase107b_result"], false);
+        assert_eq!(payload["partial_outputs_audit_only"], true);
+        assert_eq!(payload["off_vps_candidate_replay_allowed"], false);
+        assert_eq!(payload["ready_for_off_vps_candidate_replay"], false);
+        assert_eq!(payload["threshold_tuning_allowed"], false);
+        assert_eq!(
+            payload["provider_blocker_class"],
+            "provider_lagged_data_loss"
+        );
+        assert_eq!(payload["provider_data_loss_seen"], true);
+        assert_eq!(payload["partial_outputs_r2_verified"], true);
+    }
+
+    #[test]
+    fn phase107f_interrupted_candidate_rows_are_not_replayable() {
+        let summary = MaterialHunterStreamSummary {
+            provider_status: "provider_lagged_data_loss".to_owned(),
+            provider_blocker_class: Some("provider_lagged_data_loss".to_owned()),
+            provider_data_loss_seen: true,
+            ..MaterialHunterStreamSummary::default()
+        };
+        let payload = phase107b_interrupted_countability_payload(
+            "run",
+            "provider_lagged_data_loss",
+            &summary,
+            4,
+            1,
+            1,
+            true,
+        );
+        assert_eq!(payload["candidate_count"], 1);
+        assert_eq!(payload["counted_phase107b_result"], false);
+        assert_eq!(payload["off_vps_candidate_replay_allowed"], false);
+        assert_eq!(payload["ready_for_off_vps_candidate_replay"], false);
+        assert_eq!(payload["partial_outputs_audit_only"], true);
     }
 
     #[test]
