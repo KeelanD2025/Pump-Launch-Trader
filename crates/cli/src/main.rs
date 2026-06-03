@@ -18991,7 +18991,10 @@ async fn provider_health_probe_command(
     } else {
         run_material_hunter_stream_with_progress(
             loaded,
-            MaterialHunterStreamOptions { duration_seconds },
+            MaterialHunterStreamOptions {
+                duration_seconds,
+                ..MaterialHunterStreamOptions::default()
+            },
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
             |summary| {
                 let provider_updates = provider_health_total_updates(summary);
@@ -19223,7 +19226,10 @@ async fn run_stream_acceptance_stage(
 
     let stream_summary = run_material_hunter_stream_with_progress(
         loaded,
-        MaterialHunterStreamOptions { duration_seconds },
+        MaterialHunterStreamOptions {
+            duration_seconds,
+            ..MaterialHunterStreamOptions::default()
+        },
         |event, _summary| {
             let event_started = Instant::now();
             match stage {
@@ -26365,7 +26371,7 @@ async fn upload_research_results_r2_internal(
     let mut uploaded_files = Vec::new();
     let mut verified_files = Vec::new();
     let mut failed_files = Vec::new();
-    let mut research_outputs_remote_prefix = Some(format!(
+    let research_outputs_remote_prefix = Some(format!(
         "{}/{}",
         research_remote_base_prefix(&client),
         remote_prefix
@@ -39522,6 +39528,7 @@ struct Phase107fActiveMint {
     events: Vec<NormalizedEvent>,
     related_signatures: BTreeSet<String>,
     attempt_index: usize,
+    segment_id: usize,
     finalized: bool,
     candidate_300_written: bool,
     candidate_900_written: bool,
@@ -39529,7 +39536,7 @@ struct Phase107fActiveMint {
 }
 
 impl Phase107fActiveMint {
-    fn new(mint: String, create: NormalizedEvent, attempt_index: usize) -> Self {
+    fn new(mint: String, create: NormalizedEvent, attempt_index: usize, segment_id: usize) -> Self {
         let mut related_signatures = BTreeSet::new();
         if let Some(signature) = event_signature_string(&create) {
             related_signatures.insert(signature);
@@ -39540,6 +39547,7 @@ impl Phase107fActiveMint {
             events: vec![create],
             related_signatures,
             attempt_index,
+            segment_id,
             finalized: false,
             candidate_300_written: false,
             candidate_900_written: false,
@@ -39634,6 +39642,28 @@ fn phase107f_write_health(
         "pump_updates": summary.pump_create_decoded,
         "provider_progress_stalled_seconds": summary.provider_progress_stalled_seconds,
         "pump_progress_stalled_seconds": summary.pump_progress_stalled_seconds,
+        "grpc_reader_update_count": summary.grpc_reader_update_count,
+        "grpc_reader_poll_latency_ms_p50": summary.grpc_reader_poll_latency_ms_p50,
+        "grpc_reader_poll_latency_ms_p95": summary.grpc_reader_poll_latency_ms_p95,
+        "grpc_reader_poll_latency_ms_p99": summary.grpc_reader_poll_latency_ms_p99,
+        "grpc_reader_poll_latency_ms_max": summary.grpc_reader_poll_latency_ms_max,
+        "grpc_update_interarrival_ms_p50": summary.grpc_update_interarrival_ms_p50,
+        "grpc_update_interarrival_ms_p95": summary.grpc_update_interarrival_ms_p95,
+        "grpc_update_interarrival_ms_p99": summary.grpc_update_interarrival_ms_p99,
+        "grpc_update_interarrival_ms_max": summary.grpc_update_interarrival_ms_max,
+        "internal_queue_depth_current": summary.internal_queue_depth_current,
+        "internal_queue_depth_max": summary.internal_queue_depth_max,
+        "internal_queue_capacity": summary.internal_queue_capacity,
+        "internal_queue_full_count": summary.internal_queue_full_count,
+        "decode_worker_lag_ms_max": summary.decode_worker_lag_ms_max,
+        "artifact_worker_lag_ms_max": summary.artifact_worker_lag_ms_max,
+        "r2_worker_lag_ms_max": summary.r2_worker_lag_ms_max.max(
+            checkpoint_state["checkpoint_upload_duration_ms"]
+                .as_u64()
+                .unwrap_or(0)
+        ),
+        "stream_reader_blocked_by_processing": summary.stream_reader_blocked_by_processing,
+        "client_backpressure_detected": summary.client_backpressure_detected,
         "attempts_progress_stalled_seconds": 0,
         "safe_to_continue": safe_to_continue,
         "blocker_reason": blocker_reason,
@@ -40059,6 +40089,9 @@ async fn material_candidate_hunter_command(
     }
 
     let progress_counts = Arc::new(std::sync::Mutex::new((0usize, 0usize, 0usize, 0usize)));
+    let mut current_segment_id = 1usize;
+    let mut current_segment_started_at = OffsetDateTime::now_utc();
+    let mut segment_records = Vec::<Phase107fSegmentRecord>::new();
     let interrupted_for_stream = interrupted.clone();
     let progress_counts_for_events = progress_counts.clone();
     let progress_counts_for_progress = progress_counts.clone();
@@ -40068,9 +40101,18 @@ async fn material_candidate_hunter_command(
     let interrupted_for_progress = interrupted.clone();
     let last_r2_checkpoint_for_events = last_r2_checkpoint_at.clone();
     let last_r2_checkpoint_for_progress = last_r2_checkpoint_at.clone();
-    let stream_summary = match run_material_hunter_stream_with_progress(
+    let run_started_at = Instant::now();
+    let (stream_summary, _provider_blocked_run, interrupted_run, interruption_reason) = 'segment_streams: loop {
+        let remaining_duration = duration_seconds
+            .saturating_sub(run_started_at.elapsed().as_secs())
+            .max(1);
+        let stream_summary = match run_material_hunter_stream_with_progress(
         loaded,
-        runtime::MaterialHunterStreamOptions { duration_seconds },
+        runtime::MaterialHunterStreamOptions {
+            duration_seconds: remaining_duration,
+            gap_tolerant_segments: false,
+            ..runtime::MaterialHunterStreamOptions::default()
+        },
         |event, summary| {
             if interrupted_for_stream.load(Ordering::SeqCst) {
                 return Ok(MaterialHunterStreamAction::Stop);
@@ -40108,9 +40150,15 @@ async fn material_candidate_hunter_command(
                     let attempt_index = attempt_rows.len() + 1;
                     active_mints.insert(
                         mint.clone(),
-                        Phase107fActiveMint::new(mint.clone(), event.clone(), attempt_index),
+                        Phase107fActiveMint::new(
+                            mint.clone(),
+                            event.clone(),
+                            attempt_index,
+                            current_segment_id,
+                        ),
                     );
                     attempt_rows.push(json!({
+                        "segment_id": current_segment_id,
                         "attempt_index": attempt_index,
                         "mint": mint,
                         "run_id": run_id,
@@ -40196,6 +40244,7 @@ async fn material_candidate_hunter_command(
                         rejected_inconclusive = rejected_inconclusive.saturating_add(1);
                     }
                     rejected_rows.push(json!({
+                        "segment_id": active.segment_id,
                         "mint": mint,
                         "run_id": run_id,
                         "final_state": decision.final_state,
@@ -40232,6 +40281,7 @@ async fn material_candidate_hunter_command(
                         wrote_candidate_checkpoint = true;
                     }
                     let candidate_row = json!({
+                        "segment_id": active.segment_id,
                         "mint": mint,
                         "run_id": run_id,
                         "final_state": if should_finalize { decision.final_state.clone() } else { format!("{}_checkpoint", decision.final_state) },
@@ -40411,174 +40461,291 @@ async fn material_candidate_hunter_command(
             summary
         }
     };
-    let provider_blocker_class = stream_summary.provider_blocker_class.as_deref();
-    let provider_blocked_run = stream_summary.provider_data_loss_seen
-        || matches!(
-            provider_blocker_class,
-            Some(
-                "provider_lagged_data_loss"
-                    | "provider_reconnect_exhausted"
-                    | "auth_rejected"
-                    | "unsupported"
-                    | "connection_failed"
-                    | "provider_stream_closed_before_deadline"
-                    | "stream_runtime_error"
-            )
-        );
-    let interruption_reason = if stream_summary.provider_data_loss_seen {
-        "provider_lagged_data_loss".to_owned()
-    } else if let Some(class) = provider_blocker_class {
-        class.to_owned()
-    } else if interrupted.load(Ordering::SeqCst) {
-        "signal_interrupted".to_owned()
-    } else {
-        String::new()
-    };
-    let interrupted_run = interrupted.load(Ordering::SeqCst) || provider_blocked_run;
-
-    if !interrupted_run
-        && !provider_blocked_run
-        && stream_summary.transaction_updates
-            + stream_summary.account_updates
-            + stream_summary.slot_updates
-            == 0
-    {
-        phase107f_write_health(
-            &health_dir,
-            &run_id,
-            "provider_zero_updates",
-            &stream_summary,
-            attempt_rows.len(),
-            active_mints.len(),
-            rejected_rows.len(),
-            candidate_rows.len(),
-            false,
-            "provider_zero_updates",
-        )?;
-        bail!(
-            "material-candidate-hunter provider stream emitted zero updates; provider_status={}",
-            stream_summary.provider_status
-        );
-    } else if !interrupted_run
-        && !provider_blocked_run
-        && stream_summary.transaction_updates
-            + stream_summary.account_updates
-            + stream_summary.slot_updates
-            > 0
-        && stream_summary.pump_create_decoded == 0
-    {
-        phase107f_write_health(
-            &health_dir,
-            &run_id,
-            "no_launches_seen_but_stream_alive",
-            &stream_summary,
-            attempt_rows.len(),
-            active_mints.len(),
-            rejected_rows.len(),
-            candidate_rows.len(),
-            true,
-            "no_launches_seen_but_stream_alive",
-        )?;
-    }
-
-    for (_mint, active) in active_mints.iter() {
-        let observed_horizon_seconds = active
-            .events
-            .iter()
-            .map(|event| {
-                (event.meta.received_at_wall_time - active.create.meta.received_at_wall_time)
-                    .whole_seconds()
-                    .max(0) as u64
-            })
-            .max()
-            .unwrap_or(0);
-        let analysis = phase107b_analyze_token(
-            loaded,
-            &risk_engine,
-            &run_id,
-            &active.mint,
-            &active.create,
-            &active.events,
-            observed_horizon_seconds,
-            OffsetDateTime::now_utc(),
-        )?;
-        let decision = Phase107bDecision {
-            final_state: "terminal_inconclusive".to_owned(),
-            reason: if interrupted_run {
-                format!("{interruption_reason}_active_mint_finalized_inconclusive")
-            } else {
-                "stream_slice_completed_before_terminal_gate".to_owned()
-            },
-            tracked_until_seconds: observed_horizon_seconds,
-            early_warning_families: analysis
-                .early_rule_rows
-                .iter()
-                .filter(|row| row["rule_fired"].as_bool().unwrap_or(false))
-                .filter_map(|row| row["rule_id"].as_str().map(str::to_owned))
-                .collect(),
-            rug_like_by_300: false,
-            survived_300: false,
-            survived_900: false,
-            survived_1800: false,
-            promoted: false,
-            provider_confirmed_bundle: false,
+        let provider_blocker_class = stream_summary.provider_blocker_class.as_deref();
+        let provider_blocked_run = stream_summary.provider_data_loss_seen
+            || matches!(
+                provider_blocker_class,
+                Some(
+                    "provider_lagged_data_loss"
+                        | "provider_reconnect_exhausted"
+                        | "auth_rejected"
+                        | "unsupported"
+                        | "connection_failed"
+                        | "provider_stream_closed_before_deadline"
+                        | "client_backpressure_detected"
+                        | "stream_runtime_error"
+                )
+            );
+        let interruption_reason = if stream_summary.provider_data_loss_seen {
+            "provider_lagged_data_loss".to_owned()
+        } else if let Some(class) = provider_blocker_class {
+            class.to_owned()
+        } else if interrupted.load(Ordering::SeqCst) {
+            "signal_interrupted".to_owned()
+        } else {
+            String::new()
         };
-        rejected_inconclusive = rejected_inconclusive.saturating_add(1);
-        phase107b_write_rejected_token(
-            &output_dir,
-            &run_id,
-            &active.mint,
-            &active.create,
-            &decision,
-            &analysis,
-        )?;
-        rejected_rows.push(json!({
-            "mint": active.mint,
-            "run_id": run_id,
-            "final_state": decision.final_state,
-            "rejection_class": decision.reason,
-            "stop_tracking_at_seconds": decision.tracked_until_seconds,
-            "early_warning_families": decision.early_warning_families.join("|"),
-            "holder_rpc_used": false,
-            "threshold_tuning_allowed": false,
-        }));
-        candidate_rows.retain(|row| row["mint"].as_str() != Some(active.mint.as_str()));
-        if let Some(row) = attempt_rows
-            .iter_mut()
-            .find(|row| row["attempt_index"].as_u64() == Some(active.attempt_index as u64))
+        let interrupted_run = interrupted.load(Ordering::SeqCst) || provider_blocked_run;
+
+        if !interrupted_run
+            && !provider_blocked_run
+            && stream_summary.transaction_updates
+                + stream_summary.account_updates
+                + stream_summary.slot_updates
+                == 0
         {
-            if let Some(map) = row.as_object_mut() {
-                map.insert(
-                    "tracked_until_seconds".to_owned(),
-                    json!(decision.tracked_until_seconds),
-                );
-                map.insert("final_state".to_owned(), json!(decision.final_state));
-                map.insert(
-                    "rejection_or_promotion_reason".to_owned(),
-                    json!(decision.reason),
-                );
-                map.insert(
-                    "early_warning_families".to_owned(),
-                    json!(decision.early_warning_families.join("|")),
-                );
-                map.insert("rug_like_outcome_by_300s".to_owned(), json!(false));
-                map.insert("survived_300s".to_owned(), json!(false));
-                map.insert("survived_900s".to_owned(), json!(false));
-                map.insert("survived_1800s".to_owned(), json!(false));
-                map.insert("promoted_to_candidate_dataset".to_owned(), json!(false));
-                map.insert("tombstone_written".to_owned(), json!(true));
+            phase107f_write_health(
+                &health_dir,
+                &run_id,
+                "provider_zero_updates",
+                &stream_summary,
+                attempt_rows.len(),
+                active_mints.len(),
+                rejected_rows.len(),
+                candidate_rows.len(),
+                false,
+                "provider_zero_updates",
+            )?;
+            bail!(
+                "material-candidate-hunter provider stream emitted zero updates; provider_status={}",
+                stream_summary.provider_status
+            );
+        } else if !interrupted_run
+            && !provider_blocked_run
+            && stream_summary.transaction_updates
+                + stream_summary.account_updates
+                + stream_summary.slot_updates
+                > 0
+            && stream_summary.pump_create_decoded == 0
+        {
+            phase107f_write_health(
+                &health_dir,
+                &run_id,
+                "no_launches_seen_but_stream_alive",
+                &stream_summary,
+                attempt_rows.len(),
+                active_mints.len(),
+                rejected_rows.len(),
+                candidate_rows.len(),
+                true,
+                "no_launches_seen_but_stream_alive",
+            )?;
+        }
+
+        for (_mint, active) in active_mints.iter() {
+            let observed_horizon_seconds = active
+                .events
+                .iter()
+                .map(|event| {
+                    (event.meta.received_at_wall_time - active.create.meta.received_at_wall_time)
+                        .whole_seconds()
+                        .max(0) as u64
+                })
+                .max()
+                .unwrap_or(0);
+            let analysis = phase107b_analyze_token(
+                loaded,
+                &risk_engine,
+                &run_id,
+                &active.mint,
+                &active.create,
+                &active.events,
+                observed_horizon_seconds,
+                OffsetDateTime::now_utc(),
+            )?;
+            let decision = Phase107bDecision {
+                final_state: "terminal_inconclusive".to_owned(),
+                reason: if interrupted_run {
+                    format!("{interruption_reason}_active_mint_finalized_inconclusive")
+                } else {
+                    "stream_slice_completed_before_terminal_gate".to_owned()
+                },
+                tracked_until_seconds: observed_horizon_seconds,
+                early_warning_families: analysis
+                    .early_rule_rows
+                    .iter()
+                    .filter(|row| row["rule_fired"].as_bool().unwrap_or(false))
+                    .filter_map(|row| row["rule_id"].as_str().map(str::to_owned))
+                    .collect(),
+                rug_like_by_300: false,
+                survived_300: false,
+                survived_900: false,
+                survived_1800: false,
+                promoted: false,
+                provider_confirmed_bundle: false,
+            };
+            rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+            phase107b_write_rejected_token(
+                &output_dir,
+                &run_id,
+                &active.mint,
+                &active.create,
+                &decision,
+                &analysis,
+            )?;
+            rejected_rows.push(json!({
+                "segment_id": active.segment_id,
+                "mint": active.mint,
+                "run_id": run_id,
+                "final_state": decision.final_state,
+                "rejection_class": decision.reason,
+                "stop_tracking_at_seconds": decision.tracked_until_seconds,
+                "early_warning_families": decision.early_warning_families.join("|"),
+                "holder_rpc_used": false,
+                "threshold_tuning_allowed": false,
+            }));
+            candidate_rows.retain(|row| row["mint"].as_str() != Some(active.mint.as_str()));
+            if let Some(row) = attempt_rows
+                .iter_mut()
+                .find(|row| row["attempt_index"].as_u64() == Some(active.attempt_index as u64))
+            {
+                if let Some(map) = row.as_object_mut() {
+                    map.insert(
+                        "tracked_until_seconds".to_owned(),
+                        json!(decision.tracked_until_seconds),
+                    );
+                    map.insert("final_state".to_owned(), json!(decision.final_state));
+                    map.insert(
+                        "rejection_or_promotion_reason".to_owned(),
+                        json!(decision.reason),
+                    );
+                    map.insert(
+                        "early_warning_families".to_owned(),
+                        json!(decision.early_warning_families.join("|")),
+                    );
+                    map.insert("rug_like_outcome_by_300s".to_owned(), json!(false));
+                    map.insert("survived_300s".to_owned(), json!(false));
+                    map.insert("survived_900s".to_owned(), json!(false));
+                    map.insert("survived_1800s".to_owned(), json!(false));
+                    map.insert("promoted_to_candidate_dataset".to_owned(), json!(false));
+                    map.insert("tombstone_written".to_owned(), json!(true));
+                }
             }
         }
-    }
-    phase107b_demote_rejected_candidate_rows(&mut candidate_rows, &rejected_rows);
-    phase107b_write_incremental_checkpoint(
-        &output_dir,
-        &run_id,
-        &attempt_rows,
-        &rejected_rows,
-        &candidate_rows,
-        &unavailable_rows,
-    )?;
+        phase107b_demote_rejected_candidate_rows(&mut candidate_rows, &rejected_rows);
+        phase107b_write_incremental_checkpoint(
+            &output_dir,
+            &run_id,
+            &attempt_rows,
+            &rejected_rows,
+            &candidate_rows,
+            &unavailable_rows,
+        )?;
+        if provider_blocked_run {
+            for row in &mut candidate_rows {
+                if phase107f_row_segment_id(row) == current_segment_id {
+                    if let Some(map) = row.as_object_mut() {
+                        map.insert("candidate_checkpoint".to_owned(), json!(true));
+                        map.insert("replay_eligible".to_owned(), json!(false));
+                        if let Some(final_state) =
+                            map.get("final_state").and_then(|value| value.as_str())
+                        {
+                            if !final_state.ends_with("_audit_only") {
+                                map.insert(
+                                    "final_state".to_owned(),
+                                    json!(format!("{final_state}_audit_only")),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            phase107b_write_incremental_checkpoint(
+                &output_dir,
+                &run_id,
+                &attempt_rows,
+                &rejected_rows,
+                &candidate_rows,
+                &unavailable_rows,
+            )?;
+        }
+        let segment_attempts = phase107f_rows_for_segment(&attempt_rows, current_segment_id);
+        let segment_rejections = phase107f_rows_for_segment(&rejected_rows, current_segment_id);
+        let segment_candidates = phase107f_rows_for_segment(&candidate_rows, current_segment_id);
+        let segment_candidate_checkpoint_count = segment_candidates
+            .iter()
+            .filter(|row| row["candidate_checkpoint"].as_bool().unwrap_or(false))
+            .count();
+        let segment_replay_eligible_candidate_count = segment_candidates
+            .iter()
+            .filter(|row| row["replay_eligible"].as_bool().unwrap_or(false))
+            .count();
+        let affected_mints_at_gap = if provider_blocked_run {
+            segment_rejections
+                .iter()
+                .filter(|row| {
+                    row["rejection_class"]
+                        .as_str()
+                        .map(|reason| reason.contains("_active_mint_finalized_inconclusive"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let segment_counted = !interrupted_run
+            && !provider_blocked_run
+            && stream_summary.provider_blocker_class.is_none()
+            && !stream_summary.client_backpressure_detected;
+        let segment_record = Phase107fSegmentRecord {
+            segment_id: current_segment_id,
+            started_at: current_segment_started_at,
+            ended_at: OffsetDateTime::now_utc(),
+            provider_status: stream_summary.provider_status.clone(),
+            provider_blocker_class: stream_summary.provider_blocker_class.clone(),
+            provider_data_loss_seen: stream_summary.provider_data_loss_seen && provider_blocked_run,
+            client_backpressure_detected: stream_summary.client_backpressure_detected
+                && provider_blocked_run,
+            attempted_launches: segment_attempts.len(),
+            rejected_count: segment_rejections.len(),
+            candidate_checkpoint_count: segment_candidate_checkpoint_count,
+            replay_eligible_candidate_count: if segment_counted {
+                segment_replay_eligible_candidate_count
+            } else {
+                0
+            },
+            affected_mints_at_gap,
+            counted_phase107b_result: segment_counted,
+            partial_outputs_audit_only: !segment_counted,
+        };
+        phase107f_write_segment_artifacts(
+            &output_dir,
+            &run_id,
+            &segment_record,
+            &attempt_rows,
+            &rejected_rows,
+            &candidate_rows,
+        )?;
+        segment_records.push(segment_record);
+        phase107f_write_run_segment_artifacts(&output_dir, &run_id, &segment_records)?;
+        let target_candidate_total = if duration_seconds >= 1800 {
+            candidates_1800
+        } else if duration_seconds >= 900 {
+            candidates_900
+        } else {
+            candidates_300
+        } as usize;
+        let reconnect_allowed = provider_blocked_run
+            && !interrupted.load(Ordering::SeqCst)
+            && run_started_at.elapsed().as_secs() < duration_seconds
+            && attempt_rows.len() < max_attempted_launches.max(1)
+            && target_candidate_total < target_material_candidates
+            && stream_summary.provider_blocker_class.as_deref()
+                != Some("provider_reconnect_exhausted");
+        if reconnect_allowed {
+            current_segment_id = current_segment_id.saturating_add(1);
+            current_segment_started_at = OffsetDateTime::now_utc();
+            active_mints.clear();
+            continue 'segment_streams;
+        }
+        break 'segment_streams (
+            stream_summary,
+            provider_blocked_run,
+            interrupted_run,
+            interruption_reason,
+        );
+    };
     if interrupted_run {
         let interrupted_summary = json!({
             "schema_version": "phase107f.hunter_summary_interrupted.v1",
@@ -40587,6 +40754,7 @@ async fn material_candidate_hunter_command(
             "provider_status": stream_summary.provider_status,
             "provider_blocker_class": stream_summary.provider_blocker_class,
             "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
+            "client_backpressure_detected": stream_summary.client_backpressure_detected,
             "last_attempt_index": attempt_rows.len(),
             "last_tracked_mint": attempt_rows.last().and_then(|row| row["mint"].as_str()).unwrap_or(""),
             "attempted_launches": attempt_rows.len(),
@@ -40695,9 +40863,44 @@ async fn material_candidate_hunter_command(
     )?;
 
     let attempted_launches = attempt_rows.len() as u64;
-    let (candidate_checkpoint_count, replay_eligible_candidate_count) =
+    let (candidate_checkpoint_count, _replay_eligible_candidate_count) =
         phase107b_candidate_counts(&candidate_rows);
-    let replay_allowed = !interrupted_run && replay_eligible_candidate_count > 0;
+    let segment_count = segment_records.len() as u64;
+    let clean_segment_count = segment_records
+        .iter()
+        .filter(|record| {
+            record.provider_blocker_class.is_none()
+                && !record.provider_data_loss_seen
+                && !record.client_backpressure_detected
+        })
+        .count() as u64;
+    let blocked_segment_count = segment_count.saturating_sub(clean_segment_count);
+    let gap_count = segment_records
+        .iter()
+        .filter(|record| {
+            record.provider_blocker_class.is_some()
+                || record.provider_data_loss_seen
+                || record.client_backpressure_detected
+        })
+        .count() as u64;
+    let counted_segment_attempted_launches = segment_records
+        .iter()
+        .filter(|record| record.counted_phase107b_result)
+        .map(|record| record.attempted_launches as u64)
+        .sum::<u64>();
+    let audit_only_segment_attempted_launches =
+        attempted_launches.saturating_sub(counted_segment_attempted_launches);
+    let affected_mints_at_gaps = segment_records
+        .iter()
+        .flat_map(|record| record.affected_mints_at_gap.clone())
+        .collect::<Vec<_>>();
+    phase107f_write_run_segment_artifacts(&output_dir, &run_id, &segment_records)?;
+    let run_replay_eligible_candidate_count = segment_records
+        .iter()
+        .filter(|record| record.counted_phase107b_result)
+        .map(|record| record.replay_eligible_candidate_count as u64)
+        .sum::<u64>();
+    let replay_allowed = run_replay_eligible_candidate_count > 0;
     let hunter_summary = json!({
         "schema_version": "phase107b.hunter_summary.v1",
         "run_id": run_id,
@@ -40710,8 +40913,16 @@ async fn material_candidate_hunter_command(
         "candidates_900s_count": candidates_900,
         "candidates_1800s_count": candidates_1800,
         "material_candidates_found": candidate_rows.len(),
+        "total_attempted_launches": attempted_launches,
+        "segment_count": segment_count,
+        "counted_segment_attempted_launches": counted_segment_attempted_launches,
+        "audit_only_segment_attempted_launches": audit_only_segment_attempted_launches,
+        "gap_count": gap_count,
+        "clean_segment_count": clean_segment_count,
+        "blocked_segment_count": blocked_segment_count,
+        "affected_mints_at_gaps": affected_mints_at_gaps,
         "candidate_checkpoint_count": candidate_checkpoint_count,
-        "replay_eligible_candidate_count": replay_eligible_candidate_count,
+        "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
         "target_material_candidates": target_material_candidates,
         "code_path_failures": 0,
         "missing_evidence_became_zero": false,
@@ -40725,6 +40936,24 @@ async fn material_candidate_hunter_command(
         "provider_status": stream_summary.provider_status,
         "provider_blocker_class": stream_summary.provider_blocker_class,
         "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
+        "client_backpressure_detected": stream_summary.client_backpressure_detected,
+        "grpc_reader_update_count": stream_summary.grpc_reader_update_count,
+        "grpc_reader_poll_latency_ms_p50": stream_summary.grpc_reader_poll_latency_ms_p50,
+        "grpc_reader_poll_latency_ms_p95": stream_summary.grpc_reader_poll_latency_ms_p95,
+        "grpc_reader_poll_latency_ms_p99": stream_summary.grpc_reader_poll_latency_ms_p99,
+        "grpc_reader_poll_latency_ms_max": stream_summary.grpc_reader_poll_latency_ms_max,
+        "grpc_update_interarrival_ms_p50": stream_summary.grpc_update_interarrival_ms_p50,
+        "grpc_update_interarrival_ms_p95": stream_summary.grpc_update_interarrival_ms_p95,
+        "grpc_update_interarrival_ms_p99": stream_summary.grpc_update_interarrival_ms_p99,
+        "grpc_update_interarrival_ms_max": stream_summary.grpc_update_interarrival_ms_max,
+        "internal_queue_depth_current": stream_summary.internal_queue_depth_current,
+        "internal_queue_depth_max": stream_summary.internal_queue_depth_max,
+        "internal_queue_capacity": stream_summary.internal_queue_capacity,
+        "internal_queue_full_count": stream_summary.internal_queue_full_count,
+        "decode_worker_lag_ms_max": stream_summary.decode_worker_lag_ms_max,
+        "artifact_worker_lag_ms_max": stream_summary.artifact_worker_lag_ms_max,
+        "r2_worker_lag_ms_max": stream_summary.r2_worker_lag_ms_max,
+        "stream_reader_blocked_by_processing": stream_summary.stream_reader_blocked_by_processing,
         "ready_for_off_vps_candidate_replay": replay_allowed,
         "ready_for_large_strategy_dataset": false,
     });
@@ -40758,7 +40987,13 @@ async fn material_candidate_hunter_command(
         "candidates_900s_count": candidates_900,
         "candidates_1800s_count": candidates_1800,
         "candidate_checkpoint_count": candidate_checkpoint_count,
-        "replay_eligible_candidate_count": replay_eligible_candidate_count,
+        "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "segment_count": segment_count,
+        "clean_segment_count": clean_segment_count,
+        "blocked_segment_count": blocked_segment_count,
+        "gap_count": gap_count,
+        "counted_segment_attempted_launches": counted_segment_attempted_launches,
+        "audit_only_segment_attempted_launches": audit_only_segment_attempted_launches,
         "holder_rpc_used": false,
         "rpc_mint_supply_canonical": false,
         "provider_confirmed_bundle_count": provider_confirmed_bundle_count,
@@ -40931,13 +41166,16 @@ async fn material_candidate_hunter_command(
             && candidate_artifacts_exist
             && no_dead_token_promoted
             && no_candidate_also_rejected;
+        let has_counted_clean_segment = segment_records
+            .iter()
+            .any(|record| record.counted_phase107b_result);
         let counted_phase107b_result = r2_upload["verified"].as_bool().unwrap_or(false)
             && final_artifacts_exist
             && hard_invariants_passed
             && latest_checkpoint_verified
             && attempted_launches > 0
-            && !interrupted_run;
-        let replay_allowed = counted_phase107b_result && replay_eligible_candidate_count > 0;
+            && has_counted_clean_segment;
+        let replay_allowed = counted_phase107b_result && run_replay_eligible_candidate_count > 0;
         let countability = json!({
             "schema_version": "phase107b.countability_decision.v1",
             "phase": "phase107b_replacement_after_retention_fix",
@@ -40965,7 +41203,15 @@ async fn material_candidate_hunter_command(
             "partial_outputs_audit_only": !counted_phase107b_result,
             "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
             "candidate_checkpoint_count": candidate_checkpoint_count,
-            "replay_eligible_candidate_count": replay_eligible_candidate_count,
+            "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+            "segment_count": segment_count,
+            "clean_segment_count": clean_segment_count,
+            "blocked_segment_count": blocked_segment_count,
+            "gap_count": gap_count,
+            "counted_segment_attempted_launches": counted_segment_attempted_launches,
+            "audit_only_segment_attempted_launches": audit_only_segment_attempted_launches,
+            "run_provider_data_loss_seen": segment_records.iter().any(|record| record.provider_data_loss_seen),
+            "run_client_backpressure_detected": segment_records.iter().any(|record| record.client_backpressure_detected),
             "off_vps_candidate_replay_allowed": replay_allowed,
             "ready_for_off_vps_candidate_replay": replay_allowed,
             "formal_backtesting_allowed": false,
@@ -41004,11 +41250,16 @@ async fn material_candidate_hunter_command(
             "provider_status": stream_summary.provider_status,
             "provider_blocker_class": stream_summary.provider_blocker_class,
             "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
+            "client_backpressure_detected": stream_summary.client_backpressure_detected,
             "final_artifacts_exist": phase107b_required_final_artifacts_exist(&output_dir),
             "r2_verified": false,
             "partial_outputs_audit_only": true,
             "candidate_checkpoint_count": candidate_checkpoint_count,
-            "replay_eligible_candidate_count": replay_eligible_candidate_count,
+            "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+            "segment_count": segment_count,
+            "clean_segment_count": clean_segment_count,
+            "blocked_segment_count": blocked_segment_count,
+            "gap_count": gap_count,
             "off_vps_candidate_replay_allowed": replay_allowed,
             "ready_for_off_vps_candidate_replay": replay_allowed,
             "formal_backtesting_allowed": false,
@@ -41194,6 +41445,326 @@ fn phase107b_write_incremental_checkpoint(
             "threshold_tuning_allowed": false,
             "updated_at": OffsetDateTime::now_utc(),
         }))?,
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct Phase107fSegmentRecord {
+    segment_id: usize,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    provider_status: String,
+    provider_blocker_class: Option<String>,
+    provider_data_loss_seen: bool,
+    client_backpressure_detected: bool,
+    attempted_launches: usize,
+    rejected_count: usize,
+    candidate_checkpoint_count: usize,
+    replay_eligible_candidate_count: usize,
+    affected_mints_at_gap: Vec<String>,
+    counted_phase107b_result: bool,
+    partial_outputs_audit_only: bool,
+}
+
+fn phase107f_row_segment_id(row: &serde_json::Value) -> usize {
+    row["segment_id"].as_u64().unwrap_or(1) as usize
+}
+
+fn phase107f_rows_for_segment(
+    rows: &[serde_json::Value],
+    segment_id: usize,
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .filter(|row| phase107f_row_segment_id(row) == segment_id)
+        .cloned()
+        .collect()
+}
+
+fn phase107f_write_segment_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    record: &Phase107fSegmentRecord,
+    attempt_rows: &[serde_json::Value],
+    rejected_rows: &[serde_json::Value],
+    candidate_rows: &[serde_json::Value],
+) -> Result<()> {
+    let segment_dir = output_dir
+        .join("segments")
+        .join(format!("segment_{}", record.segment_id));
+    fs::create_dir_all(&segment_dir)?;
+    let segment_attempt_rows = phase107f_rows_for_segment(attempt_rows, record.segment_id);
+    let segment_rejected_rows = phase107f_rows_for_segment(rejected_rows, record.segment_id);
+    let segment_candidate_rows = phase107f_rows_for_segment(candidate_rows, record.segment_id);
+    write_json_rows_csv(
+        &segment_dir.join("attempt_ledger.csv"),
+        &[
+            "attempt_index",
+            "mint",
+            "run_id",
+            "launch_timestamp",
+            "tracked_until_seconds",
+            "final_state",
+            "rejection_or_promotion_reason",
+            "early_warning_families",
+            "rug_like_outcome_by_300s",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+            "r2_verified",
+            "local_artifact_size_bytes",
+            "promoted_to_candidate_dataset",
+            "tombstone_written",
+        ],
+        &segment_attempt_rows,
+    )?;
+    write_json_rows_csv(
+        &segment_dir.join("rejected_summary.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "rejection_class",
+            "stop_tracking_at_seconds",
+            "early_warning_families",
+            "holder_rpc_used",
+            "threshold_tuning_allowed",
+        ],
+        &segment_rejected_rows,
+    )?;
+    write_json_rows_csv(
+        &segment_dir.join("candidate_summary.csv"),
+        &[
+            "mint",
+            "run_id",
+            "final_state",
+            "promotion_reason",
+            "survived_300s",
+            "survived_900s",
+            "survived_1800s",
+            "risk_timeline_rows",
+            "pre_entry_risk_feature_rows",
+            "post_event_label_rows",
+            "candidate_checkpoint",
+            "replay_eligible",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+        ],
+        &segment_candidate_rows,
+    )?;
+    let replay_allowed = record.counted_phase107b_result
+        && record.replay_eligible_candidate_count > 0
+        && record.provider_blocker_class.is_none()
+        && !record.provider_data_loss_seen
+        && !record.client_backpressure_detected;
+    let summary = json!({
+        "schema_version": "phase107f.segment_summary.v1",
+        "run_id": run_id,
+        "segment_id": record.segment_id,
+        "started_at": record.started_at,
+        "ended_at": record.ended_at,
+        "provider_status": record.provider_status,
+        "provider_blocker_class": record.provider_blocker_class,
+        "provider_data_loss_seen": record.provider_data_loss_seen,
+        "client_backpressure_detected": record.client_backpressure_detected,
+        "attempted_launches": record.attempted_launches,
+        "rejected_count": record.rejected_count,
+        "candidate_checkpoint_count": record.candidate_checkpoint_count,
+        "replay_eligible_candidate_count": record.replay_eligible_candidate_count,
+        "affected_mints_at_gap": record.affected_mints_at_gap,
+        "counted_phase107b_result": record.counted_phase107b_result,
+        "partial_outputs_audit_only": record.partial_outputs_audit_only,
+        "off_vps_candidate_replay_allowed": replay_allowed,
+        "ready_for_off_vps_candidate_replay": replay_allowed,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "artifact_paths": {
+            "attempt_ledger": segment_dir.join("attempt_ledger.csv").display().to_string(),
+            "candidate_summary": segment_dir.join("candidate_summary.csv").display().to_string(),
+            "rejected_summary": segment_dir.join("rejected_summary.csv").display().to_string(),
+            "countability_decision": segment_dir.join("countability_decision.json").display().to_string()
+        },
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        segment_dir.join("segment_summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    let countability = json!({
+        "schema_version": "phase107f.segment_countability_decision.v1",
+        "run_id": run_id,
+        "segment_id": record.segment_id,
+        "counted_phase107b_result": record.counted_phase107b_result,
+        "provider_status": record.provider_status,
+        "provider_blocker_class": record.provider_blocker_class,
+        "provider_data_loss_seen": record.provider_data_loss_seen,
+        "client_backpressure_detected": record.client_backpressure_detected,
+        "final_artifacts_exist": true,
+        "partial_outputs_audit_only": record.partial_outputs_audit_only,
+        "candidate_checkpoint_count": record.candidate_checkpoint_count,
+        "replay_eligible_candidate_count": record.replay_eligible_candidate_count,
+        "off_vps_candidate_replay_allowed": replay_allowed,
+        "ready_for_off_vps_candidate_replay": replay_allowed,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        segment_dir.join("countability_decision.json"),
+        serde_json::to_vec_pretty(&countability)?,
+    )?;
+    Ok(())
+}
+
+fn phase107f_write_run_segment_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    records: &[Phase107fSegmentRecord],
+) -> Result<()> {
+    let gap_rows = records
+        .iter()
+        .filter(|record| {
+            record.provider_blocker_class.is_some()
+                || record.provider_data_loss_seen
+                || record.client_backpressure_detected
+        })
+        .map(|record| {
+            json!({
+                "gap_index": record.segment_id,
+                "segment_id": record.segment_id,
+                "provider_status": record.provider_status,
+                "provider_blocker_class": record.provider_blocker_class,
+                "provider_data_loss_seen": record.provider_data_loss_seen,
+                "client_backpressure_detected": record.client_backpressure_detected,
+                "affected_mints": record.affected_mints_at_gap.join("|"),
+                "created_at": record.ended_at,
+                "off_vps_candidate_replay_allowed": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+            })
+        })
+        .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &output_dir.join("run_gap_events.csv"),
+        &[
+            "gap_index",
+            "segment_id",
+            "provider_status",
+            "provider_blocker_class",
+            "provider_data_loss_seen",
+            "client_backpressure_detected",
+            "affected_mints",
+            "created_at",
+            "off_vps_candidate_replay_allowed",
+            "formal_backtesting_allowed",
+            "threshold_tuning_allowed",
+        ],
+        &gap_rows,
+    )?;
+    let segment_rows = records
+        .iter()
+        .map(|record| {
+            json!({
+                "segment_id": record.segment_id,
+                "started_at": record.started_at,
+                "ended_at": record.ended_at,
+                "provider_status": record.provider_status,
+                "provider_blocker_class": record.provider_blocker_class,
+                "provider_data_loss_seen": record.provider_data_loss_seen,
+                "client_backpressure_detected": record.client_backpressure_detected,
+                "attempted_launches": record.attempted_launches,
+                "rejected_count": record.rejected_count,
+                "candidate_checkpoint_count": record.candidate_checkpoint_count,
+                "replay_eligible_candidate_count": record.replay_eligible_candidate_count,
+                "counted_phase107b_result": record.counted_phase107b_result,
+                "partial_outputs_audit_only": record.partial_outputs_audit_only,
+                "off_vps_candidate_replay_allowed": record.counted_phase107b_result && record.replay_eligible_candidate_count > 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &output_dir.join("run_segment_summary.csv"),
+        &[
+            "segment_id",
+            "started_at",
+            "ended_at",
+            "provider_status",
+            "provider_blocker_class",
+            "provider_data_loss_seen",
+            "client_backpressure_detected",
+            "attempted_launches",
+            "rejected_count",
+            "candidate_checkpoint_count",
+            "replay_eligible_candidate_count",
+            "counted_phase107b_result",
+            "partial_outputs_audit_only",
+            "off_vps_candidate_replay_allowed",
+        ],
+        &segment_rows,
+    )?;
+    let segment_count = records.len();
+    let clean_segment_count = records
+        .iter()
+        .filter(|record| {
+            record.provider_blocker_class.is_none()
+                && !record.provider_data_loss_seen
+                && !record.client_backpressure_detected
+        })
+        .count();
+    let blocked_segment_count = segment_count.saturating_sub(clean_segment_count);
+    let total_attempted_launches = records
+        .iter()
+        .map(|record| record.attempted_launches as u64)
+        .sum::<u64>();
+    let counted_segment_attempted_launches = records
+        .iter()
+        .filter(|record| record.counted_phase107b_result)
+        .map(|record| record.attempted_launches as u64)
+        .sum::<u64>();
+    let audit_only_segment_attempted_launches =
+        total_attempted_launches.saturating_sub(counted_segment_attempted_launches);
+    let replay_eligible_candidate_count = records
+        .iter()
+        .filter(|record| record.counted_phase107b_result)
+        .map(|record| record.replay_eligible_candidate_count as u64)
+        .sum::<u64>();
+    let replay_allowed = replay_eligible_candidate_count > 0;
+    let affected_mints_at_gaps = records
+        .iter()
+        .flat_map(|record| record.affected_mints_at_gap.clone())
+        .collect::<Vec<_>>();
+    let run_countability = json!({
+        "schema_version": "phase107.run_countability_decision.v1",
+        "run_id": run_id,
+        "segment_count": segment_count,
+        "clean_segment_count": clean_segment_count,
+        "blocked_segment_count": blocked_segment_count,
+        "gap_count": gap_rows.len(),
+        "total_attempted_launches": total_attempted_launches,
+        "counted_segment_attempted_launches": counted_segment_attempted_launches,
+        "audit_only_segment_attempted_launches": audit_only_segment_attempted_launches,
+        "candidate_checkpoint_count": records.iter().map(|record| record.candidate_checkpoint_count as u64).sum::<u64>(),
+        "replay_eligible_candidate_count": replay_eligible_candidate_count,
+        "affected_mints_at_gaps": affected_mints_at_gaps,
+        "run_provider_data_loss_seen": records.iter().any(|record| record.provider_data_loss_seen),
+        "run_client_backpressure_detected": records.iter().any(|record| record.client_backpressure_detected),
+        "off_vps_candidate_replay_allowed": replay_allowed,
+        "ready_for_off_vps_candidate_replay": replay_allowed,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("run_countability_decision.json"),
+        serde_json::to_vec_pretty(&run_countability)?,
     )?;
     Ok(())
 }
@@ -42133,6 +42704,7 @@ fn phase107f_non_countable_blocker_classes() -> BTreeSet<&'static str> {
         "provider_slot_regression",
         "provider_duplicate_update_overflow",
         "provider_backpressure_detected",
+        "client_backpressure_detected",
         "signal_interrupted",
         "systemd_timeout",
         "startup_sentinel_failed",
@@ -42366,6 +42938,33 @@ fn phase107f_static_preflight_report(
         || stream_only.use_rpc_send
     {
         blockers.push("live_trading_or_send_rpc_enabled".to_owned());
+    }
+    let geyser = &loaded.config.geyser;
+    if geyser.keep_alive_interval_seconds.unwrap_or(1) == 0
+        || geyser.keep_alive_timeout_seconds.unwrap_or(1) == 0
+    {
+        blockers.push("geyser_keep_alive_values_invalid".to_owned());
+    }
+    if !geyser.http2_adaptive_window {
+        if geyser.initial_stream_window_size_bytes.unwrap_or(0) < 1024 * 1024 {
+            blockers.push("geyser_initial_stream_window_too_small".to_owned());
+        }
+        if geyser.initial_connection_window_size_bytes.unwrap_or(0) < 1024 * 1024 {
+            blockers.push("geyser_initial_connection_window_too_small".to_owned());
+        }
+    }
+    if geyser.max_decoding_message_size_bytes.unwrap_or(0) < 1024 * 1024 {
+        blockers.push("geyser_max_decoding_message_size_too_small".to_owned());
+    }
+    for (field, value) in [
+        ("accept_compressed", geyser.accept_compressed.as_deref()),
+        ("send_compressed", geyser.send_compressed.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if !value.is_empty() && value != "zstd" {
+                blockers.push(format!("geyser_{field}_unsupported:{value}"));
+            }
+        }
     }
 
     let repo_root = std::env::current_dir()
@@ -53638,11 +54237,26 @@ mod tests {
     #[test]
     fn phase107f_health_heartbeat_is_written_by_cli() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let stream_summary = MaterialHunterStreamSummary {
+            grpc_reader_update_count: 42,
+            grpc_reader_poll_latency_ms_p95: 7,
+            grpc_update_interarrival_ms_p99: 11,
+            internal_queue_depth_current: 3,
+            internal_queue_depth_max: 9,
+            internal_queue_capacity: 128,
+            internal_queue_full_count: 1,
+            decode_worker_lag_ms_max: 13,
+            artifact_worker_lag_ms_max: 17,
+            r2_worker_lag_ms_max: 19,
+            stream_reader_blocked_by_processing: false,
+            client_backpressure_detected: true,
+            ..MaterialHunterStreamSummary::default()
+        };
         phase107f_write_health(
             temp.path(),
             "run",
             "startup",
-            &MaterialHunterStreamSummary::default(),
+            &stream_summary,
             0,
             0,
             0,
@@ -53657,6 +54271,18 @@ mod tests {
         assert_eq!(heartbeat["run_id"], "run");
         assert_eq!(heartbeat["current_state"], "startup");
         assert_eq!(heartbeat["safe_to_continue"], true);
+        assert_eq!(heartbeat["grpc_reader_update_count"], 42);
+        assert_eq!(heartbeat["grpc_reader_poll_latency_ms_p95"], 7);
+        assert_eq!(heartbeat["grpc_update_interarrival_ms_p99"], 11);
+        assert_eq!(heartbeat["internal_queue_depth_current"], 3);
+        assert_eq!(heartbeat["internal_queue_depth_max"], 9);
+        assert_eq!(heartbeat["internal_queue_capacity"], 128);
+        assert_eq!(heartbeat["internal_queue_full_count"], 1);
+        assert_eq!(heartbeat["decode_worker_lag_ms_max"], 13);
+        assert_eq!(heartbeat["artifact_worker_lag_ms_max"], 17);
+        assert_eq!(heartbeat["r2_worker_lag_ms_max"], 19);
+        assert_eq!(heartbeat["stream_reader_blocked_by_processing"], false);
+        assert_eq!(heartbeat["client_backpressure_detected"], true);
     }
 
     #[test]
@@ -53869,6 +54495,178 @@ mod tests {
             "provider_lagged_data_loss_active_mint_finalized_inconclusive"
         );
         assert_eq!(attempt_row["promoted_to_candidate_dataset"], false);
+    }
+
+    #[test]
+    fn phase107f_segment_artifacts_gate_replay_to_clean_segments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output_dir = temp.path();
+        let started_at = OffsetDateTime::now_utc();
+        let ended_at = started_at + time::Duration::seconds(30);
+        let attempt_rows = vec![
+            json!({
+                "segment_id": 1,
+                "attempt_index": 1,
+                "mint": "gap-mint",
+                "run_id": "run",
+                "launch_timestamp": "",
+                "tracked_until_seconds": 30,
+                "final_state": "terminal_inconclusive",
+                "rejection_or_promotion_reason": "provider_lagged_data_loss_active_mint_finalized_inconclusive",
+                "early_warning_families": "",
+                "rug_like_outcome_by_300s": false,
+                "survived_300s": false,
+                "survived_900s": false,
+                "survived_1800s": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "r2_verified": false,
+                "local_artifact_size_bytes": 0,
+                "promoted_to_candidate_dataset": false,
+                "tombstone_written": true,
+            }),
+            json!({
+                "segment_id": 2,
+                "attempt_index": 2,
+                "mint": "clean-mint",
+                "run_id": "run",
+                "launch_timestamp": "",
+                "tracked_until_seconds": 900,
+                "final_state": "material_candidate_900s",
+                "rejection_or_promotion_reason": "survived_early_death_gates",
+                "early_warning_families": "",
+                "rug_like_outcome_by_300s": false,
+                "survived_300s": true,
+                "survived_900s": true,
+                "survived_1800s": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "r2_verified": false,
+                "local_artifact_size_bytes": 0,
+                "promoted_to_candidate_dataset": true,
+                "tombstone_written": false,
+            }),
+        ];
+        let rejected_rows = vec![json!({
+            "segment_id": 1,
+            "mint": "gap-mint",
+            "run_id": "run",
+            "final_state": "terminal_inconclusive",
+            "rejection_class": "provider_lagged_data_loss_active_mint_finalized_inconclusive",
+            "stop_tracking_at_seconds": 30,
+            "early_warning_families": "",
+            "holder_rpc_used": false,
+            "threshold_tuning_allowed": false,
+        })];
+        let candidate_rows = vec![
+            json!({
+                "segment_id": 1,
+                "mint": "gap-candidate",
+                "run_id": "run",
+                "final_state": "survived_300s_candidate_checkpoint_audit_only",
+                "promotion_reason": "survived_early_death_gates",
+                "survived_300s": true,
+                "survived_900s": false,
+                "survived_1800s": false,
+                "risk_timeline_rows": 1,
+                "pre_entry_risk_feature_rows": 1,
+                "post_event_label_rows": 1,
+                "candidate_checkpoint": true,
+                "replay_eligible": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+            }),
+            json!({
+                "segment_id": 2,
+                "mint": "clean-mint",
+                "run_id": "run",
+                "final_state": "material_candidate_900s",
+                "promotion_reason": "survived_early_death_gates",
+                "survived_300s": true,
+                "survived_900s": true,
+                "survived_1800s": false,
+                "risk_timeline_rows": 1,
+                "pre_entry_risk_feature_rows": 1,
+                "post_event_label_rows": 1,
+                "candidate_checkpoint": false,
+                "replay_eligible": true,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+            }),
+        ];
+        let blocked = Phase107fSegmentRecord {
+            segment_id: 1,
+            started_at,
+            ended_at,
+            provider_status: "provider_lagged_data_loss".to_owned(),
+            provider_blocker_class: Some("provider_lagged_data_loss".to_owned()),
+            provider_data_loss_seen: true,
+            client_backpressure_detected: false,
+            attempted_launches: 1,
+            rejected_count: 1,
+            candidate_checkpoint_count: 1,
+            replay_eligible_candidate_count: 0,
+            affected_mints_at_gap: vec!["gap-mint".to_owned()],
+            counted_phase107b_result: false,
+            partial_outputs_audit_only: true,
+        };
+        let clean = Phase107fSegmentRecord {
+            segment_id: 2,
+            started_at: ended_at,
+            ended_at: ended_at + time::Duration::seconds(900),
+            provider_status: "completed".to_owned(),
+            provider_blocker_class: None,
+            provider_data_loss_seen: false,
+            client_backpressure_detected: false,
+            attempted_launches: 1,
+            rejected_count: 0,
+            candidate_checkpoint_count: 0,
+            replay_eligible_candidate_count: 1,
+            affected_mints_at_gap: Vec::new(),
+            counted_phase107b_result: true,
+            partial_outputs_audit_only: false,
+        };
+        phase107f_write_segment_artifacts(
+            output_dir,
+            "run",
+            &blocked,
+            &attempt_rows,
+            &rejected_rows,
+            &candidate_rows,
+        )
+        .expect("blocked segment artifacts");
+        phase107f_write_segment_artifacts(
+            output_dir,
+            "run",
+            &clean,
+            &attempt_rows,
+            &rejected_rows,
+            &candidate_rows,
+        )
+        .expect("clean segment artifacts");
+        phase107f_write_run_segment_artifacts(output_dir, "run", &[blocked, clean])
+            .expect("run segment artifacts");
+        let blocked_countability: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.join("segments/segment_1/countability_decision.json"))
+                .expect("blocked countability"),
+        )
+        .expect("blocked json");
+        assert_eq!(blocked_countability["counted_phase107b_result"], false);
+        assert_eq!(
+            blocked_countability["off_vps_candidate_replay_allowed"],
+            false
+        );
+        let run_countability: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.join("run_countability_decision.json")).expect("run countability"),
+        )
+        .expect("run json");
+        assert_eq!(run_countability["run_provider_data_loss_seen"], true);
+        assert_eq!(run_countability["blocked_segment_count"], 1);
+        assert_eq!(run_countability["clean_segment_count"], 1);
+        assert_eq!(run_countability["replay_eligible_candidate_count"], 1);
+        assert_eq!(run_countability["off_vps_candidate_replay_allowed"], true);
+        assert_eq!(run_countability["formal_backtesting_allowed"], false);
+        assert_eq!(run_countability["threshold_tuning_allowed"], false);
     }
 
     #[test]

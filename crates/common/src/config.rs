@@ -2255,6 +2255,26 @@ pub struct GeyserConfig {
     pub ping_interval_ms: u64,
     #[serde(default)]
     pub max_decoded_message_size: usize,
+    #[serde(default)]
+    pub http2_adaptive_window: bool,
+    #[serde(default)]
+    pub initial_stream_window_size_bytes: Option<u32>,
+    #[serde(default)]
+    pub initial_connection_window_size_bytes: Option<u32>,
+    #[serde(default)]
+    pub keep_alive_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub keep_alive_timeout_seconds: Option<u64>,
+    #[serde(default = "default_true")]
+    pub keep_alive_while_idle: bool,
+    #[serde(default = "default_true")]
+    pub tcp_nodelay: bool,
+    #[serde(default)]
+    pub max_decoding_message_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub accept_compressed: Option<String>,
+    #[serde(default)]
+    pub send_compressed: Option<String>,
     #[serde(default = "default_true")]
     pub geyser_only_allowed: bool,
     pub max_inflight_messages: usize,
@@ -2279,6 +2299,13 @@ impl GeyserConfig {
         if self.keepalive_interval_ms == 0 {
             self.keepalive_interval_ms = 10_000;
         }
+        if self.keep_alive_interval_seconds.is_none() {
+            self.keep_alive_interval_seconds =
+                Some((self.keepalive_interval_ms.max(1) / 1000).max(1));
+        }
+        if self.keep_alive_timeout_seconds.is_none() {
+            self.keep_alive_timeout_seconds = Some(20);
+        }
         if self.reconnect_backoff_ms.is_empty() {
             self.reconnect_backoff_ms = vec![250, 500, 1_000, 2_000, 5_000];
         }
@@ -2296,6 +2323,20 @@ impl GeyserConfig {
         }
         if self.max_decoded_message_size == 0 {
             self.max_decoded_message_size = 64 * 1024 * 1024;
+        }
+        if self.max_decoding_message_size_bytes.is_none() {
+            self.max_decoding_message_size_bytes = Some(self.max_decoded_message_size);
+        }
+        if self.http2_adaptive_window {
+            self.initial_stream_window_size_bytes = None;
+            self.initial_connection_window_size_bytes = None;
+        } else {
+            if self.initial_stream_window_size_bytes.is_none() {
+                self.initial_stream_window_size_bytes = Some(16 * 1024 * 1024);
+            }
+            if self.initial_connection_window_size_bytes.is_none() {
+                self.initial_connection_window_size_bytes = Some(32 * 1024 * 1024);
+            }
         }
         if self.auth_metadata_key.is_empty() && !self.auth_token_env.is_empty() {
             self.auth_metadata_key = "x-token".to_owned();

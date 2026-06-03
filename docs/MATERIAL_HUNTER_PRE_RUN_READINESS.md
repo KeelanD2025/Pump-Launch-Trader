@@ -41,6 +41,7 @@ Provider and control-plane failures must be represented as structured non-counta
 - `provider_slot_regression`
 - `provider_duplicate_update_overflow`
 - `provider_backpressure_detected`
+- `client_backpressure_detected`
 - `signal_interrupted`
 - `systemd_timeout`
 - `startup_sentinel_failed`
@@ -164,6 +165,48 @@ The staged gate is:
 Acceptance is `PASS` only when all requested stages complete without provider lag/data loss, reconnect exhaustion, early close, provider progress stall, Pump progress stall, or artifact contradiction. A Stage A failure is classified as `PROVIDER_OR_SUBSCRIPTION_EXTERNAL_LAG_LIKELY`. A Stage B failure is classified as `CLIENT_DECODE_BACKPRESSURE_LIKELY`. A Stage C failure is classified as `CLIENT_HUNTER_WORKLOAD_BACKPRESSURE_LIKELY` or `R2_CHECKPOINT_INTERFERENCE_LIKELY` depending on the blocker.
 
 Real collection remains blocked while exact stream acceptance fails. Launch caps must not be raised until exact-subscription acceptance passes.
+
+## Same-Endpoint Backpressure Guardrails
+
+The material hunter uses the same configured Geyser endpoint as the provider probes, but collection work is heavier than raw provider acceptance. A low-ping endpoint can still lag if the client receive loop, decoder, artifact writer, or checkpoint path falls behind the gRPC stream.
+
+The hunter stream path must therefore be drain-first:
+
+- the gRPC reader polls the stream and pushes updates into a bounded internal queue;
+- decode, state updates, risk/features, ledger writes, tombstones, candidate artifacts, heartbeat writes, and R2 checkpoint coordination run behind that queue;
+- R2 checkpoints must remain bounded and must not recursively upload rich token artifact directories from the stream polling path;
+- if the bounded queue fills, the run is classified as `client_backpressure_detected`, non-countable, audit-only, replay-disabled, backtesting-disabled, and threshold-tuning-disabled.
+
+Heartbeat and summaries expose:
+
+- `grpc_reader_update_count`
+- `grpc_reader_poll_latency_ms_p50/p95/p99/max`
+- `grpc_update_interarrival_ms_p50/p95/p99/max`
+- `internal_queue_depth_current/max/capacity`
+- `internal_queue_full_count`
+- `decode_worker_lag_ms_max`
+- `artifact_worker_lag_ms_max`
+- `r2_worker_lag_ms_max`
+- `stream_reader_blocked_by_processing`
+- `client_backpressure_detected`
+
+These fields are release-gate evidence. A stale green heartbeat is not enough; provider counters must continue to advance and queue/backpressure telemetry must remain safe.
+
+## Gap-Segmented Artifact Policy
+
+Provider gaps are label-boundary events. When a slice observes `provider_lagged_data_loss`, early stream close, reconnect exhaustion, progress stall, or client backpressure, any active mint whose observation window crosses that gap must be finalized as `terminal_inconclusive` for that segment and cannot become replay-eligible.
+
+The service-owned run may continue as ordered segments when the overall run deadline, attempt budget, candidate target, and reconnect policy still allow it. The blocked segment is closed first, then the next stream segment starts after reconnect. A token created after reconnect can be counted inside the new clean segment if that segment has no blocker and normal material-candidate criteria are satisfied.
+
+Segment artifacts are written under `segments/segment_<n>/` with a segment-level summary, countability decision, attempt ledger, candidate summary, and rejected summary. Run-level artifacts also include:
+
+- `run_gap_events.csv`
+- `run_segment_summary.csv`
+- `run_countability_decision.json`
+
+Run-level `run_provider_data_loss_seen=true` does not by itself make clean future post-reconnect segments dirty, but every gap-affected segment remains audit-only. Replay can be allowed at run level only when at least one clean segment has `replay_eligible_candidate_count > 0`, no artifact contradictions exist, final R2/artifact checks pass, and the run-level countability decision explicitly allows replay. Formal backtesting and threshold tuning remain false.
+
+Current conservative release policy keeps launch caps blocked until same-endpoint stream acceptance and at least one short real service-owned proof slice validate segment continuation without structural contradictions. Do not raise caps based on ping or provider-health probe success alone.
 
 By default, the gate skips workspace clippy because existing broad workspace warnings are not yet release-gate clean. To enforce clippy too:
 

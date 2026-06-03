@@ -175,7 +175,10 @@ impl GeyserStreamConnector for RealGeyserConnector {
         let mut resolved = config.clone();
         resolved.endpoint = endpoint.clone();
         let channel = YellowstoneEndpoint::connect(&resolved).await?.channel;
-        let max_size = resolved.max_decoded_message_size.max(1024 * 1024);
+        let max_size = resolved
+            .max_decoding_message_size_bytes
+            .unwrap_or(resolved.max_decoded_message_size)
+            .max(1024 * 1024);
         let auth = resolved_geyser_metadata(&resolved)?;
         let interceptor = match auth {
             Some((key, value)) => MetadataInjector::new(Some((&key, &value)))?,
@@ -818,6 +821,8 @@ pub struct FreshLaunchCanaryLiveSummary {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct MaterialHunterStreamOptions {
     pub duration_seconds: u64,
+    #[serde(default)]
+    pub gap_tolerant_segments: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -844,7 +849,111 @@ pub struct MaterialHunterStreamSummary {
     pub slot_updates: u64,
     pub normalized_events: u64,
     pub pump_create_decoded: u64,
+    #[serde(default)]
+    pub grpc_reader_update_count: u64,
+    #[serde(default)]
+    pub grpc_reader_poll_latency_ms_p50: u64,
+    #[serde(default)]
+    pub grpc_reader_poll_latency_ms_p95: u64,
+    #[serde(default)]
+    pub grpc_reader_poll_latency_ms_p99: u64,
+    #[serde(default)]
+    pub grpc_reader_poll_latency_ms_max: u64,
+    #[serde(default)]
+    pub grpc_update_interarrival_ms_p50: u64,
+    #[serde(default)]
+    pub grpc_update_interarrival_ms_p95: u64,
+    #[serde(default)]
+    pub grpc_update_interarrival_ms_p99: u64,
+    #[serde(default)]
+    pub grpc_update_interarrival_ms_max: u64,
+    #[serde(default)]
+    pub internal_queue_depth_current: u64,
+    #[serde(default)]
+    pub internal_queue_depth_max: u64,
+    #[serde(default)]
+    pub internal_queue_capacity: u64,
+    #[serde(default)]
+    pub internal_queue_full_count: u64,
+    #[serde(default)]
+    pub decode_worker_lag_ms_max: u64,
+    #[serde(default)]
+    pub artifact_worker_lag_ms_max: u64,
+    #[serde(default)]
+    pub r2_worker_lag_ms_max: u64,
+    #[serde(default)]
+    pub stream_reader_blocked_by_processing: bool,
+    #[serde(default)]
+    pub client_backpressure_detected: bool,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug)]
+enum MaterialHunterReaderMessage {
+    Update(SubscribeUpdate, tokio::time::Instant),
+    StreamError(Status),
+    StreamClosed,
+}
+
+#[derive(Debug, Default)]
+struct MaterialHunterReaderStats {
+    update_count: u64,
+    poll_latency_ms: Vec<u64>,
+    interarrival_ms: Vec<u64>,
+    queue_depth_current: u64,
+    queue_depth_max: u64,
+    queue_capacity: u64,
+    queue_full_count: u64,
+    decode_worker_lag_ms_max: u64,
+    client_backpressure_detected: bool,
+}
+
+impl MaterialHunterReaderStats {
+    fn record_poll_latency(&mut self, millis: u64) {
+        if self.poll_latency_ms.len() < 100_000 {
+            self.poll_latency_ms.push(millis);
+        }
+    }
+
+    fn record_interarrival(&mut self, millis: u64) {
+        if self.interarrival_ms.len() < 100_000 {
+            self.interarrival_ms.push(millis);
+        }
+    }
+}
+
+fn percentile(values: &[u64], numerator: usize, denominator: usize) -> u64 {
+    if values.is_empty() || denominator == 0 {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = sorted.len().saturating_sub(1).saturating_mul(numerator) / denominator;
+    sorted[index]
+}
+
+fn apply_reader_stats_to_summary(
+    summary: &mut MaterialHunterStreamSummary,
+    stats: &MaterialHunterReaderStats,
+) {
+    summary.grpc_reader_update_count = stats.update_count;
+    summary.grpc_reader_poll_latency_ms_p50 = percentile(&stats.poll_latency_ms, 50, 100);
+    summary.grpc_reader_poll_latency_ms_p95 = percentile(&stats.poll_latency_ms, 95, 100);
+    summary.grpc_reader_poll_latency_ms_p99 = percentile(&stats.poll_latency_ms, 99, 100);
+    summary.grpc_reader_poll_latency_ms_max =
+        stats.poll_latency_ms.iter().copied().max().unwrap_or(0);
+    summary.grpc_update_interarrival_ms_p50 = percentile(&stats.interarrival_ms, 50, 100);
+    summary.grpc_update_interarrival_ms_p95 = percentile(&stats.interarrival_ms, 95, 100);
+    summary.grpc_update_interarrival_ms_p99 = percentile(&stats.interarrival_ms, 99, 100);
+    summary.grpc_update_interarrival_ms_max =
+        stats.interarrival_ms.iter().copied().max().unwrap_or(0);
+    summary.internal_queue_depth_current = stats.queue_depth_current;
+    summary.internal_queue_depth_max = stats.queue_depth_max;
+    summary.internal_queue_capacity = stats.queue_capacity;
+    summary.internal_queue_full_count = stats.queue_full_count;
+    summary.decode_worker_lag_ms_max = stats.decode_worker_lag_ms_max;
+    summary.stream_reader_blocked_by_processing = stats.queue_full_count > 0;
+    summary.client_backpressure_detected = stats.client_backpressure_detected;
 }
 
 pub fn material_hunter_subscription_fingerprint(loaded: &LoadedConfig) -> Result<String> {
@@ -1030,6 +1139,22 @@ where
                         summary.provider_lagged_count =
                             summary.provider_lagged_count.saturating_add(1);
                         let _ = on_progress(&summary)?;
+                        if options.gap_tolerant_segments && tokio::time::Instant::now() < deadline {
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
+                            summary.reconnect_attempts =
+                                summary.reconnect_attempts.saturating_add(1);
+                            if reconnect_attempts < max_attempts {
+                                summary.provider_status = "reconnecting_after_gap".to_owned();
+                                summary.provider_blocker_class = None;
+                                tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts))
+                                    .await;
+                                continue 'streaming;
+                            }
+                            summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                            summary.provider_blocker_class =
+                                Some("provider_reconnect_exhausted".to_owned());
+                            let _ = on_progress(&summary)?;
+                        }
                         return Ok(summary);
                     }
                     if retryable {
@@ -1057,6 +1182,65 @@ where
             }
         };
 
+        let queue_capacity = config.max_inflight_messages.max(128);
+        let (reader_tx, mut reader_rx) =
+            mpsc::channel::<MaterialHunterReaderMessage>(queue_capacity);
+        let reader_stats = Arc::new(std::sync::Mutex::new(MaterialHunterReaderStats {
+            queue_capacity: queue_capacity as u64,
+            ..MaterialHunterReaderStats::default()
+        }));
+        let reader_stats_for_task = reader_stats.clone();
+        tokio::spawn(async move {
+            let mut last_read_at: Option<tokio::time::Instant> = None;
+            loop {
+                let poll_started = tokio::time::Instant::now();
+                let next = stream.next().await;
+                let read_at = tokio::time::Instant::now();
+                if let Ok(mut stats) = reader_stats_for_task.lock() {
+                    stats.record_poll_latency(
+                        read_at.duration_since(poll_started).as_millis() as u64
+                    );
+                    if let Some(previous) = last_read_at {
+                        stats.record_interarrival(
+                            read_at.duration_since(previous).as_millis() as u64
+                        );
+                    }
+                    last_read_at = Some(read_at);
+                }
+                let message = match next {
+                    Some(Ok(update)) => {
+                        if let Ok(mut stats) = reader_stats_for_task.lock() {
+                            stats.update_count = stats.update_count.saturating_add(1);
+                        }
+                        MaterialHunterReaderMessage::Update(update, read_at)
+                    }
+                    Some(Err(status)) => MaterialHunterReaderMessage::StreamError(status),
+                    None => MaterialHunterReaderMessage::StreamClosed,
+                };
+                match reader_tx.try_send(message) {
+                    Ok(()) => {
+                        if let Ok(mut stats) = reader_stats_for_task.lock() {
+                            let current_depth = reader_tx
+                                .max_capacity()
+                                .saturating_sub(reader_tx.capacity());
+                            stats.queue_depth_current = current_depth as u64;
+                            stats.queue_depth_max = stats.queue_depth_max.max(current_depth as u64);
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        if let Ok(mut stats) = reader_stats_for_task.lock() {
+                            stats.queue_full_count = stats.queue_full_count.saturating_add(1);
+                            stats.client_backpressure_detected = true;
+                            stats.queue_depth_current = stats.queue_capacity;
+                            stats.queue_depth_max = stats.queue_capacity;
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
         let mut last_progress_tick = tokio::time::Instant::now();
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1064,8 +1248,33 @@ where
             if poll_window.is_zero() {
                 break 'streaming;
             }
-            match tokio::time::timeout(poll_window, stream.next()).await {
-                Ok(Some(Ok(update))) => {
+            if let Ok(stats) = reader_stats.lock() {
+                apply_reader_stats_to_summary(&mut summary, &stats);
+                if stats.client_backpressure_detected {
+                    summary.provider_status = "client_backpressure_detected".to_owned();
+                    summary.provider_blocker_class =
+                        Some("client_backpressure_detected".to_owned());
+                    summary.stream_completed_normally = false;
+                    let _ = on_progress(&summary)?;
+                    if options.gap_tolerant_segments && tokio::time::Instant::now() < deadline {
+                        reconnect_attempts = reconnect_attempts.saturating_add(1);
+                        summary.reconnect_attempts = summary.reconnect_attempts.saturating_add(1);
+                        if reconnect_attempts < max_attempts {
+                            summary.provider_status = "reconnecting_after_gap".to_owned();
+                            summary.provider_blocker_class = None;
+                            tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts)).await;
+                            continue 'streaming;
+                        }
+                        summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                        summary.provider_blocker_class =
+                            Some("provider_reconnect_exhausted".to_owned());
+                        let _ = on_progress(&summary)?;
+                    }
+                    return Ok(summary);
+                }
+            }
+            match tokio::time::timeout(poll_window, reader_rx.recv()).await {
+                Ok(Some(MaterialHunterReaderMessage::Update(update, read_at))) => {
                     reconnect_attempts = 0;
                     match update.update_oneof.as_ref() {
                         Some(UpdateOneof::Transaction(_))
@@ -1083,6 +1292,15 @@ where
                     }
                     last_provider_progress_at = tokio::time::Instant::now();
                     summary.provider_progress_stalled_seconds = 0;
+                    if let Ok(mut stats) = reader_stats.lock() {
+                        let worker_lag = tokio::time::Instant::now()
+                            .duration_since(read_at)
+                            .as_millis() as u64;
+                        stats.decode_worker_lag_ms_max =
+                            stats.decode_worker_lag_ms_max.max(worker_lag);
+                        stats.queue_depth_current = reader_rx.len() as u64;
+                        apply_reader_stats_to_summary(&mut summary, &stats);
+                    }
                     if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
                         summary.provider_status = "stopped_by_hunter".to_owned();
                         summary.stream_completed_normally = true;
@@ -1108,9 +1326,20 @@ where
                             summary.stream_completed_normally = true;
                             return Ok(summary);
                         }
+                        if let Ok(stats) = reader_stats.lock() {
+                            if stats.client_backpressure_detected {
+                                summary.provider_status = "client_backpressure_detected".to_owned();
+                                summary.provider_blocker_class =
+                                    Some("client_backpressure_detected".to_owned());
+                                summary.stream_completed_normally = false;
+                                apply_reader_stats_to_summary(&mut summary, &stats);
+                                let _ = on_progress(&summary)?;
+                                return Ok(summary);
+                            }
+                        }
                     }
                 }
-                Ok(Some(Err(status))) => {
+                Ok(Some(MaterialHunterReaderMessage::StreamError(status))) => {
                     let (class, retryable, data_loss) = material_hunter_status_class(&status);
                     summary.provider_status = class.to_owned();
                     summary.provider_blocker_class = Some(class.to_owned());
@@ -1120,6 +1349,22 @@ where
                         summary.provider_lagged_count =
                             summary.provider_lagged_count.saturating_add(1);
                         let _ = on_progress(&summary)?;
+                        if options.gap_tolerant_segments && tokio::time::Instant::now() < deadline {
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
+                            summary.reconnect_attempts =
+                                summary.reconnect_attempts.saturating_add(1);
+                            if reconnect_attempts < max_attempts {
+                                summary.provider_status = "reconnecting_after_gap".to_owned();
+                                summary.provider_blocker_class = None;
+                                tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts))
+                                    .await;
+                                continue 'streaming;
+                            }
+                            summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                            summary.provider_blocker_class =
+                                Some("provider_reconnect_exhausted".to_owned());
+                            let _ = on_progress(&summary)?;
+                        }
                         return Ok(summary);
                     }
                     if retryable {
@@ -1138,7 +1383,7 @@ where
                     let _ = on_progress(&summary)?;
                     return Ok(summary);
                 }
-                Ok(None) => {
+                Ok(Some(MaterialHunterReaderMessage::StreamClosed)) | Ok(None) => {
                     if tokio::time::Instant::now() < deadline {
                         summary.provider_status =
                             "provider_stream_closed_before_deadline".to_owned();
@@ -1150,11 +1395,59 @@ where
                         summary.pump_progress_stalled_seconds =
                             last_pump_progress_at.elapsed().as_secs();
                         let _ = on_progress(&summary)?;
+                        if options.gap_tolerant_segments && tokio::time::Instant::now() < deadline {
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
+                            summary.reconnect_attempts =
+                                summary.reconnect_attempts.saturating_add(1);
+                            if reconnect_attempts < max_attempts {
+                                summary.provider_status = "reconnecting_after_gap".to_owned();
+                                summary.provider_blocker_class = None;
+                                tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts))
+                                    .await;
+                                continue 'streaming;
+                            }
+                            summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                            summary.provider_blocker_class =
+                                Some("provider_reconnect_exhausted".to_owned());
+                            let _ = on_progress(&summary)?;
+                        }
                         return Ok(summary);
                     }
                     break 'streaming;
                 }
                 Err(_) => {
+                    if let Ok(stats) = reader_stats.lock() {
+                        apply_reader_stats_to_summary(&mut summary, &stats);
+                        if stats.client_backpressure_detected {
+                            summary.provider_status = "client_backpressure_detected".to_owned();
+                            summary.provider_blocker_class =
+                                Some("client_backpressure_detected".to_owned());
+                            summary.stream_completed_normally = false;
+                            let _ = on_progress(&summary)?;
+                            if options.gap_tolerant_segments
+                                && tokio::time::Instant::now() < deadline
+                            {
+                                reconnect_attempts = reconnect_attempts.saturating_add(1);
+                                summary.reconnect_attempts =
+                                    summary.reconnect_attempts.saturating_add(1);
+                                if reconnect_attempts < max_attempts {
+                                    summary.provider_status = "reconnecting_after_gap".to_owned();
+                                    summary.provider_blocker_class = None;
+                                    tokio::time::sleep(next_backoff_ms(
+                                        &config,
+                                        reconnect_attempts,
+                                    ))
+                                    .await;
+                                    continue 'streaming;
+                                }
+                                summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                                summary.provider_blocker_class =
+                                    Some("provider_reconnect_exhausted".to_owned());
+                                let _ = on_progress(&summary)?;
+                            }
+                            return Ok(summary);
+                        }
+                    }
                     if last_progress_tick.elapsed() >= StdDuration::from_secs(30) {
                         summary.provider_progress_stalled_seconds =
                             last_provider_progress_at.elapsed().as_secs();
@@ -3441,6 +3734,7 @@ mod tests {
             &loaded,
             MaterialHunterStreamOptions {
                 duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
@@ -3460,6 +3754,53 @@ mod tests {
         assert_eq!(summary.provider_status, "stopped_by_hunter");
         assert!(summary.slot_updates > 0);
         assert!(*progress_calls.lock().expect("progress lock") >= 2);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_bounded_reader_queue_reports_client_backpressure() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.max_inflight_messages = 1;
+        let mut updates = Vec::new();
+        for slot in 0..512u64 {
+            updates.push(Ok(update_wrap(
+                yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                    SubscribeUpdateSlot {
+                        slot,
+                        parent: slot.checked_sub(1),
+                        status: SlotStatus::SlotProcessed as i32,
+                        dead_error: None,
+                    },
+                ),
+            )));
+        }
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch { updates }])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| {
+                std::thread::sleep(StdDuration::from_millis(5));
+                Ok(MaterialHunterStreamAction::Continue)
+            },
+        )
+        .await
+        .expect("client backpressure should be structured");
+        assert_eq!(summary.provider_status, "client_backpressure_detected");
+        assert_eq!(
+            summary.provider_blocker_class.as_deref(),
+            Some("client_backpressure_detected")
+        );
+        assert!(summary.client_backpressure_detected);
+        assert!(summary.internal_queue_full_count > 0);
+        assert_eq!(summary.internal_queue_capacity, 128);
+        assert!(!summary.stream_completed_normally);
     }
 
     #[tokio::test]
@@ -3484,6 +3825,7 @@ mod tests {
             &loaded,
             MaterialHunterStreamOptions {
                 duration_seconds: 2,
+                ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
@@ -3518,6 +3860,7 @@ mod tests {
             &loaded,
             MaterialHunterStreamOptions {
                 duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
@@ -3533,6 +3876,69 @@ mod tests {
         assert!(summary.provider_data_loss_seen);
         assert!(summary.provider_lagged_count > 0);
         assert!(!summary.stream_completed_normally);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_provider_lag_can_reconnect_in_gap_tolerant_mode() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.max_reconnect_attempts = Some(3);
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![
+                MockConnectorBatch {
+                    updates: vec![Err(
+                        "code: 'Unrecoverable data loss or corruption', message: \"lagged\""
+                            .to_owned(),
+                    )],
+                },
+                MockConnectorBatch {
+                    updates: vec![Ok(update_wrap(
+                        yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                            SubscribeUpdateSlot {
+                                slot: 101,
+                                parent: Some(100),
+                                status: SlotStatus::SlotProcessed as i32,
+                                dead_error: None,
+                            },
+                        ),
+                    ))],
+                },
+            ])),
+        };
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let statuses_for_progress = statuses.clone();
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+                gap_tolerant_segments: true,
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            move |summary| {
+                statuses_for_progress
+                    .lock()
+                    .expect("statuses")
+                    .push(summary.provider_status.clone());
+                if summary.slot_updates > 0 {
+                    return Ok(MaterialHunterStreamAction::Stop);
+                }
+                Ok(MaterialHunterStreamAction::Continue)
+            },
+        )
+        .await
+        .expect("gap-tolerant lag should reconnect");
+        assert!(summary.provider_data_loss_seen);
+        assert!(summary.provider_lagged_count > 0);
+        assert!(summary.reconnect_attempts > 0);
+        assert!(summary.slot_updates > 0);
+        assert_eq!(summary.provider_status, "stopped_by_hunter");
+        let statuses = statuses.lock().expect("statuses");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status == "provider_lagged_data_loss")
+        );
     }
 
     #[tokio::test]
@@ -3563,6 +3969,7 @@ mod tests {
             &loaded,
             MaterialHunterStreamOptions {
                 duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
@@ -3601,6 +4008,7 @@ mod tests {
             &loaded,
             MaterialHunterStreamOptions {
                 duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
             |_event, _summary| Ok(MaterialHunterStreamAction::Continue),

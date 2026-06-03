@@ -192,14 +192,29 @@ pub struct YellowstoneEndpoint {
 
 impl YellowstoneEndpoint {
     pub async fn connect(config: &GeyserConfig) -> Result<Self, GeyserIngestError> {
-        let endpoint = Endpoint::from_shared(config.endpoint.clone())?
+        let keep_alive_interval = config
+            .keep_alive_interval_seconds
+            .map(StdDuration::from_secs)
+            .unwrap_or_else(|| StdDuration::from_millis(config.keepalive_interval_ms.max(1)));
+        let keep_alive_timeout =
+            StdDuration::from_secs(config.keep_alive_timeout_seconds.unwrap_or(20).max(1));
+        let mut endpoint = Endpoint::from_shared(config.endpoint.clone())?
             .connect_timeout(StdDuration::from_millis(config.connect_timeout_ms.max(1)))
             .timeout(StdDuration::from_millis(config.request_timeout_ms.max(1)))
-            .http2_keep_alive_interval(StdDuration::from_millis(
-                config.keepalive_interval_ms.max(1),
-            ))
-            .keep_alive_while_idle(true)
-            .tcp_nodelay(true);
+            .http2_keep_alive_interval(keep_alive_interval)
+            .keep_alive_timeout(keep_alive_timeout)
+            .keep_alive_while_idle(config.keep_alive_while_idle)
+            .tcp_nodelay(config.tcp_nodelay);
+        if config.http2_adaptive_window {
+            endpoint = endpoint.http2_adaptive_window(true);
+        } else {
+            if let Some(size) = config.initial_stream_window_size_bytes {
+                endpoint = endpoint.initial_stream_window_size(size);
+            }
+            if let Some(size) = config.initial_connection_window_size_bytes {
+                endpoint = endpoint.initial_connection_window_size(size);
+            }
+        }
         let channel = endpoint.connect().await?;
         Ok(Self { channel })
     }
