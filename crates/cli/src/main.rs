@@ -39591,6 +39591,249 @@ fn phase107f_event_related_to_active_mint(
     }
 }
 
+fn phase107f_insert_stream_telemetry(
+    value: &mut serde_json::Value,
+    summary: &MaterialHunterStreamSummary,
+    checkpoint_upload_duration_ms: u64,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let fields = [
+        (
+            "grpc_reader_update_count",
+            json!(summary.grpc_reader_update_count),
+        ),
+        (
+            "grpc_reader_poll_latency_ms_p50",
+            json!(summary.grpc_reader_poll_latency_ms_p50),
+        ),
+        (
+            "grpc_reader_poll_latency_ms_p95",
+            json!(summary.grpc_reader_poll_latency_ms_p95),
+        ),
+        (
+            "grpc_reader_poll_latency_ms_p99",
+            json!(summary.grpc_reader_poll_latency_ms_p99),
+        ),
+        (
+            "grpc_reader_poll_latency_ms_max",
+            json!(summary.grpc_reader_poll_latency_ms_max),
+        ),
+        (
+            "grpc_update_interarrival_ms_p50",
+            json!(summary.grpc_update_interarrival_ms_p50),
+        ),
+        (
+            "grpc_update_interarrival_ms_p95",
+            json!(summary.grpc_update_interarrival_ms_p95),
+        ),
+        (
+            "grpc_update_interarrival_ms_p99",
+            json!(summary.grpc_update_interarrival_ms_p99),
+        ),
+        (
+            "grpc_update_interarrival_ms_max",
+            json!(summary.grpc_update_interarrival_ms_max),
+        ),
+        (
+            "internal_queue_depth_current",
+            json!(summary.internal_queue_depth_current),
+        ),
+        (
+            "internal_queue_depth_max",
+            json!(summary.internal_queue_depth_max),
+        ),
+        (
+            "internal_queue_capacity",
+            json!(summary.internal_queue_capacity),
+        ),
+        (
+            "internal_queue_full_count",
+            json!(summary.internal_queue_full_count),
+        ),
+        (
+            "decode_worker_lag_ms_max",
+            json!(summary.decode_worker_lag_ms_max),
+        ),
+        (
+            "artifact_worker_lag_ms_max",
+            json!(summary.artifact_worker_lag_ms_max),
+        ),
+        (
+            "r2_worker_lag_ms_max",
+            json!(
+                summary
+                    .r2_worker_lag_ms_max
+                    .max(checkpoint_upload_duration_ms)
+            ),
+        ),
+        (
+            "stream_reader_blocked_by_processing",
+            json!(summary.stream_reader_blocked_by_processing),
+        ),
+        (
+            "client_backpressure_detected",
+            json!(summary.client_backpressure_detected),
+        ),
+        (
+            "raw_queue_enqueue_latency_ms_p50",
+            json!(summary.raw_queue_enqueue_latency_ms_p50),
+        ),
+        (
+            "raw_queue_enqueue_latency_ms_p95",
+            json!(summary.raw_queue_enqueue_latency_ms_p95),
+        ),
+        (
+            "raw_queue_enqueue_latency_ms_p99",
+            json!(summary.raw_queue_enqueue_latency_ms_p99),
+        ),
+        (
+            "raw_queue_enqueue_latency_ms_max",
+            json!(summary.raw_queue_enqueue_latency_ms_max),
+        ),
+        (
+            "raw_queue_wait_before_decode_ms_p50",
+            json!(summary.raw_queue_wait_before_decode_ms_p50),
+        ),
+        (
+            "raw_queue_wait_before_decode_ms_p95",
+            json!(summary.raw_queue_wait_before_decode_ms_p95),
+        ),
+        (
+            "raw_queue_wait_before_decode_ms_p99",
+            json!(summary.raw_queue_wait_before_decode_ms_p99),
+        ),
+        (
+            "raw_queue_wait_before_decode_ms_max",
+            json!(summary.raw_queue_wait_before_decode_ms_max),
+        ),
+        (
+            "decode_duration_ms_p50",
+            json!(summary.decode_duration_ms_p50),
+        ),
+        (
+            "decode_duration_ms_p95",
+            json!(summary.decode_duration_ms_p95),
+        ),
+        (
+            "decode_duration_ms_p99",
+            json!(summary.decode_duration_ms_p99),
+        ),
+        (
+            "decode_duration_ms_max",
+            json!(summary.decode_duration_ms_max),
+        ),
+        (
+            "state_update_duration_ms_p50",
+            json!(summary.state_update_duration_ms_p50),
+        ),
+        (
+            "state_update_duration_ms_p95",
+            json!(summary.state_update_duration_ms_p95),
+        ),
+        (
+            "state_update_duration_ms_p99",
+            json!(summary.state_update_duration_ms_p99),
+        ),
+        (
+            "state_update_duration_ms_max",
+            json!(summary.state_update_duration_ms_max),
+        ),
+        (
+            "risk_feature_duration_ms_p50",
+            json!(summary.risk_feature_duration_ms_p50),
+        ),
+        (
+            "risk_feature_duration_ms_p95",
+            json!(summary.risk_feature_duration_ms_p95),
+        ),
+        (
+            "risk_feature_duration_ms_p99",
+            json!(summary.risk_feature_duration_ms_p99),
+        ),
+        (
+            "risk_feature_duration_ms_max",
+            json!(summary.risk_feature_duration_ms_max),
+        ),
+        (
+            "artifact_enqueue_duration_ms_p50",
+            json!(summary.artifact_enqueue_duration_ms_p50),
+        ),
+        (
+            "artifact_enqueue_duration_ms_p95",
+            json!(summary.artifact_enqueue_duration_ms_p95),
+        ),
+        (
+            "artifact_enqueue_duration_ms_p99",
+            json!(summary.artifact_enqueue_duration_ms_p99),
+        ),
+        (
+            "artifact_enqueue_duration_ms_max",
+            json!(summary.artifact_enqueue_duration_ms_max),
+        ),
+        (
+            "artifact_write_duration_ms_p50",
+            json!(summary.artifact_write_duration_ms_p50),
+        ),
+        (
+            "artifact_write_duration_ms_p95",
+            json!(summary.artifact_write_duration_ms_p95),
+        ),
+        (
+            "artifact_write_duration_ms_p99",
+            json!(summary.artifact_write_duration_ms_p99),
+        ),
+        (
+            "artifact_write_duration_ms_max",
+            json!(summary.artifact_write_duration_ms_max),
+        ),
+        (
+            "worker_batch_size_p50",
+            json!(summary.worker_batch_size_p50),
+        ),
+        (
+            "worker_batch_size_p95",
+            json!(summary.worker_batch_size_p95),
+        ),
+        (
+            "worker_batch_size_max",
+            json!(summary.worker_batch_size_max),
+        ),
+        (
+            "worker_updates_processed",
+            json!(summary.worker_updates_processed),
+        ),
+        (
+            "worker_updates_per_second",
+            json!(summary.worker_updates_per_second),
+        ),
+        (
+            "worker_backlog_oldest_update_age_ms",
+            json!(summary.worker_backlog_oldest_update_age_ms),
+        ),
+        (
+            "segment_queue_dropped_dirty_updates",
+            json!(summary.segment_queue_dropped_dirty_updates),
+        ),
+        (
+            "segment_worker_reset_count",
+            json!(summary.segment_worker_reset_count),
+        ),
+        (
+            "backpressure_threshold_crossed_at",
+            json!(summary.backpressure_threshold_crossed_at),
+        ),
+        (
+            "backpressure_queue_depth_at_blocker",
+            json!(summary.backpressure_queue_depth_at_blocker),
+        ),
+    ];
+    for (key, field_value) in fields {
+        object.insert(key.to_owned(), field_value);
+    }
+}
+
 fn phase107f_write_health(
     health_dir: &Path,
     run_id: &str,
@@ -39610,7 +39853,7 @@ fn phase107f_write_health(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .unwrap_or_else(|| json!({}));
-    let heartbeat = json!({
+    let mut heartbeat = json!({
         "schema_version": "phase107f.material_hunter_heartbeat.v1",
         "run_id": run_id,
         "campaign_id": run_id,
@@ -39642,28 +39885,6 @@ fn phase107f_write_health(
         "pump_updates": summary.pump_create_decoded,
         "provider_progress_stalled_seconds": summary.provider_progress_stalled_seconds,
         "pump_progress_stalled_seconds": summary.pump_progress_stalled_seconds,
-        "grpc_reader_update_count": summary.grpc_reader_update_count,
-        "grpc_reader_poll_latency_ms_p50": summary.grpc_reader_poll_latency_ms_p50,
-        "grpc_reader_poll_latency_ms_p95": summary.grpc_reader_poll_latency_ms_p95,
-        "grpc_reader_poll_latency_ms_p99": summary.grpc_reader_poll_latency_ms_p99,
-        "grpc_reader_poll_latency_ms_max": summary.grpc_reader_poll_latency_ms_max,
-        "grpc_update_interarrival_ms_p50": summary.grpc_update_interarrival_ms_p50,
-        "grpc_update_interarrival_ms_p95": summary.grpc_update_interarrival_ms_p95,
-        "grpc_update_interarrival_ms_p99": summary.grpc_update_interarrival_ms_p99,
-        "grpc_update_interarrival_ms_max": summary.grpc_update_interarrival_ms_max,
-        "internal_queue_depth_current": summary.internal_queue_depth_current,
-        "internal_queue_depth_max": summary.internal_queue_depth_max,
-        "internal_queue_capacity": summary.internal_queue_capacity,
-        "internal_queue_full_count": summary.internal_queue_full_count,
-        "decode_worker_lag_ms_max": summary.decode_worker_lag_ms_max,
-        "artifact_worker_lag_ms_max": summary.artifact_worker_lag_ms_max,
-        "r2_worker_lag_ms_max": summary.r2_worker_lag_ms_max.max(
-            checkpoint_state["checkpoint_upload_duration_ms"]
-                .as_u64()
-                .unwrap_or(0)
-        ),
-        "stream_reader_blocked_by_processing": summary.stream_reader_blocked_by_processing,
-        "client_backpressure_detected": summary.client_backpressure_detected,
         "attempts_progress_stalled_seconds": 0,
         "safe_to_continue": safe_to_continue,
         "blocker_reason": blocker_reason,
@@ -39671,6 +39892,13 @@ fn phase107f_write_health(
         "rpc_mint_supply_canonical": false,
         "threshold_tuning_allowed": false,
     });
+    phase107f_insert_stream_telemetry(
+        &mut heartbeat,
+        summary,
+        checkpoint_state["checkpoint_upload_duration_ms"]
+            .as_u64()
+            .unwrap_or(0),
+    );
     fs::write(
         health_dir.join("heartbeat.json"),
         serde_json::to_string_pretty(&heartbeat)?,
@@ -40901,7 +41129,7 @@ async fn material_candidate_hunter_command(
         .map(|record| record.replay_eligible_candidate_count as u64)
         .sum::<u64>();
     let replay_allowed = run_replay_eligible_candidate_count > 0;
-    let hunter_summary = json!({
+    let mut hunter_summary = json!({
         "schema_version": "phase107b.hunter_summary.v1",
         "run_id": run_id,
         "attempted_launches": attempted_launches,
@@ -40937,26 +41165,10 @@ async fn material_candidate_hunter_command(
         "provider_blocker_class": stream_summary.provider_blocker_class,
         "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
         "client_backpressure_detected": stream_summary.client_backpressure_detected,
-        "grpc_reader_update_count": stream_summary.grpc_reader_update_count,
-        "grpc_reader_poll_latency_ms_p50": stream_summary.grpc_reader_poll_latency_ms_p50,
-        "grpc_reader_poll_latency_ms_p95": stream_summary.grpc_reader_poll_latency_ms_p95,
-        "grpc_reader_poll_latency_ms_p99": stream_summary.grpc_reader_poll_latency_ms_p99,
-        "grpc_reader_poll_latency_ms_max": stream_summary.grpc_reader_poll_latency_ms_max,
-        "grpc_update_interarrival_ms_p50": stream_summary.grpc_update_interarrival_ms_p50,
-        "grpc_update_interarrival_ms_p95": stream_summary.grpc_update_interarrival_ms_p95,
-        "grpc_update_interarrival_ms_p99": stream_summary.grpc_update_interarrival_ms_p99,
-        "grpc_update_interarrival_ms_max": stream_summary.grpc_update_interarrival_ms_max,
-        "internal_queue_depth_current": stream_summary.internal_queue_depth_current,
-        "internal_queue_depth_max": stream_summary.internal_queue_depth_max,
-        "internal_queue_capacity": stream_summary.internal_queue_capacity,
-        "internal_queue_full_count": stream_summary.internal_queue_full_count,
-        "decode_worker_lag_ms_max": stream_summary.decode_worker_lag_ms_max,
-        "artifact_worker_lag_ms_max": stream_summary.artifact_worker_lag_ms_max,
-        "r2_worker_lag_ms_max": stream_summary.r2_worker_lag_ms_max,
-        "stream_reader_blocked_by_processing": stream_summary.stream_reader_blocked_by_processing,
         "ready_for_off_vps_candidate_replay": replay_allowed,
         "ready_for_large_strategy_dataset": false,
     });
+    phase107f_insert_stream_telemetry(&mut hunter_summary, &stream_summary, 0);
     write_quant_json_md(
         &output_dir,
         "hunter_summary",
