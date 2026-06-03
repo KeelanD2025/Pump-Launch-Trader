@@ -172,10 +172,13 @@ The material hunter uses the same configured Geyser endpoint as the provider pro
 
 The hunter stream path must therefore be drain-first:
 
-- the gRPC reader polls the stream and pushes updates into a bounded internal queue;
-- decode, state updates, risk/features, ledger writes, tombstones, candidate artifacts, heartbeat writes, and R2 checkpoint coordination run behind that queue;
+- one gRPC reader polls one stream and handles slot/liveness/counter-only updates on a cheap reader-side path;
+- worker-relevant updates go through a bounded router queue into deterministic partition worker queues;
+- partition workers decode/normalize concurrently while preserving arrival order for keys assigned to the same mint/account partition;
+- the coordinator remains the only owner of attempt lifecycle, active mints, segment closure, countability, and replay eligibility;
+- ledger writes, tombstones, candidate artifacts, heartbeat writes, and R2 checkpoint coordination must not run inline in the gRPC reader task;
 - R2 checkpoints must remain bounded and must not recursively upload rich token artifact directories from the stream polling path;
-- if the bounded queue fills, the run is classified as `client_backpressure_detected`, non-countable, audit-only, replay-disabled, backtesting-disabled, and threshold-tuning-disabled.
+- if the router queue, any partition queue, or the worker backlog exceeds its hard threshold, the current segment is classified as `client_backpressure_detected`, non-countable, audit-only, replay-disabled, backtesting-disabled, and threshold-tuning-disabled.
 
 Heartbeat and summaries expose:
 
@@ -185,6 +188,26 @@ Heartbeat and summaries expose:
 - `internal_queue_depth_current/max/capacity`
 - `internal_queue_full_count`
 - `decode_worker_lag_ms_max`
+- `worker_partitions`
+- `partitioning_enabled`
+- `router_updates_received/routed`
+- `router_fallback_count`
+- `router_queue_depth_current/max`
+- `router_queue_full_count`
+- `partition_queue_depth_current_max`
+- `partition_queue_depth_max_overall`
+- `partition_queue_full_count_total/by_partition`
+- `partition_updates_processed_total/by_partition`
+- `partition_updates_per_second_total/by_partition`
+- `partition_worker_lag_ms_p50/p95/p99/max`
+- `partition_decode_duration_ms_p50/p95/p99/max`
+- `partition_lock_wait_ms_max`
+- `partition_batch_size_p50/p95/max`
+- `worker_backpressure_detected`
+- `dirty_partition_queued_updates_discarded`
+- `partition_worker_reset_count`
+- `artifact_queue_depth_max`
+- `artifact_queue_full_count`
 - `artifact_worker_lag_ms_max`
 - `r2_worker_lag_ms_max`
 - `stream_reader_blocked_by_processing`

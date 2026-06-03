@@ -2278,6 +2278,26 @@ pub struct GeyserConfig {
     #[serde(default = "default_true")]
     pub geyser_only_allowed: bool,
     pub max_inflight_messages: usize,
+    #[serde(default = "default_material_hunter_partitioning_enabled")]
+    pub material_hunter_partitioning_enabled: bool,
+    #[serde(default = "default_material_hunter_worker_partitions")]
+    pub material_hunter_worker_partitions: usize,
+    #[serde(default = "default_material_hunter_partition_queue_capacity")]
+    pub material_hunter_partition_queue_capacity: usize,
+    #[serde(default = "default_material_hunter_router_queue_capacity")]
+    pub material_hunter_router_queue_capacity: usize,
+    #[serde(default = "default_material_hunter_artifact_writer_queue_capacity")]
+    pub material_hunter_artifact_writer_queue_capacity: usize,
+    #[serde(default = "default_material_hunter_partition_batch_size")]
+    pub material_hunter_partition_batch_size: usize,
+    #[serde(default = "default_material_hunter_partition_soft_queue_threshold_ratio")]
+    pub material_hunter_partition_soft_queue_threshold_ratio: f64,
+    #[serde(default = "default_material_hunter_partition_hard_queue_threshold_ratio")]
+    pub material_hunter_partition_hard_queue_threshold_ratio: f64,
+    #[serde(default = "default_material_hunter_worker_lag_warn_ms")]
+    pub material_hunter_worker_lag_warn_ms: u64,
+    #[serde(default = "default_material_hunter_worker_lag_blocker_ms")]
+    pub material_hunter_worker_lag_blocker_ms: u64,
     pub slot_gap_tolerance: u64,
     #[serde(default)]
     pub program_filters: Vec<String>,
@@ -2320,6 +2340,47 @@ impl GeyserConfig {
         }
         if self.max_inflight_messages == 0 {
             self.max_inflight_messages = 8_192;
+        }
+        if self.material_hunter_worker_partitions == 0 {
+            self.material_hunter_worker_partitions = 4;
+        }
+        if self.material_hunter_worker_partitions > 16 {
+            self.material_hunter_worker_partitions = 16;
+        }
+        if self.material_hunter_partition_queue_capacity == 0 {
+            self.material_hunter_partition_queue_capacity = 2_048;
+        }
+        if self.material_hunter_router_queue_capacity == 0 {
+            self.material_hunter_router_queue_capacity = self.max_inflight_messages.max(8_192);
+        }
+        if self.material_hunter_artifact_writer_queue_capacity == 0 {
+            self.material_hunter_artifact_writer_queue_capacity = 2_048;
+        }
+        if self.material_hunter_partition_batch_size == 0 {
+            self.material_hunter_partition_batch_size = 256;
+        }
+        if self.material_hunter_partition_batch_size > self.material_hunter_partition_queue_capacity
+        {
+            self.material_hunter_partition_batch_size =
+                self.material_hunter_partition_queue_capacity;
+        }
+        if self.material_hunter_partition_soft_queue_threshold_ratio <= 0.0 {
+            self.material_hunter_partition_soft_queue_threshold_ratio = 0.75;
+        }
+        if self.material_hunter_partition_hard_queue_threshold_ratio <= 0.0 {
+            self.material_hunter_partition_hard_queue_threshold_ratio = 1.0;
+        }
+        if self.material_hunter_partition_soft_queue_threshold_ratio
+            >= self.material_hunter_partition_hard_queue_threshold_ratio
+        {
+            self.material_hunter_partition_soft_queue_threshold_ratio = 0.75;
+            self.material_hunter_partition_hard_queue_threshold_ratio = 1.0;
+        }
+        if self.material_hunter_worker_lag_warn_ms == 0 {
+            self.material_hunter_worker_lag_warn_ms = 5_000;
+        }
+        if self.material_hunter_worker_lag_blocker_ms == 0 {
+            self.material_hunter_worker_lag_blocker_ms = 10_000;
         }
         if self.max_decoded_message_size == 0 {
             self.max_decoded_message_size = 64 * 1024 * 1024;
@@ -4041,6 +4102,46 @@ impl LoadedConfig {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_material_hunter_partitioning_enabled() -> bool {
+    true
+}
+
+const fn default_material_hunter_worker_partitions() -> usize {
+    4
+}
+
+const fn default_material_hunter_partition_queue_capacity() -> usize {
+    2_048
+}
+
+const fn default_material_hunter_router_queue_capacity() -> usize {
+    8_192
+}
+
+const fn default_material_hunter_artifact_writer_queue_capacity() -> usize {
+    2_048
+}
+
+const fn default_material_hunter_partition_batch_size() -> usize {
+    256
+}
+
+fn default_material_hunter_partition_soft_queue_threshold_ratio() -> f64 {
+    0.75
+}
+
+fn default_material_hunter_partition_hard_queue_threshold_ratio() -> f64 {
+    1.0
+}
+
+const fn default_material_hunter_worker_lag_warn_ms() -> u64 {
+    5_000
+}
+
+const fn default_material_hunter_worker_lag_blocker_ms() -> u64 {
+    10_000
 }
 
 fn default_edge_collector_segment_dir() -> String {

@@ -223,6 +223,16 @@ subscribe_slots = true
 subscribe_blocks = false
 geyser_only_allowed = true
 max_inflight_messages = 8192
+material_hunter_partitioning_enabled = true
+material_hunter_worker_partitions = 4
+material_hunter_partition_queue_capacity = 2048
+material_hunter_router_queue_capacity = 8192
+material_hunter_artifact_writer_queue_capacity = 2048
+material_hunter_partition_batch_size = 256
+material_hunter_partition_soft_queue_threshold_ratio = 0.75
+material_hunter_partition_hard_queue_threshold_ratio = 1.0
+material_hunter_worker_lag_warn_ms = 5000
+material_hunter_worker_lag_blocker_ms = 10000
 slot_gap_tolerance = 1
 program_filters = [
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",

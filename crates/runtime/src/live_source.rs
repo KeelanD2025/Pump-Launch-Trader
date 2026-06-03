@@ -961,12 +961,107 @@ pub struct MaterialHunterStreamSummary {
     pub backpressure_threshold_crossed_at: Option<String>,
     #[serde(default)]
     pub backpressure_queue_depth_at_blocker: u64,
+    #[serde(default)]
+    pub worker_partitions: u64,
+    #[serde(default)]
+    pub partitioning_enabled: bool,
+    #[serde(default)]
+    pub router_updates_received: u64,
+    #[serde(default)]
+    pub router_updates_routed: u64,
+    #[serde(default)]
+    pub router_fallback_count: u64,
+    #[serde(default)]
+    pub router_error_count: u64,
+    #[serde(default)]
+    pub router_queue_depth_current: u64,
+    #[serde(default)]
+    pub router_queue_depth_max: u64,
+    #[serde(default)]
+    pub router_queue_full_count: u64,
+    #[serde(default)]
+    pub partition_queue_depth_current_max: u64,
+    #[serde(default)]
+    pub partition_queue_depth_max_overall: u64,
+    #[serde(default)]
+    pub partition_queue_full_count_total: u64,
+    #[serde(default)]
+    pub partition_queue_full_count_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_updates_processed_total: u64,
+    #[serde(default)]
+    pub partition_updates_processed_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_updates_per_second_total: u64,
+    #[serde(default)]
+    pub partition_updates_per_second_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_worker_lag_ms_p50: u64,
+    #[serde(default)]
+    pub partition_worker_lag_ms_p95: u64,
+    #[serde(default)]
+    pub partition_worker_lag_ms_p99: u64,
+    #[serde(default)]
+    pub partition_worker_lag_ms_max: u64,
+    #[serde(default)]
+    pub partition_decode_duration_ms_p50: u64,
+    #[serde(default)]
+    pub partition_decode_duration_ms_p95: u64,
+    #[serde(default)]
+    pub partition_decode_duration_ms_p99: u64,
+    #[serde(default)]
+    pub partition_decode_duration_ms_max: u64,
+    #[serde(default)]
+    pub partition_state_update_duration_ms_p50: u64,
+    #[serde(default)]
+    pub partition_state_update_duration_ms_p95: u64,
+    #[serde(default)]
+    pub partition_state_update_duration_ms_p99: u64,
+    #[serde(default)]
+    pub partition_state_update_duration_ms_max: u64,
+    #[serde(default)]
+    pub partition_lock_wait_ms_max: u64,
+    #[serde(default)]
+    pub partition_batch_size_p50: u64,
+    #[serde(default)]
+    pub partition_batch_size_p95: u64,
+    #[serde(default)]
+    pub partition_batch_size_max: u64,
+    #[serde(default)]
+    pub worker_backpressure_detected: bool,
+    #[serde(default)]
+    pub dirty_partition_queued_updates_discarded: u64,
+    #[serde(default)]
+    pub partition_worker_reset_count: u64,
+    #[serde(default)]
+    pub artifact_queue_depth_max: u64,
+    #[serde(default)]
+    pub artifact_queue_full_count: u64,
     pub errors: Vec<String>,
 }
 
 #[derive(Debug)]
 enum MaterialHunterReaderMessage {
     Update(SubscribeUpdate, tokio::time::Instant),
+    StreamError(Status),
+    StreamClosed,
+}
+
+#[derive(Debug)]
+struct MaterialHunterPartitionUpdate {
+    update: SubscribeUpdate,
+    read_at: tokio::time::Instant,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+enum MaterialHunterWorkerOutput {
+    Event {
+        event: NormalizedEvent,
+        read_at: tokio::time::Instant,
+        partition: usize,
+        sequence: u64,
+    },
     StreamError(Status),
     StreamClosed,
 }
@@ -996,6 +1091,28 @@ struct MaterialHunterReaderStats {
     segment_worker_reset_count: u64,
     backpressure_threshold_crossed_at: Option<String>,
     backpressure_queue_depth_at_blocker: u64,
+    worker_partitions: u64,
+    partitioning_enabled: bool,
+    router_updates_received: u64,
+    router_updates_routed: u64,
+    router_fallback_count: u64,
+    router_error_count: u64,
+    router_queue_depth_current: u64,
+    router_queue_depth_max: u64,
+    router_queue_full_count: u64,
+    partition_queue_depth_current: Vec<u64>,
+    partition_queue_depth_max: Vec<u64>,
+    partition_queue_full_count_by_partition: Vec<u64>,
+    partition_updates_processed_by_partition: Vec<u64>,
+    partition_started_at: Option<tokio::time::Instant>,
+    partition_worker_lag_ms: Vec<u64>,
+    partition_decode_duration_ms: Vec<u64>,
+    partition_batch_sizes: Vec<u64>,
+    worker_backpressure_detected: bool,
+    dirty_partition_queued_updates_discarded: u64,
+    partition_worker_reset_count: u64,
+    artifact_queue_depth_max: u64,
+    artifact_queue_full_count: u64,
 }
 
 impl MaterialHunterReaderStats {
@@ -1032,6 +1149,24 @@ impl MaterialHunterReaderStats {
     fn record_worker_batch(&mut self, size: u64) {
         if self.worker_batch_sizes.len() < 100_000 {
             self.worker_batch_sizes.push(size);
+        }
+    }
+
+    fn record_partition_lag(&mut self, millis: u64) {
+        if self.partition_worker_lag_ms.len() < 100_000 {
+            self.partition_worker_lag_ms.push(millis);
+        }
+    }
+
+    fn record_partition_decode_duration(&mut self, millis: u64) {
+        if self.partition_decode_duration_ms.len() < 100_000 {
+            self.partition_decode_duration_ms.push(millis);
+        }
+    }
+
+    fn record_partition_batch(&mut self, size: u64) {
+        if self.partition_batch_sizes.len() < 100_000 {
+            self.partition_batch_sizes.push(size);
         }
     }
 
@@ -1139,6 +1274,93 @@ fn apply_reader_stats_to_summary(
     summary.segment_worker_reset_count = stats.segment_worker_reset_count;
     summary.backpressure_threshold_crossed_at = stats.backpressure_threshold_crossed_at.clone();
     summary.backpressure_queue_depth_at_blocker = stats.backpressure_queue_depth_at_blocker;
+    summary.worker_partitions = stats.worker_partitions;
+    summary.partitioning_enabled = stats.partitioning_enabled;
+    summary.router_updates_received = stats.router_updates_received;
+    summary.router_updates_routed = stats.router_updates_routed;
+    summary.router_fallback_count = stats.router_fallback_count;
+    summary.router_error_count = stats.router_error_count;
+    summary.router_queue_depth_current = stats.router_queue_depth_current;
+    summary.router_queue_depth_max = stats.router_queue_depth_max;
+    summary.router_queue_full_count = stats.router_queue_full_count;
+    summary.partition_queue_depth_current_max = stats
+        .partition_queue_depth_current
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.partition_queue_depth_max_overall = stats
+        .partition_queue_depth_max
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.partition_queue_full_count_total =
+        stats.partition_queue_full_count_by_partition.iter().sum();
+    summary.partition_queue_full_count_by_partition =
+        stats.partition_queue_full_count_by_partition.clone();
+    summary.partition_updates_processed_total =
+        stats.partition_updates_processed_by_partition.iter().sum();
+    summary.partition_updates_processed_by_partition =
+        stats.partition_updates_processed_by_partition.clone();
+    summary.partition_updates_per_second_total = stats
+        .partition_started_at
+        .map(|started| {
+            let secs = started.elapsed().as_secs().max(1);
+            summary.partition_updates_processed_total / secs
+        })
+        .unwrap_or(0);
+    summary.partition_updates_per_second_by_partition = stats
+        .partition_started_at
+        .map(|started| {
+            let secs = started.elapsed().as_secs().max(1);
+            stats
+                .partition_updates_processed_by_partition
+                .iter()
+                .map(|count| count / secs)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    summary.partition_worker_lag_ms_p50 = percentile(&stats.partition_worker_lag_ms, 50, 100);
+    summary.partition_worker_lag_ms_p95 = percentile(&stats.partition_worker_lag_ms, 95, 100);
+    summary.partition_worker_lag_ms_p99 = percentile(&stats.partition_worker_lag_ms, 99, 100);
+    summary.partition_worker_lag_ms_max = stats
+        .partition_worker_lag_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.partition_decode_duration_ms_p50 =
+        percentile(&stats.partition_decode_duration_ms, 50, 100);
+    summary.partition_decode_duration_ms_p95 =
+        percentile(&stats.partition_decode_duration_ms, 95, 100);
+    summary.partition_decode_duration_ms_p99 =
+        percentile(&stats.partition_decode_duration_ms, 99, 100);
+    summary.partition_decode_duration_ms_max = stats
+        .partition_decode_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.partition_state_update_duration_ms_p50 = 0;
+    summary.partition_state_update_duration_ms_p95 = 0;
+    summary.partition_state_update_duration_ms_p99 = 0;
+    summary.partition_state_update_duration_ms_max = 0;
+    summary.partition_lock_wait_ms_max = 0;
+    summary.partition_batch_size_p50 = percentile(&stats.partition_batch_sizes, 50, 100);
+    summary.partition_batch_size_p95 = percentile(&stats.partition_batch_sizes, 95, 100);
+    summary.partition_batch_size_max = stats
+        .partition_batch_sizes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.worker_backpressure_detected = stats.worker_backpressure_detected;
+    summary.dirty_partition_queued_updates_discarded =
+        stats.dirty_partition_queued_updates_discarded;
+    summary.partition_worker_reset_count = stats.partition_worker_reset_count;
+    summary.artifact_queue_depth_max = stats.artifact_queue_depth_max;
+    summary.artifact_queue_full_count = stats.artifact_queue_full_count;
 }
 
 pub fn material_hunter_subscription_fingerprint(loaded: &LoadedConfig) -> Result<String> {
@@ -1223,6 +1445,88 @@ fn material_hunter_update_needs_worker(update: &SubscribeUpdate) -> bool {
     !matches!(update.update_oneof.as_ref(), Some(UpdateOneof::Slot(_)))
 }
 
+fn material_hunter_partition_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    u64::from_le_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ])
+}
+
+fn material_hunter_partition_for_key(key: &[u8], partitions: usize) -> usize {
+    if partitions <= 1 {
+        return 0;
+    }
+    (material_hunter_partition_hash(key) as usize) % partitions
+}
+
+fn material_hunter_partition_key(update: &SubscribeUpdate) -> (Vec<u8>, bool) {
+    match update.update_oneof.as_ref() {
+        Some(UpdateOneof::Transaction(tx)) => {
+            if let Some(info) = tx.transaction.as_ref() {
+                if let Some(meta) = info.meta.as_ref() {
+                    if let Some(balance) = meta
+                        .post_token_balances
+                        .iter()
+                        .chain(meta.pre_token_balances.iter())
+                        .find(|balance| !balance.mint.trim().is_empty())
+                    {
+                        return (balance.mint.as_bytes().to_vec(), false);
+                    }
+                }
+                if let Some(transaction) = info.transaction.as_ref() {
+                    if let Some(message) = transaction.message.as_ref() {
+                        if let Some(key) = message.account_keys.first() {
+                            return (key.clone(), false);
+                        }
+                    }
+                    if let Some(signature) = transaction.signatures.first() {
+                        return (signature.clone(), false);
+                    }
+                }
+                if !info.signature.is_empty() {
+                    return (info.signature.clone(), false);
+                }
+            }
+            (tx.slot.to_le_bytes().to_vec(), true)
+        }
+        Some(UpdateOneof::TransactionStatus(status)) => {
+            if !status.signature.is_empty() {
+                (status.signature.clone(), false)
+            } else {
+                (status.slot.to_le_bytes().to_vec(), true)
+            }
+        }
+        Some(UpdateOneof::Account(account_update)) => {
+            if let Some(account) = account_update.account.as_ref() {
+                if !account.pubkey.is_empty() {
+                    return (account.pubkey.clone(), false);
+                }
+                if !account.owner.is_empty() {
+                    return (account.owner.clone(), false);
+                }
+            }
+            (account_update.slot.to_le_bytes().to_vec(), true)
+        }
+        Some(UpdateOneof::Block(block)) => (block.slot.to_le_bytes().to_vec(), true),
+        Some(UpdateOneof::BlockMeta(block)) => (block.slot.to_le_bytes().to_vec(), true),
+        Some(UpdateOneof::Entry(entry)) => (entry.slot.to_le_bytes().to_vec(), true),
+        _ => (b"material-hunter-fallback".to_vec(), true),
+    }
+}
+
+fn material_hunter_partition_for_update(
+    update: &SubscribeUpdate,
+    partitions: usize,
+) -> (usize, bool) {
+    let (key, fallback) = material_hunter_partition_key(update);
+    (
+        material_hunter_partition_for_key(&key, partitions),
+        fallback,
+    )
+}
+
 pub async fn run_material_hunter_stream<F>(
     loaded: &LoadedConfig,
     options: MaterialHunterStreamOptions,
@@ -1284,8 +1588,7 @@ where
 
     let deadline =
         tokio::time::Instant::now() + StdDuration::from_secs(options.duration_seconds.max(1));
-    let mut normalizer = GeyserEventNormalizer::from_loaded(loaded)?;
-    let mut ingest = GeyserIngestService::new(config.clone());
+    let ingest = GeyserIngestService::new(config.clone());
     let request = ingest.proto_subscription_request();
     let max_attempts = config.max_reconnect_attempts.unwrap_or(10).max(1) as usize;
     let mut reconnect_attempts = 0usize;
@@ -1371,17 +1674,41 @@ where
             }
         };
 
-        let queue_capacity = config.max_inflight_messages.max(128);
-        let (reader_tx, mut reader_rx) =
+        let partitioning_enabled = config.material_hunter_partitioning_enabled;
+        let worker_partitions = if partitioning_enabled {
+            config.material_hunter_worker_partitions.clamp(1, 16)
+        } else {
+            1
+        };
+        let queue_capacity = config
+            .material_hunter_router_queue_capacity
+            .max(config.max_inflight_messages)
+            .max(128);
+        let partition_queue_capacity = config.material_hunter_partition_queue_capacity.max(1);
+        let partition_batch_size = config
+            .material_hunter_partition_batch_size
+            .clamp(1, partition_queue_capacity);
+        let worker_lag_blocker_ms = config.material_hunter_worker_lag_blocker_ms.max(1);
+        let (reader_tx, mut router_rx) =
             mpsc::channel::<MaterialHunterReaderMessage>(queue_capacity);
+        let (worker_output_tx, mut worker_output_rx) =
+            mpsc::channel::<MaterialHunterWorkerOutput>(queue_capacity);
         let reader_stats = Arc::new(std::sync::Mutex::new(MaterialHunterReaderStats {
             queue_capacity: queue_capacity as u64,
             worker_started_at: Some(tokio::time::Instant::now()),
+            worker_partitions: worker_partitions as u64,
+            partitioning_enabled,
+            partition_queue_depth_current: vec![0; worker_partitions],
+            partition_queue_depth_max: vec![0; worker_partitions],
+            partition_queue_full_count_by_partition: vec![0; worker_partitions],
+            partition_updates_processed_by_partition: vec![0; worker_partitions],
+            partition_started_at: Some(tokio::time::Instant::now()),
             ..MaterialHunterReaderStats::default()
         }));
         let reader_stats_for_task = reader_stats.clone();
         tokio::spawn(async move {
             let mut last_read_at: Option<tokio::time::Instant> = None;
+            let mut sequence = 0u64;
             loop {
                 let poll_started = tokio::time::Instant::now();
                 let next = stream.next().await;
@@ -1422,6 +1749,7 @@ where
                     }
                 };
                 let enqueue_started = tokio::time::Instant::now();
+                sequence = sequence.saturating_add(1);
                 match reader_tx.try_send(MaterialHunterReaderMessage::Update(update, read_at)) {
                     Ok(()) => {
                         if let Ok(mut stats) = reader_stats_for_task.lock() {
@@ -1447,12 +1775,22 @@ where
                         if let Ok(mut stats) = reader_stats_for_task.lock() {
                             stats.queue_full_count = stats.queue_full_count.saturating_add(1);
                             stats.client_backpressure_detected = true;
+                            stats.worker_backpressure_detected = true;
+                            stats.router_queue_full_count =
+                                stats.router_queue_full_count.saturating_add(1);
                             stats.queue_depth_current = stats.queue_capacity;
                             stats.queue_depth_max = stats.queue_capacity;
+                            stats.router_queue_depth_current = stats.queue_capacity;
+                            stats.router_queue_depth_max = stats.queue_capacity;
                             stats.backpressure_queue_depth_at_blocker = stats.queue_capacity;
                             stats.segment_queue_dropped_dirty_updates = stats.queue_capacity;
+                            stats.dirty_partition_queued_updates_discarded = stats
+                                .dirty_partition_queued_updates_discarded
+                                .saturating_add(stats.queue_capacity);
                             stats.segment_worker_reset_count =
                                 stats.segment_worker_reset_count.saturating_add(1);
+                            stats.partition_worker_reset_count =
+                                stats.partition_worker_reset_count.saturating_add(1);
                             if stats.backpressure_threshold_crossed_at.is_none() {
                                 stats.backpressure_threshold_crossed_at =
                                     Some(OffsetDateTime::now_utc().to_string());
@@ -1464,6 +1802,237 @@ where
                 }
             }
         });
+
+        let mut partition_txs = Vec::with_capacity(worker_partitions);
+        for partition in 0..worker_partitions {
+            let (partition_tx, mut partition_rx) =
+                mpsc::channel::<MaterialHunterPartitionUpdate>(partition_queue_capacity);
+            partition_txs.push(partition_tx);
+            let output_tx = worker_output_tx.clone();
+            let stats_for_worker = reader_stats.clone();
+            let loaded_for_worker = loaded.clone();
+            let config_for_worker = config.clone();
+            tokio::spawn(async move {
+                let mut ingest = GeyserIngestService::new(config_for_worker);
+                let mut normalizer = match GeyserEventNormalizer::from_loaded(&loaded_for_worker) {
+                    Ok(normalizer) => normalizer,
+                    Err(error) => {
+                        let _ = output_tx
+                            .send(MaterialHunterWorkerOutput::StreamError(Status::internal(
+                                error.to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                while let Some(first) = partition_rx.recv().await {
+                    let mut batch = vec![first];
+                    while batch.len() < partition_batch_size {
+                        match partition_rx.try_recv() {
+                            Ok(update) => batch.push(update),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if let Ok(mut stats) = stats_for_worker.lock() {
+                        stats.record_partition_batch(batch.len() as u64);
+                        stats.record_worker_batch(batch.len() as u64);
+                    }
+                    for item in batch {
+                        let now = tokio::time::Instant::now();
+                        let worker_lag = now.duration_since(item.read_at).as_millis() as u64;
+                        if let Ok(mut stats) = stats_for_worker.lock() {
+                            stats.decode_worker_lag_ms_max =
+                                stats.decode_worker_lag_ms_max.max(worker_lag);
+                            stats.record_queue_wait(worker_lag);
+                            stats.record_partition_lag(worker_lag);
+                            stats.worker_backlog_oldest_update_age_ms =
+                                stats.worker_backlog_oldest_update_age_ms.max(worker_lag);
+                            stats.queue_depth_current =
+                                stats.partition_queue_depth_current.iter().sum();
+                            if let Some(depth) =
+                                stats.partition_queue_depth_current.get_mut(partition)
+                            {
+                                *depth = partition_rx.len() as u64;
+                            }
+                            if worker_lag >= worker_lag_blocker_ms {
+                                stats.client_backpressure_detected = true;
+                                stats.worker_backpressure_detected = true;
+                                stats.backpressure_queue_depth_at_blocker =
+                                    stats.queue_depth_current;
+                                stats.dirty_partition_queued_updates_discarded = stats
+                                    .dirty_partition_queued_updates_discarded
+                                    .saturating_add(partition_rx.len() as u64);
+                                stats.segment_queue_dropped_dirty_updates = stats
+                                    .segment_queue_dropped_dirty_updates
+                                    .saturating_add(partition_rx.len() as u64);
+                                stats.partition_worker_reset_count =
+                                    stats.partition_worker_reset_count.saturating_add(1);
+                                stats.segment_worker_reset_count =
+                                    stats.segment_worker_reset_count.saturating_add(1);
+                                if stats.backpressure_threshold_crossed_at.is_none() {
+                                    stats.backpressure_threshold_crossed_at =
+                                        Some(OffsetDateTime::now_utc().to_string());
+                                }
+                            }
+                        }
+                        let decode_started = tokio::time::Instant::now();
+                        let outputs =
+                            ingest.process_subscribe_update(item.update, monotonic_now_ns());
+                        let normalized = outputs
+                            .into_iter()
+                            .flat_map(|output| normalizer.normalize_output(output))
+                            .collect::<Vec<_>>();
+                        let decode_ms = decode_started.elapsed().as_millis() as u64;
+                        if let Ok(mut stats) = stats_for_worker.lock() {
+                            stats.record_decode_duration(decode_ms);
+                            stats.record_partition_decode_duration(decode_ms);
+                            stats.worker_updates_processed =
+                                stats.worker_updates_processed.saturating_add(1);
+                            if let Some(count) = stats
+                                .partition_updates_processed_by_partition
+                                .get_mut(partition)
+                            {
+                                *count = count.saturating_add(1);
+                            }
+                        }
+                        for event in normalized {
+                            if output_tx
+                                .send(MaterialHunterWorkerOutput::Event {
+                                    event,
+                                    read_at: item.read_at,
+                                    partition,
+                                    sequence: item.sequence,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let router_stats = reader_stats.clone();
+        let router_output_tx = worker_output_tx.clone();
+        tokio::spawn(async move {
+            while let Some(message) = router_rx.recv().await {
+                match message {
+                    MaterialHunterReaderMessage::Update(update, read_at) => {
+                        let (partition, fallback) =
+                            material_hunter_partition_for_update(&update, worker_partitions);
+                        if let Ok(mut stats) = router_stats.lock() {
+                            stats.router_updates_received =
+                                stats.router_updates_received.saturating_add(1);
+                            if fallback {
+                                stats.router_fallback_count =
+                                    stats.router_fallback_count.saturating_add(1);
+                            }
+                            stats.router_queue_depth_current = router_rx.len() as u64;
+                            stats.router_queue_depth_max =
+                                stats.router_queue_depth_max.max(router_rx.len() as u64);
+                        }
+                        let Some(partition_tx) = partition_txs.get(partition) else {
+                            if let Ok(mut stats) = router_stats.lock() {
+                                stats.router_error_count =
+                                    stats.router_error_count.saturating_add(1);
+                                stats.client_backpressure_detected = true;
+                                stats.worker_backpressure_detected = true;
+                            }
+                            break;
+                        };
+                        let sequence = if let Ok(stats) = router_stats.lock() {
+                            stats.router_updates_received
+                        } else {
+                            0
+                        };
+                        match partition_tx.try_send(MaterialHunterPartitionUpdate {
+                            update,
+                            read_at,
+                            sequence,
+                        }) {
+                            Ok(()) => {
+                                if let Ok(mut stats) = router_stats.lock() {
+                                    stats.router_updates_routed =
+                                        stats.router_updates_routed.saturating_add(1);
+                                    let depth = partition_tx
+                                        .max_capacity()
+                                        .saturating_sub(partition_tx.capacity())
+                                        as u64;
+                                    if let Some(current) =
+                                        stats.partition_queue_depth_current.get_mut(partition)
+                                    {
+                                        *current = depth;
+                                    }
+                                    if let Some(max_depth) =
+                                        stats.partition_queue_depth_max.get_mut(partition)
+                                    {
+                                        *max_depth = (*max_depth).max(depth);
+                                    }
+                                    stats.queue_depth_current =
+                                        stats.partition_queue_depth_current.iter().sum();
+                                    stats.queue_depth_max =
+                                        stats.queue_depth_max.max(stats.queue_depth_current);
+                                    let soft_threshold =
+                                        ((partition_tx.max_capacity() as f64) * 0.75).ceil() as u64;
+                                    if depth >= soft_threshold.max(1)
+                                        && stats.backpressure_threshold_crossed_at.is_none()
+                                    {
+                                        stats.backpressure_threshold_crossed_at =
+                                            Some(OffsetDateTime::now_utc().to_string());
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                if let Ok(mut stats) = router_stats.lock() {
+                                    if let Some(count) = stats
+                                        .partition_queue_full_count_by_partition
+                                        .get_mut(partition)
+                                    {
+                                        *count = count.saturating_add(1);
+                                    }
+                                    stats.client_backpressure_detected = true;
+                                    stats.worker_backpressure_detected = true;
+                                    stats.backpressure_queue_depth_at_blocker =
+                                        partition_tx.max_capacity() as u64;
+                                    stats.dirty_partition_queued_updates_discarded = stats
+                                        .dirty_partition_queued_updates_discarded
+                                        .saturating_add(partition_tx.max_capacity() as u64);
+                                    stats.segment_queue_dropped_dirty_updates = stats
+                                        .segment_queue_dropped_dirty_updates
+                                        .saturating_add(partition_tx.max_capacity() as u64);
+                                    stats.partition_worker_reset_count =
+                                        stats.partition_worker_reset_count.saturating_add(1);
+                                    stats.segment_worker_reset_count =
+                                        stats.segment_worker_reset_count.saturating_add(1);
+                                    if stats.backpressure_threshold_crossed_at.is_none() {
+                                        stats.backpressure_threshold_crossed_at =
+                                            Some(OffsetDateTime::now_utc().to_string());
+                                    }
+                                }
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    MaterialHunterReaderMessage::StreamError(status) => {
+                        let _ = router_output_tx
+                            .send(MaterialHunterWorkerOutput::StreamError(status))
+                            .await;
+                        break;
+                    }
+                    MaterialHunterReaderMessage::StreamClosed => {
+                        let _ = router_output_tx
+                            .send(MaterialHunterWorkerOutput::StreamClosed)
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+        drop(worker_output_tx);
 
         let mut last_progress_tick = tokio::time::Instant::now();
         while tokio::time::Instant::now() < deadline {
@@ -1497,141 +2066,52 @@ where
                     return Ok(summary);
                 }
             }
-            match tokio::time::timeout(poll_window, reader_rx.recv()).await {
-                Ok(Some(first_message @ MaterialHunterReaderMessage::Update(_, _))) => {
-                    let mut batch = vec![first_message];
-                    while batch.len() < 256 {
-                        match reader_rx.try_recv() {
-                            Ok(message @ MaterialHunterReaderMessage::Update(_, _)) => {
-                                batch.push(message);
-                            }
-                            Ok(other) => {
-                                batch.push(other);
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                        }
+            match tokio::time::timeout(poll_window, worker_output_rx.recv()).await {
+                Ok(Some(MaterialHunterWorkerOutput::Event {
+                    event,
+                    read_at,
+                    partition,
+                    sequence,
+                })) => {
+                    let _partition_sequence_marker = (partition, sequence);
+                    reconnect_attempts = 0;
+                    last_provider_progress_at = tokio::time::Instant::now();
+                    summary.provider_progress_stalled_seconds = 0;
+                    if let Ok(stats) = reader_stats.lock() {
+                        apply_reader_stats_to_summary(&mut summary, &stats);
                     }
-                    if let Ok(mut stats) = reader_stats.lock() {
-                        stats.record_worker_batch(batch.len() as u64);
+                    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                        summary.provider_status = "stopped_by_hunter".to_owned();
+                        summary.stream_completed_normally = true;
+                        return Ok(summary);
                     }
-                    for message in batch {
-                        let MaterialHunterReaderMessage::Update(update, read_at) = message else {
-                            match message {
-                                MaterialHunterReaderMessage::StreamError(status) => {
-                                    let (class, retryable, data_loss) =
-                                        material_hunter_status_class(&status);
-                                    summary.provider_status = class.to_owned();
-                                    summary.provider_blocker_class = Some(class.to_owned());
-                                    summary.errors.push(status.to_string());
-                                    if data_loss {
-                                        summary.provider_data_loss_seen = true;
-                                        summary.provider_lagged_count =
-                                            summary.provider_lagged_count.saturating_add(1);
-                                    }
-                                    if data_loss || !retryable {
-                                        let _ = on_progress(&summary)?;
-                                        return Ok(summary);
-                                    }
-                                    reconnect_attempts = reconnect_attempts.saturating_add(1);
-                                    summary.reconnect_attempts =
-                                        summary.reconnect_attempts.saturating_add(1);
-                                    if reconnect_attempts < max_attempts {
-                                        summary.provider_blocker_class = None;
-                                        let _ = on_progress(&summary)?;
-                                        tokio::time::sleep(next_backoff_ms(
-                                            &config,
-                                            reconnect_attempts,
-                                        ))
-                                        .await;
-                                        continue 'streaming;
-                                    }
-                                    summary.provider_status =
-                                        "provider_reconnect_exhausted".to_owned();
-                                    summary.provider_blocker_class =
-                                        Some("provider_reconnect_exhausted".to_owned());
-                                    let _ = on_progress(&summary)?;
-                                    return Ok(summary);
-                                }
-                                MaterialHunterReaderMessage::StreamClosed => {
-                                    if tokio::time::Instant::now() < deadline {
-                                        summary.provider_status =
-                                            "provider_stream_closed_before_deadline".to_owned();
-                                        summary.provider_blocker_class = Some(
-                                            "provider_stream_closed_before_deadline".to_owned(),
-                                        );
-                                        summary.stream_completed_normally = false;
-                                        let _ = on_progress(&summary)?;
-                                        return Ok(summary);
-                                    }
-                                    break 'streaming;
-                                }
-                                MaterialHunterReaderMessage::Update(_, _) => continue,
-                            }
-                        };
-                        reconnect_attempts = 0;
-                        last_provider_progress_at = tokio::time::Instant::now();
-                        summary.provider_progress_stalled_seconds = 0;
-                        if let Ok(mut stats) = reader_stats.lock() {
-                            let worker_lag = tokio::time::Instant::now()
-                                .duration_since(read_at)
-                                .as_millis() as u64;
-                            stats.decode_worker_lag_ms_max =
-                                stats.decode_worker_lag_ms_max.max(worker_lag);
-                            stats.record_queue_wait(worker_lag);
-                            stats.worker_backlog_oldest_update_age_ms =
-                                stats.worker_backlog_oldest_update_age_ms.max(worker_lag);
-                            stats.queue_depth_current = reader_rx.len() as u64;
+                    last_progress_tick = tokio::time::Instant::now();
+                    if matches!(&event.payload, EventPayload::TokenCreated(payload) if payload.status != TransactionStatus::Failed)
+                    {
+                        summary.pump_create_decoded = summary.pump_create_decoded.saturating_add(1);
+                        last_pump_progress_at = tokio::time::Instant::now();
+                        summary.pump_progress_stalled_seconds = 0;
+                    }
+                    summary.normalized_events = summary.normalized_events.saturating_add(1);
+                    if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
+                        summary.provider_status = "stopped_by_hunter".to_owned();
+                        summary.stream_completed_normally = true;
+                        return Ok(summary);
+                    }
+                    if let Ok(stats) = reader_stats.lock() {
+                        if stats.client_backpressure_detected {
+                            summary.provider_status = "client_backpressure_detected".to_owned();
+                            summary.provider_blocker_class =
+                                Some("client_backpressure_detected".to_owned());
+                            summary.stream_completed_normally = false;
                             apply_reader_stats_to_summary(&mut summary, &stats);
-                        }
-                        if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
-                            summary.provider_status = "stopped_by_hunter".to_owned();
-                            summary.stream_completed_normally = true;
+                            let _ = on_progress(&summary)?;
                             return Ok(summary);
                         }
-                        last_progress_tick = tokio::time::Instant::now();
-                        let decode_started = tokio::time::Instant::now();
-                        let outputs = ingest.process_subscribe_update(update, monotonic_now_ns());
-                        let normalized = outputs
-                            .into_iter()
-                            .flat_map(|output| normalizer.normalize_output(output))
-                            .collect::<Vec<_>>();
-                        if let Ok(mut stats) = reader_stats.lock() {
-                            stats.record_decode_duration(decode_started.elapsed().as_millis() as u64);
-                            stats.worker_updates_processed =
-                                stats.worker_updates_processed.saturating_add(1);
-                        }
-                        for event in normalized {
-                            if matches!(&event.payload, EventPayload::TokenCreated(payload) if payload.status != TransactionStatus::Failed)
-                            {
-                                summary.pump_create_decoded =
-                                    summary.pump_create_decoded.saturating_add(1);
-                                last_pump_progress_at = tokio::time::Instant::now();
-                                summary.pump_progress_stalled_seconds = 0;
-                            }
-                            summary.normalized_events = summary.normalized_events.saturating_add(1);
-                            if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
-                                summary.provider_status = "stopped_by_hunter".to_owned();
-                                summary.stream_completed_normally = true;
-                                return Ok(summary);
-                            }
-                            if let Ok(stats) = reader_stats.lock() {
-                                if stats.client_backpressure_detected {
-                                    summary.provider_status =
-                                        "client_backpressure_detected".to_owned();
-                                    summary.provider_blocker_class =
-                                        Some("client_backpressure_detected".to_owned());
-                                    summary.stream_completed_normally = false;
-                                    apply_reader_stats_to_summary(&mut summary, &stats);
-                                    let _ = on_progress(&summary)?;
-                                    return Ok(summary);
-                                }
-                            }
-                        }
                     }
+                    let _ = read_at;
                 }
-                Ok(Some(MaterialHunterReaderMessage::StreamError(status))) => {
+                Ok(Some(MaterialHunterWorkerOutput::StreamError(status))) => {
                     let (class, retryable, data_loss) = material_hunter_status_class(&status);
                     summary.provider_status = class.to_owned();
                     summary.provider_blocker_class = Some(class.to_owned());
@@ -1659,23 +2139,25 @@ where
                         }
                         return Ok(summary);
                     }
-                    if retryable {
-                        reconnect_attempts = reconnect_attempts.saturating_add(1);
-                        summary.reconnect_attempts = summary.reconnect_attempts.saturating_add(1);
-                        if reconnect_attempts < max_attempts {
-                            summary.provider_blocker_class = None;
-                            let _ = on_progress(&summary)?;
-                            tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts)).await;
-                            continue 'streaming;
-                        }
-                        summary.provider_status = "provider_reconnect_exhausted".to_owned();
-                        summary.provider_blocker_class =
-                            Some("provider_reconnect_exhausted".to_owned());
+                    if !retryable {
+                        let _ = on_progress(&summary)?;
+                        return Ok(summary);
                     }
+                    reconnect_attempts = reconnect_attempts.saturating_add(1);
+                    summary.reconnect_attempts = summary.reconnect_attempts.saturating_add(1);
+                    if reconnect_attempts < max_attempts {
+                        summary.provider_blocker_class = None;
+                        let _ = on_progress(&summary)?;
+                        tokio::time::sleep(next_backoff_ms(&config, reconnect_attempts)).await;
+                        continue 'streaming;
+                    }
+                    summary.provider_status = "provider_reconnect_exhausted".to_owned();
+                    summary.provider_blocker_class =
+                        Some("provider_reconnect_exhausted".to_owned());
                     let _ = on_progress(&summary)?;
                     return Ok(summary);
                 }
-                Ok(Some(MaterialHunterReaderMessage::StreamClosed)) | Ok(None) => {
+                Ok(Some(MaterialHunterWorkerOutput::StreamClosed)) | Ok(None) => {
                     if let Ok(stats) = reader_stats.lock() {
                         apply_reader_stats_to_summary(&mut summary, &stats);
                     }
@@ -3150,11 +3632,11 @@ mod tests {
     };
     use ingest_geyser::{GeyserIngestService, TransactionTokenBalance, TransactionUpdate};
     use yellowstone_grpc_proto::prelude::{
-        CompiledInstruction, Message, SlotStatus, SubscribeUpdate, SubscribeUpdateDeshred,
-        SubscribeUpdateDeshredTransaction, SubscribeUpdateDeshredTransactionInfo,
-        SubscribeUpdatePing, SubscribeUpdateSlot, SubscribeUpdateTransaction,
-        SubscribeUpdateTransactionInfo, TokenBalance, Transaction, TransactionStatusMeta,
-        UiTokenAmount, subscribe_update_deshred,
+        CompiledInstruction, Message, SlotStatus, SubscribeUpdate, SubscribeUpdateAccount,
+        SubscribeUpdateAccountInfo, SubscribeUpdateDeshred, SubscribeUpdateDeshredTransaction,
+        SubscribeUpdateDeshredTransactionInfo, SubscribeUpdatePing, SubscribeUpdateSlot,
+        SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo, TokenBalance, Transaction,
+        TransactionStatusMeta, UiTokenAmount, subscribe_update_deshred,
     };
 
     use super::*;
@@ -3435,6 +3917,83 @@ mod tests {
                             cost_units: Some(100),
                         }),
                         index: 0,
+                    }),
+                },
+            ),
+        )
+    }
+
+    fn geyser_token_balance_update(mint: &str, first_account_byte: u8) -> SubscribeUpdate {
+        update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
+                SubscribeUpdateTransaction {
+                    slot: 11,
+                    transaction: Some(SubscribeUpdateTransactionInfo {
+                        signature: vec![first_account_byte; 64],
+                        is_vote: false,
+                        transaction: Some(Transaction {
+                            signatures: vec![vec![first_account_byte; 64]],
+                            message: Some(Message {
+                                header: None,
+                                account_keys: vec![vec![first_account_byte; 32]],
+                                recent_blockhash: vec![0; 32],
+                                instructions: Vec::new(),
+                                versioned: false,
+                                address_table_lookups: Vec::new(),
+                            }),
+                        }),
+                        meta: Some(TransactionStatusMeta {
+                            err: None,
+                            fee: 5000,
+                            pre_balances: Vec::new(),
+                            post_balances: Vec::new(),
+                            inner_instructions: Vec::new(),
+                            inner_instructions_none: false,
+                            log_messages: Vec::new(),
+                            log_messages_none: false,
+                            pre_token_balances: Vec::new(),
+                            post_token_balances: vec![TokenBalance {
+                                account_index: 0,
+                                mint: mint.to_owned(),
+                                ui_token_amount: Some(UiTokenAmount {
+                                    ui_amount: 1.0,
+                                    decimals: 6,
+                                    amount: "1".to_owned(),
+                                    ui_amount_string: "1".to_owned(),
+                                }),
+                                owner: String::new(),
+                                program_id: String::new(),
+                            }],
+                            rewards: Vec::new(),
+                            loaded_writable_addresses: Vec::new(),
+                            loaded_readonly_addresses: Vec::new(),
+                            return_data: None,
+                            return_data_none: true,
+                            compute_units_consumed: None,
+                            cost_units: None,
+                        }),
+                        index: 0,
+                    }),
+                },
+            ),
+        )
+    }
+
+    fn geyser_account_update(pubkey_byte: u8, owner_byte: u8) -> SubscribeUpdate {
+        update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Account(
+                SubscribeUpdateAccount {
+                    slot: 12,
+                    is_startup: false,
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: vec![pubkey_byte; 32],
+                        lamports: 1,
+                        owner: vec![owner_byte; 32],
+                        executable: false,
+                        rent_epoch: 0,
+                        data: Vec::new(),
+                        write_version: 1,
+                        txn_signature: None,
                     }),
                 },
             ),
@@ -4061,6 +4620,12 @@ mod tests {
         let mut loaded = loaded_config();
         loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
         loaded.config.geyser.max_inflight_messages = 1;
+        loaded.config.geyser.material_hunter_router_queue_capacity = 1;
+        loaded.config.geyser.material_hunter_worker_partitions = 1;
+        loaded
+            .config
+            .geyser
+            .material_hunter_partition_queue_capacity = 1;
         let mut updates = Vec::new();
         for _ in 0..512u64 {
             updates.push(Ok(geyser_pump_candidate_update(&loaded)));
@@ -4089,9 +4654,53 @@ mod tests {
             Some("client_backpressure_detected")
         );
         assert!(summary.client_backpressure_detected);
-        assert!(summary.internal_queue_full_count > 0);
-        assert_eq!(summary.internal_queue_capacity, 128);
+        assert!(
+            summary.internal_queue_full_count > 0
+                || summary.router_queue_full_count > 0
+                || summary.partition_queue_full_count_total > 0
+                || summary.worker_backpressure_detected
+        );
+        assert!(summary.worker_partitions >= 1);
         assert!(!summary.stream_completed_normally);
+    }
+
+    #[test]
+    fn partition_router_same_mint_same_partition() {
+        let a = geyser_token_balance_update("Mint111111111111111111111111111111111111111", 1);
+        let b = geyser_token_balance_update("Mint111111111111111111111111111111111111111", 2);
+        let c = geyser_token_balance_update("Mint222222222222222222222222222222222222222", 1);
+        let (pa, fa) = material_hunter_partition_for_update(&a, 4);
+        let (pb, fb) = material_hunter_partition_for_update(&b, 4);
+        let (pc, _) = material_hunter_partition_for_update(&c, 4);
+        assert_eq!(pa, pb);
+        assert!(!fa);
+        assert!(!fb);
+        assert!(pa < 4);
+        assert!(pc < 4);
+    }
+
+    #[test]
+    fn partition_router_same_account_same_partition() {
+        let a = geyser_account_update(7, 8);
+        let b = geyser_account_update(7, 9);
+        let (pa, fa) = material_hunter_partition_for_update(&a, 4);
+        let (pb, fb) = material_hunter_partition_for_update(&b, 4);
+        assert_eq!(pa, pb);
+        assert!(!fa);
+        assert!(!fb);
+    }
+
+    #[test]
+    fn partition_router_fallback_is_deterministic() {
+        let update = update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Ping(
+                SubscribeUpdatePing {},
+            ),
+        );
+        let first = material_hunter_partition_for_update(&update, 4);
+        let second = material_hunter_partition_for_update(&update, 4);
+        assert_eq!(first, second);
+        assert!(first.1);
     }
 
     #[tokio::test]
@@ -4139,6 +4748,76 @@ mod tests {
             summary.provider_blocker_class.as_deref(),
             Some("client_backpressure_detected")
         );
+    }
+
+    #[tokio::test]
+    async fn material_hunter_partition_telemetry_is_reported() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.material_hunter_worker_partitions = 4;
+        loaded
+            .config
+            .geyser
+            .material_hunter_partition_queue_capacity = 64;
+        loaded.config.geyser.material_hunter_router_queue_capacity = 256;
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch {
+                updates: vec![
+                    Ok(geyser_pump_candidate_update(&loaded)),
+                    Ok(geyser_pump_candidate_update(&loaded)),
+                ],
+            }])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("partitioned stream should run");
+        assert!(summary.partitioning_enabled);
+        assert_eq!(summary.worker_partitions, 4);
+        assert!(summary.router_updates_received > 0);
+        assert_eq!(
+            summary.router_updates_received,
+            summary.router_updates_routed
+        );
+        assert!(summary.partition_updates_processed_total > 0);
+        assert_eq!(summary.partition_updates_processed_by_partition.len(), 4);
+        assert_eq!(summary.partition_queue_full_count_by_partition.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn material_hunter_single_worker_mode_still_reports_partition_shape() {
+        let mut loaded = loaded_config();
+        loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
+        loaded.config.geyser.material_hunter_partitioning_enabled = false;
+        loaded.config.geyser.material_hunter_worker_partitions = 4;
+        let connector = MockGeyserConnector {
+            batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch {
+                updates: vec![Ok(geyser_pump_candidate_update(&loaded))],
+            }])),
+        };
+        let summary = run_material_hunter_stream_with_connector(
+            &loaded,
+            MaterialHunterStreamOptions {
+                duration_seconds: 1,
+                ..MaterialHunterStreamOptions::default()
+            },
+            Arc::new(connector),
+            |_event, _summary| Ok(MaterialHunterStreamAction::Continue),
+            |_summary| Ok(MaterialHunterStreamAction::Continue),
+        )
+        .await
+        .expect("single-worker fallback should run");
+        assert!(!summary.partitioning_enabled);
+        assert_eq!(summary.worker_partitions, 1);
+        assert_eq!(summary.partition_updates_processed_by_partition.len(), 1);
     }
 
     #[tokio::test]

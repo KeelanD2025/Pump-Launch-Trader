@@ -39828,6 +39828,149 @@ fn phase107f_insert_stream_telemetry(
             "backpressure_queue_depth_at_blocker",
             json!(summary.backpressure_queue_depth_at_blocker),
         ),
+        ("worker_partitions", json!(summary.worker_partitions)),
+        ("partitioning_enabled", json!(summary.partitioning_enabled)),
+        (
+            "router_updates_received",
+            json!(summary.router_updates_received),
+        ),
+        (
+            "router_updates_routed",
+            json!(summary.router_updates_routed),
+        ),
+        (
+            "router_fallback_count",
+            json!(summary.router_fallback_count),
+        ),
+        ("router_error_count", json!(summary.router_error_count)),
+        (
+            "router_queue_depth_current",
+            json!(summary.router_queue_depth_current),
+        ),
+        (
+            "router_queue_depth_max",
+            json!(summary.router_queue_depth_max),
+        ),
+        (
+            "router_queue_full_count",
+            json!(summary.router_queue_full_count),
+        ),
+        (
+            "partition_queue_depth_current_max",
+            json!(summary.partition_queue_depth_current_max),
+        ),
+        (
+            "partition_queue_depth_max_overall",
+            json!(summary.partition_queue_depth_max_overall),
+        ),
+        (
+            "partition_queue_full_count_total",
+            json!(summary.partition_queue_full_count_total),
+        ),
+        (
+            "partition_queue_full_count_by_partition",
+            json!(summary.partition_queue_full_count_by_partition),
+        ),
+        (
+            "partition_updates_processed_total",
+            json!(summary.partition_updates_processed_total),
+        ),
+        (
+            "partition_updates_processed_by_partition",
+            json!(summary.partition_updates_processed_by_partition),
+        ),
+        (
+            "partition_updates_per_second_total",
+            json!(summary.partition_updates_per_second_total),
+        ),
+        (
+            "partition_updates_per_second_by_partition",
+            json!(summary.partition_updates_per_second_by_partition),
+        ),
+        (
+            "partition_worker_lag_ms_p50",
+            json!(summary.partition_worker_lag_ms_p50),
+        ),
+        (
+            "partition_worker_lag_ms_p95",
+            json!(summary.partition_worker_lag_ms_p95),
+        ),
+        (
+            "partition_worker_lag_ms_p99",
+            json!(summary.partition_worker_lag_ms_p99),
+        ),
+        (
+            "partition_worker_lag_ms_max",
+            json!(summary.partition_worker_lag_ms_max),
+        ),
+        (
+            "partition_decode_duration_ms_p50",
+            json!(summary.partition_decode_duration_ms_p50),
+        ),
+        (
+            "partition_decode_duration_ms_p95",
+            json!(summary.partition_decode_duration_ms_p95),
+        ),
+        (
+            "partition_decode_duration_ms_p99",
+            json!(summary.partition_decode_duration_ms_p99),
+        ),
+        (
+            "partition_decode_duration_ms_max",
+            json!(summary.partition_decode_duration_ms_max),
+        ),
+        (
+            "partition_state_update_duration_ms_p50",
+            json!(summary.partition_state_update_duration_ms_p50),
+        ),
+        (
+            "partition_state_update_duration_ms_p95",
+            json!(summary.partition_state_update_duration_ms_p95),
+        ),
+        (
+            "partition_state_update_duration_ms_p99",
+            json!(summary.partition_state_update_duration_ms_p99),
+        ),
+        (
+            "partition_state_update_duration_ms_max",
+            json!(summary.partition_state_update_duration_ms_max),
+        ),
+        (
+            "partition_lock_wait_ms_max",
+            json!(summary.partition_lock_wait_ms_max),
+        ),
+        (
+            "partition_batch_size_p50",
+            json!(summary.partition_batch_size_p50),
+        ),
+        (
+            "partition_batch_size_p95",
+            json!(summary.partition_batch_size_p95),
+        ),
+        (
+            "partition_batch_size_max",
+            json!(summary.partition_batch_size_max),
+        ),
+        (
+            "worker_backpressure_detected",
+            json!(summary.worker_backpressure_detected),
+        ),
+        (
+            "dirty_partition_queued_updates_discarded",
+            json!(summary.dirty_partition_queued_updates_discarded),
+        ),
+        (
+            "partition_worker_reset_count",
+            json!(summary.partition_worker_reset_count),
+        ),
+        (
+            "artifact_queue_depth_max",
+            json!(summary.artifact_queue_depth_max),
+        ),
+        (
+            "artifact_queue_full_count",
+            json!(summary.artifact_queue_full_count),
+        ),
     ];
     for (key, field_value) in fields {
         object.insert(key.to_owned(), field_value);
@@ -43177,6 +43320,45 @@ fn phase107f_static_preflight_report(
                 blockers.push(format!("geyser_{field}_unsupported:{value}"));
             }
         }
+    }
+    if geyser.material_hunter_worker_partitions == 0
+        || geyser.material_hunter_worker_partitions > 16
+    {
+        blockers.push("material_hunter_worker_partitions_invalid".to_owned());
+    }
+    if geyser.material_hunter_router_queue_capacity == 0
+        || geyser.material_hunter_router_queue_capacity > 65_536
+    {
+        blockers.push("material_hunter_router_queue_capacity_invalid".to_owned());
+    }
+    if geyser.material_hunter_partition_queue_capacity == 0
+        || geyser.material_hunter_partition_queue_capacity > 65_536
+    {
+        blockers.push("material_hunter_partition_queue_capacity_invalid".to_owned());
+    }
+    if geyser.material_hunter_artifact_writer_queue_capacity == 0
+        || geyser.material_hunter_artifact_writer_queue_capacity > 65_536
+    {
+        blockers.push("material_hunter_artifact_writer_queue_capacity_invalid".to_owned());
+    }
+    if geyser.material_hunter_partition_batch_size == 0
+        || geyser.material_hunter_partition_batch_size
+            > geyser.material_hunter_partition_queue_capacity
+    {
+        blockers.push("material_hunter_partition_batch_size_invalid".to_owned());
+    }
+    if geyser.material_hunter_partition_soft_queue_threshold_ratio <= 0.0
+        || geyser.material_hunter_partition_hard_queue_threshold_ratio <= 0.0
+        || geyser.material_hunter_partition_soft_queue_threshold_ratio
+            >= geyser.material_hunter_partition_hard_queue_threshold_ratio
+    {
+        blockers.push("material_hunter_partition_thresholds_invalid".to_owned());
+    }
+    if geyser.material_hunter_worker_lag_warn_ms == 0
+        || geyser.material_hunter_worker_lag_blocker_ms == 0
+        || geyser.material_hunter_worker_lag_warn_ms >= geyser.material_hunter_worker_lag_blocker_ms
+    {
+        blockers.push("material_hunter_worker_lag_thresholds_invalid".to_owned());
     }
 
     let repo_root = std::env::current_dir()
@@ -54462,6 +54644,27 @@ mod tests {
             r2_worker_lag_ms_max: 19,
             stream_reader_blocked_by_processing: false,
             client_backpressure_detected: true,
+            worker_partitions: 4,
+            partitioning_enabled: true,
+            router_updates_received: 21,
+            router_updates_routed: 20,
+            router_fallback_count: 1,
+            router_queue_depth_max: 5,
+            partition_queue_depth_max_overall: 6,
+            partition_queue_full_count_total: 0,
+            partition_queue_full_count_by_partition: vec![0, 0, 0, 0],
+            partition_updates_processed_total: 20,
+            partition_updates_processed_by_partition: vec![5, 5, 5, 5],
+            partition_updates_per_second_total: 10,
+            partition_worker_lag_ms_p95: 23,
+            partition_worker_lag_ms_max: 29,
+            partition_decode_duration_ms_p95: 31,
+            partition_decode_duration_ms_max: 37,
+            worker_backpressure_detected: true,
+            dirty_partition_queued_updates_discarded: 2,
+            partition_worker_reset_count: 1,
+            artifact_queue_depth_max: 0,
+            artifact_queue_full_count: 0,
             ..MaterialHunterStreamSummary::default()
         };
         phase107f_write_health(
@@ -54495,6 +54698,26 @@ mod tests {
         assert_eq!(heartbeat["r2_worker_lag_ms_max"], 19);
         assert_eq!(heartbeat["stream_reader_blocked_by_processing"], false);
         assert_eq!(heartbeat["client_backpressure_detected"], true);
+        assert_eq!(heartbeat["worker_partitions"], 4);
+        assert_eq!(heartbeat["partitioning_enabled"], true);
+        assert_eq!(heartbeat["router_updates_received"], 21);
+        assert_eq!(heartbeat["router_updates_routed"], 20);
+        assert_eq!(heartbeat["router_fallback_count"], 1);
+        assert_eq!(heartbeat["router_queue_depth_max"], 5);
+        assert_eq!(heartbeat["partition_queue_depth_max_overall"], 6);
+        assert_eq!(heartbeat["partition_queue_full_count_total"], 0);
+        assert_eq!(heartbeat["partition_updates_processed_total"], 20);
+        assert_eq!(heartbeat["partition_updates_processed_by_partition"][0], 5);
+        assert_eq!(heartbeat["partition_updates_per_second_total"], 10);
+        assert_eq!(heartbeat["partition_worker_lag_ms_p95"], 23);
+        assert_eq!(heartbeat["partition_worker_lag_ms_max"], 29);
+        assert_eq!(heartbeat["partition_decode_duration_ms_p95"], 31);
+        assert_eq!(heartbeat["partition_decode_duration_ms_max"], 37);
+        assert_eq!(heartbeat["worker_backpressure_detected"], true);
+        assert_eq!(heartbeat["dirty_partition_queued_updates_discarded"], 2);
+        assert_eq!(heartbeat["partition_worker_reset_count"], 1);
+        assert_eq!(heartbeat["artifact_queue_depth_max"], 0);
+        assert_eq!(heartbeat["artifact_queue_full_count"], 0);
     }
 
     #[test]
@@ -55339,5 +55562,33 @@ mod tests {
         assert_eq!(report["threshold_tuning_allowed"], false);
         assert_eq!(report["live_trading_enabled"], false);
         assert_eq!(report["holder_rpc_enabled"], false);
+    }
+
+    #[test]
+    fn phase107f_material_hunter_preflight_rejects_bad_partition_values() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.geyser.material_hunter_worker_partitions = 32;
+        loaded
+            .config
+            .geyser
+            .material_hunter_partition_queue_capacity = 4;
+        loaded.config.geyser.material_hunter_partition_batch_size = 8;
+        loaded
+            .config
+            .geyser
+            .material_hunter_partition_soft_queue_threshold_ratio = 1.0;
+        loaded
+            .config
+            .geyser
+            .material_hunter_partition_hard_queue_threshold_ratio = 1.0;
+        loaded.config.geyser.material_hunter_worker_lag_warn_ms = 10_000;
+        loaded.config.geyser.material_hunter_worker_lag_blocker_ms = 5_000;
+        let report = phase107f_static_preflight_report(&loaded, None).expect("preflight report");
+        let blockers = report["blockers"].to_string();
+        assert_eq!(report["ok"], false);
+        assert!(blockers.contains("material_hunter_worker_partitions_invalid"));
+        assert!(blockers.contains("material_hunter_partition_batch_size_invalid"));
+        assert!(blockers.contains("material_hunter_partition_thresholds_invalid"));
+        assert!(blockers.contains("material_hunter_worker_lag_thresholds_invalid"));
     }
 }
