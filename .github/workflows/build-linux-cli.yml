@@ -93,21 +93,6 @@ on:
         required: false
         default: "900"
         type: string
-      provider_health_probe_max_updates:
-        description: Optional provider health probe max updates proof stop
-        required: false
-        default: ""
-        type: string
-      provider_health_probe_output_dir:
-        description: Optional provider health probe parent output directory on VPS
-        required: false
-        default: ""
-        type: string
-      provider_health_probe_upload_r2:
-        description: Upload provider health probe reports to R2
-        required: false
-        default: false
-        type: boolean
       run_material_hunter_stream_acceptance_probe:
         description: Run exact-subscription material hunter stream acceptance probe without starting hunter
         required: false
@@ -122,16 +107,6 @@ on:
         description: Probe stage to run (all, raw_drain, decode, hunter_dry_run)
         required: false
         default: "all"
-        type: string
-      stream_acceptance_probe_max_updates:
-        description: Optional stream acceptance probe max updates proof stop
-        required: false
-        default: ""
-        type: string
-      stream_acceptance_probe_output_dir:
-        description: Optional stream acceptance probe parent output directory on VPS
-        required: false
-        default: ""
         type: string
       smoke_duration_seconds:
         description: Edge-only smoke/canary duration in seconds
@@ -754,9 +729,9 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
           PROBE_DURATION_SECONDS: ${{ github.event.inputs.provider_health_probe_duration_seconds }}
-          PROBE_MAX_UPDATES: ${{ github.event.inputs.provider_health_probe_max_updates }}
-          PROBE_OUTPUT_DIR: ${{ github.event.inputs.provider_health_probe_output_dir }}
-          PROBE_UPLOAD_R2: ${{ github.event.inputs.provider_health_probe_upload_r2 }}
+          PROBE_MAX_UPDATES: ""
+          PROBE_OUTPUT_DIR: ""
+          PROBE_UPLOAD_R2: "false"
           EXPECTED_COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -889,7 +864,7 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
-          PROBE_OUTPUT_DIR: ${{ github.event.inputs.provider_health_probe_output_dir }}
+          PROBE_OUTPUT_DIR: ""
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
@@ -985,8 +960,8 @@ jobs:
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
           PROBE_DURATION_SECONDS: ${{ github.event.inputs.stream_acceptance_probe_duration_seconds }}
           PROBE_STAGE: ${{ github.event.inputs.stream_acceptance_probe_stage }}
-          PROBE_MAX_UPDATES: ${{ github.event.inputs.stream_acceptance_probe_max_updates }}
-          PROBE_OUTPUT_DIR: ${{ github.event.inputs.stream_acceptance_probe_output_dir }}
+          PROBE_MAX_UPDATES: ""
+          PROBE_OUTPUT_DIR: ""
           EXPECTED_COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -1109,7 +1084,7 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
-          PROBE_OUTPUT_DIR: ${{ github.event.inputs.stream_acceptance_probe_output_dir }}
+          PROBE_OUTPUT_DIR: ""
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
