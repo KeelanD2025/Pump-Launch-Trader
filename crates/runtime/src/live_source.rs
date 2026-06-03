@@ -43,6 +43,7 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestPing, SubscribeUpdate, SubscribeUpdateDeshred, geyser_client::GeyserClient,
     subscribe_update::UpdateOneof, subscribe_update_deshred,
 };
+use yellowstone_grpc_proto::prost::Message as _;
 
 use crate::{resolved_geyser_endpoint, resolved_geyser_metadata};
 
@@ -844,6 +845,15 @@ pub struct MaterialHunterStreamSummary {
     pub normalized_events: u64,
     pub pump_create_decoded: u64,
     pub errors: Vec<String>,
+}
+
+pub fn material_hunter_subscription_fingerprint(loaded: &LoadedConfig) -> Result<String> {
+    let ingest = GeyserIngestService::new(loaded.config.geyser.clone());
+    let request = ingest.proto_subscription_request();
+    let bytes = request.encode_to_vec();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

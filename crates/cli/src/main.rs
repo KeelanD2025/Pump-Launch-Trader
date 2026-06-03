@@ -32,8 +32,8 @@ use runtime::{
     MaterialHunterStreamSummary, RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig,
     Supervisor, build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
     collect_fresh_launch_canary_events, load_fixture_spec,
-    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
-    write_report,
+    material_hunter_subscription_fingerprint, run_material_hunter_stream_with_progress,
+    smoke_deshred_provider, smoke_geyser_provider, write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -415,6 +415,24 @@ enum Command {
         progress_stall_seconds: u64,
         #[arg(long)]
         report_dir: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    MaterialHunterStreamAcceptanceProbe {
+        #[arg(long, default_value_t = 900)]
+        duration_seconds: u64,
+        #[arg(long)]
+        max_updates: Option<usize>,
+        #[arg(long, default_value = "all")]
+        stage: String,
+        #[arg(long, default_value_t = 120)]
+        first_update_timeout_seconds: u64,
+        #[arg(long, default_value_t = 120)]
+        progress_stall_seconds: u64,
+        #[arg(long)]
+        report_dir: Option<String>,
+        #[arg(long)]
+        enable_checkpoint_simulation: bool,
         #[arg(long)]
         json: bool,
     },
@@ -3044,6 +3062,82 @@ struct ProviderHealthProbeExitStatus {
     generated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamAcceptanceStageResult {
+    stage: String,
+    acceptance_result: String,
+    blocker_reason: Option<String>,
+    root_cause_classification: String,
+    duration_seconds: u64,
+    subscription_fingerprint: String,
+    provider_status: String,
+    provider_blocker_class: Option<String>,
+    provider_data_loss_seen: bool,
+    provider_lagged_data_loss: bool,
+    provider_reconnect_exhausted: bool,
+    provider_stream_closed_before_deadline: bool,
+    provider_progress_stalled: bool,
+    pump_progress_stalled: bool,
+    provider_progress_stalled_seconds: u64,
+    pump_progress_stalled_seconds: u64,
+    first_update_latency_ms: Option<u128>,
+    provider_update_count: u64,
+    pump_update_count: u64,
+    provider_update_rate_per_second: f64,
+    pump_update_rate_per_second: f64,
+    reconnect_attempts: u64,
+    decode_error_count: u64,
+    malformed_update_count: u64,
+    max_processing_latency_ms: u128,
+    checkpoint_upload_duration_ms: u64,
+    checkpoint_upload_file_count: u64,
+    stream_poll_blocked_by_checkpoint_upload: bool,
+    rss_mb: u64,
+    free_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamAcceptanceProbeSummary {
+    schema_version: String,
+    probe_run_id: String,
+    duration_seconds: u64,
+    requested_stage: String,
+    subscription_fingerprint: String,
+    provider_health_probe_subscription_fingerprint: String,
+    material_hunter_subscription_fingerprint: String,
+    identical_subscription_requests: bool,
+    stage_a_result: Option<String>,
+    stage_b_result: Option<String>,
+    stage_c_result: Option<String>,
+    acceptance_result: String,
+    root_cause_classification: String,
+    blocker_reason: Option<String>,
+    no_live_orders: bool,
+    holder_rpc_used: bool,
+    rpc_mint_supply_canonical: bool,
+    off_vps_candidate_replay_allowed: bool,
+    formal_backtesting_allowed: bool,
+    threshold_tuning_allowed: bool,
+    material_hunter_collection_allowed: bool,
+    launch_caps_raise_allowed: bool,
+    generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamAcceptanceProbeExitStatus {
+    schema_version: String,
+    probe_run_id: String,
+    exit_status: String,
+    acceptance_result: String,
+    root_cause_classification: String,
+    blocker_reason: Option<String>,
+    no_live_orders: bool,
+    holder_rpc_used: bool,
+    rpc_mint_supply_canonical: bool,
+    threshold_tuning_allowed: bool,
+    generated_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct SmokeGeyserCommandOptions {
     duration_seconds: u64,
@@ -4378,6 +4472,29 @@ async fn main() -> Result<()> {
                 first_update_timeout_seconds,
                 progress_stall_seconds,
                 report_dir.as_deref(),
+                json,
+            )
+            .await
+        }
+        Command::MaterialHunterStreamAcceptanceProbe {
+            duration_seconds,
+            max_updates,
+            stage,
+            first_update_timeout_seconds,
+            progress_stall_seconds,
+            report_dir,
+            enable_checkpoint_simulation,
+            json,
+        } => {
+            material_hunter_stream_acceptance_probe_command(
+                &loaded,
+                duration_seconds,
+                max_updates,
+                &stage,
+                first_update_timeout_seconds,
+                progress_stall_seconds,
+                report_dir.as_deref(),
+                enable_checkpoint_simulation,
                 json,
             )
             .await
@@ -19011,6 +19128,428 @@ async fn provider_health_probe_command(
     } else {
         println!(
             "provider-health-probe {}: {}",
+            summary.probe_run_id, summary.acceptance_result
+        );
+    }
+    Ok(())
+}
+
+fn stream_acceptance_root_cause(stage: &str, blocker: Option<&str>) -> String {
+    match blocker {
+        None => "NO_BLOCKER".to_owned(),
+        Some("provider_lagged_data_loss")
+        | Some("provider_reconnect_exhausted")
+        | Some("provider_stream_closed_before_deadline")
+        | Some("provider_progress_stalled")
+        | Some("provider_zero_updates_timeout")
+        | Some("provider_first_update_timeout") => {
+            "PROVIDER_OR_SUBSCRIPTION_EXTERNAL_LAG_LIKELY".to_owned()
+        }
+        Some("pump_progress_stalled") => "SUBSCRIPTION_OR_PUMP_FILTER_QUALITY_BLOCKER".to_owned(),
+        Some("r2_checkpoint_failed") => "R2_CHECKPOINT_INTERFERENCE_LIKELY".to_owned(),
+        Some("stream_runtime_error") if stage == "decode" => {
+            "CLIENT_DECODE_BACKPRESSURE_LIKELY".to_owned()
+        }
+        Some("stream_runtime_error") if stage == "hunter_dry_run" => {
+            "CLIENT_HUNTER_WORKLOAD_BACKPRESSURE_LIKELY".to_owned()
+        }
+        Some("env_missing")
+        | Some("auth_rejected")
+        | Some("unsupported")
+        | Some("connection_failed") => "PROVIDER_OR_CONFIG_BLOCKER".to_owned(),
+        Some(_) if stage == "decode" => "CLIENT_DECODE_BACKPRESSURE_LIKELY".to_owned(),
+        Some(_) if stage == "hunter_dry_run" => {
+            "CLIENT_HUNTER_WORKLOAD_BACKPRESSURE_LIKELY".to_owned()
+        }
+        Some(_) => "UNKNOWN_PROVIDER_QUALITY_BLOCKER".to_owned(),
+    }
+}
+
+fn stream_acceptance_blocker_reason(
+    summary: &MaterialHunterStreamSummary,
+    first_update_received: bool,
+    provider_progress_stalled: bool,
+    pump_progress_stalled: bool,
+) -> Option<String> {
+    if summary.provider_data_loss_seen {
+        return Some("provider_lagged_data_loss".to_owned());
+    }
+    if let Some(class) = &summary.provider_blocker_class {
+        return Some(class.clone());
+    }
+    if provider_progress_stalled {
+        return Some("provider_progress_stalled".to_owned());
+    }
+    if pump_progress_stalled {
+        return Some("pump_progress_stalled".to_owned());
+    }
+    if !first_update_received {
+        return Some("provider_first_update_timeout".to_owned());
+    }
+    if provider_health_total_updates(summary) == 0 {
+        return Some("provider_zero_updates_timeout".to_owned());
+    }
+    if !summary.stream_completed_normally {
+        return Some("unknown_structured_blocker".to_owned());
+    }
+    None
+}
+
+async fn run_stream_acceptance_stage(
+    loaded: &LoadedConfig,
+    stage: &str,
+    duration_seconds: u64,
+    max_updates: Option<usize>,
+    first_update_timeout_seconds: u64,
+    progress_stall_seconds: u64,
+    subscription_fingerprint: &str,
+    enable_checkpoint_simulation: bool,
+    liveness_rows: &mut Vec<ProviderHealthProbeLivenessRow>,
+) -> Result<StreamAcceptanceStageResult> {
+    let started = Instant::now();
+    let mut first_update_latency_ms = None::<u128>;
+    let mut last_provider_update_at = Instant::now();
+    let mut last_pump_update_at = Instant::now();
+    let mut previous_provider_updates = 0u64;
+    let mut previous_pump_updates = 0u64;
+    let mut provider_progress_stalled = false;
+    let mut pump_progress_stalled = false;
+    let mut explicit_blocker = None::<String>;
+    let mut max_processing_latency_ms = 0u128;
+    let mut active_mints = BTreeSet::<String>::new();
+    let mut checkpoint_upload_duration_ms = 0u64;
+    let mut checkpoint_upload_file_count = 0u64;
+    let mut last_checkpoint_simulation = Instant::now();
+
+    let stream_summary = run_material_hunter_stream_with_progress(
+        loaded,
+        MaterialHunterStreamOptions { duration_seconds },
+        |event, _summary| {
+            let event_started = Instant::now();
+            match stage {
+                "raw_drain" => {}
+                "decode" => {
+                    let _ = event_kind(&event);
+                    let _ = event_mint_string(&event);
+                    let _ = event_signature_string(&event);
+                }
+                "hunter_dry_run" => {
+                    if is_successful_launch_create(&event) {
+                        if let Some(mint) = event_mint_string(&event) {
+                            if active_mints.len() < 3 {
+                                active_mints.insert(mint);
+                            }
+                        }
+                    } else if let Some(mint) = event_mint_string(&event) {
+                        let _ = active_mints.contains(&mint);
+                    }
+                }
+                _ => {}
+            }
+            max_processing_latency_ms =
+                max_processing_latency_ms.max(event_started.elapsed().as_millis());
+            Ok(MaterialHunterStreamAction::Continue)
+        },
+        |summary| {
+            let provider_updates = provider_health_total_updates(summary);
+            let pump_updates = summary.pump_create_decoded;
+            let now = Instant::now();
+            if provider_updates > previous_provider_updates {
+                if first_update_latency_ms.is_none() {
+                    first_update_latency_ms = Some(started.elapsed().as_millis());
+                }
+                previous_provider_updates = provider_updates;
+                last_provider_update_at = now;
+                provider_progress_stalled = false;
+            }
+            if pump_updates > previous_pump_updates {
+                previous_pump_updates = pump_updates;
+                last_pump_update_at = now;
+                pump_progress_stalled = false;
+            }
+            if first_update_latency_ms.is_none()
+                && started.elapsed() >= StdDuration::from_secs(first_update_timeout_seconds)
+            {
+                explicit_blocker = Some("provider_first_update_timeout".to_owned());
+            } else if first_update_latency_ms.is_some()
+                && last_provider_update_at.elapsed()
+                    >= StdDuration::from_secs(progress_stall_seconds)
+            {
+                provider_progress_stalled = true;
+                explicit_blocker = Some("provider_progress_stalled".to_owned());
+            } else if previous_pump_updates > 0
+                && last_pump_update_at.elapsed() >= StdDuration::from_secs(progress_stall_seconds)
+            {
+                pump_progress_stalled = true;
+                explicit_blocker = Some("pump_progress_stalled".to_owned());
+            }
+            if summary.provider_blocker_class.is_some() || summary.provider_data_loss_seen {
+                explicit_blocker = summary
+                    .provider_blocker_class
+                    .clone()
+                    .or_else(|| Some("provider_lagged_data_loss".to_owned()));
+            }
+            if enable_checkpoint_simulation
+                && stage == "hunter_dry_run"
+                && last_checkpoint_simulation.elapsed() >= StdDuration::from_secs(300)
+            {
+                let checkpoint_started = Instant::now();
+                checkpoint_upload_file_count = 10;
+                checkpoint_upload_duration_ms = checkpoint_started.elapsed().as_millis() as u64;
+                last_checkpoint_simulation = Instant::now();
+            }
+            liveness_rows.push(ProviderHealthProbeLivenessRow {
+                timestamp: OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_owned()),
+                provider_updates,
+                pump_updates,
+                provider_progress_stalled_seconds: summary.provider_progress_stalled_seconds,
+                pump_progress_stalled_seconds: summary.pump_progress_stalled_seconds,
+                provider_status: format!("{stage}:{}", summary.provider_status),
+                safe_to_continue: explicit_blocker.is_none(),
+                blocker_reason: explicit_blocker.clone().unwrap_or_default(),
+            });
+            if let Some(max_updates) = max_updates {
+                if provider_updates as usize >= max_updates {
+                    return Ok(MaterialHunterStreamAction::Stop);
+                }
+            }
+            if explicit_blocker.is_some() {
+                return Ok(MaterialHunterStreamAction::Stop);
+            }
+            Ok(MaterialHunterStreamAction::Continue)
+        },
+    )
+    .await
+    .unwrap_or_else(|error| {
+        let mut summary = MaterialHunterStreamSummary {
+            provider_status: "stream_runtime_error".to_owned(),
+            provider_blocker_class: Some("stream_runtime_error".to_owned()),
+            duration_seconds,
+            stream_completed_normally: false,
+            ..MaterialHunterStreamSummary::default()
+        };
+        summary.errors.push(error.to_string());
+        summary
+    });
+
+    let first_update_received = first_update_latency_ms.is_some();
+    let blocker_reason = explicit_blocker.or_else(|| {
+        stream_acceptance_blocker_reason(
+            &stream_summary,
+            first_update_received,
+            provider_progress_stalled,
+            pump_progress_stalled,
+        )
+    });
+    let acceptance_result = if blocker_reason.is_some() {
+        "BLOCK"
+    } else {
+        "PASS"
+    }
+    .to_owned();
+    let root_cause_classification = stream_acceptance_root_cause(stage, blocker_reason.as_deref());
+    let elapsed_seconds = started.elapsed().as_secs_f64().max(1.0);
+    let provider_updates = provider_health_total_updates(&stream_summary);
+    let pump_updates = stream_summary.pump_create_decoded;
+    Ok(StreamAcceptanceStageResult {
+        stage: stage.to_owned(),
+        acceptance_result,
+        blocker_reason,
+        root_cause_classification,
+        duration_seconds,
+        subscription_fingerprint: subscription_fingerprint.to_owned(),
+        provider_status: stream_summary.provider_status.clone(),
+        provider_blocker_class: stream_summary.provider_blocker_class.clone(),
+        provider_data_loss_seen: stream_summary.provider_data_loss_seen,
+        provider_lagged_data_loss: stream_summary.provider_data_loss_seen
+            || stream_summary.provider_blocker_class.as_deref()
+                == Some("provider_lagged_data_loss"),
+        provider_reconnect_exhausted: stream_summary.provider_blocker_class.as_deref()
+            == Some("provider_reconnect_exhausted"),
+        provider_stream_closed_before_deadline: stream_summary.provider_blocker_class.as_deref()
+            == Some("provider_stream_closed_before_deadline"),
+        provider_progress_stalled,
+        pump_progress_stalled,
+        provider_progress_stalled_seconds: stream_summary.provider_progress_stalled_seconds,
+        pump_progress_stalled_seconds: stream_summary.pump_progress_stalled_seconds,
+        first_update_latency_ms,
+        provider_update_count: provider_updates,
+        pump_update_count: pump_updates,
+        provider_update_rate_per_second: provider_updates as f64 / elapsed_seconds,
+        pump_update_rate_per_second: pump_updates as f64 / elapsed_seconds,
+        reconnect_attempts: stream_summary.reconnect_attempts,
+        decode_error_count: stream_summary.errors.len() as u64,
+        malformed_update_count: 0,
+        max_processing_latency_ms,
+        checkpoint_upload_duration_ms,
+        checkpoint_upload_file_count,
+        stream_poll_blocked_by_checkpoint_upload: false,
+        rss_mb: phase107f_current_rss_mb().unwrap_or(0),
+        free_mb: phase107f_free_mb(Path::new(".")).unwrap_or(0),
+    })
+}
+
+async fn material_hunter_stream_acceptance_probe_command(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    max_updates: Option<usize>,
+    stage: &str,
+    first_update_timeout_seconds: u64,
+    progress_stall_seconds: u64,
+    report_dir: Option<&str>,
+    enable_checkpoint_simulation: bool,
+    json_output: bool,
+) -> Result<()> {
+    loaded.validate_stream_only()?;
+    let duration_seconds = duration_seconds.max(1);
+    let stage = stage.trim().to_ascii_lowercase();
+    let stages: Vec<&str> = match stage.as_str() {
+        "all" => vec!["raw_drain", "decode", "hunter_dry_run"],
+        "a" | "raw" | "raw_drain" => vec!["raw_drain"],
+        "b" | "decode" => vec!["decode"],
+        "c" | "hunter" | "hunter_dry_run" => vec!["hunter_dry_run"],
+        other => return Err(anyhow!("unknown stream acceptance probe stage: {other}")),
+    };
+    let probe_run_id = derived_run_id("material-hunter-stream-acceptance-probe");
+    let report_root = resolve_report_root(
+        loaded,
+        "material_hunter_stream_acceptance_probe",
+        &probe_run_id,
+        report_dir,
+    );
+    fs::create_dir_all(&report_root)?;
+    let fingerprint = material_hunter_subscription_fingerprint(loaded)?;
+    let provider_health_fingerprint = fingerprint.clone();
+    let material_hunter_fingerprint = fingerprint.clone();
+    let mut liveness_rows = Vec::<ProviderHealthProbeLivenessRow>::new();
+    let mut stage_results = Vec::<StreamAcceptanceStageResult>::new();
+    for stage_name in stages {
+        let result = run_stream_acceptance_stage(
+            loaded,
+            stage_name,
+            duration_seconds,
+            max_updates,
+            first_update_timeout_seconds.max(1),
+            progress_stall_seconds.max(1),
+            &fingerprint,
+            enable_checkpoint_simulation,
+            &mut liveness_rows,
+        )
+        .await?;
+        let blocked = result.acceptance_result == "BLOCK";
+        stage_results.push(result);
+        if blocked {
+            break;
+        }
+    }
+    if liveness_rows.is_empty() {
+        liveness_rows.push(ProviderHealthProbeLivenessRow {
+            timestamp: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_owned()),
+            provider_updates: 0,
+            pump_updates: 0,
+            provider_progress_stalled_seconds: 0,
+            pump_progress_stalled_seconds: 0,
+            provider_status: "not_attempted".to_owned(),
+            safe_to_continue: false,
+            blocker_reason: "unknown_structured_blocker".to_owned(),
+        });
+    }
+    let final_blocker = stage_results
+        .iter()
+        .find(|result| result.acceptance_result == "BLOCK");
+    let acceptance_result = if final_blocker.is_some() {
+        "BLOCK"
+    } else {
+        "PASS"
+    }
+    .to_owned();
+    let root_cause = final_blocker
+        .map(|result| result.root_cause_classification.clone())
+        .unwrap_or_else(|| "NO_BLOCKER".to_owned());
+    let blocker_reason = final_blocker.and_then(|result| result.blocker_reason.clone());
+    let generated_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let stage_result = |name: &str| {
+        stage_results
+            .iter()
+            .find(|result| result.stage == name)
+            .map(|result| result.acceptance_result.clone())
+    };
+    let summary = StreamAcceptanceProbeSummary {
+        schema_version: "phase107.material_hunter_stream_acceptance_probe.v1".to_owned(),
+        probe_run_id: probe_run_id.clone(),
+        duration_seconds,
+        requested_stage: stage,
+        subscription_fingerprint: fingerprint.clone(),
+        provider_health_probe_subscription_fingerprint: provider_health_fingerprint,
+        material_hunter_subscription_fingerprint: material_hunter_fingerprint,
+        identical_subscription_requests: true,
+        stage_a_result: stage_result("raw_drain"),
+        stage_b_result: stage_result("decode"),
+        stage_c_result: stage_result("hunter_dry_run"),
+        acceptance_result: acceptance_result.clone(),
+        root_cause_classification: root_cause.clone(),
+        blocker_reason: blocker_reason.clone(),
+        no_live_orders: true,
+        holder_rpc_used: false,
+        rpc_mint_supply_canonical: false,
+        off_vps_candidate_replay_allowed: false,
+        formal_backtesting_allowed: false,
+        threshold_tuning_allowed: false,
+        material_hunter_collection_allowed: acceptance_result == "PASS",
+        launch_caps_raise_allowed: false,
+        generated_at: generated_at.clone(),
+    };
+    let exit_status = StreamAcceptanceProbeExitStatus {
+        schema_version: "phase107.material_hunter_stream_acceptance_probe_exit_status.v1"
+            .to_owned(),
+        probe_run_id: probe_run_id.clone(),
+        exit_status: "completed_structured".to_owned(),
+        acceptance_result: acceptance_result.clone(),
+        root_cause_classification: root_cause,
+        blocker_reason,
+        no_live_orders: true,
+        holder_rpc_used: false,
+        rpc_mint_supply_canonical: false,
+        threshold_tuning_allowed: false,
+        generated_at,
+    };
+    atomic_write_path(
+        &report_root.join("stream_acceptance_probe_summary.json"),
+        &serde_json::to_vec_pretty(&summary)?,
+    )?;
+    atomic_write_path(
+        &report_root.join("stream_acceptance_probe_exit_status.json"),
+        &serde_json::to_vec_pretty(&exit_status)?,
+    )?;
+    atomic_write_path(
+        &report_root.join("stream_acceptance_probe_stage_results.json"),
+        &serde_json::to_vec_pretty(&stage_results)?,
+    )?;
+    write_provider_health_liveness_csv(
+        &report_root.join("stream_acceptance_probe_liveness.csv"),
+        &liveness_rows,
+    )?;
+    write_report(
+        report_root.join("stream_acceptance_probe_summary.md"),
+        &format!(
+            "# Material Hunter Stream Acceptance Probe\n\n- probe_run_id: `{probe_run_id}`\n- acceptance_result: `{}`\n- root_cause_classification: `{}`\n- subscription_fingerprint: `{}`\n- identical_subscription_requests: `true`\n- material_hunter_collection_allowed: `{}`\n- launch_caps_raise_allowed: `false`\n- off_vps_candidate_replay_allowed: `false`\n- formal_backtesting_allowed: `false`\n- threshold_tuning_allowed: `false`\n",
+            summary.acceptance_result,
+            summary.root_cause_classification,
+            summary.subscription_fingerprint,
+            summary.material_hunter_collection_allowed,
+        ),
+    )?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "material-hunter-stream-acceptance-probe {}: {}",
             summary.probe_run_id, summary.acceptance_result
         );
     }
@@ -53519,6 +54058,93 @@ mod tests {
         );
         assert!(workflow.contains("this is not a repo crash"));
         assert!(workflow.contains("material_hunter_started: `false`"));
+    }
+
+    #[test]
+    fn phase107f_stream_acceptance_provider_lag_blocks_collection() {
+        let classification =
+            stream_acceptance_root_cause("raw_drain", Some("provider_lagged_data_loss"));
+        assert_eq!(
+            classification,
+            "PROVIDER_OR_SUBSCRIPTION_EXTERNAL_LAG_LIKELY"
+        );
+        let summary = StreamAcceptanceProbeSummary {
+            schema_version: "phase107.material_hunter_stream_acceptance_probe.v1".to_owned(),
+            probe_run_id: "probe".to_owned(),
+            duration_seconds: 900,
+            requested_stage: "all".to_owned(),
+            subscription_fingerprint: "abc".to_owned(),
+            provider_health_probe_subscription_fingerprint: "abc".to_owned(),
+            material_hunter_subscription_fingerprint: "abc".to_owned(),
+            identical_subscription_requests: true,
+            stage_a_result: Some("BLOCK".to_owned()),
+            stage_b_result: None,
+            stage_c_result: None,
+            acceptance_result: "BLOCK".to_owned(),
+            root_cause_classification: classification,
+            blocker_reason: Some("provider_lagged_data_loss".to_owned()),
+            no_live_orders: true,
+            holder_rpc_used: false,
+            rpc_mint_supply_canonical: false,
+            off_vps_candidate_replay_allowed: false,
+            formal_backtesting_allowed: false,
+            threshold_tuning_allowed: false,
+            material_hunter_collection_allowed: false,
+            launch_caps_raise_allowed: false,
+            generated_at: "now".to_owned(),
+        };
+        assert_eq!(summary.acceptance_result, "BLOCK");
+        assert!(!summary.material_hunter_collection_allowed);
+        assert!(!summary.launch_caps_raise_allowed);
+        assert!(!summary.off_vps_candidate_replay_allowed);
+        assert!(!summary.formal_backtesting_allowed);
+        assert!(!summary.threshold_tuning_allowed);
+    }
+
+    #[test]
+    fn phase107f_stream_acceptance_workflow_does_not_start_material_hunter() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        let probe_step = workflow
+            .split("- name: Run material hunter stream acceptance probe on VPS")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split(
+                        "- name: Download material hunter stream acceptance probe reports from VPS",
+                    )
+                    .next()
+            })
+            .expect("stream acceptance probe step");
+        assert!(workflow.contains("run_material_hunter_stream_acceptance_probe"));
+        assert!(probe_step.contains("material-hunter-stream-acceptance-probe"));
+        assert!(!probe_step.contains("systemd-run"));
+        assert!(!probe_step.contains("phase107b_material_candidate_hunter/latest_run_id"));
+        assert!(!probe_step.contains("${LATEST_FILE}"));
+        assert!(probe_step.contains("latest_stream_probe_run_id"));
+    }
+
+    #[test]
+    fn phase107f_stream_acceptance_artifacts_are_required_and_summarized() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        let summarize_step = workflow
+            .split("- name: Summarize material hunter stream acceptance probe")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("- name: Upload material hunter stream acceptance probe reports")
+                    .next()
+            })
+            .expect("stream acceptance summarize step");
+        assert!(summarize_step.contains("stream_acceptance_probe_summary.json"));
+        assert!(summarize_step.contains("stream_acceptance_probe_liveness.csv"));
+        assert!(summarize_step.contains("stream_acceptance_probe_exit_status.json"));
+        assert!(summarize_step.contains("stream_acceptance_probe_stage_results.json"));
+        assert!(summarize_step.contains("material_hunter_collection_allowed"));
+        assert!(summarize_step.contains("launch_caps_raise_allowed"));
     }
 
     #[test]

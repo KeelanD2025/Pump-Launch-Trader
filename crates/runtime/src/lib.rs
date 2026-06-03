@@ -56,8 +56,8 @@ pub use live_source::{
     FreshLaunchCanaryLiveOptions, FreshLaunchCanaryLiveSummary, GeyserProviderSmokeOptions,
     GeyserProviderSmokeSummary, MaterialHunterStreamAction, MaterialHunterStreamOptions,
     MaterialHunterStreamSummary, collect_fresh_launch_canary_events, inspect_deshred_capability,
-    run_material_hunter_stream, run_material_hunter_stream_with_progress, smoke_deshred_provider,
-    smoke_geyser_provider,
+    material_hunter_subscription_fingerprint, run_material_hunter_stream,
+    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
 };
 use live_source::{
     DeshredStreamConnector, GeyserEventNormalizer, GeyserStreamConnector, RealDeshredConnector,

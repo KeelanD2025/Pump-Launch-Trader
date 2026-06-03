@@ -55,7 +55,7 @@ Provider and control-plane failures must be represented as structured non-counta
 
 Any such blocker must produce non-countable, audit-only artifacts with replay, formal backtesting, and threshold tuning disabled.
 
-`provider_lagged_data_loss` during a collection slice is a safe structural outcome when final artifacts exist, countability is false, replay is false, and R2/artifact consistency pass. It is still an operational provider-quality blocker. Longer collection must not resume after repeated `provider_lagged_data_loss` until provider acceptance passes or the Geyser endpoint/configuration is remediated. Launch caps must not be raised while provider acceptance is failing.
+`provider_lagged_data_loss` during a collection slice is a safe structural outcome when final artifacts exist, countability is false, replay is false, and R2/artifact consistency pass. It is still an operational provider-quality blocker. Longer collection must not resume after repeated `provider_lagged_data_loss` until provider acceptance and exact material-hunter stream acceptance pass or the Geyser endpoint/configuration is remediated. Launch caps must not be raised while either acceptance gate is failing.
 
 ## Countability Rules
 
@@ -128,6 +128,42 @@ Provider acceptance is `PASS` only when provider updates arrive, the stream reac
 A structured provider `BLOCK` in this probe is not a repo crash. It means material-hunter collection remains blocked until provider/config remediation is complete and provider acceptance later passes. Launch caps remain blocked while provider acceptance fails.
 
 If provider acceptance blocks, do not run material-hunter collection. Recommended remediation is a higher-throughput or dedicated Geyser endpoint, an alternate provider, narrower subscription if it still preserves stream-authoritative holder metrics and fresh Pump.fun launch detection, or provider-side support investigation.
+
+## Exact Stream Acceptance Gate
+
+`provider-health-probe` is a base provider gate. If a real material-hunter slice later hits `provider_lagged_data_loss`, the base gate is not representative enough by itself. Collection remains blocked until the exact material-hunter stream acceptance gate passes.
+
+Run:
+
+```bash
+target/release/cli material-hunter-stream-acceptance-probe \
+  --config config/default.toml \
+  --config-override config/local.example.toml \
+  --duration-seconds 900 \
+  --stage all \
+  --json
+```
+
+In the VPS/GitHub control plane, use `run_material_hunter_stream_acceptance_probe=true`. This probe must not start or stop the material-hunter service and must not modify `phase107b_material_candidate_hunter/latest_run_id`.
+
+The exact stream acceptance probe writes operational artifacts only:
+
+- `stream_acceptance_probe_summary.json`
+- `stream_acceptance_probe_liveness.csv`
+- `stream_acceptance_probe_exit_status.json`
+- `stream_acceptance_probe_stage_results.json`
+
+It does not write candidate or rejected token research artifacts and it never enables replay, formal backtesting, threshold tuning, or trading.
+
+The staged gate is:
+
+- Stage A, `raw_drain`: exact material-hunter subscription with minimal event handling.
+- Stage B, `decode`: exact material-hunter subscription with decode/update handling.
+- Stage C, `hunter_dry_run`: exact material-hunter stream path with minimal in-memory active-mint handling, but no research token artifacts.
+
+Acceptance is `PASS` only when all requested stages complete without provider lag/data loss, reconnect exhaustion, early close, provider progress stall, Pump progress stall, or artifact contradiction. A Stage A failure is classified as `PROVIDER_OR_SUBSCRIPTION_EXTERNAL_LAG_LIKELY`. A Stage B failure is classified as `CLIENT_DECODE_BACKPRESSURE_LIKELY`. A Stage C failure is classified as `CLIENT_HUNTER_WORKLOAD_BACKPRESSURE_LIKELY` or `R2_CHECKPOINT_INTERFERENCE_LIKELY` depending on the blocker.
+
+Real collection remains blocked while exact stream acceptance fails. Launch caps must not be raised until exact-subscription acceptance passes.
 
 By default, the gate skips workspace clippy because existing broad workspace warnings are not yet release-gate clean. To enforce clippy too:
 
