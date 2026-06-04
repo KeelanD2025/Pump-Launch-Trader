@@ -29,9 +29,9 @@ use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
     LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
-    MaterialHunterStreamSummary, RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig,
-    Supervisor, build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
-    collect_fresh_launch_canary_events, load_fixture_spec,
+    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RuntimeMode, RuntimeReplayProfile,
+    RuntimeResolvedConfig, Supervisor, build_fixture_scenario, builtin_fixture_suite,
+    builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events, load_fixture_spec,
     material_hunter_subscription_fingerprint, run_material_hunter_stream_with_progress,
     smoke_deshred_provider, smoke_geyser_provider, write_report,
 };
@@ -39984,6 +39984,91 @@ fn phase107f_insert_stream_telemetry(
             json!(summary.top_update_classes_by_count),
         ),
         (
+            "pump_trade_fast_prefilter_count",
+            json!(summary.pump_trade_fast_prefilter_count),
+        ),
+        (
+            "pump_trade_deep_processed_count",
+            json!(summary.pump_trade_deep_processed_count),
+        ),
+        (
+            "pump_trade_skipped_untracked_count",
+            json!(summary.pump_trade_skipped_untracked_count),
+        ),
+        (
+            "pump_trade_skipped_tombstoned_count",
+            json!(summary.pump_trade_skipped_tombstoned_count),
+        ),
+        (
+            "pump_trade_unknown_mint_count",
+            json!(summary.pump_trade_unknown_mint_count),
+        ),
+        (
+            "pump_trade_deferred_feature_count",
+            json!(summary.pump_trade_deferred_feature_count),
+        ),
+        (
+            "pump_trade_feature_recompute_count",
+            json!(summary.pump_trade_feature_recompute_count),
+        ),
+        (
+            "pump_trade_deep_process_duration_ms_p95",
+            json!(summary.pump_trade_deep_process_duration_ms_p95),
+        ),
+        (
+            "pump_trade_deep_process_duration_ms_max",
+            json!(summary.pump_trade_deep_process_duration_ms_max),
+        ),
+        (
+            "pump_trade_prefilter_duration_ms_p95",
+            json!(summary.pump_trade_prefilter_duration_ms_p95),
+        ),
+        (
+            "pump_trade_prefilter_duration_ms_max",
+            json!(summary.pump_trade_prefilter_duration_ms_max),
+        ),
+        (
+            "pump_trade_state_update_duration_ms_p95",
+            json!(summary.pump_trade_state_update_duration_ms_p95),
+        ),
+        (
+            "pump_trade_state_update_duration_ms_max",
+            json!(summary.pump_trade_state_update_duration_ms_max),
+        ),
+        (
+            "pump_trade_risk_feature_duration_ms_p95",
+            json!(summary.pump_trade_risk_feature_duration_ms_p95),
+        ),
+        (
+            "pump_trade_risk_feature_duration_ms_max",
+            json!(summary.pump_trade_risk_feature_duration_ms_max),
+        ),
+        (
+            "unknown_mint_route_count_by_class",
+            json!(summary.unknown_mint_route_count_by_class),
+        ),
+        (
+            "account_pinned_update_count",
+            json!(summary.account_pinned_update_count),
+        ),
+        ("backpressure_hot_key", json!(summary.backpressure_hot_key)),
+        (
+            "backpressure_hot_mint",
+            json!(summary.backpressure_hot_mint),
+        ),
+        (
+            "backpressure_hot_account",
+            json!(summary.backpressure_hot_account),
+        ),
+        (
+            "backpressure_deep_processed_count_at_trigger",
+            json!(summary.backpressure_deep_processed_count_at_trigger),
+        ),
+        (
+            "backpressure_skipped_count_at_trigger",
+            json!(summary.backpressure_skipped_count_at_trigger),
+        ),
+        (
             "partition_decode_duration_ms_p50",
             json!(summary.partition_decode_duration_ms_p50),
         ),
@@ -40589,6 +40674,7 @@ async fn material_candidate_hunter_command(
                 "",
             )?;
 
+            let mut stream_state_hint = MaterialHunterStreamStateHint::default();
             if is_successful_launch_create(&event)
                 && attempt_rows.len() < max_attempted_launches.max(1)
                 && !event_mint_string(&event)
@@ -40599,6 +40685,7 @@ async fn material_candidate_hunter_command(
                     let mint = event_mint_string(&event)
                         .ok_or_else(|| anyhow!("create event missing mint"))?;
                     let attempt_index = attempt_rows.len() + 1;
+                    stream_state_hint.active_mints.push(mint.clone());
                     active_mints.insert(
                         mint.clone(),
                         Phase107fActiveMint::new(
@@ -40689,6 +40776,7 @@ async fn material_candidate_hunter_command(
                     provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
                 }
                 if decision.final_state.starts_with("early_rejected") {
+                    stream_state_hint.tombstoned_mints.push(mint.clone());
                     if decision.final_state == "early_rejected_dead" {
                         rejected_dead = rejected_dead.saturating_add(1);
                     } else {
@@ -40800,6 +40888,7 @@ async fn material_candidate_hunter_command(
                 }
                 if should_finalize {
                     active.finalized = true;
+                    stream_state_hint.inactive_mints.push(mint.clone());
                     finalized_now.push(mint.clone());
                 }
             }
@@ -40849,6 +40938,11 @@ async fn material_candidate_hunter_command(
                 || (attempt_rows.len() >= max_attempted_launches.max(1) && active_mints.is_empty())
             {
                 return Ok(MaterialHunterStreamAction::Stop);
+            }
+            if !stream_state_hint.is_empty() {
+                return Ok(MaterialHunterStreamAction::ContinueWithStateHint(
+                    stream_state_hint,
+                ));
             }
             Ok(MaterialHunterStreamAction::Continue)
         },

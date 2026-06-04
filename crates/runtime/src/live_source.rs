@@ -20,7 +20,7 @@ use common::{
     pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
 };
 use futures::Stream;
-use idl::{AccountDecode, DecodedAccount, InstructionDecode, LoadedIdl};
+use idl::{AccountDecode, DecodedAccount, InstructionDecode, LoadedIdl, anchor_discriminator};
 use ingest_geyser::{
     AccountUpdate, GeyserIngestService, IngestOutput, TransactionInstruction,
     TransactionTokenBalance, TransactionUpdate, YellowstoneEndpoint,
@@ -50,6 +50,7 @@ use crate::{resolved_geyser_endpoint, resolved_geyser_metadata};
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 pub type SubscribeUpdateStream =
     Pin<Box<dyn Stream<Item = std::result::Result<SubscribeUpdate, Status>> + Send>>;
@@ -1064,6 +1065,50 @@ pub struct MaterialHunterStreamSummary {
     #[serde(default)]
     pub top_update_classes_by_count: Vec<MaterialHunterTopKeySummary>,
     #[serde(default)]
+    pub pump_trade_fast_prefilter_count: u64,
+    #[serde(default)]
+    pub pump_trade_deep_processed_count: u64,
+    #[serde(default)]
+    pub pump_trade_skipped_untracked_count: u64,
+    #[serde(default)]
+    pub pump_trade_skipped_tombstoned_count: u64,
+    #[serde(default)]
+    pub pump_trade_unknown_mint_count: u64,
+    #[serde(default)]
+    pub pump_trade_deferred_feature_count: u64,
+    #[serde(default)]
+    pub pump_trade_feature_recompute_count: u64,
+    #[serde(default)]
+    pub pump_trade_deep_process_duration_ms_p95: u64,
+    #[serde(default)]
+    pub pump_trade_deep_process_duration_ms_max: u64,
+    #[serde(default)]
+    pub pump_trade_prefilter_duration_ms_p95: u64,
+    #[serde(default)]
+    pub pump_trade_prefilter_duration_ms_max: u64,
+    #[serde(default)]
+    pub pump_trade_state_update_duration_ms_p95: u64,
+    #[serde(default)]
+    pub pump_trade_state_update_duration_ms_max: u64,
+    #[serde(default)]
+    pub pump_trade_risk_feature_duration_ms_p95: u64,
+    #[serde(default)]
+    pub pump_trade_risk_feature_duration_ms_max: u64,
+    #[serde(default)]
+    pub unknown_mint_route_count_by_class: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub account_pinned_update_count: u64,
+    #[serde(default)]
+    pub backpressure_hot_key: Option<String>,
+    #[serde(default)]
+    pub backpressure_hot_mint: Option<String>,
+    #[serde(default)]
+    pub backpressure_hot_account: Option<String>,
+    #[serde(default)]
+    pub backpressure_deep_processed_count_at_trigger: u64,
+    #[serde(default)]
+    pub backpressure_skipped_count_at_trigger: u64,
+    #[serde(default)]
     pub partition_decode_duration_ms_p50: u64,
     #[serde(default)]
     pub partition_decode_duration_ms_p95: u64,
@@ -1113,6 +1158,7 @@ struct MaterialHunterPartitionUpdate {
     read_at: tokio::time::Instant,
     sequence: u64,
     update_class: &'static str,
+    route_key_label: String,
 }
 
 #[derive(Debug)]
@@ -1198,6 +1244,24 @@ struct MaterialHunterReaderStats {
     top_partition_key_counts: BTreeMap<String, u64>,
     top_mint_counts: BTreeMap<String, u64>,
     top_account_counts: BTreeMap<String, u64>,
+    pump_trade_fast_prefilter_count: u64,
+    pump_trade_deep_processed_count: u64,
+    pump_trade_skipped_untracked_count: u64,
+    pump_trade_skipped_tombstoned_count: u64,
+    pump_trade_unknown_mint_count: u64,
+    pump_trade_deferred_feature_count: u64,
+    pump_trade_feature_recompute_count: u64,
+    pump_trade_deep_process_duration_ms: Vec<u64>,
+    pump_trade_prefilter_duration_ms: Vec<u64>,
+    pump_trade_state_update_duration_ms: Vec<u64>,
+    pump_trade_risk_feature_duration_ms: Vec<u64>,
+    unknown_mint_route_count_by_class: BTreeMap<String, u64>,
+    account_pinned_update_count: u64,
+    backpressure_hot_key: Option<String>,
+    backpressure_hot_mint: Option<String>,
+    backpressure_hot_account: Option<String>,
+    backpressure_deep_processed_count_at_trigger: u64,
+    backpressure_skipped_count_at_trigger: u64,
 }
 
 impl MaterialHunterReaderStats {
@@ -1284,6 +1348,30 @@ impl MaterialHunterReaderStats {
         }
         if let Some(count) = entry.routed_partition_distribution.get_mut(partition) {
             *count = count.saturating_add(1);
+        }
+    }
+
+    fn record_update_class_skipped(&mut self, class_name: &'static str) {
+        let partitions = self.worker_partitions.max(1) as usize;
+        let entry = self
+            .update_class_stats
+            .entry(class_name)
+            .or_insert_with(|| MaterialHunterUpdateClassStats {
+                routed_partition_distribution: vec![0; partitions],
+                ..MaterialHunterUpdateClassStats::default()
+            });
+        entry.count = entry.count.saturating_add(1);
+    }
+
+    fn record_pump_trade_prefilter_duration(&mut self, millis: u64) {
+        if self.pump_trade_prefilter_duration_ms.len() < 100_000 {
+            self.pump_trade_prefilter_duration_ms.push(millis);
+        }
+    }
+
+    fn record_pump_trade_deep_duration(&mut self, millis: u64) {
+        if self.pump_trade_deep_process_duration_ms.len() < 100_000 {
+            self.pump_trade_deep_process_duration_ms.push(millis);
         }
     }
 
@@ -1610,6 +1698,54 @@ fn apply_reader_stats_to_summary(
     });
     classes_by_count.truncate(20);
     summary.top_update_classes_by_count = classes_by_count;
+    summary.pump_trade_fast_prefilter_count = stats.pump_trade_fast_prefilter_count;
+    summary.pump_trade_deep_processed_count = stats.pump_trade_deep_processed_count;
+    summary.pump_trade_skipped_untracked_count = stats.pump_trade_skipped_untracked_count;
+    summary.pump_trade_skipped_tombstoned_count = stats.pump_trade_skipped_tombstoned_count;
+    summary.pump_trade_unknown_mint_count = stats.pump_trade_unknown_mint_count;
+    summary.pump_trade_deferred_feature_count = stats.pump_trade_deferred_feature_count;
+    summary.pump_trade_feature_recompute_count = stats.pump_trade_feature_recompute_count;
+    summary.pump_trade_deep_process_duration_ms_p95 =
+        percentile(&stats.pump_trade_deep_process_duration_ms, 95, 100);
+    summary.pump_trade_deep_process_duration_ms_max = stats
+        .pump_trade_deep_process_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.pump_trade_prefilter_duration_ms_p95 =
+        percentile(&stats.pump_trade_prefilter_duration_ms, 95, 100);
+    summary.pump_trade_prefilter_duration_ms_max = stats
+        .pump_trade_prefilter_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.pump_trade_state_update_duration_ms_p95 =
+        percentile(&stats.pump_trade_state_update_duration_ms, 95, 100);
+    summary.pump_trade_state_update_duration_ms_max = stats
+        .pump_trade_state_update_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.pump_trade_risk_feature_duration_ms_p95 =
+        percentile(&stats.pump_trade_risk_feature_duration_ms, 95, 100);
+    summary.pump_trade_risk_feature_duration_ms_max = stats
+        .pump_trade_risk_feature_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.unknown_mint_route_count_by_class =
+        top_key_summaries(&stats.unknown_mint_route_count_by_class, 20);
+    summary.account_pinned_update_count = stats.account_pinned_update_count;
+    summary.backpressure_hot_key = stats.backpressure_hot_key.clone();
+    summary.backpressure_hot_mint = stats.backpressure_hot_mint.clone();
+    summary.backpressure_hot_account = stats.backpressure_hot_account.clone();
+    summary.backpressure_deep_processed_count_at_trigger =
+        stats.backpressure_deep_processed_count_at_trigger;
+    summary.backpressure_skipped_count_at_trigger = stats.backpressure_skipped_count_at_trigger;
     summary.partition_decode_duration_ms_p50 =
         percentile(&stats.partition_decode_duration_ms, 50, 100);
     summary.partition_decode_duration_ms_p95 =
@@ -1652,10 +1788,65 @@ pub fn material_hunter_subscription_fingerprint(loaded: &LoadedConfig) -> Result
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaterialHunterStreamStateHint {
+    pub active_mints: Vec<String>,
+    pub tombstoned_mints: Vec<String>,
+    pub inactive_mints: Vec<String>,
+}
+
+impl MaterialHunterStreamStateHint {
+    pub fn is_empty(&self) -> bool {
+        self.active_mints.is_empty()
+            && self.tombstoned_mints.is_empty()
+            && self.inactive_mints.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterialHunterStreamAction {
     Continue,
+    ContinueWithStateHint(MaterialHunterStreamStateHint),
     Stop,
+}
+
+impl MaterialHunterStreamAction {
+    fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop)
+    }
+
+    fn state_hint(&self) -> Option<&MaterialHunterStreamStateHint> {
+        match self {
+            Self::ContinueWithStateHint(hint) => Some(hint),
+            Self::Continue | Self::Stop => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MaterialHunterRelevanceState {
+    active_mints: HashSet<String>,
+    tombstoned_mints: HashSet<String>,
+}
+
+fn apply_material_hunter_state_hint(
+    relevance: &Arc<std::sync::Mutex<MaterialHunterRelevanceState>>,
+    hint: &MaterialHunterStreamStateHint,
+) {
+    let Ok(mut state) = relevance.lock() else {
+        return;
+    };
+    for mint in &hint.active_mints {
+        state.tombstoned_mints.remove(mint);
+        state.active_mints.insert(mint.clone());
+    }
+    for mint in &hint.inactive_mints {
+        state.active_mints.remove(mint);
+    }
+    for mint in &hint.tombstoned_mints {
+        state.active_mints.remove(mint);
+        state.tombstoned_mints.insert(mint.clone());
+    }
 }
 
 fn material_hunter_status_class(status: &Status) -> (&'static str, bool, bool) {
@@ -1724,6 +1915,172 @@ fn should_retain_fresh_launch_event(
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPq9sJqzQdbqT6qhHV4";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialHunterPumpPrefilterDecision {
+    DeepProcess,
+    SkipUntracked,
+    SkipTombstoned,
+    SkipUnknownMint,
+    SkipMalformed,
+    SkipOther,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterialHunterPumpPrefilter {
+    update_class: &'static str,
+    decision: MaterialHunterPumpPrefilterDecision,
+    mint: Option<String>,
+    account: Option<String>,
+}
+
+fn material_hunter_pump_discriminator_name(data: &[u8]) -> Option<&'static str> {
+    if data.len() < 8 {
+        return None;
+    }
+    let discriminator = &data[..8];
+    if discriminator == anchor_discriminator("global", "create") {
+        return Some("create");
+    }
+    if discriminator == anchor_discriminator("global", "create_v2") {
+        return Some("create_v2");
+    }
+    if discriminator == anchor_discriminator("global", "buy")
+        || discriminator == anchor_discriminator("global", "buy_v2")
+        || discriminator == anchor_discriminator("global", "buy_exact_quote_in_v2")
+    {
+        return Some("buy");
+    }
+    if discriminator == anchor_discriminator("global", "sell")
+        || discriminator == anchor_discriminator("global", "sell_v2")
+    {
+        return Some("sell");
+    }
+    Some("other")
+}
+
+fn material_hunter_transaction_mint_hint(update: &SubscribeUpdate) -> Option<String> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let info = tx.transaction.as_ref()?;
+    let meta = info.meta.as_ref()?;
+    meta.post_token_balances
+        .iter()
+        .chain(meta.pre_token_balances.iter())
+        .find_map(|balance| {
+            let mint = balance.mint.trim();
+            (!mint.is_empty()).then(|| mint.to_owned())
+        })
+}
+
+fn material_hunter_transaction_account_hint(update: &SubscribeUpdate) -> Option<String> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let info = tx.transaction.as_ref()?;
+    let message = info.transaction.as_ref()?.message.as_ref()?;
+    message
+        .account_keys
+        .first()
+        .map(|key| bs58::encode(key).into_string())
+}
+
+fn material_hunter_prefilter_pump_instruction(
+    update: &SubscribeUpdate,
+    active_mints: &HashSet<String>,
+    tombstoned_mints: &HashSet<String>,
+) -> Option<MaterialHunterPumpPrefilter> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let info = tx.transaction.as_ref()?;
+    let transaction = info.transaction.as_ref()?;
+    let message = transaction.message.as_ref()?;
+    let mint = material_hunter_transaction_mint_hint(update);
+    let account = material_hunter_transaction_account_hint(update);
+    let mut saw_pump = false;
+    let mut saw_malformed = false;
+    let mut saw_create = false;
+    let mut saw_trade = false;
+    for instruction in &message.instructions {
+        let Some(program_id) = message
+            .account_keys
+            .get(instruction.program_id_index as usize)
+        else {
+            saw_malformed = true;
+            continue;
+        };
+        if bs58::encode(program_id).into_string() != PUMP_PROGRAM_ID {
+            continue;
+        }
+        saw_pump = true;
+        match material_hunter_pump_discriminator_name(&instruction.data) {
+            Some("create") | Some("create_v2") => saw_create = true,
+            Some("buy") | Some("sell") => saw_trade = true,
+            Some("other") => {}
+            None => saw_malformed = true,
+            _ => {}
+        }
+    }
+    if !saw_pump {
+        return None;
+    }
+    if saw_create {
+        return Some(MaterialHunterPumpPrefilter {
+            update_class: "pump_token_created",
+            decision: MaterialHunterPumpPrefilterDecision::DeepProcess,
+            mint,
+            account,
+        });
+    }
+    if saw_trade {
+        let Some(mint_value) = mint.clone() else {
+            return Some(MaterialHunterPumpPrefilter {
+                update_class: "pump_trade_unknown_mint",
+                decision: MaterialHunterPumpPrefilterDecision::SkipUnknownMint,
+                mint,
+                account,
+            });
+        };
+        if tombstoned_mints.contains(&mint_value) {
+            return Some(MaterialHunterPumpPrefilter {
+                update_class: "pump_trade_tombstoned_mint",
+                decision: MaterialHunterPumpPrefilterDecision::SkipTombstoned,
+                mint,
+                account,
+            });
+        }
+        if active_mints.contains(&mint_value) {
+            return Some(MaterialHunterPumpPrefilter {
+                update_class: "pump_trade_active_mint",
+                decision: MaterialHunterPumpPrefilterDecision::DeepProcess,
+                mint,
+                account,
+            });
+        }
+        return Some(MaterialHunterPumpPrefilter {
+            update_class: "pump_trade_untracked_mint",
+            decision: MaterialHunterPumpPrefilterDecision::SkipUntracked,
+            mint,
+            account,
+        });
+    }
+    if saw_malformed {
+        return Some(MaterialHunterPumpPrefilter {
+            update_class: "pump_instruction_malformed",
+            decision: MaterialHunterPumpPrefilterDecision::SkipMalformed,
+            mint,
+            account,
+        });
+    }
+    Some(MaterialHunterPumpPrefilter {
+        update_class: "pump_instruction_other",
+        decision: MaterialHunterPumpPrefilterDecision::SkipOther,
+        mint,
+        account,
+    })
+}
+
 fn material_hunter_update_class(update: &SubscribeUpdate) -> &'static str {
     match update.update_oneof.as_ref() {
         Some(UpdateOneof::Slot(_)) | Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {
@@ -1733,10 +2090,11 @@ fn material_hunter_update_class(update: &SubscribeUpdate) -> &'static str {
             if let Some(info) = tx.transaction.as_ref() {
                 if let Some(transaction) = info.transaction.as_ref() {
                     if let Some(message) = transaction.message.as_ref() {
-                        if message.account_keys.iter().any(|key| {
-                            bs58::encode(key).into_string()
-                                == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-                        }) {
+                        if message
+                            .account_keys
+                            .iter()
+                            .any(|key| bs58::encode(key).into_string() == PUMP_PROGRAM_ID)
+                        {
                             return "pump_trade_or_instruction";
                         }
                     }
@@ -2060,7 +2418,7 @@ where
     let stream_started_at = tokio::time::Instant::now();
     let mut last_provider_progress_at = stream_started_at;
     let mut last_pump_progress_at = stream_started_at;
-    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+    if on_progress(&summary)?.is_stop() {
         summary.provider_status = "stopped_by_hunter".to_owned();
         summary.stream_completed_normally = true;
         return Ok(summary);
@@ -2078,7 +2436,7 @@ where
                     "connected".to_owned()
                 };
                 summary.connected = true;
-                if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                if on_progress(&summary)?.is_stop() {
                     summary.provider_status = "stopped_by_hunter".to_owned();
                     summary.stream_completed_normally = true;
                     return Ok(summary);
@@ -2174,6 +2532,9 @@ where
             partition_started_at: Some(tokio::time::Instant::now()),
             ..MaterialHunterReaderStats::default()
         }));
+        let relevance_state = Arc::new(std::sync::Mutex::new(
+            MaterialHunterRelevanceState::default(),
+        ));
         let reader_stats_for_task = reader_stats.clone();
         tokio::spawn(async move {
             let mut last_read_at: Option<tokio::time::Instant> = None;
@@ -2351,6 +2712,20 @@ where
                                     Some(item.update_class.to_owned());
                                 stats.backpressure_partition_id = Some(partition as u64);
                                 stats.backpressure_segment_id.get_or_insert(1);
+                                stats.backpressure_hot_key = Some(item.route_key_label.clone());
+                                if let Some(mint) = item.route_key_label.strip_prefix("mint:") {
+                                    stats.backpressure_hot_mint = Some(mint.to_owned());
+                                }
+                                if let Some(account) = item.route_key_label.strip_prefix("account:")
+                                {
+                                    stats.backpressure_hot_account = Some(account.to_owned());
+                                }
+                                stats.backpressure_deep_processed_count_at_trigger =
+                                    stats.pump_trade_deep_processed_count;
+                                stats.backpressure_skipped_count_at_trigger = stats
+                                    .pump_trade_skipped_untracked_count
+                                    .saturating_add(stats.pump_trade_skipped_tombstoned_count)
+                                    .saturating_add(stats.pump_trade_unknown_mint_count);
                                 stats.partition_backpressure_trigger_partition =
                                     Some(partition as u64);
                                 stats.partition_backpressure_trigger_reason =
@@ -2390,6 +2765,18 @@ where
                                 worker_lag,
                                 decode_ms,
                             );
+                            if matches!(
+                                item.update_class,
+                                "pump_trade_active_mint" | "pump_token_created"
+                            ) {
+                                stats.record_pump_trade_deep_duration(decode_ms);
+                                if stats.pump_trade_state_update_duration_ms.len() < 100_000 {
+                                    stats.pump_trade_state_update_duration_ms.push(decode_ms);
+                                }
+                                if stats.pump_trade_risk_feature_duration_ms.len() < 100_000 {
+                                    stats.pump_trade_risk_feature_duration_ms.push(0);
+                                }
+                            }
                             stats.worker_updates_processed =
                                 stats.worker_updates_processed.saturating_add(1);
                             if let Some(count) = stats
@@ -2420,13 +2807,109 @@ where
 
         let router_stats = reader_stats.clone();
         let router_output_tx = worker_output_tx.clone();
+        let relevance_state_for_router = relevance_state.clone();
         tokio::spawn(async move {
             let mut token_account_to_mint = HashMap::<Vec<u8>, String>::new();
             let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
             while let Some(message) = router_rx.recv().await {
                 match message {
                     MaterialHunterReaderMessage::Update(update, read_at) => {
-                        let update_class = material_hunter_update_class(&update);
+                        let prefilter_started = tokio::time::Instant::now();
+                        let (active_mints, tombstoned_mints) = relevance_state_for_router
+                            .lock()
+                            .map(|state| {
+                                (state.active_mints.clone(), state.tombstoned_mints.clone())
+                            })
+                            .unwrap_or_default();
+                        let pump_prefilter = material_hunter_prefilter_pump_instruction(
+                            &update,
+                            &active_mints,
+                            &tombstoned_mints,
+                        );
+                        let prefilter_ms = prefilter_started.elapsed().as_millis() as u64;
+                        let mut update_class = material_hunter_update_class(&update);
+                        if let Some(prefilter) = pump_prefilter.as_ref() {
+                            update_class = prefilter.update_class;
+                            if let Ok(mut stats) = router_stats.lock() {
+                                stats.pump_trade_fast_prefilter_count =
+                                    stats.pump_trade_fast_prefilter_count.saturating_add(1);
+                                stats.record_pump_trade_prefilter_duration(prefilter_ms);
+                            }
+                            if prefilter.update_class == "pump_token_created" {
+                                if let Some(mint) = prefilter.mint.as_ref() {
+                                    apply_material_hunter_state_hint(
+                                        &relevance_state_for_router,
+                                        &MaterialHunterStreamStateHint {
+                                            active_mints: vec![mint.clone()],
+                                            ..MaterialHunterStreamStateHint::default()
+                                        },
+                                    );
+                                }
+                            }
+                            match prefilter.decision {
+                                MaterialHunterPumpPrefilterDecision::DeepProcess => {
+                                    if prefilter.update_class == "pump_trade_active_mint" {
+                                        if let Ok(mut stats) = router_stats.lock() {
+                                            stats.pump_trade_deep_processed_count = stats
+                                                .pump_trade_deep_processed_count
+                                                .saturating_add(1);
+                                            stats.pump_trade_deferred_feature_count = stats
+                                                .pump_trade_deferred_feature_count
+                                                .saturating_add(1);
+                                        }
+                                    }
+                                }
+                                MaterialHunterPumpPrefilterDecision::SkipUntracked
+                                | MaterialHunterPumpPrefilterDecision::SkipTombstoned
+                                | MaterialHunterPumpPrefilterDecision::SkipUnknownMint
+                                | MaterialHunterPumpPrefilterDecision::SkipMalformed
+                                | MaterialHunterPumpPrefilterDecision::SkipOther => {
+                                    if let Ok(mut stats) = router_stats.lock() {
+                                        match prefilter.decision {
+                                            MaterialHunterPumpPrefilterDecision::SkipUntracked => {
+                                                stats.pump_trade_skipped_untracked_count = stats
+                                                    .pump_trade_skipped_untracked_count
+                                                    .saturating_add(1);
+                                            }
+                                            MaterialHunterPumpPrefilterDecision::SkipTombstoned => {
+                                                stats.pump_trade_skipped_tombstoned_count = stats
+                                                    .pump_trade_skipped_tombstoned_count
+                                                    .saturating_add(1);
+                                            }
+                                            MaterialHunterPumpPrefilterDecision::SkipUnknownMint => {
+                                                stats.pump_trade_unknown_mint_count = stats
+                                                    .pump_trade_unknown_mint_count
+                                                    .saturating_add(1);
+                                                stats.unknown_mint_route_count = stats
+                                                    .unknown_mint_route_count
+                                                    .saturating_add(1);
+                                                MaterialHunterReaderStats::increment_top_count(
+                                                    &mut stats.unknown_mint_route_count_by_class,
+                                                    prefilter.update_class.to_owned(),
+                                                );
+                                            }
+                                            MaterialHunterPumpPrefilterDecision::SkipMalformed
+                                            | MaterialHunterPumpPrefilterDecision::SkipOther
+                                            | MaterialHunterPumpPrefilterDecision::DeepProcess => {}
+                                        }
+                                        stats.record_update_class_skipped(prefilter.update_class);
+                                        if let Some(mint) = prefilter.mint.as_ref() {
+                                            MaterialHunterReaderStats::increment_top_count(
+                                                &mut stats.top_mint_counts,
+                                                mint.clone(),
+                                            );
+                                        }
+                                        if let Some(account) = prefilter.account.as_ref() {
+                                            MaterialHunterReaderStats::increment_top_count(
+                                                &mut stats.top_account_counts,
+                                                account.clone(),
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         for (account, mint) in material_hunter_token_account_mint_mappings(&update)
                         {
                             token_account_to_mint.entry(account).or_insert(mint);
@@ -2446,6 +2929,14 @@ where
                                     stats.router_fallback_count.saturating_add(1);
                                 stats.unknown_mint_route_count =
                                     stats.unknown_mint_route_count.saturating_add(1);
+                                MaterialHunterReaderStats::increment_top_count(
+                                    &mut stats.unknown_mint_route_count_by_class,
+                                    update_class.to_owned(),
+                                );
+                            }
+                            if route_key_label.starts_with("account_pinned:") {
+                                stats.account_pinned_update_count =
+                                    stats.account_pinned_update_count.saturating_add(1);
                             }
                             stats.record_update_class_route(update_class, partition);
                             MaterialHunterReaderStats::increment_top_count(
@@ -2487,6 +2978,7 @@ where
                             read_at,
                             sequence,
                             update_class,
+                            route_key_label: route_key_label.clone(),
                         }) {
                             Ok(()) => {
                                 if let Ok(mut stats) = router_stats.lock() {
@@ -2536,6 +3028,20 @@ where
                                     stats.partition_backpressure_trigger_reason =
                                         Some("partition_queue_full".to_owned());
                                     stats.backpressure_update_class = Some(update_class.to_owned());
+                                    stats.backpressure_hot_key = Some(route_key_label.clone());
+                                    if let Some(mint) = route_key_label.strip_prefix("mint:") {
+                                        stats.backpressure_hot_mint = Some(mint.to_owned());
+                                    }
+                                    if let Some(account) = route_key_label.strip_prefix("account:")
+                                    {
+                                        stats.backpressure_hot_account = Some(account.to_owned());
+                                    }
+                                    stats.backpressure_deep_processed_count_at_trigger =
+                                        stats.pump_trade_deep_processed_count;
+                                    stats.backpressure_skipped_count_at_trigger = stats
+                                        .pump_trade_skipped_untracked_count
+                                        .saturating_add(stats.pump_trade_skipped_tombstoned_count)
+                                        .saturating_add(stats.pump_trade_unknown_mint_count);
                                     stats.backpressure_queue_depth_at_blocker =
                                         partition_tx.max_capacity() as u64;
                                     stats.dirty_partition_queued_updates_discarded = stats
@@ -2621,7 +3127,7 @@ where
                     if let Ok(stats) = reader_stats.lock() {
                         apply_reader_stats_to_summary(&mut summary, &stats);
                     }
-                    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                    if on_progress(&summary)?.is_stop() {
                         summary.provider_status = "stopped_by_hunter".to_owned();
                         summary.stream_completed_normally = true;
                         return Ok(summary);
@@ -2634,7 +3140,11 @@ where
                         summary.pump_progress_stalled_seconds = 0;
                     }
                     summary.normalized_events = summary.normalized_events.saturating_add(1);
-                    if on_event(event, &summary)? == MaterialHunterStreamAction::Stop {
+                    let action = on_event(event, &summary)?;
+                    if let Some(hint) = action.state_hint() {
+                        apply_material_hunter_state_hint(&relevance_state, hint);
+                    }
+                    if action.is_stop() {
                         summary.provider_status = "stopped_by_hunter".to_owned();
                         summary.stream_completed_normally = true;
                         return Ok(summary);
@@ -2702,7 +3212,7 @@ where
                     if let Ok(stats) = reader_stats.lock() {
                         apply_reader_stats_to_summary(&mut summary, &stats);
                     }
-                    if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                    if on_progress(&summary)?.is_stop() {
                         summary.provider_status = "stopped_by_hunter".to_owned();
                         summary.stream_completed_normally = true;
                         return Ok(summary);
@@ -2776,7 +3286,7 @@ where
                             last_provider_progress_at.elapsed().as_secs();
                         summary.pump_progress_stalled_seconds =
                             last_pump_progress_at.elapsed().as_secs();
-                        if on_progress(&summary)? == MaterialHunterStreamAction::Stop {
+                        if on_progress(&summary)?.is_stop() {
                             summary.provider_status = "stopped_by_hunter".to_owned();
                             summary.stream_completed_normally = true;
                             return Ok(summary);
@@ -4421,7 +4931,7 @@ mod tests {
                                 instructions: vec![CompiledInstruction {
                                     program_id_index: 0,
                                     accounts: vec![0, 1],
-                                    data: vec![1, 2, 3, 4],
+                                    data: anchor_discriminator("global", "create").to_vec(),
                                 }],
                                 versioned: false,
                                 address_table_lookups: Vec::new(),
@@ -4449,6 +4959,81 @@ mod tests {
                                 owner: bs58::encode([2u8; 32]).into_string(),
                                 program_id: "".to_owned(),
                             }],
+                            rewards: Vec::new(),
+                            loaded_writable_addresses: Vec::new(),
+                            loaded_readonly_addresses: Vec::new(),
+                            return_data: None,
+                            return_data_none: true,
+                            compute_units_consumed: Some(100),
+                            cost_units: Some(100),
+                        }),
+                        index: 0,
+                    }),
+                },
+            ),
+        )
+    }
+
+    fn geyser_pump_instruction_update(
+        instruction_name: &str,
+        mint: Option<&str>,
+    ) -> SubscribeUpdate {
+        let pump_program_bytes = bs58::decode(PUMP_PROGRAM_ID)
+            .into_vec()
+            .expect("pump program bytes");
+        let account_key = vec![7; 32];
+        let mut data = Vec::new();
+        data.extend_from_slice(&anchor_discriminator("global", instruction_name));
+        data.extend_from_slice(&[0; 8]);
+        let token_balances = mint
+            .map(|mint| {
+                vec![TokenBalance {
+                    account_index: 1,
+                    mint: mint.to_owned(),
+                    ui_token_amount: Some(UiTokenAmount {
+                        ui_amount: 20.0,
+                        decimals: 6,
+                        amount: "20".to_owned(),
+                        ui_amount_string: "20".to_owned(),
+                    }),
+                    owner: bs58::encode([2u8; 32]).into_string(),
+                    program_id: "".to_owned(),
+                }]
+            })
+            .unwrap_or_default();
+        update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
+                SubscribeUpdateTransaction {
+                    slot: 12,
+                    transaction: Some(SubscribeUpdateTransactionInfo {
+                        signature: vec![9; 64],
+                        is_vote: false,
+                        transaction: Some(Transaction {
+                            signatures: vec![vec![9; 64]],
+                            message: Some(Message {
+                                header: None,
+                                account_keys: vec![pump_program_bytes, account_key],
+                                recent_blockhash: vec![0; 32],
+                                instructions: vec![CompiledInstruction {
+                                    program_id_index: 0,
+                                    accounts: vec![0, 1],
+                                    data,
+                                }],
+                                versioned: false,
+                                address_table_lookups: Vec::new(),
+                            }),
+                        }),
+                        meta: Some(TransactionStatusMeta {
+                            err: None,
+                            fee: 5000,
+                            pre_balances: vec![100, 0],
+                            post_balances: vec![90, 10],
+                            inner_instructions: Vec::new(),
+                            inner_instructions_none: false,
+                            log_messages: Vec::new(),
+                            log_messages_none: false,
+                            pre_token_balances: Vec::new(),
+                            post_token_balances: token_balances,
                             rewards: Vec::new(),
                             loaded_writable_addresses: Vec::new(),
                             loaded_readonly_addresses: Vec::new(),
@@ -4646,6 +5231,97 @@ mod tests {
         assert_eq!(first_partition, second_partition);
         assert!(first_label.starts_with("account:"));
         assert!(second_label.starts_with("account_pinned:"));
+    }
+
+    #[test]
+    fn pump_trade_untracked_mint_is_cheap_counted_and_skipped() {
+        let mint = bs58::encode([11u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("buy", Some(&mint));
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &HashSet::new(), &HashSet::new())
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_trade_untracked_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::SkipUntracked
+        );
+        assert_eq!(prefilter.mint.as_deref(), Some(mint.as_str()));
+    }
+
+    #[test]
+    fn pump_trade_tombstoned_mint_is_cheap_counted_and_skipped() {
+        let mint = bs58::encode([12u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("sell", Some(&mint));
+        let mut tombstoned = HashSet::new();
+        tombstoned.insert(mint);
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &HashSet::new(), &tombstoned)
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_trade_tombstoned_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::SkipTombstoned
+        );
+    }
+
+    #[test]
+    fn pump_trade_active_mint_is_deep_processed() {
+        let mint = bs58::encode([13u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("buy", Some(&mint));
+        let mut active = HashSet::new();
+        active.insert(mint);
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &active, &HashSet::new())
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_trade_active_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::DeepProcess
+        );
+    }
+
+    #[test]
+    fn pump_token_created_remains_high_priority() {
+        let mint = bs58::encode([14u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("create", Some(&mint));
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &HashSet::new(), &HashSet::new())
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_token_created");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::DeepProcess
+        );
+    }
+
+    #[test]
+    fn pump_trade_unknown_mint_minimal_decode_does_not_panic() {
+        let update = geyser_pump_instruction_update("buy", None);
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &HashSet::new(), &HashSet::new())
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_trade_unknown_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::SkipUnknownMint
+        );
+        assert!(prefilter.mint.is_none());
+    }
+
+    #[test]
+    fn skipped_pump_trade_noise_does_not_trigger_worker_backpressure() {
+        let mut stats = MaterialHunterReaderStats {
+            worker_partitions: 4,
+            ..MaterialHunterReaderStats::default()
+        };
+        stats.pump_trade_skipped_untracked_count = 10_000;
+        stats.record_update_class_skipped("pump_trade_untracked_mint");
+        let mut summary = MaterialHunterStreamSummary::default();
+        apply_reader_stats_to_summary(&mut summary, &stats);
+        assert_eq!(summary.pump_trade_skipped_untracked_count, 10_000);
+        assert!(!summary.client_backpressure_detected);
+        assert!(!summary.worker_backpressure_detected);
+        assert_eq!(summary.partition_worker_lag_ms_max, 0);
     }
 
     #[test]

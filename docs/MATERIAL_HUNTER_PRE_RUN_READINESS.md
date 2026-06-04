@@ -219,6 +219,24 @@ Heartbeat and summaries expose:
 - `top_accounts_by_worker_updates`
 - `top_update_classes_by_lag`
 - `top_update_classes_by_count`
+- `pump_trade_fast_prefilter_count`
+- `pump_trade_deep_processed_count`
+- `pump_trade_skipped_untracked_count`
+- `pump_trade_skipped_tombstoned_count`
+- `pump_trade_unknown_mint_count`
+- `pump_trade_deferred_feature_count`
+- `pump_trade_feature_recompute_count`
+- `pump_trade_deep_process_duration_ms_p95/max`
+- `pump_trade_prefilter_duration_ms_p95/max`
+- `pump_trade_state_update_duration_ms_p95/max`
+- `pump_trade_risk_feature_duration_ms_p95/max`
+- `unknown_mint_route_count_by_class`
+- `account_pinned_update_count`
+- `backpressure_hot_key`
+- `backpressure_hot_mint`
+- `backpressure_hot_account`
+- `backpressure_deep_processed_count_at_trigger`
+- `backpressure_skipped_count_at_trigger`
 - `partition_decode_duration_ms_p50/p95/p99/max`
 - `partition_lock_wait_ms_max`
 - `partition_batch_size_p50/p95/max`
@@ -233,6 +251,8 @@ Heartbeat and summaries expose:
 - `client_backpressure_detected`
 
 These fields are release-gate evidence. A stale green heartbeat is not enough; provider counters must continue to advance and queue/backpressure telemetry must remain safe.
+
+Pump trade/instruction traffic is prefiltered before deep worker processing. `pump_token_created` remains launch-critical and is processed immediately. Pump trades for active in-segment mints are deep-processed only while they can affect death/candidate gates; untracked, unknown-mint, malformed, other, and tombstoned-mint Pump traffic is cheap-counted and skipped from rich processing. Skipped Pump noise must not create attempt rows, rejected rows, candidate rows, replay eligibility, backtesting eligibility, threshold-tuning eligibility, or worker-backpressure lag by itself. Rich feature/risk recomputation is deferred to gates/checkpoints/finalization rather than recomputed for every Pump trade.
 
 Worker-side lag must be diagnosed by partition and update class before launch caps are raised. Slot/liveness traffic and empty untracked account updates are reader-side cheap-counted and must not enter the heavy partition worker path. A `client_backpressure_detected` blocker should include the triggering partition, update class, observed lag, threshold, and bounded top-key summaries so the next patch can distinguish hot-key skew from unnecessary worker traffic.
 
