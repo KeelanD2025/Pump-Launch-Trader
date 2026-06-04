@@ -237,12 +237,57 @@ Heartbeat and summaries expose:
 - `backpressure_hot_account`
 - `backpressure_deep_processed_count_at_trigger`
 - `backpressure_skipped_count_at_trigger`
+- `transaction_signature_seen_count`
+- `transaction_duplicate_signature_count`
+- `transaction_duplicate_signature_skipped_count`
+- `transaction_prefilter_count`
+- `transaction_deep_processed_count`
+- `transaction_mapping_hint_only_count`
+- `transaction_untracked_pump_skipped_count`
+- `transaction_account_pinned_unknown_count`
+- `transaction_tombstoned_mint_skipped_count`
+- `transaction_malformed_or_unknown_count`
+- `transaction_other_untracked_skipped_count`
+- `account_pinned_active_count`
+- `account_pinned_unknown_count`
+- `account_pinned_skipped_count`
+- `account_pinned_deep_processed_count`
+- `active_mint_transaction_update_count`
+- `active_mint_transaction_deep_processed_count`
+- `active_mint_transaction_skipped_count`
+- `active_mint_transaction_coalesced_count`
+- `active_mint_transaction_dirty_feature_count`
+- `top_active_mints_by_transaction_count`
+- `top_active_mints_by_transaction_lag`
+- `transaction_feature_deferred_count`
+- `transaction_feature_recompute_count`
+- `transaction_deep_process_duration_ms_p95/max`
+- `transaction_prefilter_duration_ms_p95/max`
+- `transaction_state_update_duration_ms_p95/max`
+- `transaction_risk_feature_duration_ms_p95/max`
+- `backpressure_transaction_class`
+- `backpressure_transaction_signature`
+- `backpressure_transaction_mint`
+- `backpressure_transaction_account`
+- `backpressure_deep_transaction_count_at_trigger`
+- `backpressure_skipped_transaction_count_at_trigger`
+- `backpressure_account_pinned_count_at_trigger`
 - `partition_decode_duration_ms_p50/p95/p99/max`
 - `partition_lock_wait_ms_max`
 - `partition_batch_size_p50/p95/max`
 - `worker_backpressure_detected`
 - `dirty_partition_queued_updates_discarded`
 - `partition_worker_reset_count`
+
+Transaction updates use a fast prefilter before rich ingest. Token-created and active tracked
+mint/account transactions remain deep-processed. Mapping hints update stream-authoritative
+account-to-mint state and then skip rich processing. Untracked Pump transactions,
+account-pinned unknown traffic, duplicate signatures, tombstoned mints, malformed transactions,
+and other unrelated transactions are cheap-counted only. Skipped transaction noise must not create
+attempt rows, candidate rows, rejected rows, replay eligibility, backtesting eligibility, tuning
+eligibility, provider-confirmed bundle claims, holder RPC data, or canonical RPC mint supply.
+Active-mint transaction feature work is marked dirty/deferred and recomputed only at gates,
+checkpoints, segment close, or finalization.
 - `artifact_queue_depth_max`
 - `artifact_queue_full_count`
 - `artifact_worker_lag_ms_max`

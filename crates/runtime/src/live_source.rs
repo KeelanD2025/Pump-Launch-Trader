@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     pin::Pin,
     str::FromStr,
     sync::Arc,
@@ -1109,6 +1109,84 @@ pub struct MaterialHunterStreamSummary {
     #[serde(default)]
     pub backpressure_skipped_count_at_trigger: u64,
     #[serde(default)]
+    pub transaction_signature_seen_count: u64,
+    #[serde(default)]
+    pub transaction_duplicate_signature_count: u64,
+    #[serde(default)]
+    pub transaction_duplicate_signature_skipped_count: u64,
+    #[serde(default)]
+    pub transaction_prefilter_count: u64,
+    #[serde(default)]
+    pub transaction_deep_processed_count: u64,
+    #[serde(default)]
+    pub transaction_mapping_hint_only_count: u64,
+    #[serde(default)]
+    pub transaction_untracked_pump_skipped_count: u64,
+    #[serde(default)]
+    pub transaction_account_pinned_unknown_count: u64,
+    #[serde(default)]
+    pub transaction_tombstoned_mint_skipped_count: u64,
+    #[serde(default)]
+    pub transaction_malformed_or_unknown_count: u64,
+    #[serde(default)]
+    pub transaction_other_untracked_skipped_count: u64,
+    #[serde(default)]
+    pub account_pinned_active_count: u64,
+    #[serde(default)]
+    pub account_pinned_unknown_count: u64,
+    #[serde(default)]
+    pub account_pinned_skipped_count: u64,
+    #[serde(default)]
+    pub account_pinned_deep_processed_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_update_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_deep_processed_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_skipped_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_coalesced_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_dirty_feature_count: u64,
+    #[serde(default)]
+    pub top_active_mints_by_transaction_count: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_active_mints_by_transaction_lag: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub transaction_feature_deferred_count: u64,
+    #[serde(default)]
+    pub transaction_feature_recompute_count: u64,
+    #[serde(default)]
+    pub transaction_risk_feature_duration_ms_p95: u64,
+    #[serde(default)]
+    pub transaction_risk_feature_duration_ms_max: u64,
+    #[serde(default)]
+    pub transaction_state_update_duration_ms_p95: u64,
+    #[serde(default)]
+    pub transaction_state_update_duration_ms_max: u64,
+    #[serde(default)]
+    pub transaction_deep_process_duration_ms_p95: u64,
+    #[serde(default)]
+    pub transaction_deep_process_duration_ms_max: u64,
+    #[serde(default)]
+    pub transaction_prefilter_duration_ms_p95: u64,
+    #[serde(default)]
+    pub transaction_prefilter_duration_ms_max: u64,
+    #[serde(default)]
+    pub backpressure_transaction_class: Option<String>,
+    #[serde(default)]
+    pub backpressure_transaction_signature: Option<String>,
+    #[serde(default)]
+    pub backpressure_transaction_mint: Option<String>,
+    #[serde(default)]
+    pub backpressure_transaction_account: Option<String>,
+    #[serde(default)]
+    pub backpressure_deep_transaction_count_at_trigger: u64,
+    #[serde(default)]
+    pub backpressure_skipped_transaction_count_at_trigger: u64,
+    #[serde(default)]
+    pub backpressure_account_pinned_count_at_trigger: u64,
+    #[serde(default)]
     pub partition_decode_duration_ms_p50: u64,
     #[serde(default)]
     pub partition_decode_duration_ms_p95: u64,
@@ -1159,6 +1237,9 @@ struct MaterialHunterPartitionUpdate {
     sequence: u64,
     update_class: &'static str,
     route_key_label: String,
+    transaction_signature: Option<String>,
+    transaction_mint: Option<String>,
+    transaction_account: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1262,6 +1343,41 @@ struct MaterialHunterReaderStats {
     backpressure_hot_account: Option<String>,
     backpressure_deep_processed_count_at_trigger: u64,
     backpressure_skipped_count_at_trigger: u64,
+    transaction_signature_seen_count: u64,
+    transaction_duplicate_signature_count: u64,
+    transaction_duplicate_signature_skipped_count: u64,
+    transaction_prefilter_count: u64,
+    transaction_deep_processed_count: u64,
+    transaction_mapping_hint_only_count: u64,
+    transaction_untracked_pump_skipped_count: u64,
+    transaction_account_pinned_unknown_count: u64,
+    transaction_tombstoned_mint_skipped_count: u64,
+    transaction_malformed_or_unknown_count: u64,
+    transaction_other_untracked_skipped_count: u64,
+    account_pinned_active_count: u64,
+    account_pinned_unknown_count: u64,
+    account_pinned_skipped_count: u64,
+    account_pinned_deep_processed_count: u64,
+    active_mint_transaction_update_count: u64,
+    active_mint_transaction_deep_processed_count: u64,
+    active_mint_transaction_skipped_count: u64,
+    active_mint_transaction_coalesced_count: u64,
+    active_mint_transaction_dirty_feature_count: u64,
+    top_active_mint_transaction_counts: BTreeMap<String, u64>,
+    top_active_mint_transaction_lag: BTreeMap<String, u64>,
+    transaction_feature_deferred_count: u64,
+    transaction_feature_recompute_count: u64,
+    transaction_risk_feature_duration_ms: Vec<u64>,
+    transaction_state_update_duration_ms: Vec<u64>,
+    transaction_deep_process_duration_ms: Vec<u64>,
+    transaction_prefilter_duration_ms: Vec<u64>,
+    backpressure_transaction_class: Option<String>,
+    backpressure_transaction_signature: Option<String>,
+    backpressure_transaction_mint: Option<String>,
+    backpressure_transaction_account: Option<String>,
+    backpressure_deep_transaction_count_at_trigger: u64,
+    backpressure_skipped_transaction_count_at_trigger: u64,
+    backpressure_account_pinned_count_at_trigger: u64,
 }
 
 impl MaterialHunterReaderStats {
@@ -1375,6 +1491,18 @@ impl MaterialHunterReaderStats {
         }
     }
 
+    fn record_transaction_prefilter_duration(&mut self, millis: u64) {
+        if self.transaction_prefilter_duration_ms.len() < 100_000 {
+            self.transaction_prefilter_duration_ms.push(millis);
+        }
+    }
+
+    fn record_transaction_deep_duration(&mut self, millis: u64) {
+        if self.transaction_deep_process_duration_ms.len() < 100_000 {
+            self.transaction_deep_process_duration_ms.push(millis);
+        }
+    }
+
     fn record_update_class_worker(
         &mut self,
         class_name: &'static str,
@@ -1410,6 +1538,23 @@ impl MaterialHunterReaderStats {
         }
         let next = map.get(&key).copied().unwrap_or(0).saturating_add(1);
         map.insert(key, next);
+        if map.len() > 256 {
+            if let Some(remove_key) = map
+                .iter()
+                .min_by_key(|(_, count)| *count)
+                .map(|(key, _)| key.clone())
+            {
+                map.remove(&remove_key);
+            }
+        }
+    }
+
+    fn max_top_value(map: &mut BTreeMap<String, u64>, key: String, value: u64) {
+        if key.trim().is_empty() {
+            return;
+        }
+        let current = map.get(&key).copied().unwrap_or(0);
+        map.insert(key, current.max(value));
         if map.len() > 256 {
             if let Some(remove_key) = map
                 .iter()
@@ -1746,6 +1891,81 @@ fn apply_reader_stats_to_summary(
     summary.backpressure_deep_processed_count_at_trigger =
         stats.backpressure_deep_processed_count_at_trigger;
     summary.backpressure_skipped_count_at_trigger = stats.backpressure_skipped_count_at_trigger;
+    summary.transaction_signature_seen_count = stats.transaction_signature_seen_count;
+    summary.transaction_duplicate_signature_count = stats.transaction_duplicate_signature_count;
+    summary.transaction_duplicate_signature_skipped_count =
+        stats.transaction_duplicate_signature_skipped_count;
+    summary.transaction_prefilter_count = stats.transaction_prefilter_count;
+    summary.transaction_deep_processed_count = stats.transaction_deep_processed_count;
+    summary.transaction_mapping_hint_only_count = stats.transaction_mapping_hint_only_count;
+    summary.transaction_untracked_pump_skipped_count =
+        stats.transaction_untracked_pump_skipped_count;
+    summary.transaction_account_pinned_unknown_count =
+        stats.transaction_account_pinned_unknown_count;
+    summary.transaction_tombstoned_mint_skipped_count =
+        stats.transaction_tombstoned_mint_skipped_count;
+    summary.transaction_malformed_or_unknown_count = stats.transaction_malformed_or_unknown_count;
+    summary.transaction_other_untracked_skipped_count =
+        stats.transaction_other_untracked_skipped_count;
+    summary.account_pinned_active_count = stats.account_pinned_active_count;
+    summary.account_pinned_unknown_count = stats.account_pinned_unknown_count;
+    summary.account_pinned_skipped_count = stats.account_pinned_skipped_count;
+    summary.account_pinned_deep_processed_count = stats.account_pinned_deep_processed_count;
+    summary.active_mint_transaction_update_count = stats.active_mint_transaction_update_count;
+    summary.active_mint_transaction_deep_processed_count =
+        stats.active_mint_transaction_deep_processed_count;
+    summary.active_mint_transaction_skipped_count = stats.active_mint_transaction_skipped_count;
+    summary.active_mint_transaction_coalesced_count = stats.active_mint_transaction_coalesced_count;
+    summary.active_mint_transaction_dirty_feature_count =
+        stats.active_mint_transaction_dirty_feature_count;
+    summary.top_active_mints_by_transaction_count =
+        top_key_summaries(&stats.top_active_mint_transaction_counts, 20);
+    summary.top_active_mints_by_transaction_lag =
+        top_key_summaries(&stats.top_active_mint_transaction_lag, 20);
+    summary.transaction_feature_deferred_count = stats.transaction_feature_deferred_count;
+    summary.transaction_feature_recompute_count = stats.transaction_feature_recompute_count;
+    summary.transaction_risk_feature_duration_ms_p95 =
+        percentile(&stats.transaction_risk_feature_duration_ms, 95, 100);
+    summary.transaction_risk_feature_duration_ms_max = stats
+        .transaction_risk_feature_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.transaction_state_update_duration_ms_p95 =
+        percentile(&stats.transaction_state_update_duration_ms, 95, 100);
+    summary.transaction_state_update_duration_ms_max = stats
+        .transaction_state_update_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.transaction_deep_process_duration_ms_p95 =
+        percentile(&stats.transaction_deep_process_duration_ms, 95, 100);
+    summary.transaction_deep_process_duration_ms_max = stats
+        .transaction_deep_process_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.transaction_prefilter_duration_ms_p95 =
+        percentile(&stats.transaction_prefilter_duration_ms, 95, 100);
+    summary.transaction_prefilter_duration_ms_max = stats
+        .transaction_prefilter_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.backpressure_transaction_class = stats.backpressure_transaction_class.clone();
+    summary.backpressure_transaction_signature = stats.backpressure_transaction_signature.clone();
+    summary.backpressure_transaction_mint = stats.backpressure_transaction_mint.clone();
+    summary.backpressure_transaction_account = stats.backpressure_transaction_account.clone();
+    summary.backpressure_deep_transaction_count_at_trigger =
+        stats.backpressure_deep_transaction_count_at_trigger;
+    summary.backpressure_skipped_transaction_count_at_trigger =
+        stats.backpressure_skipped_transaction_count_at_trigger;
+    summary.backpressure_account_pinned_count_at_trigger =
+        stats.backpressure_account_pinned_count_at_trigger;
     summary.partition_decode_duration_ms_p50 =
         percentile(&stats.partition_decode_duration_ms, 50, 100);
     summary.partition_decode_duration_ms_p95 =
@@ -1933,6 +2153,27 @@ struct MaterialHunterPumpPrefilter {
     account: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialHunterTransactionPrefilterDecision {
+    DeepProcess,
+    SkipMappingHintOnly,
+    SkipUntrackedPump,
+    SkipAccountPinnedUnknown,
+    SkipTombstoned,
+    SkipDuplicateSignature,
+    SkipMalformedOrUnknown,
+    SkipOtherUntracked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterialHunterTransactionPrefilter {
+    update_class: &'static str,
+    decision: MaterialHunterTransactionPrefilterDecision,
+    mint: Option<String>,
+    account: Option<String>,
+    signature: Option<String>,
+}
+
 fn material_hunter_pump_discriminator_name(data: &[u8]) -> Option<&'static str> {
     if data.len() < 8 {
         return None;
@@ -1973,6 +2214,21 @@ fn material_hunter_transaction_mint_hint(update: &SubscribeUpdate) -> Option<Str
         })
 }
 
+fn material_hunter_transaction_signature_hint(update: &SubscribeUpdate) -> Option<String> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let info = tx.transaction.as_ref()?;
+    if !info.signature.is_empty() {
+        return Some(bs58::encode(&info.signature).into_string());
+    }
+    info.transaction
+        .as_ref()
+        .and_then(|transaction| transaction.signatures.first())
+        .filter(|signature| !signature.is_empty())
+        .map(|signature| bs58::encode(signature).into_string())
+}
+
 fn material_hunter_transaction_account_hint(update: &SubscribeUpdate) -> Option<String> {
     let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
         return None;
@@ -1983,6 +2239,225 @@ fn material_hunter_transaction_account_hint(update: &SubscribeUpdate) -> Option<
         .account_keys
         .first()
         .map(|key| bs58::encode(key).into_string())
+}
+
+fn material_hunter_transaction_account_keys(update: &SubscribeUpdate) -> Vec<Vec<u8>> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return Vec::new();
+    };
+    tx.transaction
+        .as_ref()
+        .and_then(|info| info.transaction.as_ref())
+        .and_then(|transaction| transaction.message.as_ref())
+        .map(|message| message.account_keys.clone())
+        .unwrap_or_default()
+}
+
+fn material_hunter_transaction_has_pump_program(update: &SubscribeUpdate) -> bool {
+    material_hunter_transaction_account_keys(update)
+        .iter()
+        .any(|key| bs58::encode(key).into_string() == PUMP_PROGRAM_ID)
+}
+
+fn material_hunter_transaction_has_pump_create(update: &SubscribeUpdate) -> bool {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return false;
+    };
+    let Some(message) = tx
+        .transaction
+        .as_ref()
+        .and_then(|info| info.transaction.as_ref())
+        .and_then(|transaction| transaction.message.as_ref())
+    else {
+        return false;
+    };
+    message.instructions.iter().any(|instruction| {
+        message
+            .account_keys
+            .get(instruction.program_id_index as usize)
+            .map(|program_id| bs58::encode(program_id).into_string() == PUMP_PROGRAM_ID)
+            .unwrap_or(false)
+            && matches!(
+                material_hunter_pump_discriminator_name(&instruction.data),
+                Some("create") | Some("create_v2")
+            )
+    })
+}
+
+fn material_hunter_signature_seen_or_insert(
+    seen_signatures: &mut HashSet<String>,
+    signature_lru: &mut VecDeque<String>,
+    signature: &str,
+    capacity: usize,
+) -> bool {
+    if signature.trim().is_empty() {
+        return false;
+    }
+    if seen_signatures.contains(signature) {
+        return true;
+    }
+    seen_signatures.insert(signature.to_owned());
+    signature_lru.push_back(signature.to_owned());
+    while seen_signatures.len() > capacity.max(1) {
+        if let Some(old) = signature_lru.pop_front() {
+            seen_signatures.remove(&old);
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn material_hunter_prefilter_transaction_update(
+    update: &SubscribeUpdate,
+    active_mints: &HashSet<String>,
+    tombstoned_mints: &HashSet<String>,
+    token_account_to_mint: &HashMap<Vec<u8>, String>,
+    account_partition_pins: &HashMap<Vec<u8>, usize>,
+    duplicate_signature: bool,
+) -> Option<MaterialHunterTransactionPrefilter> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let signature = material_hunter_transaction_signature_hint(update);
+    if duplicate_signature {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_duplicate_signature",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipDuplicateSignature,
+            mint: material_hunter_transaction_mint_hint(update),
+            account: material_hunter_transaction_account_hint(update),
+            signature,
+        });
+    }
+    let Some(info) = tx.transaction.as_ref() else {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_malformed_or_unknown",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipMalformedOrUnknown,
+            mint: None,
+            account: None,
+            signature,
+        });
+    };
+    let account_keys = material_hunter_transaction_account_keys(update);
+    if account_keys.is_empty() && info.meta.is_none() {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_malformed_or_unknown",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipMalformedOrUnknown,
+            mint: None,
+            account: None,
+            signature,
+        });
+    }
+    let mint = material_hunter_transaction_mint_hint(update);
+    let account = material_hunter_transaction_account_hint(update);
+    let has_pump = material_hunter_transaction_has_pump_program(update);
+    if material_hunter_transaction_has_pump_create(update) {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_token_created",
+            decision: MaterialHunterTransactionPrefilterDecision::DeepProcess,
+            mint,
+            account,
+            signature,
+        });
+    }
+    let token_balance_mints = info
+        .meta
+        .as_ref()
+        .map(|meta| {
+            meta.post_token_balances
+                .iter()
+                .chain(meta.pre_token_balances.iter())
+                .filter_map(|balance| {
+                    let mint = balance.mint.trim();
+                    (!mint.is_empty()).then(|| mint.to_owned())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mapped_mints = account_keys
+        .iter()
+        .filter_map(|key| token_account_to_mint.get(key).cloned())
+        .collect::<Vec<_>>();
+    let active_mint = token_balance_mints
+        .iter()
+        .chain(mapped_mints.iter())
+        .find(|mint| active_mints.contains(*mint))
+        .cloned();
+    if let Some(active) = active_mint {
+        let account = account_keys
+            .iter()
+            .find(|key| {
+                token_account_to_mint
+                    .get(*key)
+                    .map(|mint| mint == &active)
+                    .unwrap_or(false)
+            })
+            .map(|key| bs58::encode(key).into_string())
+            .or(account);
+        let update_class = if token_balance_mints.iter().any(|mint| mint == &active) {
+            "transaction_active_mint"
+        } else {
+            "transaction_active_account"
+        };
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class,
+            decision: MaterialHunterTransactionPrefilterDecision::DeepProcess,
+            mint: Some(active),
+            account,
+            signature,
+        });
+    }
+    let tombstoned_mint = token_balance_mints
+        .iter()
+        .chain(mapped_mints.iter())
+        .find(|mint| tombstoned_mints.contains(*mint))
+        .cloned();
+    if let Some(tombstoned) = tombstoned_mint {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_tombstoned_mint",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipTombstoned,
+            mint: Some(tombstoned),
+            account,
+            signature,
+        });
+    }
+    if account_keys
+        .iter()
+        .any(|account| account_partition_pins.contains_key(account))
+    {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_account_pinned_unknown",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipAccountPinnedUnknown,
+            mint,
+            account,
+            signature,
+        });
+    }
+    if has_pump {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_untracked_pump",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipUntrackedPump,
+            mint,
+            account,
+            signature,
+        });
+    }
+    if !token_balance_mints.is_empty() || !mapped_mints.is_empty() {
+        return Some(MaterialHunterTransactionPrefilter {
+            update_class: "transaction_mapping_hint_only",
+            decision: MaterialHunterTransactionPrefilterDecision::SkipMappingHintOnly,
+            mint,
+            account,
+            signature,
+        });
+    }
+    Some(MaterialHunterTransactionPrefilter {
+        update_class: "transaction_other_untracked",
+        decision: MaterialHunterTransactionPrefilterDecision::SkipOtherUntracked,
+        mint,
+        account,
+        signature,
+    })
 }
 
 fn material_hunter_prefilter_pump_instruction(
@@ -2726,6 +3201,40 @@ where
                                     .pump_trade_skipped_untracked_count
                                     .saturating_add(stats.pump_trade_skipped_tombstoned_count)
                                     .saturating_add(stats.pump_trade_unknown_mint_count);
+                                if item.update_class.starts_with("transaction_") {
+                                    stats.backpressure_transaction_class =
+                                        Some(item.update_class.to_owned());
+                                    stats.backpressure_transaction_signature =
+                                        item.transaction_signature.clone();
+                                    stats.backpressure_transaction_mint =
+                                        item.transaction_mint.clone();
+                                    stats.backpressure_transaction_account =
+                                        item.transaction_account.clone();
+                                    stats.backpressure_deep_transaction_count_at_trigger =
+                                        stats.transaction_deep_processed_count;
+                                    stats.backpressure_skipped_transaction_count_at_trigger = stats
+                                        .transaction_mapping_hint_only_count
+                                        .saturating_add(
+                                            stats.transaction_untracked_pump_skipped_count,
+                                        )
+                                        .saturating_add(
+                                            stats.transaction_account_pinned_unknown_count,
+                                        )
+                                        .saturating_add(
+                                            stats.transaction_tombstoned_mint_skipped_count,
+                                        )
+                                        .saturating_add(
+                                            stats.transaction_duplicate_signature_skipped_count,
+                                        )
+                                        .saturating_add(
+                                            stats.transaction_malformed_or_unknown_count,
+                                        )
+                                        .saturating_add(
+                                            stats.transaction_other_untracked_skipped_count,
+                                        );
+                                    stats.backpressure_account_pinned_count_at_trigger =
+                                        stats.account_pinned_update_count;
+                                }
                                 stats.partition_backpressure_trigger_partition =
                                     Some(partition as u64);
                                 stats.partition_backpressure_trigger_reason =
@@ -2777,6 +3286,22 @@ where
                                     stats.pump_trade_risk_feature_duration_ms.push(0);
                                 }
                             }
+                            if item.update_class.starts_with("transaction_") {
+                                stats.record_transaction_deep_duration(decode_ms);
+                                if stats.transaction_state_update_duration_ms.len() < 100_000 {
+                                    stats.transaction_state_update_duration_ms.push(decode_ms);
+                                }
+                                if stats.transaction_risk_feature_duration_ms.len() < 100_000 {
+                                    stats.transaction_risk_feature_duration_ms.push(0);
+                                }
+                                if let Some(mint) = item.transaction_mint.as_ref() {
+                                    MaterialHunterReaderStats::max_top_value(
+                                        &mut stats.top_active_mint_transaction_lag,
+                                        mint.clone(),
+                                        worker_lag,
+                                    );
+                                }
+                            }
                             stats.worker_updates_processed =
                                 stats.worker_updates_processed.saturating_add(1);
                             if let Some(count) = stats
@@ -2811,6 +3336,8 @@ where
         tokio::spawn(async move {
             let mut token_account_to_mint = HashMap::<Vec<u8>, String>::new();
             let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
+            let mut seen_transaction_signatures = HashSet::<String>::new();
+            let mut transaction_signature_lru = VecDeque::<String>::new();
             while let Some(message) = router_rx.recv().await {
                 match message {
                     MaterialHunterReaderMessage::Update(update, read_at) => {
@@ -2821,6 +3348,33 @@ where
                                 (state.active_mints.clone(), state.tombstoned_mints.clone())
                             })
                             .unwrap_or_default();
+                        for (account, mint) in material_hunter_token_account_mint_mappings(&update)
+                        {
+                            token_account_to_mint.entry(account).or_insert(mint);
+                        }
+                        let signature = material_hunter_transaction_signature_hint(&update);
+                        let duplicate_signature = signature
+                            .as_ref()
+                            .map(|signature| {
+                                material_hunter_signature_seen_or_insert(
+                                    &mut seen_transaction_signatures,
+                                    &mut transaction_signature_lru,
+                                    signature,
+                                    4096,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if let Ok(mut stats) = router_stats.lock() {
+                            if signature.is_some() {
+                                stats.transaction_signature_seen_count =
+                                    stats.transaction_signature_seen_count.saturating_add(1);
+                            }
+                            if duplicate_signature {
+                                stats.transaction_duplicate_signature_count = stats
+                                    .transaction_duplicate_signature_count
+                                    .saturating_add(1);
+                            }
+                        }
                         let pump_prefilter = material_hunter_prefilter_pump_instruction(
                             &update,
                             &active_mints,
@@ -2828,6 +3382,32 @@ where
                         );
                         let prefilter_ms = prefilter_started.elapsed().as_millis() as u64;
                         let mut update_class = material_hunter_update_class(&update);
+                        let mut transaction_hint_signature = signature.clone();
+                        let mut transaction_hint_mint =
+                            material_hunter_transaction_mint_hint(&update);
+                        let mut transaction_hint_account =
+                            material_hunter_transaction_account_hint(&update);
+                        if duplicate_signature {
+                            if let Some(prefilter) = material_hunter_prefilter_transaction_update(
+                                &update,
+                                &active_mints,
+                                &tombstoned_mints,
+                                &token_account_to_mint,
+                                &account_partition_pins,
+                                true,
+                            ) {
+                                if let Ok(mut stats) = router_stats.lock() {
+                                    stats.transaction_prefilter_count =
+                                        stats.transaction_prefilter_count.saturating_add(1);
+                                    stats.transaction_duplicate_signature_skipped_count = stats
+                                        .transaction_duplicate_signature_skipped_count
+                                        .saturating_add(1);
+                                    stats.record_transaction_prefilter_duration(prefilter_ms);
+                                    stats.record_update_class_skipped(prefilter.update_class);
+                                }
+                                continue;
+                            }
+                        }
                         if let Some(prefilter) = pump_prefilter.as_ref() {
                             update_class = prefilter.update_class;
                             if let Ok(mut stats) = router_stats.lock() {
@@ -2910,9 +3490,138 @@ where
                                 }
                             }
                         }
-                        for (account, mint) in material_hunter_token_account_mint_mappings(&update)
-                        {
-                            token_account_to_mint.entry(account).or_insert(mint);
+                        if pump_prefilter.is_none() {
+                            if let Some(prefilter) = material_hunter_prefilter_transaction_update(
+                                &update,
+                                &active_mints,
+                                &tombstoned_mints,
+                                &token_account_to_mint,
+                                &account_partition_pins,
+                                false,
+                            ) {
+                                update_class = prefilter.update_class;
+                                transaction_hint_signature = prefilter.signature.clone();
+                                transaction_hint_mint = prefilter.mint.clone();
+                                transaction_hint_account = prefilter.account.clone();
+                                if let Ok(mut stats) = router_stats.lock() {
+                                    stats.transaction_prefilter_count =
+                                        stats.transaction_prefilter_count.saturating_add(1);
+                                    stats.record_transaction_prefilter_duration(prefilter_ms);
+                                    match prefilter.decision {
+                                        MaterialHunterTransactionPrefilterDecision::DeepProcess => {
+                                            stats.transaction_deep_processed_count = stats
+                                                .transaction_deep_processed_count
+                                                .saturating_add(1);
+                                            stats.transaction_feature_deferred_count = stats
+                                                .transaction_feature_deferred_count
+                                                .saturating_add(1);
+                                            if prefilter.update_class == "transaction_active_mint"
+                                                || prefilter.update_class
+                                                    == "transaction_active_account"
+                                            {
+                                                stats.active_mint_transaction_update_count = stats
+                                                    .active_mint_transaction_update_count
+                                                    .saturating_add(1);
+                                                stats.active_mint_transaction_deep_processed_count =
+                                                    stats
+                                                        .active_mint_transaction_deep_processed_count
+                                                        .saturating_add(1);
+                                                stats.active_mint_transaction_dirty_feature_count =
+                                                    stats
+                                                        .active_mint_transaction_dirty_feature_count
+                                                        .saturating_add(1);
+                                                if let Some(mint) = prefilter.mint.as_ref() {
+                                                    MaterialHunterReaderStats::increment_top_count(
+                                                        &mut stats
+                                                            .top_active_mint_transaction_counts,
+                                                        mint.clone(),
+                                                    );
+                                                }
+                                            }
+                                            if prefilter.update_class == "transaction_active_account"
+                                            {
+                                                stats.account_pinned_active_count = stats
+                                                    .account_pinned_active_count
+                                                    .saturating_add(1);
+                                                stats.account_pinned_deep_processed_count = stats
+                                                    .account_pinned_deep_processed_count
+                                                    .saturating_add(1);
+                                            }
+                                        }
+                                        MaterialHunterTransactionPrefilterDecision::SkipMappingHintOnly
+                                        | MaterialHunterTransactionPrefilterDecision::SkipUntrackedPump
+                                        | MaterialHunterTransactionPrefilterDecision::SkipAccountPinnedUnknown
+                                        | MaterialHunterTransactionPrefilterDecision::SkipTombstoned
+                                        | MaterialHunterTransactionPrefilterDecision::SkipDuplicateSignature
+                                        | MaterialHunterTransactionPrefilterDecision::SkipMalformedOrUnknown
+                                        | MaterialHunterTransactionPrefilterDecision::SkipOtherUntracked => {
+                                            match prefilter.decision {
+                                                MaterialHunterTransactionPrefilterDecision::SkipMappingHintOnly => {
+                                                    stats.transaction_mapping_hint_only_count = stats
+                                                        .transaction_mapping_hint_only_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipUntrackedPump => {
+                                                    stats.transaction_untracked_pump_skipped_count = stats
+                                                        .transaction_untracked_pump_skipped_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipAccountPinnedUnknown => {
+                                                    stats.transaction_account_pinned_unknown_count = stats
+                                                        .transaction_account_pinned_unknown_count
+                                                        .saturating_add(1);
+                                                    stats.account_pinned_unknown_count = stats
+                                                        .account_pinned_unknown_count
+                                                        .saturating_add(1);
+                                                    stats.account_pinned_skipped_count = stats
+                                                        .account_pinned_skipped_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipTombstoned => {
+                                                    stats.transaction_tombstoned_mint_skipped_count = stats
+                                                        .transaction_tombstoned_mint_skipped_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipDuplicateSignature => {
+                                                    stats.transaction_duplicate_signature_skipped_count = stats
+                                                        .transaction_duplicate_signature_skipped_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipMalformedOrUnknown => {
+                                                    stats.transaction_malformed_or_unknown_count = stats
+                                                        .transaction_malformed_or_unknown_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::SkipOtherUntracked => {
+                                                    stats.transaction_other_untracked_skipped_count = stats
+                                                        .transaction_other_untracked_skipped_count
+                                                        .saturating_add(1);
+                                                }
+                                                MaterialHunterTransactionPrefilterDecision::DeepProcess => {}
+                                            }
+                                            if prefilter.update_class.starts_with("transaction_active_") {
+                                                stats.active_mint_transaction_skipped_count = stats
+                                                    .active_mint_transaction_skipped_count
+                                                    .saturating_add(1);
+                                            }
+                                            stats.record_update_class_skipped(prefilter.update_class);
+                                            if let Some(mint) = prefilter.mint.as_ref() {
+                                                MaterialHunterReaderStats::increment_top_count(
+                                                    &mut stats.top_mint_counts,
+                                                    mint.clone(),
+                                                );
+                                            }
+                                            if let Some(account) = prefilter.account.as_ref() {
+                                                MaterialHunterReaderStats::increment_top_count(
+                                                    &mut stats.top_account_counts,
+                                                    account.clone(),
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         let (partition, fallback, route_key_label) =
                             material_hunter_partition_for_update_with_account_map(
@@ -2979,6 +3688,9 @@ where
                             sequence,
                             update_class,
                             route_key_label: route_key_label.clone(),
+                            transaction_signature: transaction_hint_signature.clone(),
+                            transaction_mint: transaction_hint_mint.clone(),
+                            transaction_account: transaction_hint_account.clone(),
                         }) {
                             Ok(()) => {
                                 if let Ok(mut stats) = router_stats.lock() {
@@ -3042,6 +3754,43 @@ where
                                         .pump_trade_skipped_untracked_count
                                         .saturating_add(stats.pump_trade_skipped_tombstoned_count)
                                         .saturating_add(stats.pump_trade_unknown_mint_count);
+                                    if update_class.starts_with("transaction_") {
+                                        stats.backpressure_transaction_class =
+                                            Some(update_class.to_owned());
+                                        stats.backpressure_transaction_signature =
+                                            transaction_hint_signature.clone();
+                                        stats.backpressure_transaction_mint =
+                                            transaction_hint_mint.clone();
+                                        stats.backpressure_transaction_account =
+                                            transaction_hint_account.clone();
+                                        stats.backpressure_deep_transaction_count_at_trigger =
+                                            stats.transaction_deep_processed_count;
+                                        stats.backpressure_skipped_transaction_count_at_trigger =
+                                            stats.transaction_mapping_hint_only_count
+                                                .saturating_add(
+                                                    stats.transaction_untracked_pump_skipped_count,
+                                                )
+                                                .saturating_add(
+                                                    stats
+                                                        .transaction_account_pinned_unknown_count,
+                                                )
+                                                .saturating_add(
+                                                    stats
+                                                        .transaction_tombstoned_mint_skipped_count,
+                                                )
+                                                .saturating_add(
+                                                    stats
+                                                        .transaction_duplicate_signature_skipped_count,
+                                                )
+                                                .saturating_add(
+                                                    stats.transaction_malformed_or_unknown_count,
+                                                )
+                                                .saturating_add(
+                                                    stats.transaction_other_untracked_skipped_count,
+                                                );
+                                        stats.backpressure_account_pinned_count_at_trigger =
+                                            stats.account_pinned_update_count;
+                                    }
                                     stats.backpressure_queue_depth_at_blocker =
                                         partition_tx.max_capacity() as u64;
                                     stats.dirty_partition_queued_updates_discarded = stats
@@ -5105,6 +5854,51 @@ mod tests {
         )
     }
 
+    fn geyser_transaction_without_token_balances(first_account_byte: u8) -> SubscribeUpdate {
+        update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
+                SubscribeUpdateTransaction {
+                    slot: 11,
+                    transaction: Some(SubscribeUpdateTransactionInfo {
+                        signature: vec![first_account_byte; 64],
+                        is_vote: false,
+                        transaction: Some(Transaction {
+                            signatures: vec![vec![first_account_byte; 64]],
+                            message: Some(Message {
+                                header: None,
+                                account_keys: vec![vec![first_account_byte; 32]],
+                                recent_blockhash: vec![0; 32],
+                                instructions: Vec::new(),
+                                versioned: false,
+                                address_table_lookups: Vec::new(),
+                            }),
+                        }),
+                        meta: Some(TransactionStatusMeta {
+                            err: None,
+                            fee: 5000,
+                            pre_balances: Vec::new(),
+                            post_balances: Vec::new(),
+                            inner_instructions: Vec::new(),
+                            inner_instructions_none: false,
+                            log_messages: Vec::new(),
+                            log_messages_none: false,
+                            pre_token_balances: Vec::new(),
+                            post_token_balances: Vec::new(),
+                            rewards: Vec::new(),
+                            loaded_writable_addresses: Vec::new(),
+                            loaded_readonly_addresses: Vec::new(),
+                            return_data: None,
+                            return_data_none: true,
+                            compute_units_consumed: None,
+                            cost_units: None,
+                        }),
+                        index: 0,
+                    }),
+                },
+            ),
+        )
+    }
+
     fn geyser_account_update(pubkey_byte: u8, owner_byte: u8) -> SubscribeUpdate {
         update_wrap(
             yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Account(
@@ -5322,6 +6116,259 @@ mod tests {
         assert!(!summary.client_backpressure_detected);
         assert!(!summary.worker_backpressure_detected);
         assert_eq!(summary.partition_worker_lag_ms_max, 0);
+    }
+
+    #[test]
+    fn transaction_mapping_hint_updates_token_account_to_mint_without_rich_processing() {
+        let mint = bs58::encode([31u8; 32]).into_string();
+        let update = geyser_token_balance_update(&mint, 31);
+        let mappings = material_hunter_token_account_mint_mappings(&update);
+        let token_account_to_mint = mappings.into_iter().collect::<HashMap<_, _>>();
+        let account_partition_pins = HashMap::<Vec<u8>, usize>::new();
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &HashSet::new(),
+            &token_account_to_mint,
+            &account_partition_pins,
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_mapping_hint_only");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::SkipMappingHintOnly
+        );
+    }
+
+    #[test]
+    fn transaction_active_mint_is_deep_processed_or_delta_accumulated() {
+        let mint = bs58::encode([32u8; 32]).into_string();
+        let update = geyser_token_balance_update(&mint, 32);
+        let mut active = HashSet::new();
+        active.insert(mint.clone());
+        let token_account_to_mint = material_hunter_token_account_mint_mappings(&update)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &active,
+            &HashSet::new(),
+            &token_account_to_mint,
+            &HashMap::new(),
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_active_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::DeepProcess
+        );
+        assert_eq!(prefilter.mint.as_deref(), Some(mint.as_str()));
+    }
+
+    #[test]
+    fn transaction_token_created_high_priority_not_skipped() {
+        let loaded = loaded_config();
+        let update = geyser_pump_candidate_update(&loaded);
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_token_created");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::DeepProcess
+        );
+    }
+
+    #[test]
+    fn transaction_tombstoned_mint_is_skipped() {
+        let mint = bs58::encode([33u8; 32]).into_string();
+        let update = geyser_token_balance_update(&mint, 33);
+        let mut tombstoned = HashSet::new();
+        tombstoned.insert(mint.clone());
+        let token_account_to_mint = material_hunter_token_account_mint_mappings(&update)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &tombstoned,
+            &token_account_to_mint,
+            &HashMap::new(),
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_tombstoned_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::SkipTombstoned
+        );
+    }
+
+    #[test]
+    fn transaction_duplicate_signature_is_skipped() {
+        let update = geyser_token_balance_update(&bs58::encode([34u8; 32]).into_string(), 34);
+        let signature = material_hunter_transaction_signature_hint(&update).expect("signature");
+        let mut seen = HashSet::new();
+        let mut lru = VecDeque::new();
+        assert!(!material_hunter_signature_seen_or_insert(
+            &mut seen, &mut lru, &signature, 4096,
+        ));
+        assert!(material_hunter_signature_seen_or_insert(
+            &mut seen, &mut lru, &signature, 4096,
+        ));
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_duplicate_signature");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::SkipDuplicateSignature
+        );
+    }
+
+    #[test]
+    fn transaction_account_pinned_unknown_is_skipped_unless_active_mapping_exists() {
+        let update = geyser_transaction_without_token_balances(35);
+        let mut pins = HashMap::new();
+        pins.insert(vec![35; 32], 2);
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &pins,
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_account_pinned_unknown");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::SkipAccountPinnedUnknown
+        );
+
+        let mint = bs58::encode([35u8; 32]).into_string();
+        let active = HashSet::from([mint.clone()]);
+        let mapped = HashMap::from([(vec![35; 32], mint)]);
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &active,
+            &HashSet::new(),
+            &mapped,
+            &pins,
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_active_account");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::DeepProcess
+        );
+    }
+
+    #[test]
+    fn malformed_transaction_update_does_not_panic() {
+        let update = update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
+                SubscribeUpdateTransaction {
+                    slot: 1,
+                    transaction: None,
+                },
+            ),
+        );
+        let prefilter = material_hunter_prefilter_transaction_update(
+            &update,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("transaction prefilter");
+        assert_eq!(prefilter.update_class, "transaction_malformed_or_unknown");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterTransactionPrefilterDecision::SkipMalformedOrUnknown
+        );
+    }
+
+    #[test]
+    fn skipped_transaction_noise_does_not_trigger_worker_backpressure() {
+        let mut stats = MaterialHunterReaderStats {
+            worker_partitions: 4,
+            transaction_mapping_hint_only_count: 2_000,
+            transaction_account_pinned_unknown_count: 500,
+            transaction_other_untracked_skipped_count: 500,
+            ..MaterialHunterReaderStats::default()
+        };
+        stats.record_update_class_skipped("transaction_mapping_hint_only");
+        stats.record_update_class_skipped("transaction_account_pinned_unknown");
+        let mut summary = MaterialHunterStreamSummary::default();
+        apply_reader_stats_to_summary(&mut summary, &stats);
+        assert_eq!(summary.transaction_mapping_hint_only_count, 2_000);
+        assert_eq!(summary.transaction_account_pinned_unknown_count, 500);
+        assert!(!summary.client_backpressure_detected);
+        assert!(!summary.worker_backpressure_detected);
+        assert_eq!(summary.partition_worker_lag_ms_max, 0);
+    }
+
+    #[test]
+    fn transaction_hot_class_telemetry_reports_counts_durations_and_trigger_fields() {
+        let mut stats = MaterialHunterReaderStats {
+            worker_partitions: 4,
+            transaction_deep_processed_count: 12,
+            transaction_mapping_hint_only_count: 40,
+            account_pinned_update_count: 7,
+            backpressure_transaction_class: Some("transaction_active_mint".to_owned()),
+            backpressure_transaction_signature: Some("sig".to_owned()),
+            backpressure_transaction_mint: Some("mint".to_owned()),
+            backpressure_transaction_account: Some("account".to_owned()),
+            backpressure_deep_transaction_count_at_trigger: 12,
+            backpressure_skipped_transaction_count_at_trigger: 40,
+            backpressure_account_pinned_count_at_trigger: 7,
+            ..MaterialHunterReaderStats::default()
+        };
+        stats.record_transaction_prefilter_duration(2);
+        stats.record_transaction_deep_duration(5);
+        MaterialHunterReaderStats::increment_top_count(
+            &mut stats.top_active_mint_transaction_counts,
+            "mint".to_owned(),
+        );
+        MaterialHunterReaderStats::max_top_value(
+            &mut stats.top_active_mint_transaction_lag,
+            "mint".to_owned(),
+            99,
+        );
+        let mut summary = MaterialHunterStreamSummary::default();
+        apply_reader_stats_to_summary(&mut summary, &stats);
+        assert_eq!(summary.transaction_deep_processed_count, 12);
+        assert_eq!(summary.transaction_mapping_hint_only_count, 40);
+        assert_eq!(summary.transaction_prefilter_duration_ms_max, 2);
+        assert_eq!(summary.transaction_deep_process_duration_ms_max, 5);
+        assert_eq!(
+            summary.backpressure_transaction_class.as_deref(),
+            Some("transaction_active_mint")
+        );
+        assert_eq!(summary.backpressure_deep_transaction_count_at_trigger, 12);
+        assert_eq!(
+            summary.backpressure_skipped_transaction_count_at_trigger,
+            40
+        );
+        assert_eq!(summary.backpressure_account_pinned_count_at_trigger, 7);
+        assert_eq!(summary.top_active_mints_by_transaction_lag[0].count, 99);
     }
 
     #[test]
@@ -6002,8 +7049,19 @@ mod tests {
             .geyser
             .material_hunter_partition_queue_capacity = 1;
         let mut updates = Vec::new();
-        for _ in 0..512u64 {
-            updates.push(Ok(geyser_pump_candidate_update(&loaded)));
+        for index in 0..512u64 {
+            let mut update = geyser_pump_candidate_update(&loaded);
+            if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_mut() {
+                if let Some(info) = tx.transaction.as_mut() {
+                    let mut signature = vec![0; 64];
+                    signature[..8].copy_from_slice(&index.to_le_bytes());
+                    info.signature = signature.clone();
+                    if let Some(transaction) = info.transaction.as_mut() {
+                        transaction.signatures = vec![signature];
+                    }
+                }
+            }
+            updates.push(Ok(update));
         }
         let connector = MockGeyserConnector {
             batches: Arc::new(std::sync::Mutex::new(vec![MockConnectorBatch { updates }])),
