@@ -826,6 +826,26 @@ pub struct MaterialHunterStreamOptions {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MaterialHunterUpdateClassSummary {
+    pub class_name: String,
+    pub count: u64,
+    pub rate_per_second: u64,
+    pub decode_duration_ms_p95: u64,
+    pub decode_duration_ms_max: u64,
+    pub state_update_duration_ms_p95: u64,
+    pub state_update_duration_ms_max: u64,
+    pub worker_lag_ms_p95: u64,
+    pub worker_lag_ms_max: u64,
+    pub routed_partition_distribution: Vec<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MaterialHunterTopKeySummary {
+    pub key: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct MaterialHunterStreamSummary {
     pub provider_status: String,
     #[serde(default)]
@@ -1004,6 +1024,46 @@ pub struct MaterialHunterStreamSummary {
     #[serde(default)]
     pub partition_worker_lag_ms_max: u64,
     #[serde(default)]
+    pub partition_worker_lag_ms_max_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_worker_lag_ms_p95_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_queue_depth_max_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_backlog_oldest_update_age_ms_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_batch_size_max_by_partition: Vec<u64>,
+    #[serde(default)]
+    pub partition_backpressure_trigger_partition: Option<u64>,
+    #[serde(default)]
+    pub partition_backpressure_trigger_reason: Option<String>,
+    #[serde(default)]
+    pub backpressure_threshold_ms: u64,
+    #[serde(default)]
+    pub backpressure_observed_lag_ms: u64,
+    #[serde(default)]
+    pub backpressure_update_class: Option<String>,
+    #[serde(default)]
+    pub backpressure_partition_id: Option<u64>,
+    #[serde(default)]
+    pub backpressure_segment_id: Option<u64>,
+    #[serde(default)]
+    pub unknown_mint_route_count: u64,
+    #[serde(default)]
+    pub skipped_untracked_account_updates: u64,
+    #[serde(default)]
+    pub update_class_telemetry: Vec<MaterialHunterUpdateClassSummary>,
+    #[serde(default)]
+    pub top_partition_keys_by_update_count: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_mints_by_worker_updates: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_accounts_by_worker_updates: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_update_classes_by_lag: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_update_classes_by_count: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
     pub partition_decode_duration_ms_p50: u64,
     #[serde(default)]
     pub partition_decode_duration_ms_p95: u64,
@@ -1052,6 +1112,7 @@ struct MaterialHunterPartitionUpdate {
     update: SubscribeUpdate,
     read_at: tokio::time::Instant,
     sequence: u64,
+    update_class: &'static str,
 }
 
 #[derive(Debug)]
@@ -1064,6 +1125,14 @@ enum MaterialHunterWorkerOutput {
     },
     StreamError(Status),
     StreamClosed,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MaterialHunterUpdateClassStats {
+    count: u64,
+    decode_duration_ms: Vec<u64>,
+    worker_lag_ms: Vec<u64>,
+    routed_partition_distribution: Vec<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -1104,6 +1173,9 @@ struct MaterialHunterReaderStats {
     partition_queue_depth_max: Vec<u64>,
     partition_queue_full_count_by_partition: Vec<u64>,
     partition_updates_processed_by_partition: Vec<u64>,
+    partition_worker_lag_ms_by_partition: Vec<Vec<u64>>,
+    partition_backlog_oldest_update_age_ms_by_partition: Vec<u64>,
+    partition_batch_size_max_by_partition: Vec<u64>,
     partition_started_at: Option<tokio::time::Instant>,
     partition_worker_lag_ms: Vec<u64>,
     partition_decode_duration_ms: Vec<u64>,
@@ -1113,6 +1185,19 @@ struct MaterialHunterReaderStats {
     partition_worker_reset_count: u64,
     artifact_queue_depth_max: u64,
     artifact_queue_full_count: u64,
+    partition_backpressure_trigger_partition: Option<u64>,
+    partition_backpressure_trigger_reason: Option<String>,
+    backpressure_threshold_ms: u64,
+    backpressure_observed_lag_ms: u64,
+    backpressure_update_class: Option<String>,
+    backpressure_partition_id: Option<u64>,
+    backpressure_segment_id: Option<u64>,
+    unknown_mint_route_count: u64,
+    skipped_untracked_account_updates: u64,
+    update_class_stats: BTreeMap<&'static str, MaterialHunterUpdateClassStats>,
+    top_partition_key_counts: BTreeMap<String, u64>,
+    top_mint_counts: BTreeMap<String, u64>,
+    top_account_counts: BTreeMap<String, u64>,
 }
 
 impl MaterialHunterReaderStats {
@@ -1170,6 +1255,84 @@ impl MaterialHunterReaderStats {
         }
     }
 
+    fn record_partition_lag_for_partition(&mut self, partition: usize, millis: u64) {
+        if let Some(values) = self.partition_worker_lag_ms_by_partition.get_mut(partition) {
+            if values.len() < 25_000 {
+                values.push(millis);
+            }
+        }
+        if let Some(oldest) = self
+            .partition_backlog_oldest_update_age_ms_by_partition
+            .get_mut(partition)
+        {
+            *oldest = (*oldest).max(millis);
+        }
+    }
+
+    fn record_update_class_route(&mut self, class_name: &'static str, partition: usize) {
+        let partitions = self.worker_partitions.max(1) as usize;
+        let entry = self
+            .update_class_stats
+            .entry(class_name)
+            .or_insert_with(|| MaterialHunterUpdateClassStats {
+                routed_partition_distribution: vec![0; partitions],
+                ..MaterialHunterUpdateClassStats::default()
+            });
+        entry.count = entry.count.saturating_add(1);
+        if entry.routed_partition_distribution.len() < partitions {
+            entry.routed_partition_distribution.resize(partitions, 0);
+        }
+        if let Some(count) = entry.routed_partition_distribution.get_mut(partition) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn record_update_class_worker(
+        &mut self,
+        class_name: &'static str,
+        partition: usize,
+        lag_ms: u64,
+        decode_ms: u64,
+    ) {
+        let partitions = self.worker_partitions.max(1) as usize;
+        let entry = self
+            .update_class_stats
+            .entry(class_name)
+            .or_insert_with(|| MaterialHunterUpdateClassStats {
+                routed_partition_distribution: vec![0; partitions],
+                ..MaterialHunterUpdateClassStats::default()
+            });
+        if entry.worker_lag_ms.len() < 25_000 {
+            entry.worker_lag_ms.push(lag_ms);
+        }
+        if entry.decode_duration_ms.len() < 25_000 {
+            entry.decode_duration_ms.push(decode_ms);
+        }
+        if entry.routed_partition_distribution.len() < partitions {
+            entry.routed_partition_distribution.resize(partitions, 0);
+        }
+        if let Some(count) = entry.routed_partition_distribution.get_mut(partition) {
+            *count = (*count).max(1);
+        }
+    }
+
+    fn increment_top_count(map: &mut BTreeMap<String, u64>, key: String) {
+        if key.trim().is_empty() {
+            return;
+        }
+        let next = map.get(&key).copied().unwrap_or(0).saturating_add(1);
+        map.insert(key, next);
+        if map.len() > 256 {
+            if let Some(remove_key) = map
+                .iter()
+                .min_by_key(|(_, count)| *count)
+                .map(|(key, _)| key.clone())
+            {
+                map.remove(&remove_key);
+            }
+        }
+    }
+
     fn record_update_kind(&mut self, update: &SubscribeUpdate) {
         match update.update_oneof.as_ref() {
             Some(UpdateOneof::Transaction(_)) | Some(UpdateOneof::TransactionStatus(_)) => {
@@ -1184,6 +1347,27 @@ impl MaterialHunterReaderStats {
             _ => {}
         }
     }
+}
+
+fn top_key_summaries(
+    map: &BTreeMap<String, u64>,
+    limit: usize,
+) -> Vec<MaterialHunterTopKeySummary> {
+    let mut rows = map
+        .iter()
+        .map(|(key, count)| MaterialHunterTopKeySummary {
+            key: key.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    rows.truncate(limit);
+    rows
 }
 
 fn percentile(values: &[u64], numerator: usize, denominator: usize) -> u64 {
@@ -1330,6 +1514,102 @@ fn apply_reader_stats_to_summary(
         .copied()
         .max()
         .unwrap_or(0);
+    summary.partition_worker_lag_ms_max_by_partition = stats
+        .partition_worker_lag_ms_by_partition
+        .iter()
+        .map(|values| values.iter().copied().max().unwrap_or(0))
+        .collect();
+    summary.partition_worker_lag_ms_p95_by_partition = stats
+        .partition_worker_lag_ms_by_partition
+        .iter()
+        .map(|values| percentile(values, 95, 100))
+        .collect();
+    summary.partition_queue_depth_max_by_partition = stats.partition_queue_depth_max.clone();
+    summary.partition_backlog_oldest_update_age_ms_by_partition = stats
+        .partition_backlog_oldest_update_age_ms_by_partition
+        .clone();
+    summary.partition_batch_size_max_by_partition =
+        stats.partition_batch_size_max_by_partition.clone();
+    summary.partition_backpressure_trigger_partition =
+        stats.partition_backpressure_trigger_partition;
+    summary.partition_backpressure_trigger_reason =
+        stats.partition_backpressure_trigger_reason.clone();
+    summary.backpressure_threshold_ms = stats.backpressure_threshold_ms;
+    summary.backpressure_observed_lag_ms = stats.backpressure_observed_lag_ms;
+    summary.backpressure_update_class = stats.backpressure_update_class.clone();
+    summary.backpressure_partition_id = stats.backpressure_partition_id;
+    summary.backpressure_segment_id = stats.backpressure_segment_id;
+    summary.unknown_mint_route_count = stats.unknown_mint_route_count;
+    summary.skipped_untracked_account_updates = stats.skipped_untracked_account_updates;
+    let secs = stats
+        .partition_started_at
+        .map(|started| started.elapsed().as_secs().max(1))
+        .unwrap_or(1);
+    summary.update_class_telemetry = stats
+        .update_class_stats
+        .iter()
+        .map(
+            |(class_name, class_stats)| MaterialHunterUpdateClassSummary {
+                class_name: (*class_name).to_owned(),
+                count: class_stats.count,
+                rate_per_second: class_stats.count / secs,
+                decode_duration_ms_p95: percentile(&class_stats.decode_duration_ms, 95, 100),
+                decode_duration_ms_max: class_stats
+                    .decode_duration_ms
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0),
+                state_update_duration_ms_p95: 0,
+                state_update_duration_ms_max: 0,
+                worker_lag_ms_p95: percentile(&class_stats.worker_lag_ms, 95, 100),
+                worker_lag_ms_max: class_stats.worker_lag_ms.iter().copied().max().unwrap_or(0),
+                routed_partition_distribution: class_stats.routed_partition_distribution.clone(),
+            },
+        )
+        .collect();
+    summary.update_class_telemetry.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.class_name.cmp(&right.class_name))
+    });
+    summary.top_partition_keys_by_update_count =
+        top_key_summaries(&stats.top_partition_key_counts, 20);
+    summary.top_mints_by_worker_updates = top_key_summaries(&stats.top_mint_counts, 20);
+    summary.top_accounts_by_worker_updates = top_key_summaries(&stats.top_account_counts, 20);
+    let mut classes_by_lag = stats
+        .update_class_stats
+        .iter()
+        .map(|(class_name, class_stats)| MaterialHunterTopKeySummary {
+            key: (*class_name).to_owned(),
+            count: class_stats.worker_lag_ms.iter().copied().max().unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    classes_by_lag.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    classes_by_lag.truncate(20);
+    summary.top_update_classes_by_lag = classes_by_lag;
+    let mut classes_by_count = stats
+        .update_class_stats
+        .iter()
+        .map(|(class_name, class_stats)| MaterialHunterTopKeySummary {
+            key: (*class_name).to_owned(),
+            count: class_stats.count,
+        })
+        .collect::<Vec<_>>();
+    classes_by_count.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    classes_by_count.truncate(20);
+    summary.top_update_classes_by_count = classes_by_count;
     summary.partition_decode_duration_ms_p50 =
         percentile(&stats.partition_decode_duration_ms, 50, 100);
     summary.partition_decode_duration_ms_p95 =
@@ -1441,8 +1721,63 @@ fn should_retain_fresh_launch_event(
     }
 }
 
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPq9sJqzQdbqT6qhHV4";
+
+fn material_hunter_update_class(update: &SubscribeUpdate) -> &'static str {
+    match update.update_oneof.as_ref() {
+        Some(UpdateOneof::Slot(_)) | Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {
+            "slot_or_liveness_reader_side"
+        }
+        Some(UpdateOneof::Transaction(tx)) => {
+            if let Some(info) = tx.transaction.as_ref() {
+                if let Some(transaction) = info.transaction.as_ref() {
+                    if let Some(message) = transaction.message.as_ref() {
+                        if message.account_keys.iter().any(|key| {
+                            bs58::encode(key).into_string()
+                                == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+                        }) {
+                            return "pump_trade_or_instruction";
+                        }
+                    }
+                }
+                if info
+                    .meta
+                    .as_ref()
+                    .map(|meta| {
+                        !meta.post_token_balances.is_empty() || !meta.pre_token_balances.is_empty()
+                    })
+                    .unwrap_or(false)
+                {
+                    return "transaction_update_relevant";
+                }
+            }
+            "transaction_update_untracked"
+        }
+        Some(UpdateOneof::TransactionStatus(_)) => "transaction_update_untracked",
+        Some(UpdateOneof::Account(account_update)) => {
+            let Some(account) = account_update.account.as_ref() else {
+                return "account_update_untracked";
+            };
+            if account.data.is_empty() {
+                return "account_update_untracked";
+            }
+            let owner = bs58::encode(&account.owner).into_string();
+            if owner == SPL_TOKEN_PROGRAM_ID || owner == TOKEN_2022_PROGRAM_ID {
+                "token_account_update_untracked"
+            } else {
+                "owner_account_update"
+            }
+        }
+        _ => "unknown_worker_relevant",
+    }
+}
+
 fn material_hunter_update_needs_worker(update: &SubscribeUpdate) -> bool {
-    !matches!(update.update_oneof.as_ref(), Some(UpdateOneof::Slot(_)))
+    !matches!(
+        material_hunter_update_class(update),
+        "slot_or_liveness_reader_side" | "account_update_untracked"
+    )
 }
 
 fn material_hunter_partition_hash(bytes: &[u8]) -> u64 {
@@ -1461,7 +1796,7 @@ fn material_hunter_partition_for_key(key: &[u8], partitions: usize) -> usize {
     (material_hunter_partition_hash(key) as usize) % partitions
 }
 
-fn material_hunter_partition_key(update: &SubscribeUpdate) -> (Vec<u8>, bool) {
+fn material_hunter_partition_key(update: &SubscribeUpdate) -> (Vec<u8>, bool, String) {
     match update.update_oneof.as_ref() {
         Some(UpdateOneof::Transaction(tx)) => {
             if let Some(info) = tx.transaction.as_ref() {
@@ -1472,59 +1807,189 @@ fn material_hunter_partition_key(update: &SubscribeUpdate) -> (Vec<u8>, bool) {
                         .chain(meta.pre_token_balances.iter())
                         .find(|balance| !balance.mint.trim().is_empty())
                     {
-                        return (balance.mint.as_bytes().to_vec(), false);
+                        return (
+                            balance.mint.as_bytes().to_vec(),
+                            false,
+                            format!("mint:{}", balance.mint),
+                        );
                     }
                 }
                 if let Some(transaction) = info.transaction.as_ref() {
                     if let Some(message) = transaction.message.as_ref() {
                         if let Some(key) = message.account_keys.first() {
-                            return (key.clone(), false);
+                            return (
+                                key.clone(),
+                                false,
+                                format!("account:{}", bs58::encode(key).into_string()),
+                            );
                         }
                     }
                     if let Some(signature) = transaction.signatures.first() {
-                        return (signature.clone(), false);
+                        return (
+                            signature.clone(),
+                            false,
+                            format!("signature:{}", bs58::encode(signature).into_string()),
+                        );
                     }
                 }
                 if !info.signature.is_empty() {
-                    return (info.signature.clone(), false);
+                    return (
+                        info.signature.clone(),
+                        false,
+                        format!("signature:{}", bs58::encode(&info.signature).into_string()),
+                    );
                 }
             }
-            (tx.slot.to_le_bytes().to_vec(), true)
+            (
+                tx.slot.to_le_bytes().to_vec(),
+                true,
+                format!("slot:{}", tx.slot),
+            )
         }
         Some(UpdateOneof::TransactionStatus(status)) => {
             if !status.signature.is_empty() {
-                (status.signature.clone(), false)
+                (
+                    status.signature.clone(),
+                    false,
+                    format!(
+                        "signature:{}",
+                        bs58::encode(&status.signature).into_string()
+                    ),
+                )
             } else {
-                (status.slot.to_le_bytes().to_vec(), true)
+                (
+                    status.slot.to_le_bytes().to_vec(),
+                    true,
+                    format!("slot:{}", status.slot),
+                )
             }
         }
         Some(UpdateOneof::Account(account_update)) => {
             if let Some(account) = account_update.account.as_ref() {
                 if !account.pubkey.is_empty() {
-                    return (account.pubkey.clone(), false);
+                    return (
+                        account.pubkey.clone(),
+                        false,
+                        format!("account:{}", bs58::encode(&account.pubkey).into_string()),
+                    );
                 }
                 if !account.owner.is_empty() {
-                    return (account.owner.clone(), false);
+                    return (
+                        account.owner.clone(),
+                        false,
+                        format!("owner:{}", bs58::encode(&account.owner).into_string()),
+                    );
                 }
             }
-            (account_update.slot.to_le_bytes().to_vec(), true)
+            (
+                account_update.slot.to_le_bytes().to_vec(),
+                true,
+                format!("slot:{}", account_update.slot),
+            )
         }
-        Some(UpdateOneof::Block(block)) => (block.slot.to_le_bytes().to_vec(), true),
-        Some(UpdateOneof::BlockMeta(block)) => (block.slot.to_le_bytes().to_vec(), true),
-        Some(UpdateOneof::Entry(entry)) => (entry.slot.to_le_bytes().to_vec(), true),
-        _ => (b"material-hunter-fallback".to_vec(), true),
+        Some(UpdateOneof::Block(block)) => (
+            block.slot.to_le_bytes().to_vec(),
+            true,
+            format!("slot:{}", block.slot),
+        ),
+        Some(UpdateOneof::BlockMeta(block)) => (
+            block.slot.to_le_bytes().to_vec(),
+            true,
+            format!("slot:{}", block.slot),
+        ),
+        Some(UpdateOneof::Entry(entry)) => (
+            entry.slot.to_le_bytes().to_vec(),
+            true,
+            format!("slot:{}", entry.slot),
+        ),
+        _ => (
+            b"material-hunter-fallback".to_vec(),
+            true,
+            "fallback:unknown".to_owned(),
+        ),
     }
 }
 
 fn material_hunter_partition_for_update(
     update: &SubscribeUpdate,
     partitions: usize,
-) -> (usize, bool) {
-    let (key, fallback) = material_hunter_partition_key(update);
+) -> (usize, bool, String) {
+    let (key, fallback, label) = material_hunter_partition_key(update);
     (
         material_hunter_partition_for_key(&key, partitions),
         fallback,
+        label,
     )
+}
+
+fn material_hunter_token_account_mint_mappings(update: &SubscribeUpdate) -> Vec<(Vec<u8>, String)> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return Vec::new();
+    };
+    let Some(info) = tx.transaction.as_ref() else {
+        return Vec::new();
+    };
+    let account_keys = info
+        .transaction
+        .as_ref()
+        .and_then(|transaction| transaction.message.as_ref())
+        .map(|message| message.account_keys.as_slice())
+        .unwrap_or(&[]);
+    let Some(meta) = info.meta.as_ref() else {
+        return Vec::new();
+    };
+    let mut mappings = Vec::new();
+    for balance in meta
+        .post_token_balances
+        .iter()
+        .chain(meta.pre_token_balances.iter())
+    {
+        if balance.mint.trim().is_empty() {
+            continue;
+        }
+        let Some(account_key) = account_keys.get(balance.account_index as usize) else {
+            continue;
+        };
+        if account_key.is_empty() {
+            continue;
+        }
+        mappings.push((account_key.clone(), balance.mint.clone()));
+    }
+    mappings
+}
+
+fn material_hunter_partition_for_update_with_account_map(
+    update: &SubscribeUpdate,
+    partitions: usize,
+    token_account_to_mint: &HashMap<Vec<u8>, String>,
+    account_partition_pins: &mut HashMap<Vec<u8>, usize>,
+) -> (usize, bool, String) {
+    if let Some(UpdateOneof::Account(account_update)) = update.update_oneof.as_ref() {
+        if let Some(account) = account_update.account.as_ref() {
+            if !account.pubkey.is_empty() {
+                if let Some(partition) = account_partition_pins.get(&account.pubkey).copied() {
+                    return (
+                        partition,
+                        false,
+                        format!(
+                            "account_pinned:{}",
+                            bs58::encode(&account.pubkey).into_string()
+                        ),
+                    );
+                }
+                if let Some(mint) = token_account_to_mint.get(&account.pubkey) {
+                    let partition = material_hunter_partition_for_key(mint.as_bytes(), partitions);
+                    account_partition_pins.insert(account.pubkey.clone(), partition);
+                    return (partition, false, format!("mint:{mint}"));
+                }
+                let (partition, fallback, label) =
+                    material_hunter_partition_for_update(update, partitions);
+                account_partition_pins.insert(account.pubkey.clone(), partition);
+                return (partition, fallback, label);
+            }
+        }
+    }
+    material_hunter_partition_for_update(update, partitions)
 }
 
 pub async fn run_material_hunter_stream<F>(
@@ -1702,6 +2167,10 @@ where
             partition_queue_depth_max: vec![0; worker_partitions],
             partition_queue_full_count_by_partition: vec![0; worker_partitions],
             partition_updates_processed_by_partition: vec![0; worker_partitions],
+            partition_worker_lag_ms_by_partition: vec![Vec::new(); worker_partitions],
+            partition_backlog_oldest_update_age_ms_by_partition: vec![0; worker_partitions],
+            partition_batch_size_max_by_partition: vec![0; worker_partitions],
+            backpressure_threshold_ms: worker_lag_blocker_ms,
             partition_started_at: Some(tokio::time::Instant::now()),
             ..MaterialHunterReaderStats::default()
         }));
@@ -1730,7 +2199,14 @@ where
                             stats.update_count = stats.update_count.saturating_add(1);
                             stats.record_update_kind(&update);
                         }
+                        let update_class = material_hunter_update_class(&update);
                         if !material_hunter_update_needs_worker(&update) {
+                            if update_class == "account_update_untracked" {
+                                if let Ok(mut stats) = reader_stats_for_task.lock() {
+                                    stats.skipped_untracked_account_updates =
+                                        stats.skipped_untracked_account_updates.saturating_add(1);
+                                }
+                            }
                             continue;
                         }
                         update
@@ -1778,6 +2254,10 @@ where
                             stats.worker_backpressure_detected = true;
                             stats.router_queue_full_count =
                                 stats.router_queue_full_count.saturating_add(1);
+                            stats.partition_backpressure_trigger_reason =
+                                Some("router_queue_full".to_owned());
+                            stats.backpressure_update_class =
+                                Some("unknown_worker_relevant".to_owned());
                             stats.queue_depth_current = stats.queue_capacity;
                             stats.queue_depth_max = stats.queue_capacity;
                             stats.router_queue_depth_current = stats.queue_capacity;
@@ -1837,6 +2317,12 @@ where
                     if let Ok(mut stats) = stats_for_worker.lock() {
                         stats.record_partition_batch(batch.len() as u64);
                         stats.record_worker_batch(batch.len() as u64);
+                        if let Some(max_batch) = stats
+                            .partition_batch_size_max_by_partition
+                            .get_mut(partition)
+                        {
+                            *max_batch = (*max_batch).max(batch.len() as u64);
+                        }
                     }
                     for item in batch {
                         let now = tokio::time::Instant::now();
@@ -1846,6 +2332,7 @@ where
                                 stats.decode_worker_lag_ms_max.max(worker_lag);
                             stats.record_queue_wait(worker_lag);
                             stats.record_partition_lag(worker_lag);
+                            stats.record_partition_lag_for_partition(partition, worker_lag);
                             stats.worker_backlog_oldest_update_age_ms =
                                 stats.worker_backlog_oldest_update_age_ms.max(worker_lag);
                             stats.queue_depth_current =
@@ -1858,6 +2345,16 @@ where
                             if worker_lag >= worker_lag_blocker_ms {
                                 stats.client_backpressure_detected = true;
                                 stats.worker_backpressure_detected = true;
+                                stats.backpressure_observed_lag_ms =
+                                    stats.backpressure_observed_lag_ms.max(worker_lag);
+                                stats.backpressure_update_class =
+                                    Some(item.update_class.to_owned());
+                                stats.backpressure_partition_id = Some(partition as u64);
+                                stats.backpressure_segment_id.get_or_insert(1);
+                                stats.partition_backpressure_trigger_partition =
+                                    Some(partition as u64);
+                                stats.partition_backpressure_trigger_reason =
+                                    Some("worker_lag_threshold_exceeded".to_owned());
                                 stats.backpressure_queue_depth_at_blocker =
                                     stats.queue_depth_current;
                                 stats.dirty_partition_queued_updates_discarded = stats
@@ -1887,6 +2384,12 @@ where
                         if let Ok(mut stats) = stats_for_worker.lock() {
                             stats.record_decode_duration(decode_ms);
                             stats.record_partition_decode_duration(decode_ms);
+                            stats.record_update_class_worker(
+                                item.update_class,
+                                partition,
+                                worker_lag,
+                                decode_ms,
+                            );
                             stats.worker_updates_processed =
                                 stats.worker_updates_processed.saturating_add(1);
                             if let Some(count) = stats
@@ -1918,17 +2421,48 @@ where
         let router_stats = reader_stats.clone();
         let router_output_tx = worker_output_tx.clone();
         tokio::spawn(async move {
+            let mut token_account_to_mint = HashMap::<Vec<u8>, String>::new();
+            let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
             while let Some(message) = router_rx.recv().await {
                 match message {
                     MaterialHunterReaderMessage::Update(update, read_at) => {
-                        let (partition, fallback) =
-                            material_hunter_partition_for_update(&update, worker_partitions);
+                        let update_class = material_hunter_update_class(&update);
+                        for (account, mint) in material_hunter_token_account_mint_mappings(&update)
+                        {
+                            token_account_to_mint.entry(account).or_insert(mint);
+                        }
+                        let (partition, fallback, route_key_label) =
+                            material_hunter_partition_for_update_with_account_map(
+                                &update,
+                                worker_partitions,
+                                &token_account_to_mint,
+                                &mut account_partition_pins,
+                            );
                         if let Ok(mut stats) = router_stats.lock() {
                             stats.router_updates_received =
                                 stats.router_updates_received.saturating_add(1);
                             if fallback {
                                 stats.router_fallback_count =
                                     stats.router_fallback_count.saturating_add(1);
+                                stats.unknown_mint_route_count =
+                                    stats.unknown_mint_route_count.saturating_add(1);
+                            }
+                            stats.record_update_class_route(update_class, partition);
+                            MaterialHunterReaderStats::increment_top_count(
+                                &mut stats.top_partition_key_counts,
+                                route_key_label.clone(),
+                            );
+                            if let Some(mint) = route_key_label.strip_prefix("mint:") {
+                                MaterialHunterReaderStats::increment_top_count(
+                                    &mut stats.top_mint_counts,
+                                    mint.to_owned(),
+                                );
+                            }
+                            if let Some(account) = route_key_label.strip_prefix("account:") {
+                                MaterialHunterReaderStats::increment_top_count(
+                                    &mut stats.top_account_counts,
+                                    account.to_owned(),
+                                );
                             }
                             stats.router_queue_depth_current = router_rx.len() as u64;
                             stats.router_queue_depth_max =
@@ -1952,6 +2486,7 @@ where
                             update,
                             read_at,
                             sequence,
+                            update_class,
                         }) {
                             Ok(()) => {
                                 if let Ok(mut stats) = router_stats.lock() {
@@ -1995,6 +2530,12 @@ where
                                     }
                                     stats.client_backpressure_detected = true;
                                     stats.worker_backpressure_detected = true;
+                                    stats.backpressure_partition_id = Some(partition as u64);
+                                    stats.partition_backpressure_trigger_partition =
+                                        Some(partition as u64);
+                                    stats.partition_backpressure_trigger_reason =
+                                        Some("partition_queue_full".to_owned());
+                                    stats.backpressure_update_class = Some(update_class.to_owned());
                                     stats.backpressure_queue_depth_at_blocker =
                                         partition_tx.max_capacity() as u64;
                                     stats.dirty_partition_queued_updates_discarded = stats
@@ -4000,6 +4541,164 @@ mod tests {
         )
     }
 
+    fn geyser_token_account_update(pubkey_byte: u8) -> SubscribeUpdate {
+        update_wrap(
+            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Account(
+                SubscribeUpdateAccount {
+                    slot: 12,
+                    is_startup: false,
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: vec![pubkey_byte; 32],
+                        lamports: 1,
+                        owner: bs58::decode(SPL_TOKEN_PROGRAM_ID)
+                            .into_vec()
+                            .expect("token owner"),
+                        executable: false,
+                        rent_epoch: 0,
+                        data: vec![1; 165],
+                        write_version: 1,
+                        txn_signature: None,
+                    }),
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn material_hunter_untracked_empty_account_update_is_reader_side_only() {
+        let update = geyser_account_update(7, 8);
+        assert_eq!(
+            material_hunter_update_class(&update),
+            "account_update_untracked"
+        );
+        assert!(!material_hunter_update_needs_worker(&update));
+    }
+
+    #[test]
+    fn material_hunter_token_account_update_remains_worker_relevant() {
+        let update = geyser_token_account_update(7);
+        assert_eq!(
+            material_hunter_update_class(&update),
+            "token_account_update_untracked"
+        );
+        assert!(material_hunter_update_needs_worker(&update));
+    }
+
+    #[test]
+    fn material_hunter_partition_router_same_mint_same_partition() {
+        let mint = bs58::encode([9u8; 32]).into_string();
+        let left = geyser_token_balance_update(&mint, 1);
+        let right = geyser_token_balance_update(&mint, 2);
+        let (left_partition, left_fallback, left_label) =
+            material_hunter_partition_for_update(&left, 4);
+        let (right_partition, right_fallback, right_label) =
+            material_hunter_partition_for_update(&right, 4);
+        assert_eq!(left_partition, right_partition);
+        assert!(!left_fallback);
+        assert!(!right_fallback);
+        assert_eq!(left_label, format!("mint:{mint}"));
+        assert_eq!(right_label, format!("mint:{mint}"));
+    }
+
+    #[test]
+    fn material_hunter_token_account_to_mint_routing_is_deterministic_without_migration() {
+        let mint = bs58::encode([9u8; 32]).into_string();
+        let tx_update = geyser_token_balance_update(&mint, 7);
+        let account_update = geyser_token_account_update(7);
+        let mut token_account_to_mint = HashMap::<Vec<u8>, String>::new();
+        let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
+        for (account, mapped_mint) in material_hunter_token_account_mint_mappings(&tx_update) {
+            token_account_to_mint.insert(account, mapped_mint);
+        }
+        let (tx_partition, _, _) = material_hunter_partition_for_update_with_account_map(
+            &tx_update,
+            4,
+            &token_account_to_mint,
+            &mut account_partition_pins,
+        );
+        let (account_partition, account_fallback, account_label) =
+            material_hunter_partition_for_update_with_account_map(
+                &account_update,
+                4,
+                &token_account_to_mint,
+                &mut account_partition_pins,
+            );
+        assert_eq!(tx_partition, account_partition);
+        assert!(!account_fallback);
+        assert_eq!(account_label, format!("mint:{mint}"));
+
+        let unknown_account = geyser_token_account_update(8);
+        let (first_partition, _, first_label) =
+            material_hunter_partition_for_update_with_account_map(
+                &unknown_account,
+                4,
+                &token_account_to_mint,
+                &mut account_partition_pins,
+            );
+        token_account_to_mint.insert(vec![8; 32], mint);
+        let (second_partition, _, second_label) =
+            material_hunter_partition_for_update_with_account_map(
+                &unknown_account,
+                4,
+                &token_account_to_mint,
+                &mut account_partition_pins,
+            );
+        assert_eq!(first_partition, second_partition);
+        assert!(first_label.starts_with("account:"));
+        assert!(second_label.starts_with("account_pinned:"));
+    }
+
+    #[test]
+    fn material_hunter_hot_partition_telemetry_reports_triggering_partition_and_class() {
+        let mut stats = MaterialHunterReaderStats {
+            worker_partitions: 4,
+            partition_worker_lag_ms_by_partition: vec![vec![10], vec![20, 30], vec![42], vec![]],
+            partition_queue_depth_max: vec![1, 9, 2, 0],
+            partition_backlog_oldest_update_age_ms_by_partition: vec![10, 30, 42, 0],
+            partition_batch_size_max_by_partition: vec![2, 8, 1, 0],
+            partition_backpressure_trigger_partition: Some(1),
+            partition_backpressure_trigger_reason: Some("worker_lag_threshold_exceeded".to_owned()),
+            backpressure_threshold_ms: 25,
+            backpressure_observed_lag_ms: 30,
+            backpressure_update_class: Some("transaction_update_relevant".to_owned()),
+            backpressure_partition_id: Some(1),
+            backpressure_segment_id: Some(1),
+            partition_started_at: Some(tokio::time::Instant::now()),
+            ..MaterialHunterReaderStats::default()
+        };
+        stats.record_update_class_route("transaction_update_relevant", 1);
+        stats.record_update_class_worker("transaction_update_relevant", 1, 30, 3);
+        MaterialHunterReaderStats::increment_top_count(
+            &mut stats.top_partition_key_counts,
+            "mint:hot".to_owned(),
+        );
+        let mut summary = MaterialHunterStreamSummary::default();
+        apply_reader_stats_to_summary(&mut summary, &stats);
+        assert_eq!(
+            summary.partition_worker_lag_ms_max_by_partition,
+            vec![10, 30, 42, 0]
+        );
+        assert_eq!(summary.partition_worker_lag_ms_p95_by_partition[1], 20);
+        assert_eq!(summary.partition_backpressure_trigger_partition, Some(1));
+        assert_eq!(
+            summary.partition_backpressure_trigger_reason.as_deref(),
+            Some("worker_lag_threshold_exceeded")
+        );
+        assert_eq!(
+            summary.backpressure_update_class.as_deref(),
+            Some("transaction_update_relevant")
+        );
+        assert_eq!(summary.backpressure_observed_lag_ms, 30);
+        assert_eq!(
+            summary.top_partition_keys_by_update_count[0].key,
+            "mint:hot"
+        );
+        assert_eq!(
+            summary.update_class_telemetry[0].class_name,
+            "transaction_update_relevant"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct FailingGeyserConnector {
         status: Status,
@@ -4669,9 +5368,9 @@ mod tests {
         let a = geyser_token_balance_update("Mint111111111111111111111111111111111111111", 1);
         let b = geyser_token_balance_update("Mint111111111111111111111111111111111111111", 2);
         let c = geyser_token_balance_update("Mint222222222222222222222222222222222222222", 1);
-        let (pa, fa) = material_hunter_partition_for_update(&a, 4);
-        let (pb, fb) = material_hunter_partition_for_update(&b, 4);
-        let (pc, _) = material_hunter_partition_for_update(&c, 4);
+        let (pa, fa, _) = material_hunter_partition_for_update(&a, 4);
+        let (pb, fb, _) = material_hunter_partition_for_update(&b, 4);
+        let (pc, _, _) = material_hunter_partition_for_update(&c, 4);
         assert_eq!(pa, pb);
         assert!(!fa);
         assert!(!fb);
@@ -4681,10 +5380,10 @@ mod tests {
 
     #[test]
     fn partition_router_same_account_same_partition() {
-        let a = geyser_account_update(7, 8);
-        let b = geyser_account_update(7, 9);
-        let (pa, fa) = material_hunter_partition_for_update(&a, 4);
-        let (pb, fb) = material_hunter_partition_for_update(&b, 4);
+        let a = geyser_token_account_update(7);
+        let b = geyser_token_account_update(7);
+        let (pa, fa, _) = material_hunter_partition_for_update(&a, 4);
+        let (pb, fb, _) = material_hunter_partition_for_update(&b, 4);
         assert_eq!(pa, pb);
         assert!(!fa);
         assert!(!fb);

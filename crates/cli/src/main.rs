@@ -39904,6 +39904,86 @@ fn phase107f_insert_stream_telemetry(
             json!(summary.partition_worker_lag_ms_max),
         ),
         (
+            "partition_worker_lag_ms_max_by_partition",
+            json!(summary.partition_worker_lag_ms_max_by_partition),
+        ),
+        (
+            "partition_worker_lag_ms_p95_by_partition",
+            json!(summary.partition_worker_lag_ms_p95_by_partition),
+        ),
+        (
+            "partition_queue_depth_max_by_partition",
+            json!(summary.partition_queue_depth_max_by_partition),
+        ),
+        (
+            "partition_backlog_oldest_update_age_ms_by_partition",
+            json!(summary.partition_backlog_oldest_update_age_ms_by_partition),
+        ),
+        (
+            "partition_batch_size_max_by_partition",
+            json!(summary.partition_batch_size_max_by_partition),
+        ),
+        (
+            "partition_backpressure_trigger_partition",
+            json!(summary.partition_backpressure_trigger_partition),
+        ),
+        (
+            "partition_backpressure_trigger_reason",
+            json!(summary.partition_backpressure_trigger_reason),
+        ),
+        (
+            "backpressure_threshold_ms",
+            json!(summary.backpressure_threshold_ms),
+        ),
+        (
+            "backpressure_observed_lag_ms",
+            json!(summary.backpressure_observed_lag_ms),
+        ),
+        (
+            "backpressure_update_class",
+            json!(summary.backpressure_update_class),
+        ),
+        (
+            "backpressure_partition_id",
+            json!(summary.backpressure_partition_id),
+        ),
+        (
+            "backpressure_segment_id",
+            json!(summary.backpressure_segment_id),
+        ),
+        (
+            "unknown_mint_route_count",
+            json!(summary.unknown_mint_route_count),
+        ),
+        (
+            "skipped_untracked_account_updates",
+            json!(summary.skipped_untracked_account_updates),
+        ),
+        (
+            "update_class_telemetry",
+            json!(summary.update_class_telemetry),
+        ),
+        (
+            "top_partition_keys_by_update_count",
+            json!(summary.top_partition_keys_by_update_count),
+        ),
+        (
+            "top_mints_by_worker_updates",
+            json!(summary.top_mints_by_worker_updates),
+        ),
+        (
+            "top_accounts_by_worker_updates",
+            json!(summary.top_accounts_by_worker_updates),
+        ),
+        (
+            "top_update_classes_by_lag",
+            json!(summary.top_update_classes_by_lag),
+        ),
+        (
+            "top_update_classes_by_count",
+            json!(summary.top_update_classes_by_count),
+        ),
+        (
             "partition_decode_duration_ms_p50",
             json!(summary.partition_decode_duration_ms_p50),
         ),
@@ -43175,6 +43255,7 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     let mut replay_eligible_mints = BTreeSet::<String>::new();
     let mut checkpoint_count = 0u64;
     let mut replay_eligible_count = 0u64;
+    let mut final_outcomes_by_mint = BTreeMap::<String, BTreeSet<String>>::new();
     for row in &candidate_rows {
         let state = phase107f_row_value(row, "final_state");
         let replay_eligible = phase107f_row_bool(row, "replay_eligible");
@@ -43193,6 +43274,10 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             replay_eligible_count = replay_eligible_count.saturating_add(1);
             if let Some(mint) = row.get("mint").filter(|mint| !mint.is_empty()) {
                 replay_eligible_mints.insert(mint.clone());
+                final_outcomes_by_mint
+                    .entry(mint.to_owned())
+                    .or_default()
+                    .insert("replay_eligible_candidate".to_owned());
             }
         }
     }
@@ -43215,11 +43300,48 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     for row in rejected_rows.iter().chain(attempt_rows.iter()) {
         let mint = phase107f_row_value(row, "mint");
         let state = phase107f_row_value(row, "final_state");
+        if !mint.is_empty()
+            && matches!(
+                state,
+                "terminal_inconclusive"
+                    | "early_rejected_dead"
+                    | "early_rejected_inconclusive"
+                    | "finalized_rejected"
+                    | "finalized_candidate"
+                    | "material_candidate_900s"
+                    | "material_candidate_1800s"
+            )
+        {
+            final_outcomes_by_mint
+                .entry(mint.to_owned())
+                .or_default()
+                .insert(state.to_owned());
+        }
         if state == "terminal_inconclusive" && replay_eligible_mints.contains(mint) {
             blockers.push(format!(
                 "terminal_inconclusive_replay_eligible_conflict:{mint}"
             ));
         }
+    }
+    let contradictory_final_outcome_mints = final_outcomes_by_mint
+        .iter()
+        .filter_map(|(mint, outcomes)| {
+            let has_terminal_inconclusive = outcomes.contains("terminal_inconclusive");
+            let has_replay = outcomes.contains("replay_eligible_candidate")
+                || outcomes.contains("material_candidate_900s")
+                || outcomes.contains("material_candidate_1800s")
+                || outcomes.contains("finalized_candidate");
+            let has_dead =
+                outcomes.contains("early_rejected_dead") || outcomes.contains("finalized_rejected");
+            if outcomes.len() > 1 && (has_terminal_inconclusive && (has_replay || has_dead)) {
+                Some(mint.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for mint in &contradictory_final_outcome_mints {
+        blockers.push(format!("contradictory_unique_final_outcome:{mint}"));
     }
     if let Some(manifest) = &manifest {
         if phase107f_json_bool(manifest, "off_vps_candidate_replay_allowed") != replay_allowed {
@@ -43242,6 +43364,9 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "partial_outputs_audit_only": partial_audit_only,
         "candidate_checkpoint_count": checkpoint_count,
         "replay_eligible_candidate_count": replay_eligible_count,
+        "unique_attempted_mint_count": attempt_rows.iter().filter_map(|row| row.get("mint")).filter(|mint| !mint.is_empty()).collect::<BTreeSet<_>>().len(),
+        "unique_final_outcome_mint_count": final_outcomes_by_mint.len(),
+        "contradictory_final_outcome_mints": contradictory_final_outcome_mints,
         "off_vps_candidate_replay_allowed": replay_allowed,
         "ready_for_off_vps_candidate_replay": ready_for_replay,
         "service_exit_status_exists": service_exit.is_some(),
@@ -55518,6 +55643,57 @@ mod tests {
                 .to_string()
                 .contains("terminal_inconclusive_replay_eligible_conflict:mint-a")
         );
+    }
+
+    #[test]
+    fn phase107f_artifact_consistency_rejects_contradictory_unique_final_outcomes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": false,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": true,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\n",
+        )
+        .expect("candidates");
+        fs::write(
+            temp.path().join("rejected_summary.csv"),
+            "mint,final_state,rejection_class\nmint-a,terminal_inconclusive,client_backpressure_detected_active_mint_finalized_inconclusive\n",
+        )
+        .expect("rejected");
+        fs::write(
+            temp.path().join("attempt_ledger.csv"),
+            "mint,final_state\nmint-a,early_rejected_dead\n",
+        )
+        .expect("attempt ledger");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("contradictory_unique_final_outcome:mint-a")
+        );
+        assert_eq!(report["unique_attempted_mint_count"], 1);
+        assert_eq!(report["unique_final_outcome_mint_count"], 1);
     }
 
     #[test]

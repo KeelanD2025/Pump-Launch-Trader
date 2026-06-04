@@ -200,6 +200,25 @@ Heartbeat and summaries expose:
 - `partition_updates_processed_total/by_partition`
 - `partition_updates_per_second_total/by_partition`
 - `partition_worker_lag_ms_p50/p95/p99/max`
+- `partition_worker_lag_ms_max_by_partition`
+- `partition_worker_lag_ms_p95_by_partition`
+- `partition_queue_depth_max_by_partition`
+- `partition_backlog_oldest_update_age_ms_by_partition`
+- `partition_batch_size_max_by_partition`
+- `partition_backpressure_trigger_partition`
+- `partition_backpressure_trigger_reason`
+- `backpressure_threshold_ms`
+- `backpressure_observed_lag_ms`
+- `backpressure_update_class`
+- `backpressure_partition_id`
+- `unknown_mint_route_count`
+- `skipped_untracked_account_updates`
+- `update_class_telemetry`
+- `top_partition_keys_by_update_count`
+- `top_mints_by_worker_updates`
+- `top_accounts_by_worker_updates`
+- `top_update_classes_by_lag`
+- `top_update_classes_by_count`
 - `partition_decode_duration_ms_p50/p95/p99/max`
 - `partition_lock_wait_ms_max`
 - `partition_batch_size_p50/p95/max`
@@ -215,6 +234,8 @@ Heartbeat and summaries expose:
 
 These fields are release-gate evidence. A stale green heartbeat is not enough; provider counters must continue to advance and queue/backpressure telemetry must remain safe.
 
+Worker-side lag must be diagnosed by partition and update class before launch caps are raised. Slot/liveness traffic and empty untracked account updates are reader-side cheap-counted and must not enter the heavy partition worker path. A `client_backpressure_detected` blocker should include the triggering partition, update class, observed lag, threshold, and bounded top-key summaries so the next patch can distinguish hot-key skew from unnecessary worker traffic.
+
 ## Gap-Segmented Artifact Policy
 
 Provider gaps are label-boundary events. When a slice observes `provider_lagged_data_loss`, early stream close, reconnect exhaustion, progress stall, or client backpressure, any active mint whose observation window crosses that gap must be finalized as `terminal_inconclusive` for that segment and cannot become replay-eligible.
@@ -228,6 +249,8 @@ Segment artifacts are written under `segments/segment_<n>/` with a segment-level
 - `run_countability_decision.json`
 
 Run-level `run_provider_data_loss_seen=true` does not by itself make clean future post-reconnect segments dirty, but every gap-affected segment remains audit-only. Replay can be allowed at run level only when at least one clean segment has `replay_eligible_candidate_count > 0`, no artifact contradictions exist, final R2/artifact checks pass, and the run-level countability decision explicitly allows replay. Formal backtesting and threshold tuning remain false.
+
+Run-level outcome validation groups rows by unique mint. Segment-level rows may document intermediate/audit-only outcomes, but a mint must not have contradictory final run outcomes such as `terminal_inconclusive` plus a replay-eligible/final candidate state or final dead rejection. `countability_decision.json` remains the strict source of truth and artifact consistency must block any contradiction.
 
 Current conservative release policy keeps launch caps blocked until same-endpoint stream acceptance and at least one short real service-owned proof slice validate segment continuation without structural contradictions. Do not raise caps based on ping or provider-health probe success alone.
 
