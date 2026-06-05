@@ -257,8 +257,25 @@ Heartbeat and summaries expose:
 - `active_mint_transaction_skipped_count`
 - `active_mint_transaction_coalesced_count`
 - `active_mint_transaction_dirty_feature_count`
+- `active_mint_transaction_delta_flush_count`
+- `active_mint_transaction_budget_exceeded_count`
+- `active_mint_transaction_degraded_count`
+- `active_mint_transaction_queue_pressure_count`
 - `top_active_mints_by_transaction_count`
+- `top_active_mints_by_coalesced_count`
+- `top_active_mints_by_deep_processed_count`
+- `top_active_mints_by_queue_pressure`
 - `top_active_mints_by_transaction_lag`
+- `active_mint_delta_flush_duration_ms_p95/max`
+- `degraded_active_mint_count`
+- `degraded_active_mints`
+- `partition_queue_pressure_preempted_count`
+- `partition_queue_pressure_dominant_mint`
+- `partition_queue_pressure_dominant_mint_update_count`
+- `partition_queue_pressure_degraded_mint`
+- `partition_queue_pressure_preempted_before_full`
+- `partition_queue_full_after_preemption`
+- `preemptive_noisy_mint_degraded`
 - `transaction_feature_deferred_count`
 - `transaction_feature_recompute_count`
 - `transaction_deep_process_duration_ms_p95/max`
@@ -288,6 +305,15 @@ attempt rows, candidate rows, rejected rows, replay eligibility, backtesting eli
 eligibility, provider-confirmed bundle claims, holder RPC data, or canonical RPC mint supply.
 Active-mint transaction feature work is marked dirty/deferred and recomputed only at gates,
 checkpoints, segment close, or finalization.
+
+Noisy active mints are governed by per-mint queue/rate/deep-processing budgets. Repeated
+`transaction_active_mint` or `pump_trade_active_mint` updates are cheap-delta accumulated and
+coalesced between configured flush windows. If one mint threatens partition queue safety, the
+runtime may preemptively degrade only that mint to audit-only `terminal_inconclusive` tracking,
+remove it from rich active tracking, and continue the segment when global queues remain safe. A
+degraded mint must never be replay-eligible, must not create fake candidate/rejected rows, and R2
+verification cannot override that exclusion. If preemption fails and a partition queue fills, the
+segment is still classified as `client_backpressure_detected`.
 - `artifact_queue_depth_max`
 - `artifact_queue_full_count`
 - `artifact_worker_lag_ms_max`

@@ -233,6 +233,13 @@ material_hunter_partition_soft_queue_threshold_ratio = 0.75
 material_hunter_partition_hard_queue_threshold_ratio = 1.0
 material_hunter_worker_lag_warn_ms = 5000
 material_hunter_worker_lag_blocker_ms = 10000
+material_hunter_active_mint_max_queued_updates_per_mint = 512
+material_hunter_active_mint_max_updates_per_second = 200
+material_hunter_active_mint_max_deep_updates_per_checkpoint = 256
+material_hunter_active_mint_noisy_degrade_enabled = true
+material_hunter_active_mint_noisy_degrade_reason = "noisy_active_mint_backpressure"
+material_hunter_active_mint_coalesce_window_ms = 250
+material_hunter_active_mint_delta_flush_interval_ms = 5000
 slot_gap_tolerance = 1
 program_filters = [
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",

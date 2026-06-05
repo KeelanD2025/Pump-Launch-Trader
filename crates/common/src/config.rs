@@ -2298,6 +2298,20 @@ pub struct GeyserConfig {
     pub material_hunter_worker_lag_warn_ms: u64,
     #[serde(default = "default_material_hunter_worker_lag_blocker_ms")]
     pub material_hunter_worker_lag_blocker_ms: u64,
+    #[serde(default = "default_material_hunter_active_mint_max_queued_updates_per_mint")]
+    pub material_hunter_active_mint_max_queued_updates_per_mint: u64,
+    #[serde(default = "default_material_hunter_active_mint_max_updates_per_second")]
+    pub material_hunter_active_mint_max_updates_per_second: u64,
+    #[serde(default = "default_material_hunter_active_mint_max_deep_updates_per_checkpoint")]
+    pub material_hunter_active_mint_max_deep_updates_per_checkpoint: u64,
+    #[serde(default = "default_true")]
+    pub material_hunter_active_mint_noisy_degrade_enabled: bool,
+    #[serde(default = "default_material_hunter_active_mint_noisy_degrade_reason")]
+    pub material_hunter_active_mint_noisy_degrade_reason: String,
+    #[serde(default = "default_material_hunter_active_mint_coalesce_window_ms")]
+    pub material_hunter_active_mint_coalesce_window_ms: u64,
+    #[serde(default = "default_material_hunter_active_mint_delta_flush_interval_ms")]
+    pub material_hunter_active_mint_delta_flush_interval_ms: u64,
     pub slot_gap_tolerance: u64,
     #[serde(default)]
     pub program_filters: Vec<String>,
@@ -2381,6 +2395,32 @@ impl GeyserConfig {
         }
         if self.material_hunter_worker_lag_blocker_ms == 0 {
             self.material_hunter_worker_lag_blocker_ms = 10_000;
+        }
+        if self.material_hunter_active_mint_max_queued_updates_per_mint == 0 {
+            self.material_hunter_active_mint_max_queued_updates_per_mint = 512;
+        }
+        self.material_hunter_active_mint_max_queued_updates_per_mint = self
+            .material_hunter_active_mint_max_queued_updates_per_mint
+            .min(self.material_hunter_partition_queue_capacity.max(1) as u64);
+        if self.material_hunter_active_mint_max_updates_per_second == 0 {
+            self.material_hunter_active_mint_max_updates_per_second = 200;
+        }
+        if self.material_hunter_active_mint_max_deep_updates_per_checkpoint == 0 {
+            self.material_hunter_active_mint_max_deep_updates_per_checkpoint = 256;
+        }
+        if self
+            .material_hunter_active_mint_noisy_degrade_reason
+            .trim()
+            .is_empty()
+        {
+            self.material_hunter_active_mint_noisy_degrade_reason =
+                default_material_hunter_active_mint_noisy_degrade_reason();
+        }
+        if self.material_hunter_active_mint_coalesce_window_ms == 0 {
+            self.material_hunter_active_mint_coalesce_window_ms = 250;
+        }
+        if self.material_hunter_active_mint_delta_flush_interval_ms == 0 {
+            self.material_hunter_active_mint_delta_flush_interval_ms = 5_000;
         }
         if self.max_decoded_message_size == 0 {
             self.max_decoded_message_size = 64 * 1024 * 1024;
@@ -4142,6 +4182,30 @@ const fn default_material_hunter_worker_lag_warn_ms() -> u64 {
 
 const fn default_material_hunter_worker_lag_blocker_ms() -> u64 {
     10_000
+}
+
+const fn default_material_hunter_active_mint_max_queued_updates_per_mint() -> u64 {
+    512
+}
+
+const fn default_material_hunter_active_mint_max_updates_per_second() -> u64 {
+    200
+}
+
+const fn default_material_hunter_active_mint_max_deep_updates_per_checkpoint() -> u64 {
+    256
+}
+
+fn default_material_hunter_active_mint_noisy_degrade_reason() -> String {
+    "noisy_active_mint_backpressure".to_owned()
+}
+
+const fn default_material_hunter_active_mint_coalesce_window_ms() -> u64 {
+    250
+}
+
+const fn default_material_hunter_active_mint_delta_flush_interval_ms() -> u64 {
+    5_000
 }
 
 fn default_edge_collector_segment_dir() -> String {

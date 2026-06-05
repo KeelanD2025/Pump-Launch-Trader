@@ -40149,12 +40149,84 @@ fn phase107f_insert_stream_telemetry(
             json!(summary.active_mint_transaction_dirty_feature_count),
         ),
         (
+            "active_mint_transaction_delta_flush_count",
+            json!(summary.active_mint_transaction_delta_flush_count),
+        ),
+        (
+            "active_mint_transaction_budget_exceeded_count",
+            json!(summary.active_mint_transaction_budget_exceeded_count),
+        ),
+        (
+            "active_mint_transaction_degraded_count",
+            json!(summary.active_mint_transaction_degraded_count),
+        ),
+        (
+            "active_mint_transaction_queue_pressure_count",
+            json!(summary.active_mint_transaction_queue_pressure_count),
+        ),
+        (
             "top_active_mints_by_transaction_count",
             json!(summary.top_active_mints_by_transaction_count),
         ),
         (
+            "top_active_mints_by_coalesced_count",
+            json!(summary.top_active_mints_by_coalesced_count),
+        ),
+        (
+            "top_active_mints_by_deep_processed_count",
+            json!(summary.top_active_mints_by_deep_processed_count),
+        ),
+        (
+            "top_active_mints_by_queue_pressure",
+            json!(summary.top_active_mints_by_queue_pressure),
+        ),
+        (
             "top_active_mints_by_transaction_lag",
             json!(summary.top_active_mints_by_transaction_lag),
+        ),
+        (
+            "active_mint_delta_flush_duration_ms_p95",
+            json!(summary.active_mint_delta_flush_duration_ms_p95),
+        ),
+        (
+            "active_mint_delta_flush_duration_ms_max",
+            json!(summary.active_mint_delta_flush_duration_ms_max),
+        ),
+        (
+            "degraded_active_mint_count",
+            json!(summary.degraded_active_mint_count),
+        ),
+        (
+            "degraded_active_mints",
+            json!(summary.degraded_active_mints),
+        ),
+        (
+            "partition_queue_pressure_preempted_count",
+            json!(summary.partition_queue_pressure_preempted_count),
+        ),
+        (
+            "partition_queue_pressure_dominant_mint",
+            json!(summary.partition_queue_pressure_dominant_mint),
+        ),
+        (
+            "partition_queue_pressure_dominant_mint_update_count",
+            json!(summary.partition_queue_pressure_dominant_mint_update_count),
+        ),
+        (
+            "partition_queue_pressure_degraded_mint",
+            json!(summary.partition_queue_pressure_degraded_mint),
+        ),
+        (
+            "partition_queue_pressure_preempted_before_full",
+            json!(summary.partition_queue_pressure_preempted_before_full),
+        ),
+        (
+            "partition_queue_full_after_preemption",
+            json!(summary.partition_queue_full_after_preemption),
+        ),
+        (
+            "preemptive_noisy_mint_degraded",
+            json!(summary.preemptive_noisy_mint_degraded),
         ),
         (
             "transaction_feature_deferred_count",
@@ -41916,6 +41988,8 @@ async fn material_candidate_hunter_command(
             "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
             "candidate_checkpoint_count": candidate_checkpoint_count,
             "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+            "degraded_active_mint_count": stream_summary.degraded_active_mint_count,
+            "degraded_active_mints": stream_summary.degraded_active_mints.clone(),
             "segment_count": segment_count,
             "clean_segment_count": clean_segment_count,
             "blocked_segment_count": blocked_segment_count,
@@ -42682,6 +42756,8 @@ fn phase107b_interrupted_countability_payload(
         "attempted_launches": attempt_count,
         "rejected_count": rejected_count,
         "candidate_count": candidate_count,
+        "degraded_active_mint_count": stream_summary.degraded_active_mint_count,
+        "degraded_active_mints": stream_summary.degraded_active_mints.clone(),
         "partial_outputs_r2_verified": partial_r2_verified,
         "partial_outputs_audit_only": true,
         "off_vps_candidate_replay_allowed": false,
@@ -43712,6 +43788,22 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             .as_ref()
             .map(|value| phase107f_json_bool(value, "partial_outputs_audit_only"))
             .unwrap_or(false);
+    let mut degraded_active_mints = BTreeSet::<String>::new();
+    for value in std::iter::once(&countability)
+        .chain(hunter_summary.iter())
+        .chain(interrupted_summary.iter())
+    {
+        if let Some(items) = value
+            .get("degraded_active_mints")
+            .and_then(|value| value.as_array())
+        {
+            for item in items {
+                if let Some(mint) = item.as_str().filter(|mint| !mint.is_empty()) {
+                    degraded_active_mints.insert(mint.to_owned());
+                }
+            }
+        }
+    }
 
     if service_exit.is_none()
         && (countability_path.exists() || hunter_summary.is_some() || interrupted_summary.is_some())
@@ -43780,6 +43872,9 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             replay_eligible_count = replay_eligible_count.saturating_add(1);
             if let Some(mint) = row.get("mint").filter(|mint| !mint.is_empty()) {
                 replay_eligible_mints.insert(mint.clone());
+                if degraded_active_mints.contains(mint) {
+                    blockers.push(format!("degraded_active_mint_replay_eligible:{mint}"));
+                }
                 final_outcomes_by_mint
                     .entry(mint.to_owned())
                     .or_default()
@@ -44044,6 +44139,39 @@ fn phase107f_static_preflight_report(
         || geyser.material_hunter_worker_lag_warn_ms >= geyser.material_hunter_worker_lag_blocker_ms
     {
         blockers.push("material_hunter_worker_lag_thresholds_invalid".to_owned());
+    }
+    if geyser.material_hunter_active_mint_max_queued_updates_per_mint == 0
+        || geyser.material_hunter_active_mint_max_queued_updates_per_mint
+            > geyser.material_hunter_partition_queue_capacity as u64
+    {
+        blockers.push("material_hunter_active_mint_queue_budget_invalid".to_owned());
+    }
+    if geyser.material_hunter_active_mint_max_updates_per_second == 0
+        || geyser.material_hunter_active_mint_max_updates_per_second > 10_000
+    {
+        blockers.push("material_hunter_active_mint_rate_budget_invalid".to_owned());
+    }
+    if geyser.material_hunter_active_mint_max_deep_updates_per_checkpoint == 0
+        || geyser.material_hunter_active_mint_max_deep_updates_per_checkpoint > 10_000
+    {
+        blockers.push("material_hunter_active_mint_deep_budget_invalid".to_owned());
+    }
+    if !geyser.material_hunter_active_mint_noisy_degrade_enabled {
+        blockers.push("material_hunter_active_mint_noisy_degrade_disabled".to_owned());
+    }
+    if geyser
+        .material_hunter_active_mint_noisy_degrade_reason
+        .trim()
+        .is_empty()
+    {
+        blockers.push("material_hunter_active_mint_degrade_reason_missing".to_owned());
+    }
+    if geyser.material_hunter_active_mint_coalesce_window_ms == 0
+        || geyser.material_hunter_active_mint_delta_flush_interval_ms == 0
+        || geyser.material_hunter_active_mint_coalesce_window_ms
+            > geyser.material_hunter_active_mint_delta_flush_interval_ms
+    {
+        blockers.push("material_hunter_active_mint_coalesce_window_invalid".to_owned());
     }
 
     let repo_root = std::env::current_dir()
@@ -55350,6 +55478,14 @@ mod tests {
             partition_worker_reset_count: 1,
             artifact_queue_depth_max: 0,
             artifact_queue_full_count: 0,
+            active_mint_transaction_coalesced_count: 11,
+            active_mint_transaction_degraded_count: 1,
+            active_mint_transaction_queue_pressure_count: 1,
+            degraded_active_mint_count: 1,
+            degraded_active_mints: vec!["mint-a".to_owned()],
+            partition_queue_pressure_preempted_count: 1,
+            partition_queue_pressure_degraded_mint: Some("mint-a".to_owned()),
+            partition_queue_pressure_preempted_before_full: true,
             ..MaterialHunterStreamSummary::default()
         };
         phase107f_write_health(
@@ -55403,6 +55539,20 @@ mod tests {
         assert_eq!(heartbeat["partition_worker_reset_count"], 1);
         assert_eq!(heartbeat["artifact_queue_depth_max"], 0);
         assert_eq!(heartbeat["artifact_queue_full_count"], 0);
+        assert_eq!(heartbeat["active_mint_transaction_coalesced_count"], 11);
+        assert_eq!(heartbeat["active_mint_transaction_degraded_count"], 1);
+        assert_eq!(heartbeat["active_mint_transaction_queue_pressure_count"], 1);
+        assert_eq!(heartbeat["degraded_active_mint_count"], 1);
+        assert_eq!(heartbeat["degraded_active_mints"][0], "mint-a");
+        assert_eq!(heartbeat["partition_queue_pressure_preempted_count"], 1);
+        assert_eq!(
+            heartbeat["partition_queue_pressure_degraded_mint"],
+            "mint-a"
+        );
+        assert_eq!(
+            heartbeat["partition_queue_pressure_preempted_before_full"],
+            true
+        );
     }
 
     #[test]
@@ -56518,6 +56668,51 @@ mod tests {
     }
 
     #[test]
+    fn phase107f_artifact_consistency_rejects_degraded_mint_replay_leakage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run","exit_code":0})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": false,
+                "off_vps_candidate_replay_allowed": true,
+                "ready_for_off_vps_candidate_replay": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 1,
+                "degraded_active_mints": ["mint-a"],
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\nmint-a,material_candidate_900s,false,true\n",
+        )
+        .expect("candidates");
+        fs::write(
+            temp.path().join("rejected_summary.csv"),
+            "mint,final_state\n",
+        )
+        .expect("rejected");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("degraded_active_mint_replay_eligible:mint-a")
+        );
+    }
+
+    #[test]
     fn phase107f_artifact_consistency_rejects_contradictory_unique_final_outcomes() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
@@ -56631,6 +56826,22 @@ mod tests {
             .material_hunter_partition_hard_queue_threshold_ratio = 1.0;
         loaded.config.geyser.material_hunter_worker_lag_warn_ms = 10_000;
         loaded.config.geyser.material_hunter_worker_lag_blocker_ms = 5_000;
+        loaded
+            .config
+            .geyser
+            .material_hunter_active_mint_max_queued_updates_per_mint = 8;
+        loaded
+            .config
+            .geyser
+            .material_hunter_active_mint_noisy_degrade_enabled = false;
+        loaded
+            .config
+            .geyser
+            .material_hunter_active_mint_coalesce_window_ms = 10_000;
+        loaded
+            .config
+            .geyser
+            .material_hunter_active_mint_delta_flush_interval_ms = 1_000;
         let report = phase107f_static_preflight_report(&loaded, None).expect("preflight report");
         let blockers = report["blockers"].to_string();
         assert_eq!(report["ok"], false);
@@ -56638,5 +56849,8 @@ mod tests {
         assert!(blockers.contains("material_hunter_partition_batch_size_invalid"));
         assert!(blockers.contains("material_hunter_partition_thresholds_invalid"));
         assert!(blockers.contains("material_hunter_worker_lag_thresholds_invalid"));
+        assert!(blockers.contains("material_hunter_active_mint_queue_budget_invalid"));
+        assert!(blockers.contains("material_hunter_active_mint_noisy_degrade_disabled"));
+        assert!(blockers.contains("material_hunter_active_mint_coalesce_window_invalid"));
     }
 }

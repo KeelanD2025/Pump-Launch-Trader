@@ -1149,9 +1149,45 @@ pub struct MaterialHunterStreamSummary {
     #[serde(default)]
     pub active_mint_transaction_dirty_feature_count: u64,
     #[serde(default)]
+    pub active_mint_transaction_delta_flush_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_budget_exceeded_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_degraded_count: u64,
+    #[serde(default)]
+    pub active_mint_transaction_queue_pressure_count: u64,
+    #[serde(default)]
     pub top_active_mints_by_transaction_count: Vec<MaterialHunterTopKeySummary>,
     #[serde(default)]
+    pub top_active_mints_by_coalesced_count: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_active_mints_by_deep_processed_count: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub top_active_mints_by_queue_pressure: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
     pub top_active_mints_by_transaction_lag: Vec<MaterialHunterTopKeySummary>,
+    #[serde(default)]
+    pub active_mint_delta_flush_duration_ms_p95: u64,
+    #[serde(default)]
+    pub active_mint_delta_flush_duration_ms_max: u64,
+    #[serde(default)]
+    pub degraded_active_mint_count: u64,
+    #[serde(default)]
+    pub degraded_active_mints: Vec<String>,
+    #[serde(default)]
+    pub partition_queue_pressure_preempted_count: u64,
+    #[serde(default)]
+    pub partition_queue_pressure_dominant_mint: Option<String>,
+    #[serde(default)]
+    pub partition_queue_pressure_dominant_mint_update_count: u64,
+    #[serde(default)]
+    pub partition_queue_pressure_degraded_mint: Option<String>,
+    #[serde(default)]
+    pub partition_queue_pressure_preempted_before_full: bool,
+    #[serde(default)]
+    pub partition_queue_full_after_preemption: bool,
+    #[serde(default)]
+    pub preemptive_noisy_mint_degraded: bool,
     #[serde(default)]
     pub transaction_feature_deferred_count: u64,
     #[serde(default)]
@@ -1363,8 +1399,23 @@ struct MaterialHunterReaderStats {
     active_mint_transaction_skipped_count: u64,
     active_mint_transaction_coalesced_count: u64,
     active_mint_transaction_dirty_feature_count: u64,
+    active_mint_transaction_delta_flush_count: u64,
+    active_mint_transaction_budget_exceeded_count: u64,
+    active_mint_transaction_degraded_count: u64,
+    active_mint_transaction_queue_pressure_count: u64,
     top_active_mint_transaction_counts: BTreeMap<String, u64>,
+    top_active_mint_coalesced_counts: BTreeMap<String, u64>,
+    top_active_mint_deep_processed_counts: BTreeMap<String, u64>,
+    top_active_mint_queue_pressure_counts: BTreeMap<String, u64>,
     top_active_mint_transaction_lag: BTreeMap<String, u64>,
+    active_mint_delta_flush_duration_ms: Vec<u64>,
+    degraded_active_mints: HashSet<String>,
+    partition_queue_pressure_preempted_count: u64,
+    partition_queue_pressure_dominant_mint: Option<String>,
+    partition_queue_pressure_dominant_mint_update_count: u64,
+    partition_queue_pressure_degraded_mint: Option<String>,
+    partition_queue_pressure_preempted_before_full: bool,
+    partition_queue_full_after_preemption: bool,
     transaction_feature_deferred_count: u64,
     transaction_feature_recompute_count: u64,
     transaction_risk_feature_duration_ms: Vec<u64>,
@@ -1918,10 +1969,52 @@ fn apply_reader_stats_to_summary(
     summary.active_mint_transaction_coalesced_count = stats.active_mint_transaction_coalesced_count;
     summary.active_mint_transaction_dirty_feature_count =
         stats.active_mint_transaction_dirty_feature_count;
+    summary.active_mint_transaction_delta_flush_count =
+        stats.active_mint_transaction_delta_flush_count;
+    summary.active_mint_transaction_budget_exceeded_count =
+        stats.active_mint_transaction_budget_exceeded_count;
+    summary.active_mint_transaction_degraded_count = stats.active_mint_transaction_degraded_count;
+    summary.active_mint_transaction_queue_pressure_count =
+        stats.active_mint_transaction_queue_pressure_count;
     summary.top_active_mints_by_transaction_count =
         top_key_summaries(&stats.top_active_mint_transaction_counts, 20);
+    summary.top_active_mints_by_coalesced_count =
+        top_key_summaries(&stats.top_active_mint_coalesced_counts, 20);
+    summary.top_active_mints_by_deep_processed_count =
+        top_key_summaries(&stats.top_active_mint_deep_processed_counts, 20);
+    summary.top_active_mints_by_queue_pressure =
+        top_key_summaries(&stats.top_active_mint_queue_pressure_counts, 20);
     summary.top_active_mints_by_transaction_lag =
         top_key_summaries(&stats.top_active_mint_transaction_lag, 20);
+    summary.active_mint_delta_flush_duration_ms_p95 =
+        percentile(&stats.active_mint_delta_flush_duration_ms, 95, 100);
+    summary.active_mint_delta_flush_duration_ms_max = stats
+        .active_mint_delta_flush_duration_ms
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    summary.degraded_active_mint_count = stats.degraded_active_mints.len() as u64;
+    let mut degraded_active_mints = stats
+        .degraded_active_mints
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    degraded_active_mints.sort();
+    degraded_active_mints.truncate(100);
+    summary.degraded_active_mints = degraded_active_mints;
+    summary.partition_queue_pressure_preempted_count =
+        stats.partition_queue_pressure_preempted_count;
+    summary.partition_queue_pressure_dominant_mint =
+        stats.partition_queue_pressure_dominant_mint.clone();
+    summary.partition_queue_pressure_dominant_mint_update_count =
+        stats.partition_queue_pressure_dominant_mint_update_count;
+    summary.partition_queue_pressure_degraded_mint =
+        stats.partition_queue_pressure_degraded_mint.clone();
+    summary.partition_queue_pressure_preempted_before_full =
+        stats.partition_queue_pressure_preempted_before_full;
+    summary.partition_queue_full_after_preemption = stats.partition_queue_full_after_preemption;
+    summary.preemptive_noisy_mint_degraded = stats.partition_queue_pressure_preempted_before_full;
     summary.transaction_feature_deferred_count = stats.transaction_feature_deferred_count;
     summary.transaction_feature_recompute_count = stats.transaction_feature_recompute_count;
     summary.transaction_risk_feature_duration_ms_p95 =
@@ -2047,6 +2140,138 @@ impl MaterialHunterStreamAction {
 struct MaterialHunterRelevanceState {
     active_mints: HashSet<String>,
     tombstoned_mints: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterialHunterActiveMintPressureConfig {
+    max_queued_updates_per_mint: u64,
+    max_updates_per_second: u64,
+    max_deep_updates_per_checkpoint: u64,
+    noisy_degrade_enabled: bool,
+    noisy_degrade_reason: String,
+    coalesce_window: StdDuration,
+    delta_flush_interval: StdDuration,
+    partition_soft_queue_threshold_ratio: f64,
+}
+
+impl MaterialHunterActiveMintPressureConfig {
+    fn from_geyser(config: &common::GeyserConfig) -> Self {
+        Self {
+            max_queued_updates_per_mint: config
+                .material_hunter_active_mint_max_queued_updates_per_mint
+                .max(1),
+            max_updates_per_second: config
+                .material_hunter_active_mint_max_updates_per_second
+                .max(1),
+            max_deep_updates_per_checkpoint: config
+                .material_hunter_active_mint_max_deep_updates_per_checkpoint
+                .max(1),
+            noisy_degrade_enabled: config.material_hunter_active_mint_noisy_degrade_enabled,
+            noisy_degrade_reason: config
+                .material_hunter_active_mint_noisy_degrade_reason
+                .clone(),
+            coalesce_window: StdDuration::from_millis(
+                config.material_hunter_active_mint_coalesce_window_ms.max(1),
+            ),
+            delta_flush_interval: StdDuration::from_millis(
+                config
+                    .material_hunter_active_mint_delta_flush_interval_ms
+                    .max(1),
+            ),
+            partition_soft_queue_threshold_ratio: config
+                .material_hunter_partition_soft_queue_threshold_ratio
+                .clamp(0.01, 0.99),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct MaterialHunterActiveMintPressureEntry {
+    window_started_at: Option<tokio::time::Instant>,
+    window_update_count: u64,
+    deep_updates_since_checkpoint: u64,
+    coalesced_updates_since_flush: u64,
+    last_deep_process_at: Option<tokio::time::Instant>,
+    last_delta_flush_at: Option<tokio::time::Instant>,
+    degraded: bool,
+}
+
+#[derive(Debug, Default)]
+struct MaterialHunterActiveMintPressureState {
+    by_mint: HashMap<String, MaterialHunterActiveMintPressureEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaterialHunterActiveMintPressureDecision {
+    DeepProcess,
+    Coalesce,
+    Degrade {
+        reason: String,
+        queue_pressure: bool,
+    },
+}
+
+fn material_hunter_active_mint_pressure_decision(
+    state: &mut MaterialHunterActiveMintPressureState,
+    mint: &str,
+    now: tokio::time::Instant,
+    partition_depth: u64,
+    partition_capacity: u64,
+    config: &MaterialHunterActiveMintPressureConfig,
+) -> MaterialHunterActiveMintPressureDecision {
+    let entry = state.by_mint.entry(mint.to_owned()).or_default();
+    if entry.degraded {
+        return MaterialHunterActiveMintPressureDecision::Coalesce;
+    }
+    let window_started_at = entry.window_started_at.get_or_insert(now);
+    if now.duration_since(*window_started_at) >= StdDuration::from_secs(1) {
+        entry.window_started_at = Some(now);
+        entry.window_update_count = 0;
+    }
+    entry.window_update_count = entry.window_update_count.saturating_add(1);
+
+    let soft_depth =
+        ((partition_capacity as f64) * config.partition_soft_queue_threshold_ratio).ceil() as u64;
+    let per_mint_queue_pressure = entry
+        .window_update_count
+        .saturating_add(entry.coalesced_updates_since_flush)
+        >= config.max_queued_updates_per_mint;
+    let partition_queue_pressure = partition_capacity > 0
+        && partition_depth >= soft_depth.max(1)
+        && entry.window_update_count >= config.max_updates_per_second.saturating_div(4).max(1);
+    let budget_exceeded = entry.window_update_count > config.max_updates_per_second
+        || entry.deep_updates_since_checkpoint >= config.max_deep_updates_per_checkpoint;
+    if config.noisy_degrade_enabled
+        && (per_mint_queue_pressure || partition_queue_pressure || budget_exceeded)
+    {
+        entry.degraded = true;
+        return MaterialHunterActiveMintPressureDecision::Degrade {
+            reason: if budget_exceeded {
+                "active_mint_processing_budget_exceeded".to_owned()
+            } else {
+                config.noisy_degrade_reason.clone()
+            },
+            queue_pressure: per_mint_queue_pressure || partition_queue_pressure,
+        };
+    }
+
+    let should_flush = entry
+        .last_delta_flush_at
+        .map(|last| now.duration_since(last) >= config.delta_flush_interval)
+        .unwrap_or(true);
+    let should_deep = entry
+        .last_deep_process_at
+        .map(|last| now.duration_since(last) >= config.coalesce_window)
+        .unwrap_or(true);
+    if should_flush || should_deep {
+        entry.last_deep_process_at = Some(now);
+        entry.last_delta_flush_at = Some(now);
+        entry.deep_updates_since_checkpoint = entry.deep_updates_since_checkpoint.saturating_add(1);
+        entry.coalesced_updates_since_flush = 0;
+        return MaterialHunterActiveMintPressureDecision::DeepProcess;
+    }
+    entry.coalesced_updates_since_flush = entry.coalesced_updates_since_flush.saturating_add(1);
+    MaterialHunterActiveMintPressureDecision::Coalesce
 }
 
 fn apply_material_hunter_state_hint(
@@ -3333,11 +3558,15 @@ where
         let router_stats = reader_stats.clone();
         let router_output_tx = worker_output_tx.clone();
         let relevance_state_for_router = relevance_state.clone();
+        let config_for_router = config.clone();
         tokio::spawn(async move {
             let mut token_account_to_mint = HashMap::<Vec<u8>, String>::new();
             let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
             let mut seen_transaction_signatures = HashSet::<String>::new();
             let mut transaction_signature_lru = VecDeque::<String>::new();
+            let pressure_config =
+                MaterialHunterActiveMintPressureConfig::from_geyser(&config_for_router);
+            let mut active_mint_pressure = MaterialHunterActiveMintPressureState::default();
             while let Some(message) = router_rx.recv().await {
                 match message {
                     MaterialHunterReaderMessage::Update(update, read_at) => {
@@ -3427,18 +3656,7 @@ where
                                 }
                             }
                             match prefilter.decision {
-                                MaterialHunterPumpPrefilterDecision::DeepProcess => {
-                                    if prefilter.update_class == "pump_trade_active_mint" {
-                                        if let Ok(mut stats) = router_stats.lock() {
-                                            stats.pump_trade_deep_processed_count = stats
-                                                .pump_trade_deep_processed_count
-                                                .saturating_add(1);
-                                            stats.pump_trade_deferred_feature_count = stats
-                                                .pump_trade_deferred_feature_count
-                                                .saturating_add(1);
-                                        }
-                                    }
-                                }
+                                MaterialHunterPumpPrefilterDecision::DeepProcess => {}
                                 MaterialHunterPumpPrefilterDecision::SkipUntracked
                                 | MaterialHunterPumpPrefilterDecision::SkipTombstoned
                                 | MaterialHunterPumpPrefilterDecision::SkipUnknownMint
@@ -3509,12 +3727,6 @@ where
                                     stats.record_transaction_prefilter_duration(prefilter_ms);
                                     match prefilter.decision {
                                         MaterialHunterTransactionPrefilterDecision::DeepProcess => {
-                                            stats.transaction_deep_processed_count = stats
-                                                .transaction_deep_processed_count
-                                                .saturating_add(1);
-                                            stats.transaction_feature_deferred_count = stats
-                                                .transaction_feature_deferred_count
-                                                .saturating_add(1);
                                             if prefilter.update_class == "transaction_active_mint"
                                                 || prefilter.update_class
                                                     == "transaction_active_account"
@@ -3522,10 +3734,6 @@ where
                                                 stats.active_mint_transaction_update_count = stats
                                                     .active_mint_transaction_update_count
                                                     .saturating_add(1);
-                                                stats.active_mint_transaction_deep_processed_count =
-                                                    stats
-                                                        .active_mint_transaction_deep_processed_count
-                                                        .saturating_add(1);
                                                 stats.active_mint_transaction_dirty_feature_count =
                                                     stats
                                                         .active_mint_transaction_dirty_feature_count
@@ -3537,6 +3745,13 @@ where
                                                         mint.clone(),
                                                     );
                                                 }
+                                            } else {
+                                                stats.transaction_deep_processed_count = stats
+                                                    .transaction_deep_processed_count
+                                                    .saturating_add(1);
+                                                stats.transaction_feature_deferred_count = stats
+                                                    .transaction_feature_deferred_count
+                                                    .saturating_add(1);
                                             }
                                             if prefilter.update_class == "transaction_active_account"
                                             {
@@ -3677,6 +3892,156 @@ where
                             }
                             break;
                         };
+                        let active_mint_for_pressure = if update_class == "pump_trade_active_mint" {
+                            pump_prefilter
+                                .as_ref()
+                                .and_then(|prefilter| prefilter.mint.clone())
+                        } else if update_class == "transaction_active_mint"
+                            || update_class == "transaction_active_account"
+                        {
+                            transaction_hint_mint.clone()
+                        } else {
+                            None
+                        };
+                        if let Some(mint) = active_mint_for_pressure.as_ref() {
+                            let depth = partition_tx
+                                .max_capacity()
+                                .saturating_sub(partition_tx.capacity())
+                                as u64;
+                            match material_hunter_active_mint_pressure_decision(
+                                &mut active_mint_pressure,
+                                mint,
+                                tokio::time::Instant::now(),
+                                depth,
+                                partition_tx.max_capacity() as u64,
+                                &pressure_config,
+                            ) {
+                                MaterialHunterActiveMintPressureDecision::DeepProcess => {
+                                    if let Ok(mut stats) = router_stats.lock() {
+                                        stats.active_mint_transaction_deep_processed_count = stats
+                                            .active_mint_transaction_deep_processed_count
+                                            .saturating_add(1);
+                                        stats.active_mint_transaction_delta_flush_count = stats
+                                            .active_mint_transaction_delta_flush_count
+                                            .saturating_add(1);
+                                        if stats.active_mint_delta_flush_duration_ms.len() < 100_000
+                                        {
+                                            stats.active_mint_delta_flush_duration_ms.push(0);
+                                        }
+                                        MaterialHunterReaderStats::increment_top_count(
+                                            &mut stats.top_active_mint_deep_processed_counts,
+                                            mint.clone(),
+                                        );
+                                        if update_class == "pump_trade_active_mint" {
+                                            stats.active_mint_transaction_update_count = stats
+                                                .active_mint_transaction_update_count
+                                                .saturating_add(1);
+                                            stats.active_mint_transaction_dirty_feature_count =
+                                                stats
+                                                    .active_mint_transaction_dirty_feature_count
+                                                    .saturating_add(1);
+                                            MaterialHunterReaderStats::increment_top_count(
+                                                &mut stats.top_active_mint_transaction_counts,
+                                                mint.clone(),
+                                            );
+                                            stats.pump_trade_deep_processed_count = stats
+                                                .pump_trade_deep_processed_count
+                                                .saturating_add(1);
+                                            stats.pump_trade_deferred_feature_count = stats
+                                                .pump_trade_deferred_feature_count
+                                                .saturating_add(1);
+                                        }
+                                        if update_class.starts_with("transaction_active_") {
+                                            stats.transaction_deep_processed_count = stats
+                                                .transaction_deep_processed_count
+                                                .saturating_add(1);
+                                            stats.transaction_feature_deferred_count = stats
+                                                .transaction_feature_deferred_count
+                                                .saturating_add(1);
+                                        }
+                                    }
+                                }
+                                MaterialHunterActiveMintPressureDecision::Coalesce => {
+                                    if let Ok(mut stats) = router_stats.lock() {
+                                        stats.active_mint_transaction_coalesced_count = stats
+                                            .active_mint_transaction_coalesced_count
+                                            .saturating_add(1);
+                                        stats.active_mint_transaction_skipped_count = stats
+                                            .active_mint_transaction_skipped_count
+                                            .saturating_add(1);
+                                        stats.active_mint_transaction_dirty_feature_count = stats
+                                            .active_mint_transaction_dirty_feature_count
+                                            .saturating_add(1);
+                                        MaterialHunterReaderStats::increment_top_count(
+                                            &mut stats.top_active_mint_coalesced_counts,
+                                            mint.clone(),
+                                        );
+                                        stats.record_update_class_skipped(update_class);
+                                    }
+                                    continue;
+                                }
+                                MaterialHunterActiveMintPressureDecision::Degrade {
+                                    reason,
+                                    queue_pressure,
+                                } => {
+                                    apply_material_hunter_state_hint(
+                                        &relevance_state_for_router,
+                                        &MaterialHunterStreamStateHint {
+                                            inactive_mints: vec![mint.clone()],
+                                            tombstoned_mints: vec![mint.clone()],
+                                            ..MaterialHunterStreamStateHint::default()
+                                        },
+                                    );
+                                    if let Ok(mut stats) = router_stats.lock() {
+                                        stats.active_mint_transaction_degraded_count = stats
+                                            .active_mint_transaction_degraded_count
+                                            .saturating_add(1);
+                                        stats.active_mint_transaction_skipped_count = stats
+                                            .active_mint_transaction_skipped_count
+                                            .saturating_add(1);
+                                        if reason == "active_mint_processing_budget_exceeded" {
+                                            stats.active_mint_transaction_budget_exceeded_count =
+                                                stats
+                                                    .active_mint_transaction_budget_exceeded_count
+                                                    .saturating_add(1);
+                                        }
+                                        if queue_pressure {
+                                            stats.active_mint_transaction_queue_pressure_count =
+                                                stats
+                                                    .active_mint_transaction_queue_pressure_count
+                                                    .saturating_add(1);
+                                            stats.partition_queue_pressure_preempted_count = stats
+                                                .partition_queue_pressure_preempted_count
+                                                .saturating_add(1);
+                                            stats.partition_queue_pressure_dominant_mint =
+                                                Some(mint.clone());
+                                            stats.partition_queue_pressure_dominant_mint_update_count =
+                                                stats
+                                                    .top_active_mint_transaction_counts
+                                                    .get(mint)
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    .max(1);
+                                            stats.partition_queue_pressure_degraded_mint =
+                                                Some(mint.clone());
+                                            stats.partition_queue_pressure_preempted_before_full =
+                                                true;
+                                            MaterialHunterReaderStats::increment_top_count(
+                                                &mut stats.top_active_mint_queue_pressure_counts,
+                                                mint.clone(),
+                                            );
+                                        }
+                                        stats.degraded_active_mints.insert(mint.clone());
+                                        MaterialHunterReaderStats::increment_top_count(
+                                            &mut stats.top_active_mint_coalesced_counts,
+                                            mint.clone(),
+                                        );
+                                        stats.record_update_class_skipped(update_class);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let sequence = if let Ok(stats) = router_stats.lock() {
                             stats.router_updates_received
                         } else {
@@ -3731,6 +4096,9 @@ where
                                         .get_mut(partition)
                                     {
                                         *count = count.saturating_add(1);
+                                    }
+                                    if stats.partition_queue_pressure_preempted_before_full {
+                                        stats.partition_queue_full_after_preemption = true;
                                     }
                                     stats.client_backpressure_detected = true;
                                     stats.worker_backpressure_detected = true;
@@ -6165,6 +6533,141 @@ mod tests {
             MaterialHunterTransactionPrefilterDecision::DeepProcess
         );
         assert_eq!(prefilter.mint.as_deref(), Some(mint.as_str()));
+    }
+
+    fn test_active_mint_pressure_config() -> MaterialHunterActiveMintPressureConfig {
+        MaterialHunterActiveMintPressureConfig {
+            max_queued_updates_per_mint: 4,
+            max_updates_per_second: 4,
+            max_deep_updates_per_checkpoint: 2,
+            noisy_degrade_enabled: true,
+            noisy_degrade_reason: "noisy_active_mint_backpressure".to_owned(),
+            coalesce_window: StdDuration::from_millis(250),
+            delta_flush_interval: StdDuration::from_millis(5_000),
+            partition_soft_queue_threshold_ratio: 0.75,
+        }
+    }
+
+    #[test]
+    fn active_mint_transaction_updates_are_coalesced() {
+        let mut state = MaterialHunterActiveMintPressureState::default();
+        let config = test_active_mint_pressure_config();
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            material_hunter_active_mint_pressure_decision(
+                &mut state, "mint-a", now, 0, 64, &config
+            ),
+            MaterialHunterActiveMintPressureDecision::DeepProcess
+        );
+        assert_eq!(
+            material_hunter_active_mint_pressure_decision(
+                &mut state,
+                "mint-a",
+                now + StdDuration::from_millis(10),
+                0,
+                64,
+                &config
+            ),
+            MaterialHunterActiveMintPressureDecision::Coalesce
+        );
+    }
+
+    #[test]
+    fn active_mint_noisy_budget_exceeded_degrades_mint_audit_only() {
+        let mut state = MaterialHunterActiveMintPressureState::default();
+        let config = test_active_mint_pressure_config();
+        let now = tokio::time::Instant::now();
+        for offset in [0, 300] {
+            assert_eq!(
+                material_hunter_active_mint_pressure_decision(
+                    &mut state,
+                    "mint-a",
+                    now + StdDuration::from_millis(offset),
+                    0,
+                    64,
+                    &config
+                ),
+                MaterialHunterActiveMintPressureDecision::DeepProcess
+            );
+        }
+        assert_eq!(
+            material_hunter_active_mint_pressure_decision(
+                &mut state,
+                "mint-a",
+                now + StdDuration::from_millis(600),
+                0,
+                64,
+                &config
+            ),
+            MaterialHunterActiveMintPressureDecision::Degrade {
+                reason: "active_mint_processing_budget_exceeded".to_owned(),
+                queue_pressure: false,
+            }
+        );
+    }
+
+    #[test]
+    fn partition_queue_pressure_preempts_dominant_mint_before_full() {
+        let mut state = MaterialHunterActiveMintPressureState::default();
+        let config = test_active_mint_pressure_config();
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            material_hunter_active_mint_pressure_decision(
+                &mut state, "mint-a", now, 47, 64, &config
+            ),
+            MaterialHunterActiveMintPressureDecision::DeepProcess
+        );
+        assert_eq!(
+            material_hunter_active_mint_pressure_decision(
+                &mut state,
+                "mint-a",
+                now + StdDuration::from_millis(10),
+                48,
+                64,
+                &config
+            ),
+            MaterialHunterActiveMintPressureDecision::Degrade {
+                reason: "noisy_active_mint_backpressure".to_owned(),
+                queue_pressure: true,
+            }
+        );
+    }
+
+    #[test]
+    fn active_mint_pressure_telemetry_surfaces_degraded_mints() {
+        let mut stats = MaterialHunterReaderStats {
+            active_mint_transaction_update_count: 10,
+            active_mint_transaction_coalesced_count: 6,
+            active_mint_transaction_degraded_count: 1,
+            active_mint_transaction_queue_pressure_count: 1,
+            partition_queue_pressure_preempted_count: 1,
+            partition_queue_pressure_dominant_mint: Some("mint-a".to_owned()),
+            partition_queue_pressure_dominant_mint_update_count: 7,
+            partition_queue_pressure_degraded_mint: Some("mint-a".to_owned()),
+            partition_queue_pressure_preempted_before_full: true,
+            ..MaterialHunterReaderStats::default()
+        };
+        stats.degraded_active_mints.insert("mint-a".to_owned());
+        MaterialHunterReaderStats::increment_top_count(
+            &mut stats.top_active_mint_coalesced_counts,
+            "mint-a".to_owned(),
+        );
+        MaterialHunterReaderStats::increment_top_count(
+            &mut stats.top_active_mint_queue_pressure_counts,
+            "mint-a".to_owned(),
+        );
+        let mut summary = MaterialHunterStreamSummary::default();
+        apply_reader_stats_to_summary(&mut summary, &stats);
+        assert_eq!(summary.active_mint_transaction_degraded_count, 1);
+        assert_eq!(summary.degraded_active_mint_count, 1);
+        assert_eq!(summary.degraded_active_mints, vec!["mint-a".to_owned()]);
+        assert_eq!(summary.partition_queue_pressure_preempted_count, 1);
+        assert_eq!(
+            summary.partition_queue_pressure_degraded_mint.as_deref(),
+            Some("mint-a")
+        );
+        assert!(summary.partition_queue_pressure_preempted_before_full);
+        assert_eq!(summary.top_active_mints_by_queue_pressure[0].key, "mint-a");
     }
 
     #[test]
