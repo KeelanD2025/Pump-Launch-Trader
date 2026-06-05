@@ -313,6 +313,8 @@ Segment artifacts are written under `segments/segment_<n>/` with a segment-level
 - `run_segment_summary.csv`
 - `run_countability_decision.json`
 
+For `client_backpressure_detected` or `worker_backpressure_detected`, the blocked segment must persist a `blocker_snapshot` before queue/router/worker reset. The snapshot captures the blocker source, triggering update class, partition id, observed lag, threshold, hot key/mint/account, transaction trigger fields, partition queue/lag summaries, and bounded top-N update/key summaries. `run_gap_events.csv` must flatten the core trigger fields, and `run_segment_summary.csv` must mark `blocker_snapshot_available=true`. New segment artifacts without that snapshot are release-gate blockers; older pre-snapshot artifacts remain parseable for audit only.
+
 Run-level `run_provider_data_loss_seen=true` does not by itself make clean future post-reconnect segments dirty, but every gap-affected segment remains audit-only. Replay can be allowed at run level only when at least one clean segment has `replay_eligible_candidate_count > 0`, no artifact contradictions exist, final R2/artifact checks pass, and the run-level countability decision explicitly allows replay. Formal backtesting and threshold tuning remain false.
 
 Run-level outcome validation groups rows by unique mint. Segment-level rows may document intermediate/audit-only outcomes, but a mint must not have contradictory final run outcomes such as `terminal_inconclusive` plus a replay-eligible/final candidate state or final dead rejection. `countability_decision.json` remains the strict source of truth and artifact consistency must block any contradiction.

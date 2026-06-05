@@ -41389,10 +41389,26 @@ async fn material_candidate_hunter_command(
             && !provider_blocked_run
             && stream_summary.provider_blocker_class.is_none()
             && !stream_summary.client_backpressure_detected;
+        let segment_ended_at = OffsetDateTime::now_utc();
+        let blocker_snapshot = provider_blocked_run
+            .then(|| {
+                let blocker_class = stream_summary
+                    .provider_blocker_class
+                    .as_deref()
+                    .unwrap_or(stream_summary.provider_status.as_str());
+                MaterialHunterBackpressureSnapshot::from_stream_summary(
+                    current_segment_id,
+                    current_segment_started_at,
+                    segment_ended_at,
+                    blocker_class,
+                    &stream_summary,
+                )
+            })
+            .flatten();
         let segment_record = Phase107fSegmentRecord {
             segment_id: current_segment_id,
             started_at: current_segment_started_at,
-            ended_at: OffsetDateTime::now_utc(),
+            ended_at: segment_ended_at,
             provider_status: stream_summary.provider_status.clone(),
             provider_blocker_class: stream_summary.provider_blocker_class.clone(),
             provider_data_loss_seen: stream_summary.provider_data_loss_seen && provider_blocked_run,
@@ -41409,6 +41425,7 @@ async fn material_candidate_hunter_command(
             affected_mints_at_gap,
             counted_phase107b_result: segment_counted,
             partial_outputs_audit_only: !segment_counted,
+            blocker_snapshot,
         };
         phase107f_write_segment_artifacts(
             &output_dir,
@@ -41448,6 +41465,10 @@ async fn material_candidate_hunter_command(
         );
     };
     if interrupted_run {
+        let last_blocker_snapshot = segment_records
+            .iter()
+            .rev()
+            .find_map(|record| record.blocker_snapshot.as_ref());
         let interrupted_summary = json!({
             "schema_version": "phase107f.hunter_summary_interrupted.v1",
             "run_id": run_id,
@@ -41456,6 +41477,7 @@ async fn material_candidate_hunter_command(
             "provider_blocker_class": stream_summary.provider_blocker_class,
             "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
             "client_backpressure_detected": stream_summary.client_backpressure_detected,
+            "last_blocker_snapshot": last_blocker_snapshot,
             "last_attempt_index": attempt_rows.len(),
             "last_tracked_mint": attempt_rows.last().and_then(|row| row["mint"].as_str()).unwrap_or(""),
             "attempted_launches": attempt_rows.len(),
@@ -41602,6 +41624,10 @@ async fn material_candidate_hunter_command(
         .map(|record| record.replay_eligible_candidate_count as u64)
         .sum::<u64>();
     let replay_allowed = run_replay_eligible_candidate_count > 0;
+    let last_blocker_snapshot = segment_records
+        .iter()
+        .rev()
+        .find_map(|record| record.blocker_snapshot.as_ref());
     let mut hunter_summary = json!({
         "schema_version": "phase107b.hunter_summary.v1",
         "run_id": run_id,
@@ -41638,6 +41664,7 @@ async fn material_candidate_hunter_command(
         "provider_blocker_class": stream_summary.provider_blocker_class,
         "provider_data_loss_seen": stream_summary.provider_data_loss_seen,
         "client_backpressure_detected": stream_summary.client_backpressure_detected,
+        "last_blocker_snapshot": last_blocker_snapshot,
         "ready_for_off_vps_candidate_replay": replay_allowed,
         "ready_for_large_strategy_dataset": false,
     });
@@ -42134,6 +42161,152 @@ fn phase107b_write_incremental_checkpoint(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MaterialHunterBackpressureSnapshot {
+    segment_id: usize,
+    segment_started_at: OffsetDateTime,
+    segment_closed_at: OffsetDateTime,
+    blocker_class: String,
+    blocker_source: String,
+    backpressure_update_class: Option<String>,
+    backpressure_partition_id: Option<u64>,
+    backpressure_observed_lag_ms: u64,
+    backpressure_threshold_ms: u64,
+    backpressure_hot_key: Option<String>,
+    backpressure_hot_mint: Option<String>,
+    backpressure_hot_account: Option<String>,
+    backpressure_transaction_class: Option<String>,
+    backpressure_transaction_signature: Option<String>,
+    backpressure_transaction_mint: Option<String>,
+    backpressure_transaction_account: Option<String>,
+    backpressure_deep_transaction_count_at_trigger: u64,
+    backpressure_skipped_transaction_count_at_trigger: u64,
+    backpressure_account_pinned_count_at_trigger: u64,
+    backpressure_deep_processed_count_at_trigger: u64,
+    backpressure_skipped_count_at_trigger: u64,
+    partition_backpressure_trigger_partition: Option<u64>,
+    partition_backpressure_trigger_reason: Option<String>,
+    partition_worker_lag_ms_max: u64,
+    partition_worker_lag_ms_max_by_partition: Vec<u64>,
+    partition_worker_lag_ms_p95_by_partition: Vec<u64>,
+    partition_queue_depth_max_by_partition: Vec<u64>,
+    partition_queue_depth_max_overall: u64,
+    partition_updates_processed_by_partition: Vec<u64>,
+    router_queue_full_count: u64,
+    partition_queue_full_count_total: u64,
+    internal_queue_full_count: u64,
+    dirty_partition_queued_updates_discarded: u64,
+    top_update_classes_by_lag: serde_json::Value,
+    top_update_classes_by_count: serde_json::Value,
+    top_mints_by_worker_updates: serde_json::Value,
+    top_accounts_by_worker_updates: serde_json::Value,
+    top_partition_keys_by_update_count: serde_json::Value,
+    transaction_prefilter_count: u64,
+    transaction_deep_processed_count: u64,
+    transaction_account_pinned_unknown_count: u64,
+    account_pinned_skipped_count: u64,
+    account_pinned_deep_processed_count: u64,
+    pump_trade_fast_prefilter_count: u64,
+    pump_trade_deep_processed_count: u64,
+}
+
+impl MaterialHunterBackpressureSnapshot {
+    fn from_stream_summary(
+        segment_id: usize,
+        segment_started_at: OffsetDateTime,
+        segment_closed_at: OffsetDateTime,
+        blocker_class: &str,
+        summary: &MaterialHunterStreamSummary,
+    ) -> Option<Self> {
+        let source = if summary.internal_queue_full_count > 0 {
+            "reader_queue_full"
+        } else if summary.router_queue_full_count > 0 {
+            "router_queue_full"
+        } else if summary.partition_queue_full_count_total > 0 {
+            "partition_queue_full"
+        } else if summary.worker_backpressure_detected || summary.backpressure_observed_lag_ms > 0 {
+            "worker_lag_threshold_exceeded"
+        } else if summary.client_backpressure_detected {
+            "client_backpressure_detected"
+        } else {
+            return None;
+        };
+        Some(Self {
+            segment_id,
+            segment_started_at,
+            segment_closed_at,
+            blocker_class: blocker_class.to_owned(),
+            blocker_source: source.to_owned(),
+            backpressure_update_class: summary.backpressure_update_class.clone(),
+            backpressure_partition_id: summary.backpressure_partition_id,
+            backpressure_observed_lag_ms: summary.backpressure_observed_lag_ms,
+            backpressure_threshold_ms: summary.backpressure_threshold_ms,
+            backpressure_hot_key: summary.backpressure_hot_key.clone(),
+            backpressure_hot_mint: summary.backpressure_hot_mint.clone(),
+            backpressure_hot_account: summary.backpressure_hot_account.clone(),
+            backpressure_transaction_class: summary.backpressure_transaction_class.clone(),
+            backpressure_transaction_signature: summary.backpressure_transaction_signature.clone(),
+            backpressure_transaction_mint: summary.backpressure_transaction_mint.clone(),
+            backpressure_transaction_account: summary.backpressure_transaction_account.clone(),
+            backpressure_deep_transaction_count_at_trigger: summary
+                .backpressure_deep_transaction_count_at_trigger,
+            backpressure_skipped_transaction_count_at_trigger: summary
+                .backpressure_skipped_transaction_count_at_trigger,
+            backpressure_account_pinned_count_at_trigger: summary
+                .backpressure_account_pinned_count_at_trigger,
+            backpressure_deep_processed_count_at_trigger: summary
+                .backpressure_deep_processed_count_at_trigger,
+            backpressure_skipped_count_at_trigger: summary.backpressure_skipped_count_at_trigger,
+            partition_backpressure_trigger_partition: summary
+                .partition_backpressure_trigger_partition,
+            partition_backpressure_trigger_reason: summary
+                .partition_backpressure_trigger_reason
+                .clone(),
+            partition_worker_lag_ms_max: summary.partition_worker_lag_ms_max,
+            partition_worker_lag_ms_max_by_partition: summary
+                .partition_worker_lag_ms_max_by_partition
+                .clone(),
+            partition_worker_lag_ms_p95_by_partition: summary
+                .partition_worker_lag_ms_p95_by_partition
+                .clone(),
+            partition_queue_depth_max_by_partition: summary
+                .partition_queue_depth_max_by_partition
+                .clone(),
+            partition_queue_depth_max_overall: summary.partition_queue_depth_max_overall,
+            partition_updates_processed_by_partition: summary
+                .partition_updates_processed_by_partition
+                .clone(),
+            router_queue_full_count: summary.router_queue_full_count,
+            partition_queue_full_count_total: summary.partition_queue_full_count_total,
+            internal_queue_full_count: summary.internal_queue_full_count,
+            dirty_partition_queued_updates_discarded: summary
+                .dirty_partition_queued_updates_discarded,
+            top_update_classes_by_lag: serde_json::to_value(&summary.top_update_classes_by_lag)
+                .unwrap_or_else(|_| json!([])),
+            top_update_classes_by_count: serde_json::to_value(&summary.top_update_classes_by_count)
+                .unwrap_or_else(|_| json!([])),
+            top_mints_by_worker_updates: serde_json::to_value(&summary.top_mints_by_worker_updates)
+                .unwrap_or_else(|_| json!([])),
+            top_accounts_by_worker_updates: serde_json::to_value(
+                &summary.top_accounts_by_worker_updates,
+            )
+            .unwrap_or_else(|_| json!([])),
+            top_partition_keys_by_update_count: serde_json::to_value(
+                &summary.top_partition_keys_by_update_count,
+            )
+            .unwrap_or_else(|_| json!([])),
+            transaction_prefilter_count: summary.transaction_prefilter_count,
+            transaction_deep_processed_count: summary.transaction_deep_processed_count,
+            transaction_account_pinned_unknown_count: summary
+                .transaction_account_pinned_unknown_count,
+            account_pinned_skipped_count: summary.account_pinned_skipped_count,
+            account_pinned_deep_processed_count: summary.account_pinned_deep_processed_count,
+            pump_trade_fast_prefilter_count: summary.pump_trade_fast_prefilter_count,
+            pump_trade_deep_processed_count: summary.pump_trade_deep_processed_count,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Phase107fSegmentRecord {
     segment_id: usize,
@@ -42150,6 +42323,7 @@ struct Phase107fSegmentRecord {
     affected_mints_at_gap: Vec<String>,
     counted_phase107b_result: bool,
     partial_outputs_audit_only: bool,
+    blocker_snapshot: Option<MaterialHunterBackpressureSnapshot>,
 }
 
 fn phase107f_row_segment_id(row: &serde_json::Value) -> usize {
@@ -42244,8 +42418,9 @@ fn phase107f_write_segment_artifacts(
         && record.provider_blocker_class.is_none()
         && !record.provider_data_loss_seen
         && !record.client_backpressure_detected;
+    let blocker_snapshot_available = record.blocker_snapshot.is_some();
     let summary = json!({
-        "schema_version": "phase107f.segment_summary.v1",
+        "schema_version": "phase107f.segment_summary.v2",
         "run_id": run_id,
         "segment_id": record.segment_id,
         "started_at": record.started_at,
@@ -42261,6 +42436,9 @@ fn phase107f_write_segment_artifacts(
         "affected_mints_at_gap": record.affected_mints_at_gap,
         "counted_phase107b_result": record.counted_phase107b_result,
         "partial_outputs_audit_only": record.partial_outputs_audit_only,
+        "blocker_class": record.provider_blocker_class,
+        "blocker_snapshot_available": blocker_snapshot_available,
+        "blocker_snapshot": record.blocker_snapshot,
         "off_vps_candidate_replay_allowed": replay_allowed,
         "ready_for_off_vps_candidate_replay": replay_allowed,
         "formal_backtesting_allowed": false,
@@ -42289,6 +42467,9 @@ fn phase107f_write_segment_artifacts(
         "provider_blocker_class": record.provider_blocker_class,
         "provider_data_loss_seen": record.provider_data_loss_seen,
         "client_backpressure_detected": record.client_backpressure_detected,
+        "blocker_class": record.provider_blocker_class,
+        "blocker_snapshot_available": blocker_snapshot_available,
+        "blocker_snapshot": record.blocker_snapshot,
         "final_artifacts_exist": true,
         "partial_outputs_audit_only": record.partial_outputs_audit_only,
         "candidate_checkpoint_count": record.candidate_checkpoint_count,
@@ -42324,6 +42505,16 @@ fn phase107f_write_run_segment_artifacts(
                 "segment_id": record.segment_id,
                 "provider_status": record.provider_status,
                 "provider_blocker_class": record.provider_blocker_class,
+                "blocker_class": record.provider_blocker_class,
+                "blocker_source": record.blocker_snapshot.as_ref().map(|snapshot| snapshot.blocker_source.as_str()).unwrap_or(""),
+                "blocker_snapshot_available": record.blocker_snapshot.is_some(),
+                "backpressure_update_class": record.blocker_snapshot.as_ref().and_then(|snapshot| snapshot.backpressure_update_class.as_deref()).unwrap_or(""),
+                "backpressure_partition_id": record.blocker_snapshot.as_ref().and_then(|snapshot| snapshot.backpressure_partition_id).map(|value| value.to_string()).unwrap_or_default(),
+                "backpressure_observed_lag_ms": record.blocker_snapshot.as_ref().map(|snapshot| snapshot.backpressure_observed_lag_ms).unwrap_or(0),
+                "backpressure_threshold_ms": record.blocker_snapshot.as_ref().map(|snapshot| snapshot.backpressure_threshold_ms).unwrap_or(0),
+                "backpressure_hot_key": record.blocker_snapshot.as_ref().and_then(|snapshot| snapshot.backpressure_hot_key.as_deref()).unwrap_or(""),
+                "backpressure_hot_mint": record.blocker_snapshot.as_ref().and_then(|snapshot| snapshot.backpressure_hot_mint.as_deref()).unwrap_or(""),
+                "backpressure_hot_account": record.blocker_snapshot.as_ref().and_then(|snapshot| snapshot.backpressure_hot_account.as_deref()).unwrap_or(""),
                 "provider_data_loss_seen": record.provider_data_loss_seen,
                 "client_backpressure_detected": record.client_backpressure_detected,
                 "affected_mints": record.affected_mints_at_gap.join("|"),
@@ -42341,6 +42532,16 @@ fn phase107f_write_run_segment_artifacts(
             "segment_id",
             "provider_status",
             "provider_blocker_class",
+            "blocker_class",
+            "blocker_source",
+            "blocker_snapshot_available",
+            "backpressure_update_class",
+            "backpressure_partition_id",
+            "backpressure_observed_lag_ms",
+            "backpressure_threshold_ms",
+            "backpressure_hot_key",
+            "backpressure_hot_mint",
+            "backpressure_hot_account",
             "provider_data_loss_seen",
             "client_backpressure_detected",
             "affected_mints",
@@ -42360,6 +42561,8 @@ fn phase107f_write_run_segment_artifacts(
                 "ended_at": record.ended_at,
                 "provider_status": record.provider_status,
                 "provider_blocker_class": record.provider_blocker_class,
+                "blocker_class": record.provider_blocker_class,
+                "blocker_snapshot_available": record.blocker_snapshot.is_some(),
                 "provider_data_loss_seen": record.provider_data_loss_seen,
                 "client_backpressure_detected": record.client_backpressure_detected,
                 "attempted_launches": record.attempted_launches,
@@ -42380,6 +42583,8 @@ fn phase107f_write_run_segment_artifacts(
             "ended_at",
             "provider_status",
             "provider_blocker_class",
+            "blocker_class",
+            "blocker_snapshot_available",
             "provider_data_loss_seen",
             "client_backpressure_detected",
             "attempted_launches",
@@ -42438,6 +42643,7 @@ fn phase107f_write_run_segment_artifacts(
         "affected_mints_at_gaps": affected_mints_at_gaps,
         "run_provider_data_loss_seen": records.iter().any(|record| record.provider_data_loss_seen),
         "run_client_backpressure_detected": records.iter().any(|record| record.client_backpressure_detected),
+        "segment_blocker_snapshots": records.iter().filter_map(|record| record.blocker_snapshot.as_ref()).collect::<Vec<_>>(),
         "off_vps_candidate_replay_allowed": replay_allowed,
         "ready_for_off_vps_candidate_replay": replay_allowed,
         "formal_backtesting_allowed": false,
@@ -43407,6 +43613,56 @@ fn phase107f_non_countable_blocker_classes() -> BTreeSet<&'static str> {
     .collect()
 }
 
+fn phase107f_segment_requires_backpressure_snapshot(segment_summary: &serde_json::Value) -> bool {
+    let schema_version =
+        phase107f_json_string(segment_summary, "schema_version").unwrap_or_default();
+    if schema_version != "phase107f.segment_summary.v2" {
+        return false;
+    }
+    let blocker_class = phase107f_json_string(segment_summary, "provider_blocker_class")
+        .or_else(|| phase107f_json_string(segment_summary, "blocker_class"));
+    matches!(
+        blocker_class.as_deref(),
+        Some("client_backpressure_detected" | "worker_backpressure_detected")
+    ) || phase107f_json_bool(segment_summary, "client_backpressure_detected")
+        || phase107f_json_bool(segment_summary, "worker_backpressure_detected")
+}
+
+fn phase107f_backpressure_snapshot_has_required_trigger_fields(
+    snapshot: &serde_json::Value,
+) -> bool {
+    let blocker_class = phase107f_json_string(snapshot, "blocker_class").unwrap_or_default();
+    let blocker_source = phase107f_json_string(snapshot, "blocker_source").unwrap_or_default();
+    if blocker_class.is_empty() || blocker_source.is_empty() {
+        return false;
+    }
+    match blocker_source.as_str() {
+        "reader_queue_full" => phase107f_json_u64(snapshot, "internal_queue_full_count") > 0,
+        "router_queue_full" => phase107f_json_u64(snapshot, "router_queue_full_count") > 0,
+        "partition_queue_full" => {
+            phase107f_json_u64(snapshot, "partition_queue_full_count_total") > 0
+        }
+        "worker_lag_threshold_exceeded" => {
+            phase107f_json_u64(snapshot, "backpressure_observed_lag_ms") > 0
+                && phase107f_json_u64(snapshot, "backpressure_threshold_ms") > 0
+                && phase107f_json_string(snapshot, "backpressure_update_class").is_some()
+                && snapshot
+                    .get("backpressure_partition_id")
+                    .map(|value| value.is_u64() || value.is_i64() || value.is_number())
+                    .unwrap_or(false)
+        }
+        _ => {
+            phase107f_json_string(snapshot, "backpressure_update_class").is_some()
+                || phase107f_json_string(snapshot, "partition_backpressure_trigger_reason")
+                    .is_some()
+                || phase107f_json_u64(snapshot, "backpressure_observed_lag_ms") > 0
+                || phase107f_json_u64(snapshot, "internal_queue_full_count") > 0
+                || phase107f_json_u64(snapshot, "router_queue_full_count") > 0
+                || phase107f_json_u64(snapshot, "partition_queue_full_count_total") > 0
+        }
+    }
+}
+
 fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<serde_json::Value> {
     let mut blockers = Vec::<String>::new();
     let countability_path = output_dir.join("countability_decision.json");
@@ -43601,6 +43857,59 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             blockers.push("manifest_ready_for_replay_mismatch".to_owned());
         }
     }
+    let mut missing_backpressure_snapshot_segments = Vec::<String>::new();
+    let segments_dir = output_dir.join("segments");
+    if segments_dir.exists() {
+        for entry in fs::read_dir(&segments_dir)
+            .with_context(|| format!("read segments dir {}", segments_dir.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let summary_path = entry.path().join("segment_summary.json");
+            let Some(segment_summary) = phase107f_read_json_value(&summary_path)? else {
+                continue;
+            };
+            if !phase107f_segment_requires_backpressure_snapshot(&segment_summary) {
+                continue;
+            }
+            let segment_id = phase107f_json_u64(&segment_summary, "segment_id");
+            let snapshot = segment_summary
+                .get("blocker_snapshot")
+                .unwrap_or(&serde_json::Value::Null);
+            let snapshot_available =
+                phase107f_json_bool(&segment_summary, "blocker_snapshot_available");
+            if !snapshot_available
+                || !snapshot.is_object()
+                || !phase107f_backpressure_snapshot_has_required_trigger_fields(snapshot)
+            {
+                let label = if segment_id > 0 {
+                    format!("segment_{segment_id}")
+                } else {
+                    entry.file_name().to_string_lossy().to_string()
+                };
+                missing_backpressure_snapshot_segments.push(label);
+            }
+            let countability_path = entry.path().join("countability_decision.json");
+            if let Some(segment_countability) = phase107f_read_json_value(&countability_path)? {
+                if !phase107f_json_bool(&segment_countability, "blocker_snapshot_available") {
+                    let label = if segment_id > 0 {
+                        format!("segment_{segment_id}")
+                    } else {
+                        entry.file_name().to_string_lossy().to_string()
+                    };
+                    missing_backpressure_snapshot_segments
+                        .push(format!("{label}:countability_snapshot_flag_missing"));
+                }
+            }
+        }
+    }
+    for segment in &missing_backpressure_snapshot_segments {
+        blockers.push(format!(
+            "blocked_backpressure_segment_missing_trigger_snapshot:{segment}"
+        ));
+    }
 
     Ok(json!({
         "schema_version": "phase107f.material_hunter_artifact_consistency.v1",
@@ -43617,6 +43926,7 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "unique_attempted_mint_count": attempt_rows.iter().filter_map(|row| row.get("mint")).filter(|mint| !mint.is_empty()).collect::<BTreeSet<_>>().len(),
         "unique_final_outcome_mint_count": final_outcomes_by_mint.len(),
         "contradictory_final_outcome_mints": contradictory_final_outcome_mints,
+        "missing_backpressure_snapshot_segments": missing_backpressure_snapshot_segments,
         "off_vps_candidate_replay_allowed": replay_allowed,
         "ready_for_off_vps_candidate_replay": ready_for_replay,
         "service_exit_status_exists": service_exit.is_some(),
@@ -55419,6 +55729,7 @@ mod tests {
             affected_mints_at_gap: vec!["gap-mint".to_owned()],
             counted_phase107b_result: false,
             partial_outputs_audit_only: true,
+            blocker_snapshot: None,
         };
         let clean = Phase107fSegmentRecord {
             segment_id: 2,
@@ -55435,6 +55746,7 @@ mod tests {
             affected_mints_at_gap: Vec::new(),
             counted_phase107b_result: true,
             partial_outputs_audit_only: false,
+            blocker_snapshot: None,
         };
         phase107f_write_segment_artifacts(
             output_dir,
@@ -55546,6 +55858,316 @@ mod tests {
         )
         .expect_err("stalled provider progress must fail fail-fast watchdog");
         assert!(error.to_string().contains("provider_progress_stalled"));
+    }
+
+    fn phase107f_test_backpressure_snapshot(
+        segment_id: usize,
+    ) -> MaterialHunterBackpressureSnapshot {
+        let started_at = OffsetDateTime::now_utc();
+        MaterialHunterBackpressureSnapshot {
+            segment_id,
+            segment_started_at: started_at,
+            segment_closed_at: started_at + time::Duration::seconds(10),
+            blocker_class: "client_backpressure_detected".to_owned(),
+            blocker_source: "worker_lag_threshold_exceeded".to_owned(),
+            backpressure_update_class: Some("transaction_active_mint".to_owned()),
+            backpressure_partition_id: Some(2),
+            backpressure_observed_lag_ms: 10_420,
+            backpressure_threshold_ms: 10_000,
+            backpressure_hot_key: Some("mint:hot".to_owned()),
+            backpressure_hot_mint: Some("hot-mint".to_owned()),
+            backpressure_hot_account: Some("hot-account".to_owned()),
+            backpressure_transaction_class: Some("transaction_active_mint".to_owned()),
+            backpressure_transaction_signature: Some("sig".to_owned()),
+            backpressure_transaction_mint: Some("hot-mint".to_owned()),
+            backpressure_transaction_account: Some("hot-account".to_owned()),
+            backpressure_deep_transaction_count_at_trigger: 44,
+            backpressure_skipped_transaction_count_at_trigger: 120,
+            backpressure_account_pinned_count_at_trigger: 20,
+            backpressure_deep_processed_count_at_trigger: 50,
+            backpressure_skipped_count_at_trigger: 200,
+            partition_backpressure_trigger_partition: Some(2),
+            partition_backpressure_trigger_reason: Some("worker_lag_threshold_exceeded".to_owned()),
+            partition_worker_lag_ms_max: 10_420,
+            partition_worker_lag_ms_max_by_partition: vec![10, 20, 10_420, 30],
+            partition_worker_lag_ms_p95_by_partition: vec![1, 2, 3500, 3],
+            partition_queue_depth_max_by_partition: vec![4, 5, 414, 6],
+            partition_queue_depth_max_overall: 414,
+            partition_updates_processed_by_partition: vec![100, 101, 102, 103],
+            router_queue_full_count: 0,
+            partition_queue_full_count_total: 0,
+            internal_queue_full_count: 0,
+            dirty_partition_queued_updates_discarded: 414,
+            top_update_classes_by_lag: json!([{"key":"transaction_active_mint","count":10420}]),
+            top_update_classes_by_count: json!([{"key":"owner_account_update","count":3547}]),
+            top_mints_by_worker_updates: json!([{"key":"hot-mint","count":637}]),
+            top_accounts_by_worker_updates: json!([{"key":"hot-account","count":426}]),
+            top_partition_keys_by_update_count: json!([{"key":"mint:hot","count":596}]),
+            transaction_prefilter_count: 4417,
+            transaction_deep_processed_count: 1673,
+            transaction_account_pinned_unknown_count: 2438,
+            account_pinned_skipped_count: 2438,
+            account_pinned_deep_processed_count: 0,
+            pump_trade_fast_prefilter_count: 527,
+            pump_trade_deep_processed_count: 22,
+        }
+    }
+
+    #[test]
+    fn phase107f_blocked_segment_persists_backpressure_snapshot_before_reset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started_at = OffsetDateTime::now_utc();
+        let blocked = Phase107fSegmentRecord {
+            segment_id: 1,
+            started_at,
+            ended_at: started_at + time::Duration::seconds(10),
+            provider_status: "client_backpressure_detected".to_owned(),
+            provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            provider_data_loss_seen: false,
+            client_backpressure_detected: true,
+            attempted_launches: 1,
+            rejected_count: 1,
+            candidate_checkpoint_count: 0,
+            replay_eligible_candidate_count: 0,
+            affected_mints_at_gap: vec!["hot-mint".to_owned()],
+            counted_phase107b_result: false,
+            partial_outputs_audit_only: true,
+            blocker_snapshot: Some(phase107f_test_backpressure_snapshot(1)),
+        };
+        phase107f_write_segment_artifacts(temp.path(), "run", &blocked, &[], &[], &[])
+            .expect("segment artifacts");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("segments/segment_1/segment_summary.json"))
+                .expect("summary"),
+        )
+        .expect("summary json");
+        assert_eq!(summary["schema_version"], "phase107f.segment_summary.v2");
+        assert_eq!(summary["blocker_snapshot_available"], true);
+        assert_eq!(
+            summary["blocker_snapshot"]["backpressure_update_class"],
+            "transaction_active_mint"
+        );
+        assert_eq!(
+            summary["blocker_snapshot"]["backpressure_observed_lag_ms"],
+            10420
+        );
+        let countability: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("segments/segment_1/countability_decision.json"),
+            )
+            .expect("countability"),
+        )
+        .expect("countability json");
+        assert_eq!(countability["blocker_snapshot_available"], true);
+        assert_eq!(countability["counted_phase107b_result"], false);
+    }
+
+    #[test]
+    fn phase107f_segment_reset_does_not_clear_blocker_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started_at = OffsetDateTime::now_utc();
+        let blocked = Phase107fSegmentRecord {
+            segment_id: 1,
+            started_at,
+            ended_at: started_at + time::Duration::seconds(10),
+            provider_status: "client_backpressure_detected".to_owned(),
+            provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            provider_data_loss_seen: false,
+            client_backpressure_detected: true,
+            attempted_launches: 1,
+            rejected_count: 1,
+            candidate_checkpoint_count: 0,
+            replay_eligible_candidate_count: 0,
+            affected_mints_at_gap: vec!["hot-mint".to_owned()],
+            counted_phase107b_result: false,
+            partial_outputs_audit_only: true,
+            blocker_snapshot: Some(phase107f_test_backpressure_snapshot(1)),
+        };
+        let clean = Phase107fSegmentRecord {
+            segment_id: 2,
+            started_at: blocked.ended_at,
+            ended_at: blocked.ended_at + time::Duration::seconds(20),
+            provider_status: "stopped_by_hunter".to_owned(),
+            provider_blocker_class: None,
+            provider_data_loss_seen: false,
+            client_backpressure_detected: false,
+            attempted_launches: 1,
+            rejected_count: 1,
+            candidate_checkpoint_count: 0,
+            replay_eligible_candidate_count: 0,
+            affected_mints_at_gap: Vec::new(),
+            counted_phase107b_result: true,
+            partial_outputs_audit_only: false,
+            blocker_snapshot: None,
+        };
+        phase107f_write_segment_artifacts(temp.path(), "run", &blocked, &[], &[], &[])
+            .expect("blocked artifacts");
+        phase107f_write_segment_artifacts(temp.path(), "run", &clean, &[], &[], &[])
+            .expect("clean artifacts");
+        phase107f_write_run_segment_artifacts(temp.path(), "run", &[blocked, clean])
+            .expect("run artifacts");
+        let blocked_summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("segments/segment_1/segment_summary.json"))
+                .expect("blocked summary"),
+        )
+        .expect("blocked json");
+        let clean_summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("segments/segment_2/segment_summary.json"))
+                .expect("clean summary"),
+        )
+        .expect("clean json");
+        assert_eq!(blocked_summary["blocker_snapshot_available"], true);
+        assert_eq!(clean_summary["blocker_snapshot_available"], false);
+        let run_countability: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("run_countability_decision.json")).expect("run"),
+        )
+        .expect("run json");
+        assert_eq!(
+            run_countability["segment_blocker_snapshots"][0]["backpressure_hot_mint"],
+            "hot-mint"
+        );
+    }
+
+    #[test]
+    fn phase107f_run_gap_events_contains_backpressure_trigger_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started_at = OffsetDateTime::now_utc();
+        let blocked = Phase107fSegmentRecord {
+            segment_id: 1,
+            started_at,
+            ended_at: started_at + time::Duration::seconds(10),
+            provider_status: "client_backpressure_detected".to_owned(),
+            provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            provider_data_loss_seen: false,
+            client_backpressure_detected: true,
+            attempted_launches: 1,
+            rejected_count: 1,
+            candidate_checkpoint_count: 0,
+            replay_eligible_candidate_count: 0,
+            affected_mints_at_gap: vec!["hot-mint".to_owned()],
+            counted_phase107b_result: false,
+            partial_outputs_audit_only: true,
+            blocker_snapshot: Some(phase107f_test_backpressure_snapshot(1)),
+        };
+        phase107f_write_run_segment_artifacts(temp.path(), "run", &[blocked])
+            .expect("run artifacts");
+        let gap_csv = fs::read_to_string(temp.path().join("run_gap_events.csv")).expect("gap csv");
+        assert!(gap_csv.contains("backpressure_update_class"));
+        assert!(gap_csv.contains("transaction_active_mint"));
+        assert!(gap_csv.contains("10420"));
+        let segment_csv =
+            fs::read_to_string(temp.path().join("run_segment_summary.csv")).expect("segment csv");
+        assert!(segment_csv.contains("blocker_snapshot_available"));
+        assert!(segment_csv.contains("true"));
+    }
+
+    #[test]
+    fn phase107f_artifact_validator_blocks_new_backpressure_segment_without_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let segment_dir = temp.path().join("segments/segment_1");
+        fs::create_dir_all(&segment_dir).expect("segment dir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": false,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": true,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\n",
+        )
+        .expect("candidates");
+        fs::write(
+            segment_dir.join("segment_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "phase107f.segment_summary.v2",
+                "segment_id": 1,
+                "provider_blocker_class": "client_backpressure_detected",
+                "client_backpressure_detected": true,
+                "blocker_snapshot_available": false
+            }))
+            .expect("json"),
+        )
+        .expect("segment summary");
+        fs::write(
+            segment_dir.join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "blocker_snapshot_available": false
+            }))
+            .expect("json"),
+        )
+        .expect("segment countability");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("blocked_backpressure_segment_missing_trigger_snapshot:segment_1")
+        );
+    }
+
+    #[test]
+    fn phase107f_old_backpressure_segment_without_snapshot_remains_compatible() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let segment_dir = temp.path().join("segments/segment_1");
+        fs::create_dir_all(&segment_dir).expect("segment dir");
+        fs::write(
+            temp.path().join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({"run_id":"run"})).expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": false,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": true,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\n",
+        )
+        .expect("candidates");
+        fs::write(
+            segment_dir.join("segment_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "phase107f.segment_summary.v1",
+                "segment_id": 1,
+                "provider_blocker_class": "client_backpressure_detected",
+                "client_backpressure_detected": true
+            }))
+            .expect("json"),
+        )
+        .expect("segment summary");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], true);
     }
 
     #[test]
