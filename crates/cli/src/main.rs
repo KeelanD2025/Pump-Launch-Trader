@@ -40229,6 +40229,86 @@ fn phase107f_insert_stream_telemetry(
             json!(summary.preemptive_noisy_mint_degraded),
         ),
         (
+            "classified_update_count_by_class",
+            json!(summary.classified_update_count_by_class),
+        ),
+        (
+            "processing_lane_count",
+            json!(summary.processing_lane_count),
+        ),
+        (
+            "deep_processed_count_by_class",
+            json!(summary.deep_processed_count_by_class),
+        ),
+        (
+            "cheap_skipped_count_by_class",
+            json!(summary.cheap_skipped_count_by_class),
+        ),
+        ("mapping_hint_count", json!(summary.mapping_hint_count)),
+        ("vault_delta_count", json!(summary.vault_delta_count)),
+        ("trade_delta_count", json!(summary.trade_delta_count)),
+        ("holder_delta_count", json!(summary.holder_delta_count)),
+        (
+            "deferred_feature_count",
+            json!(summary.deferred_feature_count),
+        ),
+        (
+            "high_throughput_mint_count",
+            json!(summary.high_throughput_mint_count),
+        ),
+        (
+            "high_throughput_mints",
+            json!(summary.high_throughput_mints),
+        ),
+        (
+            "per_mint_batch_deep_limit_hits",
+            json!(summary.per_mint_batch_deep_limit_hits),
+        ),
+        (
+            "fair_scheduler_rotations",
+            json!(summary.fair_scheduler_rotations),
+        ),
+        (
+            "top_mints_by_lane_count",
+            json!(summary.top_mints_by_lane_count),
+        ),
+        (
+            "top_mints_by_deferred_features",
+            json!(summary.top_mints_by_deferred_features),
+        ),
+        (
+            "top_mints_by_high_throughput_events",
+            json!(summary.top_mints_by_high_throughput_events),
+        ),
+        (
+            "feature_flush_count_by_reason",
+            json!(summary.feature_flush_count_by_reason),
+        ),
+        (
+            "feature_flush_duration_ms_p95",
+            json!(summary.feature_flush_duration_ms_p95),
+        ),
+        (
+            "feature_flush_duration_ms_max",
+            json!(summary.feature_flush_duration_ms_max),
+        ),
+        (
+            "classification_duration_ms_p95",
+            json!(summary.classification_duration_ms_p95),
+        ),
+        (
+            "classification_duration_ms_max",
+            json!(summary.classification_duration_ms_max),
+        ),
+        (
+            "module_dispatch_duration_ms_p95",
+            json!(summary.module_dispatch_duration_ms_p95),
+        ),
+        (
+            "module_dispatch_duration_ms_max",
+            json!(summary.module_dispatch_duration_ms_max),
+        ),
+        (
             "transaction_feature_deferred_count",
             json!(summary.transaction_feature_deferred_count),
         ),
@@ -55486,6 +55566,36 @@ mod tests {
             partition_queue_pressure_preempted_count: 1,
             partition_queue_pressure_degraded_mint: Some("mint-a".to_owned()),
             partition_queue_pressure_preempted_before_full: true,
+            classified_update_count_by_class: vec![runtime::MaterialHunterTopKeySummary {
+                key: "pump_token_created".to_owned(),
+                count: 2,
+            }],
+            processing_lane_count: vec![runtime::MaterialHunterTopKeySummary {
+                key: "critical_launch".to_owned(),
+                count: 2,
+            }],
+            deep_processed_count_by_class: vec![runtime::MaterialHunterTopKeySummary {
+                key: "pump_token_created".to_owned(),
+                count: 2,
+            }],
+            cheap_skipped_count_by_class: vec![runtime::MaterialHunterTopKeySummary {
+                key: "other_untracked".to_owned(),
+                count: 5,
+            }],
+            mapping_hint_count: 3,
+            trade_delta_count: 4,
+            holder_delta_count: 5,
+            deferred_feature_count: 6,
+            high_throughput_mint_count: 1,
+            high_throughput_mints: vec!["mint-a".to_owned()],
+            per_mint_batch_deep_limit_hits: 2,
+            fair_scheduler_rotations: 7,
+            feature_flush_count_by_reason: vec![runtime::MaterialHunterTopKeySummary {
+                key: "checkpoint".to_owned(),
+                count: 1,
+            }],
+            classification_duration_ms_p95: 1,
+            module_dispatch_duration_ms_p95: 2,
             ..MaterialHunterStreamSummary::default()
         };
         phase107f_write_health(
@@ -55553,6 +55663,33 @@ mod tests {
             heartbeat["partition_queue_pressure_preempted_before_full"],
             true
         );
+        assert_eq!(
+            heartbeat["classified_update_count_by_class"][0]["key"],
+            "pump_token_created"
+        );
+        assert_eq!(
+            heartbeat["processing_lane_count"][0]["key"],
+            "critical_launch"
+        );
+        assert_eq!(heartbeat["deep_processed_count_by_class"][0]["count"], 2);
+        assert_eq!(
+            heartbeat["cheap_skipped_count_by_class"][0]["key"],
+            "other_untracked"
+        );
+        assert_eq!(heartbeat["mapping_hint_count"], 3);
+        assert_eq!(heartbeat["trade_delta_count"], 4);
+        assert_eq!(heartbeat["holder_delta_count"], 5);
+        assert_eq!(heartbeat["deferred_feature_count"], 6);
+        assert_eq!(heartbeat["high_throughput_mint_count"], 1);
+        assert_eq!(heartbeat["high_throughput_mints"][0], "mint-a");
+        assert_eq!(heartbeat["per_mint_batch_deep_limit_hits"], 2);
+        assert_eq!(heartbeat["fair_scheduler_rotations"], 7);
+        assert_eq!(
+            heartbeat["feature_flush_count_by_reason"][0]["key"],
+            "checkpoint"
+        );
+        assert_eq!(heartbeat["classification_duration_ms_p95"], 1);
+        assert_eq!(heartbeat["module_dispatch_duration_ms_p95"], 2);
     }
 
     #[test]

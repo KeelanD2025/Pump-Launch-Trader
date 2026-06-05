@@ -276,6 +276,26 @@ Heartbeat and summaries expose:
 - `partition_queue_pressure_preempted_before_full`
 - `partition_queue_full_after_preemption`
 - `preemptive_noisy_mint_degraded`
+- `classified_update_count_by_class`
+- `processing_lane_count`
+- `deep_processed_count_by_class`
+- `cheap_skipped_count_by_class`
+- `mapping_hint_count`
+- `vault_delta_count`
+- `trade_delta_count`
+- `holder_delta_count`
+- `deferred_feature_count`
+- `high_throughput_mint_count`
+- `high_throughput_mints`
+- `per_mint_batch_deep_limit_hits`
+- `fair_scheduler_rotations`
+- `top_mints_by_lane_count`
+- `top_mints_by_deferred_features`
+- `top_mints_by_high_throughput_events`
+- `feature_flush_count_by_reason`
+- `feature_flush_duration_ms_p95/max`
+- `classification_duration_ms_p95/max`
+- `module_dispatch_duration_ms_p95/max`
 - `transaction_feature_deferred_count`
 - `transaction_feature_recompute_count`
 - `transaction_deep_process_duration_ms_p95/max`
@@ -314,6 +334,27 @@ remove it from rich active tracking, and continue the segment when global queues
 degraded mint must never be replay-eligible, must not create fake candidate/rejected rows, and R2
 verification cannot override that exclusion. If preemption fails and a partition queue fills, the
 segment is still classified as `client_backpressure_detected`.
+
+The worker path uses an explicit classified-update dispatcher. A cheap `FastClassifier` assigns
+each worker-relevant update to a stable `MaterialUpdateClass`, `ProcessingLane`, routing key,
+optional mint/account/signature, and safety flags before full decode. The processing modules are:
+
+- `CriticalLaunchModule` for `PumpTokenCreated` and `TransactionTokenCreated`; these updates must never be cheap-skipped.
+- `AccountMintMapper` for stream-authoritative account/mint/vault hints; mapping updates do not run rich risk/feature processing.
+- `VaultCurveDeltaProcessor` for active bonding-curve/vault deltas; these mark mint state dirty and can trigger gates without per-update full recompute.
+- `TradeDeltaProcessor` for active tracked Pump/transaction trades; repeated updates are coalesced and rich feature work is deferred to gates/checkpoints/finalization.
+- `HolderStateProcessor` for active token-account/owner deltas; holder state remains stream-authoritative and holder RPC remains disabled.
+- `CheapCounterModule` for untracked, tombstoned, duplicate, malformed, account-pinned unknown, and other noise; these updates must not create attempts, candidates, rejected rows, replay eligibility, backtesting eligibility, tuning eligibility, provider-confirmed bundle claims, holder RPC data, or canonical RPC supply.
+- `DeferredFeatureModule` for gate/checkpoint/segment-close/finalization recomputes outside the gRPC reader hot path.
+
+Per-mint tracking modes are `Rich`, `HighThroughput`, `DegradedAuditOnly`, `Tombstoned`, and
+`Finalized`. `HighThroughput` mints coalesce high-frequency events while preserving gate-critical
+events and may remain candidate-eligible only when observation is complete and clean.
+`DegradedAuditOnly` mints are terminal-inconclusive/audit-only, cannot become replay-eligible, and
+future updates are cheap-counted. The partition fair scheduler rotates across active mint/account
+keys within each batch and preserves arrival order for the same key, so one noisy mint cannot
+monopolize a partition batch while independent keys wait.
+
 - `artifact_queue_depth_max`
 - `artifact_queue_full_count`
 - `artifact_worker_lag_ms_max`
