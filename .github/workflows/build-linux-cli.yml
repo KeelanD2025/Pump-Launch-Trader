@@ -68,11 +68,6 @@ on:
         required: false
         default: false
         type: boolean
-      run_vps_resource_audit:
-        description: Collect read-only VPS disk/resource audit without starting collection
-        required: false
-        default: false
-        type: boolean
       housekeeping_run_class:
         description: Run class for housekeeping-only proof
         required: false
@@ -238,7 +233,7 @@ jobs:
 
   deploy-to-vps:
     name: Deploy prebuilt CLI to VPS
-    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' || github.event.inputs.run_housekeeping_only == 'true' || github.event.inputs.run_vps_resource_audit == 'true' }}
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
     needs: build-linux-cli
     runs-on: ubuntu-22.04
 
@@ -465,7 +460,7 @@ jobs:
           EOF
 
       - name: Collect read-only VPS resource audit
-        if: ${{ always() && github.event.inputs.run_vps_resource_audit == 'true' }}
+        if: ${{ always() && github.event.inputs.run_housekeeping_only == 'true' }}
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -591,7 +586,7 @@ jobs:
           EOF
 
       - name: Upload read-only VPS resource audit
-        if: ${{ always() && github.event.inputs.run_vps_resource_audit == 'true' }}
+        if: ${{ always() && github.event.inputs.run_housekeeping_only == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: vps-resource-audit
