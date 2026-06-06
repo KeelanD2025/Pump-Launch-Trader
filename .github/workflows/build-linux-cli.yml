@@ -233,7 +233,7 @@ jobs:
 
   deploy-to-vps:
     name: Deploy prebuilt CLI to VPS
-    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' }}
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
     needs: build-linux-cli
     runs-on: ubuntu-22.04
 
