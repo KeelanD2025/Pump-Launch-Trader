@@ -46044,6 +46044,16 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
     let receiver_unavailable_count = relay_summary["receiver_unavailable_count"]
         .as_u64()
         .unwrap_or(0);
+    let provider_data_loss_seen = countability["provider_data_loss_seen"]
+        .as_bool()
+        .unwrap_or(false)
+        || hunter_summary["provider_data_loss_seen"]
+            .as_bool()
+            .unwrap_or(false);
+    let provider_blocker_class = countability["provider_blocker_class"]
+        .as_str()
+        .or_else(|| hunter_summary["provider_blocker_class"].as_str())
+        .map(ToOwned::to_owned);
     let counted_phase107b_result = countability["counted_phase107b_result"]
         .as_bool()
         .unwrap_or(false);
@@ -46061,6 +46071,8 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "RELAY_LOCAL_DATASET_BLOCK_DECODE"
     } else if receiver_backpressure_count > 0 || receiver_unavailable_count > 0 {
         "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
+    } else if provider_data_loss_seen || provider_blocker_class.is_some() {
+        "RELAY_LOCAL_DATASET_BLOCK_PROVIDER"
     } else if !r2_verified {
         "RELAY_LOCAL_DATASET_BLOCK_R2"
     } else if retention_summary
@@ -46091,6 +46103,8 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "receiver_unavailable_count": receiver_unavailable_count,
         "attempted_launches": attempted_launches,
         "unique_attempted_mints": unique_attempted_mints,
+        "provider_data_loss_seen": provider_data_loss_seen,
+        "provider_blocker_class": provider_blocker_class,
         "rejected_dead_count": hunter_summary["rejected_dead_count"],
         "rejected_inconclusive_count": hunter_summary["rejected_inconclusive_count"],
         "candidate_checkpoint_count": countability["candidate_checkpoint_count"],
@@ -59071,6 +59085,48 @@ mod tests {
         assert_eq!(
             blocked["classification"],
             "RELAY_LOCAL_DATASET_BLOCK_SEQUENCE_GAP"
+        );
+
+        fs::write(
+            temp.path().join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "relay_session_id": "relay-session",
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("relay summary clean");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": false,
+                "provider_data_loss_seen": true,
+                "provider_blocker_class": "provider_lagged_data_loss",
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "r2_verified": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("provider countability");
+        let provider_blocked =
+            local_relay_dataset_proof_summary(temp.path()).expect("provider summary");
+        assert_eq!(
+            provider_blocked["classification"],
+            "RELAY_LOCAL_DATASET_BLOCK_PROVIDER"
+        );
+        assert_eq!(provider_blocked["provider_data_loss_seen"], true);
+        assert_eq!(
+            provider_blocked["provider_blocker_class"],
+            "provider_lagged_data_loss"
         );
     }
 
