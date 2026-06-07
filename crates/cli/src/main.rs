@@ -44093,6 +44093,8 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         phase107f_read_json_value(&output_dir.join("hunter_summary_interrupted.json"))?;
     let manifest = phase107f_read_json_value(&output_dir.join("manifest.json"))?;
     let service_exit = phase107f_read_json_value(&output_dir.join("service_exit_status.json"))?;
+    let retention_summary =
+        phase107f_read_json_value(&output_dir.join("local_retention_summary.json"))?;
     let candidate_rows = phase107f_read_csv_rows(&output_dir.join("candidate_summary.csv"))?;
     let rejected_rows = phase107f_read_csv_rows(&output_dir.join("rejected_summary.csv"))?;
     let attempt_rows = phase107f_read_csv_rows(&output_dir.join("attempt_ledger.csv"))?;
@@ -44184,6 +44186,25 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     }
     if replay_allowed && phase107f_json_u64(&countability, "replay_eligible_candidate_count") == 0 {
         blockers.push("replay_allowed_without_replay_eligible_candidate".to_owned());
+    }
+    if let Some(retention) = &retention_summary {
+        if !phase107f_json_bool(retention, "ok") {
+            blockers.push("local_retention_summary_not_ok".to_owned());
+        }
+        if phase107f_json_u64(retention, "deleted_bulk_bytes") > 0
+            && !phase107f_json_bool(retention, "r2_verified")
+        {
+            blockers.push("local_retention_deleted_without_r2_verification".to_owned());
+        }
+        if phase107f_json_bool(retention, "replay_allowed")
+            || phase107f_json_bool(retention, "formal_backtesting_allowed")
+            || phase107f_json_bool(retention, "threshold_tuning_allowed")
+            || phase107f_json_bool(retention, "live_trading_enabled")
+            || phase107f_json_bool(retention, "holder_rpc_enabled")
+            || phase107f_json_bool(retention, "rpc_mint_supply_canonical")
+        {
+            blockers.push("local_retention_safety_flag_enabled".to_owned());
+        }
     }
     if ready_for_replay && !replay_allowed {
         blockers.push("ready_for_replay_without_replay_allowed".to_owned());
@@ -44364,6 +44385,11 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "off_vps_candidate_replay_allowed": replay_allowed,
         "ready_for_off_vps_candidate_replay": ready_for_replay,
         "service_exit_status_exists": service_exit.is_some(),
+        "local_retention_summary_exists": retention_summary.is_some(),
+        "local_retained_bytes": retention_summary
+            .as_ref()
+            .and_then(|value| value.get("local_retained_bytes"))
+            .and_then(|value| value.as_u64()),
         "threshold_tuning_allowed": false,
         "generated_at": OffsetDateTime::now_utc(),
     }))
@@ -45728,6 +45754,10 @@ async fn local_stream_collector_command(
                         "local_relay_collector_completed",
                         false,
                     )?;
+                    let _retention_summary = local_relay_apply_r2_primary_retention(
+                        &output_path,
+                        LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+                    )?;
                     let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
                     atomic_write_path(
                         &output_path.join("local_relay_dataset_proof_summary.json"),
@@ -45804,6 +45834,179 @@ fn read_json_file_or_empty(path: &Path) -> serde_json::Value {
         .unwrap_or_else(|| json!({}))
 }
 
+fn local_relay_relative_artifact_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root).ok().map(|relative| {
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    })
+}
+
+fn local_relay_collect_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry.file_type()?.is_dir() {
+            files.extend(local_relay_collect_files(&entry_path)?);
+        } else {
+            files.push(entry_path);
+        }
+    }
+    Ok(files)
+}
+
+fn local_relay_r2_verified_contains(verified_files: &BTreeSet<String>, relative: &str) -> bool {
+    verified_files.iter().any(|key| key.ends_with(relative))
+}
+
+fn local_relay_apply_r2_primary_retention(
+    output_dir: &Path,
+    retention_mode: LocalCollectorRetentionMode,
+) -> Result<serde_json::Value> {
+    let r2_upload = read_json_file_or_empty(&output_dir.join("r2_upload_result.json"));
+    let r2_verified = r2_upload["verified"].as_bool().unwrap_or(false);
+    let verified_files = r2_upload["verified_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut blockers = Vec::<String>::new();
+    let mut deleted_paths = Vec::<serde_json::Value>::new();
+    let mut skipped_paths = Vec::<serde_json::Value>::new();
+    let mut deleted_bytes = 0u64;
+    let retention_enabled = retention_mode.deletes_bulk();
+
+    let bulk_candidates = [
+        output_dir.join("relay_frames"),
+        output_dir.join("rejected"),
+        output_dir.join("candidates"),
+    ];
+    if retention_enabled && !r2_verified {
+        blockers.push("r2_verification_missing_retention_skipped".to_owned());
+    }
+    if retention_enabled && r2_verified {
+        for candidate in bulk_candidates {
+            if !candidate.exists() {
+                continue;
+            }
+            let files = local_relay_collect_files(&candidate)?;
+            let mut unverified = Vec::<String>::new();
+            for file in &files {
+                let Some(relative) = local_relay_relative_artifact_path(output_dir, file) else {
+                    unverified.push(file.display().to_string());
+                    continue;
+                };
+                if !local_relay_r2_verified_contains(&verified_files, &relative) {
+                    unverified.push(relative);
+                }
+            }
+            if !unverified.is_empty() {
+                skipped_paths.push(json!({
+                    "path": candidate.display().to_string(),
+                    "reason": "unverified_bulk_artifact_retained",
+                    "unverified_files": unverified,
+                }));
+                continue;
+            }
+            let bytes = path_size_bytes(&candidate);
+            if candidate.is_dir() {
+                fs::remove_dir_all(&candidate).with_context(|| {
+                    format!("delete verified local bulk dir {}", candidate.display())
+                })?;
+            } else {
+                fs::remove_file(&candidate).with_context(|| {
+                    format!("delete verified local bulk file {}", candidate.display())
+                })?;
+            }
+            deleted_bytes = deleted_bytes.saturating_add(bytes);
+            deleted_paths.push(json!({
+                "path": candidate.display().to_string(),
+                "bytes": bytes,
+                "reason": "verified_r2_bulk_artifact_removed",
+            }));
+        }
+    }
+
+    let retained_required_paths = [
+        "attempt_ledger.csv",
+        "candidate_summary.csv",
+        "rejected_summary.csv",
+        "countability_decision.json",
+        "run_countability_decision.json",
+        "manifest.json",
+        "r2_upload_result.json",
+        "stable_manifest_upload.json",
+        "service_exit_status.json",
+        "local_collector_summary.json",
+        "local_collector_exit_status.json",
+        "relay_frame_manifest.json",
+    ]
+    .iter()
+    .filter_map(|relative| {
+        let path = output_dir.join(relative);
+        path.exists().then(|| {
+            json!({
+                "path": relative,
+                "bytes": path_size_bytes(&path),
+            })
+        })
+    })
+    .collect::<Vec<_>>();
+    let local_retained_bytes = path_size_bytes(output_dir);
+    let summary = json!({
+        "schema_version": "phase107g.local_collector_retention.v1",
+        "retention_mode": retention_mode.as_str(),
+        "retention_enabled": retention_enabled,
+        "r2_verified": r2_verified,
+        "deleted_bulk_paths": deleted_paths,
+        "deleted_bulk_bytes": deleted_bytes,
+        "skipped_paths": skipped_paths,
+        "retained_required_paths": retained_required_paths,
+        "local_retained_bytes": local_retained_bytes,
+        "ok": blockers.is_empty(),
+        "blockers": blockers,
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    atomic_write_path(
+        &output_dir.join("local_retention_summary.json"),
+        &serde_json::to_vec_pretty(&summary)?,
+    )?;
+    let pointer = json!({
+        "schema_version": "phase107g.local_collector_r2_manifest_pointer.v1",
+        "r2_verified": r2_verified,
+        "retention_summary_path": "local_retention_summary.json",
+        "r2_upload_result_path": "r2_upload_result.json",
+        "verified_object_count": verified_files.len(),
+        "local_retained_bytes": local_retained_bytes,
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    atomic_write_path(
+        &output_dir.join("local_collector_r2_manifest_pointer.json"),
+        &serde_json::to_vec_pretty(&pointer)?,
+    )?;
+    Ok(summary)
+}
+
 fn local_relay_unique_attempted_mints(path: &Path) -> usize {
     let Ok(text) = fs::read_to_string(path) else {
         return 0;
@@ -45824,6 +46027,8 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
     let run_countability =
         read_json_file_or_empty(&output_dir.join("run_countability_decision.json"));
     let r2_upload = read_json_file_or_empty(&output_dir.join("r2_upload_result.json"));
+    let retention_summary =
+        read_json_file_or_empty(&output_dir.join("local_retention_summary.json"));
     let attempted_launches = hunter_summary["attempted_launches"]
         .as_u64()
         .or_else(|| countability["attempted_launches"].as_u64())
@@ -45858,6 +46063,12 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
     } else if !r2_verified {
         "RELAY_LOCAL_DATASET_BLOCK_R2"
+    } else if retention_summary
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .is_some_and(|ok| !ok)
+    {
+        "RELAY_LOCAL_DATASET_BLOCK_SPOOL"
     } else if !counted_phase107b_result || attempted_launches == 0 || unique_attempted_mints == 0 {
         "RELAY_LOCAL_DATASET_BLOCK_COUNTABILITY"
     } else if !safety_ok {
@@ -45889,6 +46100,7 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "ready_for_off_vps_candidate_replay": countability["ready_for_off_vps_candidate_replay"].as_bool().unwrap_or(false),
         "r2_verified": r2_verified,
         "r2_upload_result": r2_upload,
+        "local_retention_summary": retention_summary,
         "run_countability_decision": run_countability,
         "formal_backtesting_allowed": false,
         "threshold_tuning_allowed": false,
@@ -59153,6 +59365,230 @@ mod tests {
             .write_chunk("candidate_summary", 1, b"too large")
             .expect_err("spool full");
         assert!(format!("{error:#}").contains("r2_local_spool_full"));
+    }
+
+    fn phase107g_write_minimal_valid_local_dataset_artifacts(root: &Path) {
+        fs::write(
+            root.join("service_exit_status.json"),
+            serde_json::to_vec_pretty(&json!({
+                "run_id": "run",
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("service exit");
+        fs::write(
+            root.join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "relay_session_id": "relay-session",
+                "subscription_fingerprint": "fingerprint",
+                "frames_received": 3,
+                "data_frames_received": 1,
+                "control_frames_received": 2,
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("collector summary");
+        fs::write(
+            root.join("hunter_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "run_id": "run",
+                "attempted_launches": 1,
+                "rejected_dead_count": 1,
+                "rejected_inconclusive_count": 0,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("hunter summary");
+        fs::write(
+            root.join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": false,
+                "partial_outputs_audit_only": false,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "r2_verified": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            root.join("run_countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "segment_count": 1,
+                "clean_segment_count": 1,
+                "blocked_segment_count": 0,
+                "gap_count": 0,
+                "counted_segment_attempted_launches": 1,
+                "run_client_backpressure_detected": false,
+                "run_provider_data_loss_seen": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("run countability");
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("stable_manifest_upload.json"),
+            serde_json::to_vec_pretty(&json!({"verified": true})).expect("json"),
+        )
+        .expect("stable manifest");
+        fs::write(
+            root.join("attempt_ledger.csv"),
+            "attempt_index,mint,run_id,final_state\n1,mint-a,run,early_rejected_dead\n",
+        )
+        .expect("attempt ledger");
+        fs::write(
+            root.join("candidate_summary.csv"),
+            "mint,final_state,candidate_checkpoint,replay_eligible\n",
+        )
+        .expect("candidate summary");
+        fs::write(
+            root.join("rejected_summary.csv"),
+            "mint,final_state,rejection_class\nmint-a,early_rejected_dead,dead\n",
+        )
+        .expect("rejected summary");
+        fs::create_dir_all(root.join("relay_frames")).expect("relay frames dir");
+        fs::write(
+            root.join("relay_frames").join("part-000001.ndjson"),
+            "{\"sequence\":1}\n",
+        )
+        .expect("relay frame");
+        fs::create_dir_all(root.join("rejected").join("mint-a")).expect("rejected dir");
+        fs::write(
+            root.join("rejected")
+                .join("mint-a")
+                .join("dead_token_tombstone.json"),
+            "{}\n",
+        )
+        .expect("tombstone");
+    }
+
+    #[test]
+    fn phase107g_r2_primary_retention_deletes_verified_bulk_and_keeps_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        fs::write(
+            temp.path().join("r2_upload_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "verified": true,
+                "verified_files": [
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/relay_frames/part-000001.ndjson",
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/rejected/mint-a/dead_token_tombstone.json"
+                ],
+                "uploaded_files": []
+            }))
+            .expect("json"),
+        )
+        .expect("r2");
+        let summary = local_relay_apply_r2_primary_retention(
+            temp.path(),
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        )
+        .expect("retention");
+        assert_eq!(summary["ok"], true);
+        assert!(summary["deleted_bulk_bytes"].as_u64().unwrap() > 0);
+        assert!(!temp.path().join("relay_frames").exists());
+        assert!(!temp.path().join("rejected").exists());
+        for retained in [
+            "attempt_ledger.csv",
+            "candidate_summary.csv",
+            "rejected_summary.csv",
+            "countability_decision.json",
+            "run_countability_decision.json",
+            "manifest.json",
+            "r2_upload_result.json",
+            "stable_manifest_upload.json",
+            "service_exit_status.json",
+            "local_retention_summary.json",
+            "local_collector_r2_manifest_pointer.json",
+        ] {
+            assert!(temp.path().join(retained).exists(), "retained {retained}");
+        }
+    }
+
+    #[test]
+    fn phase107g_r2_primary_retention_keeps_unverified_bulk_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        fs::write(
+            temp.path().join("r2_upload_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "verified": false,
+                "verified_files": []
+            }))
+            .expect("json"),
+        )
+        .expect("r2");
+        let summary = local_relay_apply_r2_primary_retention(
+            temp.path(),
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        )
+        .expect("retention");
+        assert_eq!(summary["ok"], false);
+        assert!(
+            summary["blockers"]
+                .to_string()
+                .contains("r2_verification_missing_retention_skipped")
+        );
+        assert!(temp.path().join("relay_frames").exists());
+        assert!(temp.path().join("rejected").exists());
+    }
+
+    #[test]
+    fn phase107g_artifact_consistency_passes_after_verified_bulk_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        fs::write(
+            temp.path().join("r2_upload_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "verified": true,
+                "verified_files": [
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/relay_frames/part-000001.ndjson",
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/rejected/mint-a/dead_token_tombstone.json"
+                ],
+                "uploaded_files": []
+            }))
+            .expect("json"),
+        )
+        .expect("r2");
+        local_relay_apply_r2_primary_retention(
+            temp.path(),
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        )
+        .expect("retention");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["local_retention_summary_exists"], true);
+        assert!(report["local_retained_bytes"].as_u64().unwrap() > 0);
     }
 
     #[test]
