@@ -393,6 +393,15 @@ locally. `local-collector-preflight` must pass before accepting relay data; it v
 local output, local free disk, stream-only safety, R2 readiness when upload is requested, disabled
 holder RPC, non-canonical RPC mint supply, and disabled replay/backtesting/tuning/trading.
 
+Raw relay capture alone is only a transport proof. A relay-local dataset proof must run
+`local-stream-collector --run-material-hunter` so verified `RelayFrame` payloads are decoded back
+into Yellowstone `SubscribeUpdate` messages and injected into the same classified
+material-hunter stream path used by the live Geyser connector. Use a receiver window longer than the
+VPS relay duration, but set `--material-duration-seconds` to the intended proof slice duration so a
+normal relay stop is not misclassified as a provider close before deadline. In this mode
+`countability_decision.json` and `run_countability_decision.json` are local-source-of-truth artifacts,
+and local R2 upload/verification is required for counted R2-primary proof results.
+
 `RelayFrame` fields include `schema_version`, `relay_session_id`, `stream_id`, `provider`,
 `source_kind`, `subscription_fingerprint`, `sequence`, `received_at_unix_nanos`, optional `slot`,
 optional `commitment`, `payload_codec`, `payload_compressed`, `payload_hash`, `payload_len`,

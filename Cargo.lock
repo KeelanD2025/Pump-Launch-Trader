@@ -832,6 +832,7 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "clap",
  "common",
@@ -860,6 +861,8 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "yellowstone-grpc-proto",
  "zstd",
 ]

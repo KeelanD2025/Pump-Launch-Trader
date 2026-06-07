@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use common::config::ResearchWorkerPnlSanityConfig;
@@ -33,11 +34,12 @@ use runtime::{
     GeyserStreamConnector, LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
     MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RealGeyserConnector,
     RelayControlKind, RelayFrame, RelayHealthSummary, RelaySequenceVerifier, RuntimeMode,
-    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
-    builtin_fixture_suite, builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events,
-    load_fixture_spec, material_hunter_subscription_fingerprint, relay_payload_sha256,
-    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
-    write_report,
+    RuntimeReplayProfile, RuntimeResolvedConfig, SubscribeUpdateStream, Supervisor,
+    build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
+    collect_fresh_launch_canary_events, load_fixture_spec,
+    material_hunter_subscription_fingerprint, relay_payload_sha256,
+    run_material_hunter_stream_with_connector, run_material_hunter_stream_with_progress,
+    smoke_deshred_provider, smoke_geyser_provider, write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -66,6 +68,9 @@ use storage::{
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Status;
+use yellowstone_grpc_proto::prelude::SubscribeUpdate;
 use yellowstone_grpc_proto::prost::Message as _;
 
 #[derive(Parser, Debug)]
@@ -460,8 +465,28 @@ enum Command {
         listen_url: Option<String>,
         #[arg(long, default_value_t = 900)]
         duration_seconds: u64,
+        #[arg(long)]
+        material_duration_seconds: Option<u64>,
         #[arg(long, default_value = "research_output/local_stream_collector")]
         output_dir: String,
+        #[arg(long)]
+        run_material_hunter: bool,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, default_value_t = 15)]
+        max_attempted_launches: usize,
+        #[arg(long, default_value_t = 2)]
+        target_material_candidates: usize,
+        #[arg(long, default_value_t = 3)]
+        max_concurrent_tracked_mints: usize,
+        #[arg(long)]
+        no_live_trading: bool,
+        #[arg(long)]
+        no_rpc: bool,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2: bool,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -4587,7 +4612,17 @@ async fn main() -> Result<()> {
         Command::LocalStreamCollector {
             listen_url,
             duration_seconds,
+            material_duration_seconds,
             output_dir,
+            run_material_hunter,
+            run_id,
+            max_attempted_launches,
+            target_material_candidates,
+            max_concurrent_tracked_mints,
+            no_live_trading,
+            no_rpc,
+            upload_r2,
+            verify_r2,
             dry_run,
             json,
         } => {
@@ -4595,7 +4630,17 @@ async fn main() -> Result<()> {
                 &loaded,
                 listen_url.as_deref(),
                 duration_seconds,
+                material_duration_seconds,
                 &output_dir,
+                run_material_hunter,
+                run_id,
+                max_attempted_launches,
+                target_material_candidates,
+                max_concurrent_tracked_mints,
+                no_live_trading,
+                no_rpc,
+                upload_r2,
+                verify_r2,
                 dry_run,
                 json,
             )
@@ -40935,6 +40980,39 @@ async fn material_candidate_hunter_command(
     output_dir: &str,
     run_id: Option<String>,
 ) -> Result<()> {
+    material_candidate_hunter_command_with_connector(
+        loaded,
+        duration_seconds,
+        max_attempted_launches,
+        target_material_candidates,
+        max_concurrent_tracked_mints,
+        no_live_trading,
+        no_rpc,
+        upload_r2,
+        verify_r2,
+        output_dir,
+        run_id,
+        Arc::new(RealGeyserConnector),
+        "geyser_live",
+    )
+    .await
+}
+
+async fn material_candidate_hunter_command_with_connector(
+    loaded: &LoadedConfig,
+    duration_seconds: u64,
+    max_attempted_launches: usize,
+    target_material_candidates: usize,
+    max_concurrent_tracked_mints: usize,
+    no_live_trading: bool,
+    no_rpc: bool,
+    upload_r2: bool,
+    verify_r2: bool,
+    output_dir: &str,
+    run_id: Option<String>,
+    stream_connector: Arc<dyn GeyserStreamConnector>,
+    stream_source: &str,
+) -> Result<()> {
     if !no_live_trading {
         bail!("material-candidate-hunter refuses to run unless --no-live-trading is set");
     }
@@ -40972,6 +41050,7 @@ async fn material_candidate_hunter_command(
         "broad_enrichment_started": false,
         "provider_preflight": "checked_by_live_subscription",
         "r2_preflight": if upload_r2 { "verified_after_report_generation" } else { "not_requested" },
+        "stream_source": stream_source,
     });
     write_quant_json_md(
         &output_dir,
@@ -41096,13 +41175,14 @@ async fn material_candidate_hunter_command(
         let remaining_duration = duration_seconds
             .saturating_sub(run_started_at.elapsed().as_secs())
             .max(1);
-        let stream_summary = match run_material_hunter_stream_with_progress(
+        let stream_summary = match run_material_hunter_stream_with_connector(
         loaded,
         runtime::MaterialHunterStreamOptions {
             duration_seconds: remaining_duration,
             gap_tolerant_segments: false,
             ..runtime::MaterialHunterStreamOptions::default()
         },
+        stream_connector.clone(),
         |event, summary| {
             if interrupted_for_stream.load(Ordering::SeqCst) {
                 return Ok(MaterialHunterStreamAction::Stop);
@@ -44717,6 +44797,52 @@ fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
         .join(format!("part-{part:06}.ndjson"))
 }
 
+type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
+
+#[derive(Clone)]
+struct LocalRelayGeyserConnector {
+    receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>>,
+}
+
+impl LocalRelayGeyserConnector {
+    fn new(receiver: tokio::sync::mpsc::Receiver<RelayMaterialUpdate>) -> Self {
+        Self {
+            receiver: Arc::new(tokio::sync::Mutex::new(Some(receiver))),
+        }
+    }
+}
+
+#[async_trait]
+impl GeyserStreamConnector for LocalRelayGeyserConnector {
+    async fn connect_and_subscribe(
+        &self,
+        _config: &common::GeyserConfig,
+        _request: yellowstone_grpc_proto::prelude::SubscribeRequest,
+    ) -> Result<SubscribeUpdateStream> {
+        let mut guard = self.receiver.lock().await;
+        let receiver = guard
+            .take()
+            .ok_or_else(|| anyhow!("local relay stream already consumed"))?;
+        Ok(Box::pin(ReceiverStream::new(receiver)))
+    }
+}
+
+fn relay_status_for_control(control: RelayControlKind, error: Option<&str>) -> Option<Status> {
+    let blocker = runtime::relay_control_to_material_blocker(control)?;
+    let message = match error {
+        Some(error) if !error.is_empty() => format!("{blocker}:{error}"),
+        _ => blocker.to_owned(),
+    };
+    Some(match control {
+        RelayControlKind::RelaySequenceGap | RelayControlKind::RelayUpstreamBlocker => {
+            Status::data_loss(format!("unrecoverable data loss: {message}"))
+        }
+        RelayControlKind::RelayReceiverBackpressure => Status::resource_exhausted(message),
+        RelayControlKind::RelayReceiverUnavailable => Status::unavailable(message),
+        _ => Status::unknown(message),
+    })
+}
+
 fn build_relay_health_summary(
     loaded: &LoadedConfig,
     relay_session_id: &str,
@@ -45048,6 +45174,7 @@ async fn run_live_local_stream_collector(
     listen_url: &str,
     duration_seconds: u64,
     output_dir: &Path,
+    material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
     json_output: bool,
 ) -> Result<()> {
     let listen_addr = relay_tcp_addr_from_url(listen_url)?;
@@ -45138,17 +45265,78 @@ async fn run_live_local_stream_collector(
         if let Some(error) = frame.relay_error.as_ref() {
             relay_errors.push(error.clone());
         }
-        match verifier.observe(&frame) {
+        let verification_error = match verifier.observe(&frame) {
             Ok(()) => {
                 last_sequence_by_stream.insert(frame.stream_id.clone(), frame.sequence);
+                None
             }
             Err(error) if error == "relay_payload_hash_mismatch" => {
                 hash_mismatch_count = hash_mismatch_count.saturating_add(1);
-                relay_errors.push(error);
+                relay_errors.push(error.clone());
+                Some(error)
             }
             Err(error) => {
                 sequence_gap_count = sequence_gap_count.saturating_add(1);
-                relay_errors.push(error);
+                relay_errors.push(error.clone());
+                Some(error)
+            }
+        };
+        if let Some(material_tx) = material_update_tx.as_ref() {
+            if let Some(error) = verification_error.as_ref() {
+                let status = Status::data_loss(format!("unrecoverable data loss: {error}"));
+                let _ = material_tx.try_send(Err(status));
+            } else if let Some(control) = frame.control_kind {
+                if let Some(status) =
+                    relay_status_for_control(control, frame.relay_error.as_deref())
+                {
+                    let _ = material_tx.try_send(Err(status));
+                }
+            } else {
+                let payload = if frame.payload_compressed {
+                    match zstd::decode_all(frame.payload_bytes.as_slice()) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            malformed_frame_count = malformed_frame_count.saturating_add(1);
+                            relay_errors.push(format!("relay_payload_decompress_failed:{error}"));
+                            let _ = material_tx.try_send(Err(Status::data_loss(format!(
+                                "unrecoverable data loss: relay_payload_decompress_failed:{error}"
+                            ))));
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    frame.payload_bytes.clone()
+                };
+                if !payload.is_empty() {
+                    match SubscribeUpdate::decode(payload.as_slice()) {
+                        Ok(update) => {
+                            match material_tx.try_send(Ok(update)) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    downstream_backpressure_count =
+                                        downstream_backpressure_count.saturating_add(1);
+                                    relay_errors
+                                        .push("local_material_hunter_update_queue_full".to_owned());
+                                    let _ = material_tx.try_send(Err(Status::resource_exhausted(
+                                        "relay_downstream_backpressure",
+                                    )));
+                                    break;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    // The material-hunter proof may stop early after satisfying
+                                    // conservative caps. Keep verifying and sharding relay frames.
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            malformed_frame_count = malformed_frame_count.saturating_add(1);
+                            relay_errors.push(format!("relay_payload_decode_failed:{error}"));
+                            let _ = material_tx.try_send(Err(Status::data_loss(format!(
+                                "unrecoverable data loss: relay_payload_decode_failed:{error}"
+                            ))));
+                        }
+                    }
+                }
             }
         }
         shard.write_all(trimmed.as_bytes())?;
@@ -45191,10 +45379,10 @@ async fn run_live_local_stream_collector(
             .map(|path| path.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
         "local_hash_probe": local_hash_probe,
-        "material_hunter_artifacts_local_only": false,
-        "material_hunter_processing_ran": false,
-        "countability_decision_written": false,
-        "countability_decision_source_of_truth": "not_run_relay_frame_proof_only",
+        "material_hunter_artifacts_local_only": material_update_tx.is_some(),
+        "material_hunter_processing_ran": material_update_tx.is_some(),
+        "countability_decision_written": output_dir.join("countability_decision.json").exists(),
+        "countability_decision_source_of_truth": if material_update_tx.is_some() { "local" } else { "not_run_relay_frame_proof_only" },
         "off_vps_candidate_replay_allowed": false,
         "formal_backtesting_allowed": false,
         "threshold_tuning_allowed": false,
@@ -45265,7 +45453,17 @@ async fn local_stream_collector_command(
     loaded: &LoadedConfig,
     listen_url: Option<&str>,
     duration_seconds: u64,
+    material_duration_seconds: Option<u64>,
     output_dir: &str,
+    run_material_hunter: bool,
+    run_id: Option<String>,
+    max_attempted_launches: usize,
+    target_material_candidates: usize,
+    max_concurrent_tracked_mints: usize,
+    no_live_trading: bool,
+    no_rpc: bool,
+    upload_r2: bool,
+    verify_r2: bool,
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
@@ -45276,11 +45474,83 @@ async fn local_stream_collector_command(
         let listen_url = listen_url.ok_or_else(|| {
             anyhow!("local collector listener URL missing; refusing to accept relay frames")
         })?;
+        if run_material_hunter {
+            if !no_live_trading {
+                bail!(
+                    "local-stream-collector dataset mode refuses to run unless --no-live-trading is set"
+                );
+            }
+            if !no_rpc {
+                bail!("local-stream-collector dataset mode refuses to run unless --no-rpc is set");
+            }
+            if !upload_r2 {
+                bail!(
+                    "local-stream-collector dataset mode requires --upload-r2 for R2-primary proof"
+                );
+            }
+            let output_path = PathBuf::from(output_dir);
+            fs::create_dir_all(&output_path)?;
+            let (material_tx, material_rx) =
+                tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8_192);
+            let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
+            let material_duration_seconds = material_duration_seconds.unwrap_or(duration_seconds);
+            let reader_loaded = loaded.clone();
+            let reader_output = output_path.clone();
+            let reader_listen_url = listen_url.to_owned();
+            let reader_task = tokio::spawn(async move {
+                run_live_local_stream_collector(
+                    &reader_loaded,
+                    &reader_listen_url,
+                    duration_seconds,
+                    &reader_output,
+                    Some(material_tx),
+                    false,
+                )
+                .await
+            });
+            let run_id = run_id.or_else(|| {
+                Some(format!(
+                    "local-relay-material-hunter-{}",
+                    OffsetDateTime::now_utc().unix_timestamp_nanos()
+                ))
+            });
+            let hunter_result = material_candidate_hunter_command_with_connector(
+                loaded,
+                material_duration_seconds,
+                max_attempted_launches,
+                target_material_candidates,
+                max_concurrent_tracked_mints,
+                no_live_trading,
+                no_rpc,
+                upload_r2,
+                verify_r2,
+                output_dir,
+                run_id,
+                connector,
+                "local_relay_stream",
+            )
+            .await;
+            let reader_result = reader_task
+                .await
+                .map_err(|error| anyhow!("local relay reader task failed: {error}"))?;
+            reader_result?;
+            hunter_result?;
+            let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
+            atomic_write_path(
+                &output_path.join("local_relay_dataset_proof_summary.json"),
+                &serde_json::to_vec_pretty(&proof_summary)?,
+            )?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&proof_summary)?);
+            }
+            return Ok(());
+        }
         return run_live_local_stream_collector(
             loaded,
             listen_url,
             duration_seconds,
             Path::new(output_dir),
+            None,
             json_output,
         )
         .await;
@@ -45303,10 +45573,12 @@ async fn local_stream_collector_command(
         "output_dir": output_dir,
         "listen_url_redacted": relay_redact_receiver_url(listen_url),
         "duration_seconds": duration_seconds,
+        "material_duration_seconds": material_duration_seconds,
         "dry_run": dry_run,
         "listener_ready": listener_ready,
         "preflight": report,
-        "material_hunter_artifacts_local_only": true,
+        "material_hunter_artifacts_local_only": run_material_hunter,
+        "material_hunter_processing_requested": run_material_hunter,
         "vps_material_hunter_artifacts_written": false,
         "countability_decision_source_of_truth": "local",
         "off_vps_candidate_replay_allowed": false,
@@ -45328,6 +45600,108 @@ async fn local_stream_collector_command(
         bail!("local collector listener URL missing; refusing to accept relay frames");
     }
     Ok(())
+}
+
+fn read_json_file_or_empty(path: &Path) -> serde_json::Value {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn local_relay_unique_attempted_mints(path: &Path) -> usize {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines()
+        .skip(1)
+        .filter_map(|line| line.split(',').nth(1))
+        .map(|mint| mint.trim_matches('"').to_owned())
+        .filter(|mint| !mint.is_empty())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Value> {
+    let relay_summary = read_json_file_or_empty(&output_dir.join("local_collector_summary.json"));
+    let hunter_summary = read_json_file_or_empty(&output_dir.join("hunter_summary.json"));
+    let countability = read_json_file_or_empty(&output_dir.join("countability_decision.json"));
+    let run_countability =
+        read_json_file_or_empty(&output_dir.join("run_countability_decision.json"));
+    let r2_upload = read_json_file_or_empty(&output_dir.join("r2_upload_result.json"));
+    let attempted_launches = hunter_summary["attempted_launches"]
+        .as_u64()
+        .or_else(|| countability["attempted_launches"].as_u64())
+        .unwrap_or(0);
+    let unique_attempted_mints =
+        local_relay_unique_attempted_mints(&output_dir.join("attempt_ledger.csv"));
+    let sequence_gap_count = relay_summary["sequence_gap_count"].as_u64().unwrap_or(0);
+    let hash_mismatch_count = relay_summary["hash_mismatch_count"].as_u64().unwrap_or(0);
+    let malformed_frame_count = relay_summary["malformed_frame_count"].as_u64().unwrap_or(0);
+    let receiver_backpressure_count = relay_summary["downstream_backpressure_count"]
+        .as_u64()
+        .unwrap_or(0);
+    let receiver_unavailable_count = relay_summary["receiver_unavailable_count"]
+        .as_u64()
+        .unwrap_or(0);
+    let counted_phase107b_result = countability["counted_phase107b_result"]
+        .as_bool()
+        .unwrap_or(false);
+    let r2_verified = r2_upload["verified"].as_bool().unwrap_or(false)
+        || countability["r2_verified"].as_bool().unwrap_or(false);
+    let safety_ok = countability["formal_backtesting_allowed"].as_bool() == Some(false)
+        && countability["threshold_tuning_allowed"].as_bool() == Some(false)
+        && hunter_summary["holder_rpc_used"].as_bool() == Some(false)
+        && hunter_summary["rpc_mint_supply_canonical"].as_bool() == Some(false);
+    let classification = if sequence_gap_count > 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_SEQUENCE_GAP"
+    } else if hash_mismatch_count > 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_HASH_MISMATCH"
+    } else if malformed_frame_count > 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_DECODE"
+    } else if receiver_backpressure_count > 0 || receiver_unavailable_count > 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
+    } else if !r2_verified {
+        "RELAY_LOCAL_DATASET_BLOCK_R2"
+    } else if !counted_phase107b_result || attempted_launches == 0 || unique_attempted_mints == 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_COUNTABILITY"
+    } else if !safety_ok {
+        "RELAY_LOCAL_DATASET_BLOCK_STRUCTURAL"
+    } else {
+        "RELAY_LOCAL_DATASET_PASS"
+    };
+    Ok(json!({
+        "schema_version": "phase107g.local_relay_dataset_proof_summary.v1",
+        "classification": classification,
+        "relay_session_id": relay_summary["relay_session_id"],
+        "subscription_fingerprint": relay_summary["subscription_fingerprint"],
+        "frames_received": relay_summary["frames_received"],
+        "data_frames_received": relay_summary["data_frames_received"],
+        "control_frames_received": relay_summary["control_frames_received"],
+        "sequence_gap_count": sequence_gap_count,
+        "hash_mismatch_count": hash_mismatch_count,
+        "malformed_frame_count": malformed_frame_count,
+        "receiver_backpressure_count": receiver_backpressure_count,
+        "receiver_unavailable_count": receiver_unavailable_count,
+        "attempted_launches": attempted_launches,
+        "unique_attempted_mints": unique_attempted_mints,
+        "rejected_dead_count": hunter_summary["rejected_dead_count"],
+        "rejected_inconclusive_count": hunter_summary["rejected_inconclusive_count"],
+        "candidate_checkpoint_count": countability["candidate_checkpoint_count"],
+        "replay_eligible_candidate_count": countability["replay_eligible_candidate_count"],
+        "counted_phase107b_result": counted_phase107b_result,
+        "off_vps_candidate_replay_allowed": countability["off_vps_candidate_replay_allowed"].as_bool().unwrap_or(false),
+        "ready_for_off_vps_candidate_replay": countability["ready_for_off_vps_candidate_replay"].as_bool().unwrap_or(false),
+        "r2_verified": r2_verified,
+        "r2_upload_result": r2_upload,
+        "run_countability_decision": run_countability,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    }))
 }
 
 fn local_free_mb(path: &Path) -> Option<u64> {
@@ -58156,6 +58530,135 @@ mod tests {
         assert!(summarize_step.contains("stream_acceptance_probe_stage_results.json"));
         assert!(summarize_step.contains("material_hunter_collection_allowed"));
         assert!(summarize_step.contains("launch_caps_raise_allowed"));
+    }
+
+    #[test]
+    fn phase107g_relay_wire_frame_decodes_to_subscribe_update() {
+        let update = SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(
+                yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                        slot: 42,
+                        parent: Some(41),
+                        status: yellowstone_grpc_proto::prelude::SlotStatus::SlotConfirmed as i32,
+                        dead_error: None,
+                    },
+                ),
+            ),
+            created_at: None,
+        };
+        let frame = RelayFrame::data(
+            "relay-session",
+            "geyser-material-hunter",
+            "geyser",
+            "fingerprint",
+            1,
+            123,
+            Some(42),
+            "yellowstone_subscribe_update_protobuf",
+            update.encode_to_vec(),
+        );
+        let wire = RelayWireFrame::from(&frame);
+        let decoded_frame = wire.into_relay_frame().expect("relay frame");
+        assert!(decoded_frame.verify_payload_hash());
+        let decoded = SubscribeUpdate::decode(decoded_frame.payload_bytes.as_slice())
+            .expect("subscribe update");
+        match decoded.update_oneof {
+            Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(slot)) => {
+                assert_eq!(slot.slot, 42);
+            }
+            other => panic!("unexpected update {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase107g_local_relay_dataset_summary_requires_relay_countability_and_r2() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "relay_session_id": "relay-session",
+                "subscription_fingerprint": "fingerprint",
+                "frames_received": 10,
+                "data_frames_received": 8,
+                "control_frames_received": 2,
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("relay summary");
+        fs::write(
+            temp.path().join("hunter_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "attempted_launches": 1,
+                "rejected_dead_count": 1,
+                "rejected_inconclusive_count": 0,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("hunter summary");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "r2_verified": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path().join("run_countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_segment_attempted_launches": 1
+            }))
+            .expect("json"),
+        )
+        .expect("run countability");
+        fs::write(
+            temp.path().join("r2_upload_result.json"),
+            serde_json::to_vec_pretty(&json!({"verified": true})).expect("json"),
+        )
+        .expect("r2");
+        fs::write(
+            temp.path().join("attempt_ledger.csv"),
+            "attempt_index,mint,run_id\n1,mint-a,run\n",
+        )
+        .expect("ledger");
+        let summary = local_relay_dataset_proof_summary(temp.path()).expect("proof summary");
+        assert_eq!(summary["classification"], "RELAY_LOCAL_DATASET_PASS");
+        assert_eq!(summary["unique_attempted_mints"], 1);
+
+        fs::write(
+            temp.path().join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "relay_session_id": "relay-session",
+                "sequence_gap_count": 1,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("relay summary gap");
+        let blocked = local_relay_dataset_proof_summary(temp.path()).expect("blocked summary");
+        assert_eq!(
+            blocked["classification"],
+            "RELAY_LOCAL_DATASET_BLOCK_SEQUENCE_GAP"
+        );
     }
 
     #[test]

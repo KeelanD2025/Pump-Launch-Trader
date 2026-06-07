@@ -9,6 +9,7 @@ production-shred-decoder = ["runtime/production-shred-decoder"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
 common = { path = "../common" }
@@ -36,6 +37,8 @@ state = { path = "../state" }
 storage = { path = "../storage" }
 time.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 yellowstone-grpc-proto.workspace = true
 zstd.workspace = true
 

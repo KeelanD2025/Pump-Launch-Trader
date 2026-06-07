@@ -57,9 +57,10 @@ pub use live_source::{
     GeyserProviderSmokeSummary, GeyserStreamConnector, MaterialHunterStreamAction,
     MaterialHunterStreamOptions, MaterialHunterStreamStateHint, MaterialHunterStreamSummary,
     MaterialHunterTopKeySummary, RealGeyserConnector, RelayControlKind, RelayFrame,
-    RelayHealthSummary, RelaySequenceVerifier, RelaySourceKind, collect_fresh_launch_canary_events,
-    inspect_deshred_capability, material_hunter_subscription_fingerprint,
-    relay_control_to_material_blocker, relay_payload_sha256, run_material_hunter_stream,
+    RelayHealthSummary, RelaySequenceVerifier, RelaySourceKind, SubscribeUpdateStream,
+    collect_fresh_launch_canary_events, inspect_deshred_capability,
+    material_hunter_subscription_fingerprint, relay_control_to_material_blocker,
+    relay_payload_sha256, run_material_hunter_stream, run_material_hunter_stream_with_connector,
     run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
 };
 use live_source::{
