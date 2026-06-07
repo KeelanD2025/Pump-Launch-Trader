@@ -54,17 +54,17 @@ pub use fixtures::{
 pub use live_source::{
     DeshredCapability, DeshredProviderSmokeOptions, DeshredProviderSmokeSummary,
     FreshLaunchCanaryLiveOptions, FreshLaunchCanaryLiveSummary, GeyserProviderSmokeOptions,
-    GeyserProviderSmokeSummary, MaterialHunterStreamAction, MaterialHunterStreamOptions,
-    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, MaterialHunterTopKeySummary,
-    RelayControlKind, RelayFrame, RelayHealthSummary, RelaySequenceVerifier, RelaySourceKind,
-    collect_fresh_launch_canary_events, inspect_deshred_capability,
-    material_hunter_subscription_fingerprint, relay_control_to_material_blocker,
-    relay_payload_sha256, run_material_hunter_stream, run_material_hunter_stream_with_progress,
-    smoke_deshred_provider, smoke_geyser_provider,
+    GeyserProviderSmokeSummary, GeyserStreamConnector, MaterialHunterStreamAction,
+    MaterialHunterStreamOptions, MaterialHunterStreamStateHint, MaterialHunterStreamSummary,
+    MaterialHunterTopKeySummary, RealGeyserConnector, RelayControlKind, RelayFrame,
+    RelayHealthSummary, RelaySequenceVerifier, RelaySourceKind, collect_fresh_launch_canary_events,
+    inspect_deshred_capability, material_hunter_subscription_fingerprint,
+    relay_control_to_material_blocker, relay_payload_sha256, run_material_hunter_stream,
+    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
 };
 use live_source::{
-    DeshredStreamConnector, GeyserEventNormalizer, GeyserStreamConnector, RealDeshredConnector,
-    RealGeyserConnector, run_deshred_source_with_connector, run_geyser_source_with_connector,
+    DeshredStreamConnector, GeyserEventNormalizer, RealDeshredConnector,
+    run_deshred_source_with_connector, run_geyser_source_with_connector,
 };
 use segments::LiveRunSegmentManager;
 use shred_exit::TentativeSellManager;

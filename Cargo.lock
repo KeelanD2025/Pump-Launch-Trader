@@ -832,12 +832,14 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "common",
  "decision",
  "decoder",
  "executor",
  "features",
+ "futures",
  "hex",
  "idl",
  "ingest-geyser",
@@ -858,6 +860,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "yellowstone-grpc-proto",
  "zstd",
 ]
 

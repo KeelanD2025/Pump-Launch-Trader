@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use common::config::ResearchWorkerPnlSanityConfig;
 use common::{
@@ -14,6 +15,7 @@ use features::risk_engine::{
     validate_no_post_event_pre_entry_leak,
 };
 use features::{FeatureEngine, FeatureSnapshot};
+use futures::StreamExt;
 use idl::LoadedIdl;
 use ingest_geyser::GeyserIngestService;
 use metrics::init_tracing;
@@ -28,11 +30,12 @@ use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
-    LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
-    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RelayHealthSummary, RuntimeMode,
+    GeyserStreamConnector, LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
+    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RealGeyserConnector,
+    RelayControlKind, RelayFrame, RelayHealthSummary, RelaySequenceVerifier, RuntimeMode,
     RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
     builtin_fixture_suite, builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events,
-    load_fixture_spec, material_hunter_subscription_fingerprint,
+    load_fixture_spec, material_hunter_subscription_fingerprint, relay_payload_sha256,
     run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
     write_report,
 };
@@ -61,6 +64,9 @@ use storage::{
     StoredRecord,
 };
 use time::OffsetDateTime;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+use yellowstone_grpc_proto::prost::Message as _;
 
 #[derive(Parser, Debug)]
 #[command(name = "pump-launch-quant")]
@@ -44579,6 +44585,138 @@ fn relay_health_dir_is_safe(path: &Path) -> bool {
         && !rendered.contains("attempt_ledger.csv")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelayWireFrame {
+    schema_version: String,
+    relay_session_id: String,
+    stream_id: String,
+    provider: String,
+    source_kind: runtime::RelaySourceKind,
+    subscription_fingerprint: String,
+    sequence: u64,
+    received_at_unix_nanos: u128,
+    #[serde(default)]
+    slot: Option<u64>,
+    #[serde(default)]
+    commitment: Option<String>,
+    payload_codec: String,
+    payload_compressed: bool,
+    payload_hash: String,
+    payload_len: usize,
+    #[serde(default)]
+    payload_base64: String,
+    #[serde(default)]
+    control_kind: Option<RelayControlKind>,
+    #[serde(default)]
+    relay_error: Option<String>,
+}
+
+impl From<&RelayFrame> for RelayWireFrame {
+    fn from(frame: &RelayFrame) -> Self {
+        Self {
+            schema_version: frame.schema_version.clone(),
+            relay_session_id: frame.relay_session_id.clone(),
+            stream_id: frame.stream_id.clone(),
+            provider: frame.provider.clone(),
+            source_kind: frame.source_kind,
+            subscription_fingerprint: frame.subscription_fingerprint.clone(),
+            sequence: frame.sequence,
+            received_at_unix_nanos: frame.received_at_unix_nanos,
+            slot: frame.slot,
+            commitment: frame.commitment.clone(),
+            payload_codec: frame.payload_codec.clone(),
+            payload_compressed: frame.payload_compressed,
+            payload_hash: frame.payload_hash.clone(),
+            payload_len: frame.payload_len,
+            payload_base64: BASE64_STANDARD.encode(&frame.payload_bytes),
+            control_kind: frame.control_kind,
+            relay_error: frame.relay_error.clone(),
+        }
+    }
+}
+
+impl RelayWireFrame {
+    fn into_relay_frame(self) -> Result<RelayFrame> {
+        let payload_bytes = if self.payload_base64.is_empty() {
+            Vec::new()
+        } else {
+            BASE64_STANDARD
+                .decode(self.payload_base64.as_bytes())
+                .context("decode relay payload_base64")?
+        };
+        Ok(RelayFrame {
+            schema_version: self.schema_version,
+            relay_session_id: self.relay_session_id,
+            stream_id: self.stream_id,
+            provider: self.provider,
+            source_kind: self.source_kind,
+            subscription_fingerprint: self.subscription_fingerprint,
+            sequence: self.sequence,
+            received_at_unix_nanos: self.received_at_unix_nanos,
+            slot: self.slot,
+            commitment: self.commitment,
+            payload_codec: self.payload_codec,
+            payload_compressed: self.payload_compressed,
+            payload_hash: self.payload_hash,
+            payload_len: self.payload_len,
+            payload_bytes,
+            control_kind: self.control_kind,
+            relay_error: self.relay_error,
+        })
+    }
+}
+
+fn unix_now_nanos_u128() -> u128 {
+    OffsetDateTime::now_utc().unix_timestamp_nanos().max(0) as u128
+}
+
+fn relay_tcp_addr_from_url(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("tcp://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| {
+            anyhow!("relay receiver URL must use tcp:// or http:// over a private tunnel")
+        })?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() || !authority.contains(':') {
+        bail!("relay receiver URL must include host:port");
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority)
+        .trim_matches(['[', ']']);
+    let private = host == "localhost"
+        || host == "127.0.0.1"
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("100.64.")
+        || host
+            .strip_prefix("172.")
+            .and_then(|suffix| suffix.split('.').next())
+            .and_then(|octet| octet.parse::<u8>().ok())
+            .is_some_and(|octet| (16..=31).contains(&octet));
+    if !private {
+        bail!("relay receiver URL must target a loopback or private-tunnel address");
+    }
+    Ok(authority.to_owned())
+}
+
+async fn relay_write_frame(writer: &mut TokioTcpStream, frame: &RelayFrame) -> Result<()> {
+    let wire = RelayWireFrame::from(frame);
+    let encoded = serde_json::to_vec(&wire)?;
+    writer.write_all(&encoded).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
+}
+
+fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
+    output_dir
+        .join("relay_frames")
+        .join(format!("part-{part:06}.ndjson"))
+}
+
 fn build_relay_health_summary(
     loaded: &LoadedConfig,
     relay_session_id: &str,
@@ -44635,6 +44773,184 @@ fn write_relay_health_artifacts(
     Ok(())
 }
 
+async fn run_live_vps_stream_relay(
+    loaded: &LoadedConfig,
+    receiver_url: &str,
+    duration_seconds: u64,
+    health_dir: &Path,
+    json_output: bool,
+) -> Result<()> {
+    if !relay_health_dir_is_safe(health_dir) {
+        bail!(
+            "relay health dir must not point at material-hunter artifact storage: {}",
+            health_dir.display()
+        );
+    }
+    let receiver_addr = relay_tcp_addr_from_url(receiver_url)?;
+    let relay_session_id = derived_run_id("vps-stream-relay");
+    let stream_id = "geyser-material-hunter".to_owned();
+    let subscription_fingerprint = material_hunter_subscription_fingerprint(loaded)
+        .unwrap_or_else(|error| format!("fingerprint_error:{error}"));
+    let mut summary = build_relay_health_summary(
+        loaded,
+        &relay_session_id,
+        "vps_stream_relay_live",
+        Some(receiver_url),
+        true,
+        None,
+    );
+    summary.transport = "tcp_ndjson_over_private_ssh_tunnel".to_owned();
+
+    fs::create_dir_all(health_dir)
+        .with_context(|| format!("create relay health dir {}", health_dir.display()))?;
+    let mut receiver = TokioTcpStream::connect(&receiver_addr)
+        .await
+        .with_context(|| format!("connect relay receiver at {receiver_addr}"))?;
+
+    let config = loaded.config.geyser.clone();
+    let request = GeyserIngestService::new(config.clone()).proto_subscription_request();
+    let connector = RealGeyserConnector;
+    let mut stream = connector
+        .connect_and_subscribe(&config, request)
+        .await
+        .context("connect and subscribe to geyser for VPS relay")?;
+
+    let mut sequence = 1u64;
+    let mut data_frames_forwarded = 0u64;
+    let mut control_frames_forwarded = 0u64;
+    let mut bytes_forwarded = 0u64;
+    let mut upstream_errors: Vec<String> = Vec::new();
+
+    let started = RelayFrame::control(
+        relay_session_id.clone(),
+        stream_id.clone(),
+        "geyser",
+        subscription_fingerprint.clone(),
+        sequence,
+        unix_now_nanos_u128(),
+        RelayControlKind::RelayStarted,
+        None,
+    );
+    relay_write_frame(&mut receiver, &started).await?;
+    sequence = sequence.saturating_add(1);
+    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+
+    let connected = RelayFrame::control(
+        relay_session_id.clone(),
+        stream_id.clone(),
+        "geyser",
+        subscription_fingerprint.clone(),
+        sequence,
+        unix_now_nanos_u128(),
+        RelayControlKind::RelayUpstreamConnected,
+        None,
+    );
+    relay_write_frame(&mut receiver, &connected).await?;
+    sequence = sequence.saturating_add(1);
+    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+
+    let started_at = Instant::now();
+    let deadline = started_at + StdDuration::from_secs(duration_seconds);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(update))) => {
+                let payload = update.encode_to_vec();
+                bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
+                let frame = RelayFrame::data(
+                    relay_session_id.clone(),
+                    stream_id.clone(),
+                    "geyser",
+                    subscription_fingerprint.clone(),
+                    sequence,
+                    unix_now_nanos_u128(),
+                    None,
+                    "yellowstone_subscribe_update_protobuf",
+                    payload,
+                );
+                relay_write_frame(&mut receiver, &frame).await?;
+                sequence = sequence.saturating_add(1);
+                data_frames_forwarded = data_frames_forwarded.saturating_add(1);
+            }
+            Ok(Some(Err(status))) => {
+                let rendered = status.to_string();
+                upstream_errors.push(rendered.clone());
+                let blocker = RelayFrame::control(
+                    relay_session_id.clone(),
+                    stream_id.clone(),
+                    "geyser",
+                    subscription_fingerprint.clone(),
+                    sequence,
+                    unix_now_nanos_u128(),
+                    RelayControlKind::RelayUpstreamBlocker,
+                    Some(rendered),
+                );
+                relay_write_frame(&mut receiver, &blocker).await?;
+                sequence = sequence.saturating_add(1);
+                control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+                summary.blocker_class = Some("relay_upstream_blocker".to_owned());
+                break;
+            }
+            Ok(None) => {
+                break;
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+
+    let stopped = RelayFrame::control(
+        relay_session_id.clone(),
+        stream_id.clone(),
+        "geyser",
+        subscription_fingerprint.clone(),
+        sequence,
+        unix_now_nanos_u128(),
+        RelayControlKind::RelayStopped,
+        None,
+    );
+    relay_write_frame(&mut receiver, &stopped).await?;
+    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+    receiver.flush().await?;
+
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let exit_status = json!({
+        "schema_version": "phase107g.relay_exit_status.v2",
+        "relay_session_id": relay_session_id,
+        "duration_seconds": duration_seconds,
+        "elapsed_ms": elapsed_ms,
+        "dry_run": false,
+        "provider_connected": true,
+        "receiver_available": true,
+        "structured_blocker": summary.blocker_class,
+        "data_frames_forwarded": data_frames_forwarded,
+        "control_frames_forwarded": control_frames_forwarded,
+        "bytes_forwarded": bytes_forwarded,
+        "upstream_errors": upstream_errors,
+        "material_hunter_started": false,
+        "material_hunter_artifacts_written": false,
+        "latest_run_id_mutated": false,
+        "r2_upload_attempted": false,
+        "replay_run": false,
+        "backtesting_run": false,
+        "threshold_tuning_run": false,
+        "live_trading_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+    });
+    write_relay_health_artifacts(health_dir, &summary, &exit_status)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&exit_status)?);
+    } else {
+        println!(
+            "vps stream relay forwarded data_frames={} control_frames={} elapsed_ms={}",
+            data_frames_forwarded, control_frames_forwarded, elapsed_ms
+        );
+    }
+    Ok(())
+}
+
 async fn vps_stream_relay_command(
     loaded: &LoadedConfig,
     receiver_url: Option<&str>,
@@ -44647,6 +44963,19 @@ async fn vps_stream_relay_command(
         bail!("vps-stream-relay duration must be positive");
     }
     let health_dir = Path::new(health_dir);
+    if !dry_run {
+        let receiver_url = receiver_url.ok_or_else(|| {
+            anyhow!("relay receiver unavailable; refusing to start VPS stream relay")
+        })?;
+        return run_live_vps_stream_relay(
+            loaded,
+            receiver_url,
+            duration_seconds,
+            health_dir,
+            json_output,
+        )
+        .await;
+    }
     let receiver_available = receiver_url.is_some();
     let blocker = if receiver_available {
         None
@@ -44693,11 +45022,6 @@ async fn vps_stream_relay_command(
     if !dry_run && !receiver_available {
         bail!("relay receiver unavailable; refusing to start VPS stream relay");
     }
-    if !dry_run {
-        bail!(
-            "live relay transport is gated until mTLS/private receiver config is supplied and explicitly proven"
-        );
-    }
     Ok(())
 }
 
@@ -44719,6 +45043,224 @@ async fn relay_health_probe_command(
     .await
 }
 
+async fn run_live_local_stream_collector(
+    loaded: &LoadedConfig,
+    listen_url: &str,
+    duration_seconds: u64,
+    output_dir: &Path,
+    json_output: bool,
+) -> Result<()> {
+    let listen_addr = relay_tcp_addr_from_url(listen_url)?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create local collector output dir {}", output_dir.display()))?;
+    fs::create_dir_all(output_dir.join("relay_frames"))
+        .with_context(|| format!("create local relay frame dir {}", output_dir.display()))?;
+
+    let listener = TokioTcpListener::bind(&listen_addr)
+        .await
+        .with_context(|| format!("bind local relay collector at {listen_addr}"))?;
+    let started_at = Instant::now();
+    let deadline = started_at + StdDuration::from_secs(duration_seconds);
+    let (socket, peer_addr) =
+        tokio::time::timeout(StdDuration::from_secs(duration_seconds), listener.accept())
+            .await
+            .context("timed out waiting for VPS relay connection")?
+            .context("accept VPS relay connection")?;
+    let mut reader = TokioBufReader::new(socket);
+    let mut verifier = RelaySequenceVerifier::default();
+    let mut part = 1u64;
+    let mut part_rows = 0u64;
+    let mut shard_paths = vec![relay_frame_shard_path(output_dir, part)];
+    let mut shard = BufWriter::new(File::create(&shard_paths[0])?);
+    let mut frames_received = 0u64;
+    let mut data_frames_received = 0u64;
+    let mut control_frames_received = 0u64;
+    let mut sequence_gap_count = 0u64;
+    let mut hash_mismatch_count = 0u64;
+    let mut malformed_frame_count = 0u64;
+    let mut downstream_backpressure_count = 0u64;
+    let mut receiver_unavailable_count = 0u64;
+    let mut relay_errors: Vec<String> = Vec::new();
+    let mut relay_session_id: Option<String> = None;
+    let mut subscription_fingerprint: Option<String> = None;
+    let mut last_sequence_by_stream: BTreeMap<String, u64> = BTreeMap::new();
+
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read = tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
+        let bytes_read = match read {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => return Err(error).context("read relay frame"),
+            Err(_) => break,
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        let wire: RelayWireFrame = match serde_json::from_str(trimmed) {
+            Ok(frame) => frame,
+            Err(error) => {
+                malformed_frame_count = malformed_frame_count.saturating_add(1);
+                relay_errors.push(format!("malformed_relay_frame:{error}"));
+                continue;
+            }
+        };
+        let frame = match wire.into_relay_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                malformed_frame_count = malformed_frame_count.saturating_add(1);
+                relay_errors.push(format!("invalid_relay_frame:{error}"));
+                continue;
+            }
+        };
+        frames_received = frames_received.saturating_add(1);
+        relay_session_id.get_or_insert_with(|| frame.relay_session_id.clone());
+        subscription_fingerprint.get_or_insert_with(|| frame.subscription_fingerprint.clone());
+        if frame.control_kind.is_some() {
+            control_frames_received = control_frames_received.saturating_add(1);
+        } else {
+            data_frames_received = data_frames_received.saturating_add(1);
+        }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayReceiverBackpressure)
+        ) {
+            downstream_backpressure_count = downstream_backpressure_count.saturating_add(1);
+        }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayReceiverUnavailable)
+        ) {
+            receiver_unavailable_count = receiver_unavailable_count.saturating_add(1);
+        }
+        if let Some(error) = frame.relay_error.as_ref() {
+            relay_errors.push(error.clone());
+        }
+        match verifier.observe(&frame) {
+            Ok(()) => {
+                last_sequence_by_stream.insert(frame.stream_id.clone(), frame.sequence);
+            }
+            Err(error) if error == "relay_payload_hash_mismatch" => {
+                hash_mismatch_count = hash_mismatch_count.saturating_add(1);
+                relay_errors.push(error);
+            }
+            Err(error) => {
+                sequence_gap_count = sequence_gap_count.saturating_add(1);
+                relay_errors.push(error);
+            }
+        }
+        shard.write_all(trimmed.as_bytes())?;
+        shard.write_all(b"\n")?;
+        part_rows = part_rows.saturating_add(1);
+        if part_rows >= 5_000 {
+            shard.flush()?;
+            part = part.saturating_add(1);
+            part_rows = 0;
+            let next_path = relay_frame_shard_path(output_dir, part);
+            shard_paths.push(next_path.clone());
+            shard = BufWriter::new(File::create(next_path)?);
+        }
+    }
+    shard.flush()?;
+
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let local_hash_probe =
+        relay_payload_sha256(format!("{frames_received}:{elapsed_ms}").as_bytes());
+    let summary = json!({
+        "schema_version": "phase107g.local_stream_collector_summary.v1",
+        "mode": "local_stream_collector_live",
+        "listen_url_redacted": relay_redact_receiver_url(Some(listen_url)),
+        "peer_addr": peer_addr.to_string(),
+        "duration_seconds": duration_seconds,
+        "elapsed_ms": elapsed_ms,
+        "relay_session_id": relay_session_id,
+        "subscription_fingerprint": subscription_fingerprint,
+        "frames_received": frames_received,
+        "data_frames_received": data_frames_received,
+        "control_frames_received": control_frames_received,
+        "sequence_gap_count": sequence_gap_count,
+        "hash_mismatch_count": hash_mismatch_count,
+        "malformed_frame_count": malformed_frame_count,
+        "downstream_backpressure_count": downstream_backpressure_count,
+        "receiver_unavailable_count": receiver_unavailable_count,
+        "last_sequence_by_stream": last_sequence_by_stream,
+        "relay_frame_shards": shard_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "local_hash_probe": local_hash_probe,
+        "material_hunter_artifacts_local_only": false,
+        "material_hunter_processing_ran": false,
+        "countability_decision_written": false,
+        "countability_decision_source_of_truth": "not_run_relay_frame_proof_only",
+        "off_vps_candidate_replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+        "config_subscription_fingerprint": material_hunter_subscription_fingerprint(loaded)
+            .unwrap_or_else(|error| format!("fingerprint_error:{error}")),
+        "relay_errors": relay_errors,
+    });
+    let exit_status = json!({
+        "schema_version": "phase107g.local_stream_collector_exit_status.v1",
+        "ok": sequence_gap_count == 0
+            && hash_mismatch_count == 0
+            && malformed_frame_count == 0
+            && downstream_backpressure_count == 0
+            && receiver_unavailable_count == 0
+            && frames_received > 0,
+        "frames_received": frames_received,
+        "sequence_gap_count": sequence_gap_count,
+        "hash_mismatch_count": hash_mismatch_count,
+        "malformed_frame_count": malformed_frame_count,
+        "downstream_backpressure_count": downstream_backpressure_count,
+        "receiver_unavailable_count": receiver_unavailable_count,
+        "replay_run": false,
+        "backtesting_run": false,
+        "threshold_tuning_run": false,
+        "live_trading_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+    });
+    atomic_write_path(
+        &output_dir.join("local_collector_summary.json"),
+        &serde_json::to_vec_pretty(&summary)?,
+    )?;
+    atomic_write_path(
+        &output_dir.join("local_collector_exit_status.json"),
+        &serde_json::to_vec_pretty(&exit_status)?,
+    )?;
+    atomic_write_path(
+        &output_dir.join("relay_frame_manifest.json"),
+        &serde_json::to_vec_pretty(&json!({
+            "schema_version": "phase107g.relay_frame_manifest.v1",
+            "shards": shard_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            "frames_received": frames_received,
+            "data_frames_received": data_frames_received,
+            "control_frames_received": control_frames_received,
+        }))?,
+    )?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "local stream collector received frames={} gaps={} hash_mismatches={}",
+            frames_received, sequence_gap_count, hash_mismatch_count
+        );
+    }
+    if !exit_status["ok"].as_bool().unwrap_or(false) {
+        bail!("local stream collector proof failed: {}", exit_status);
+    }
+    Ok(())
+}
+
 async fn local_stream_collector_command(
     loaded: &LoadedConfig,
     listen_url: Option<&str>,
@@ -44729,6 +45271,19 @@ async fn local_stream_collector_command(
 ) -> Result<()> {
     if duration_seconds == 0 {
         bail!("local-stream-collector duration must be positive");
+    }
+    if !dry_run {
+        let listen_url = listen_url.ok_or_else(|| {
+            anyhow!("local collector listener URL missing; refusing to accept relay frames")
+        })?;
+        return run_live_local_stream_collector(
+            loaded,
+            listen_url,
+            duration_seconds,
+            Path::new(output_dir),
+            json_output,
+        )
+        .await;
     }
     let report = local_collector_preflight_report(
         loaded,
@@ -44771,9 +45326,6 @@ async fn local_stream_collector_command(
     }
     if !dry_run && !listener_ready {
         bail!("local collector listener URL missing; refusing to accept relay frames");
-    }
-    if !dry_run {
-        bail!("live local relay ingestion is gated until relay proof is explicitly requested");
     }
     Ok(())
 }
