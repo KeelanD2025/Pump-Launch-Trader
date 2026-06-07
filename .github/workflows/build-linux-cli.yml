@@ -285,6 +285,25 @@ jobs:
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          REL="${APP_DIR}/target/release"
+          mkdir -p "${REL}"
+          rm -f \
+            "${REL}/cli.new" \
+            "${REL}/cli.new.sha256" \
+            "${REL}/build_info.json.new" \
+            "${REL}/pump-launch-quant-edge-once.service.new"
+          mapfile -t stale_backups < <(
+            find "${REL}" -maxdepth 1 -type f -name 'cli.prev.*' -printf '%T@ %p\n' \
+              | sort -nr \
+              | awk 'NR > 2 { sub(/^[^ ]+ /, ""); print }'
+          )
+          if ((${#stale_backups[@]} > 0)); then
+            rm -f "${stale_backups[@]}"
+          fi
+          EOF
           scp -P "${PORT}" dist/cli "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new"
           scp -P "${PORT}" dist/cli.sha256 "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/cli.new.sha256"
           scp -P "${PORT}" dist/build_info.json "${VPS_USER}@${VPS_HOST}:${APP_DIR}/target/release/build_info.json.new"
