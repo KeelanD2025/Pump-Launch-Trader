@@ -45900,15 +45900,44 @@ fn local_relay_apply_r2_primary_retention(
                 continue;
             }
             let files = local_relay_collect_files(&candidate)?;
+            let mut candidate_deleted_bytes = 0u64;
+            let mut candidate_deleted_files = 0usize;
             let mut unverified = Vec::<String>::new();
-            for file in &files {
-                let Some(relative) = local_relay_relative_artifact_path(output_dir, file) else {
+            for file in files {
+                let Some(relative) = local_relay_relative_artifact_path(output_dir, &file) else {
                     unverified.push(file.display().to_string());
                     continue;
                 };
                 if !local_relay_r2_verified_contains(&verified_files, &relative) {
                     unverified.push(relative);
+                    continue;
                 }
+                let bytes = path_size_bytes(&file);
+                fs::remove_file(&file).with_context(|| {
+                    format!("delete verified local bulk file {}", file.display())
+                })?;
+                candidate_deleted_bytes = candidate_deleted_bytes.saturating_add(bytes);
+                candidate_deleted_files += 1;
+            }
+            if candidate.is_dir() {
+                let remaining_files = local_relay_collect_files(&candidate)?;
+                if remaining_files.is_empty() {
+                    fs::remove_dir_all(&candidate).with_context(|| {
+                        format!(
+                            "delete empty verified local bulk dir {}",
+                            candidate.display()
+                        )
+                    })?;
+                }
+            }
+            if candidate_deleted_files > 0 {
+                deleted_bytes = deleted_bytes.saturating_add(candidate_deleted_bytes);
+                deleted_paths.push(json!({
+                    "path": candidate.display().to_string(),
+                    "bytes": candidate_deleted_bytes,
+                    "deleted_file_count": candidate_deleted_files,
+                    "reason": "verified_r2_bulk_artifacts_removed",
+                }));
             }
             if !unverified.is_empty() {
                 skipped_paths.push(json!({
@@ -45916,24 +45945,7 @@ fn local_relay_apply_r2_primary_retention(
                     "reason": "unverified_bulk_artifact_retained",
                     "unverified_files": unverified,
                 }));
-                continue;
             }
-            let bytes = path_size_bytes(&candidate);
-            if candidate.is_dir() {
-                fs::remove_dir_all(&candidate).with_context(|| {
-                    format!("delete verified local bulk dir {}", candidate.display())
-                })?;
-            } else {
-                fs::remove_file(&candidate).with_context(|| {
-                    format!("delete verified local bulk file {}", candidate.display())
-                })?;
-            }
-            deleted_bytes = deleted_bytes.saturating_add(bytes);
-            deleted_paths.push(json!({
-                "path": candidate.display().to_string(),
-                "bytes": bytes,
-                "reason": "verified_r2_bulk_artifact_removed",
-            }));
         }
     }
 
@@ -59616,6 +59628,56 @@ mod tests {
         );
         assert!(temp.path().join("relay_frames").exists());
         assert!(temp.path().join("rejected").exists());
+    }
+
+    #[test]
+    fn phase107g_r2_primary_retention_deletes_verified_files_and_keeps_unverified_tail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        fs::write(
+            temp.path().join("relay_frames").join("part-000002.ndjson"),
+            "{\"sequence\":2}\n",
+        )
+        .expect("tail frame");
+        fs::write(
+            temp.path().join("r2_upload_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "verified": true,
+                "verified_files": [
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/relay_frames/part-000001.ndjson",
+                    "pump-launch-quant/research/phase107b_material_candidate_hunter/run/rejected/mint-a/dead_token_tombstone.json"
+                ],
+                "uploaded_files": []
+            }))
+            .expect("json"),
+        )
+        .expect("r2");
+        let summary = local_relay_apply_r2_primary_retention(
+            temp.path(),
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        )
+        .expect("retention");
+        assert_eq!(summary["ok"], true);
+        assert!(summary["deleted_bulk_bytes"].as_u64().unwrap() > 0);
+        assert!(
+            !temp
+                .path()
+                .join("relay_frames")
+                .join("part-000001.ndjson")
+                .exists()
+        );
+        assert!(
+            temp.path()
+                .join("relay_frames")
+                .join("part-000002.ndjson")
+                .exists()
+        );
+        assert!(
+            summary["skipped_paths"]
+                .to_string()
+                .contains("relay_frames/part-000002.ndjson")
+        );
+        assert!(!temp.path().join("rejected").exists());
     }
 
     #[test]
