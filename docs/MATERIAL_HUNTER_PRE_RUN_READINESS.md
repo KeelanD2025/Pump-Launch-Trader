@@ -405,17 +405,26 @@ and local R2 upload/verification is required for counted R2-primary proof result
 `RelayFrame` fields include `schema_version`, `relay_session_id`, `stream_id`, `provider`,
 `source_kind`, `subscription_fingerprint`, `sequence`, `received_at_unix_nanos`, optional `slot`,
 optional `commitment`, `payload_codec`, `payload_compressed`, `payload_hash`, `payload_len`,
-`payload_bytes`, optional `control_kind`, and optional `relay_error`. Control frames include
-`relay_started`, `relay_heartbeat`, `relay_upstream_connected`, `relay_upstream_reconnected`,
-`relay_upstream_blocker`, `relay_receiver_backpressure`, `relay_receiver_unavailable`,
-`relay_stopped`, `relay_sequence_gap`, and `relay_shutdown`.
+`payload_bytes`, optional `control_kind`, optional `relay_error`, optional `blocker_class`,
+optional `provider_status`, optional safe provider error code/message,
+`upstream_reconnect_attempt`, and `will_reconnect`. Control frames include `relay_started`,
+`relay_heartbeat`, `relay_upstream_connected`, `relay_upstream_reconnect_started`,
+`relay_upstream_reconnected`, `relay_upstream_reconnect_exhausted`, `relay_upstream_blocker`,
+`relay_receiver_backpressure`, `relay_receiver_unavailable`, `relay_stopped`,
+`relay_sequence_gap`, and `relay_shutdown`.
 
-Relay gaps are label-boundary events. `relay_sequence_gap`, `relay_receiver_unavailable`, and
-`relay_downstream_backpressure` are mapped to structured material-hunter blockers. Any active mint
-whose observation window crosses a relay gap is finalized as `terminal_inconclusive` for that
-segment and cannot become replay-eligible. Clean post-gap local segments may become countable only
-when normal countability criteria are met and the local `countability_decision.json` allows it.
-R2 success from the local machine cannot override relay blockers.
+Relay gaps are label-boundary events. `relay_sequence_gap`, `relay_receiver_unavailable`,
+`relay_downstream_backpressure`, and provider upstream controls such as
+`relay_upstream_blocker(provider_lagged_data_loss)` are mapped to structured material-hunter
+segment blockers. On recoverable upstream blockers the VPS relay emits the blocker frame before any
+bounded reconnect/backoff attempt, then emits `relay_upstream_reconnect_started` and
+`relay_upstream_reconnected` if the provider stream resumes within the relay budget. The local
+collector closes only the dirty segment, finalizes active gap-crossing mints as
+`terminal_inconclusive`, and starts a clean post-reconnect segment when new data arrives. Clean
+post-gap local segments may become countable only when normal countability criteria are met and the
+local `countability_decision.json` allows it. Run-level provider data loss may be true while clean
+post-gap segment countability remains internally clean. R2 success from the local machine cannot
+override relay/provider blockers.
 
 Workflow relay control uses the separate `relay_control_action` input and the separate
 `pump-launch-quant-stream-relay` service name. It must not start the material-hunter service, stop

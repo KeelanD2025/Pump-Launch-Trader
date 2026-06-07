@@ -1056,7 +1056,9 @@ pub enum RelayControlKind {
     RelayStarted,
     RelayHeartbeat,
     RelayUpstreamConnected,
+    RelayUpstreamReconnectStarted,
     RelayUpstreamReconnected,
+    RelayUpstreamReconnectExhausted,
     RelayUpstreamBlocker,
     RelayReceiverBackpressure,
     RelayReceiverUnavailable,
@@ -1089,6 +1091,18 @@ pub struct RelayFrame {
     pub control_kind: Option<RelayControlKind>,
     #[serde(default)]
     pub relay_error: Option<String>,
+    #[serde(default)]
+    pub blocker_class: Option<String>,
+    #[serde(default)]
+    pub provider_status: Option<String>,
+    #[serde(default)]
+    pub provider_error_code: Option<String>,
+    #[serde(default)]
+    pub provider_error_message: Option<String>,
+    #[serde(default)]
+    pub upstream_reconnect_attempt: Option<u64>,
+    #[serde(default)]
+    pub will_reconnect: Option<bool>,
 }
 
 impl RelayFrame {
@@ -1122,6 +1136,12 @@ impl RelayFrame {
             payload_bytes,
             control_kind: None,
             relay_error: None,
+            blocker_class: None,
+            provider_status: None,
+            provider_error_code: None,
+            provider_error_message: None,
+            upstream_reconnect_attempt: None,
+            will_reconnect: None,
         }
     }
 
@@ -1153,7 +1173,31 @@ impl RelayFrame {
             payload_bytes: Vec::new(),
             control_kind: Some(control_kind),
             relay_error,
+            blocker_class: None,
+            provider_status: None,
+            provider_error_code: None,
+            provider_error_message: None,
+            upstream_reconnect_attempt: None,
+            will_reconnect: None,
         }
+    }
+
+    pub fn with_upstream_blocker_metadata(
+        mut self,
+        blocker_class: impl Into<String>,
+        provider_status: impl Into<String>,
+        provider_error_code: Option<String>,
+        provider_error_message: Option<String>,
+        upstream_reconnect_attempt: u64,
+        will_reconnect: bool,
+    ) -> Self {
+        self.blocker_class = Some(blocker_class.into());
+        self.provider_status = Some(provider_status.into());
+        self.provider_error_code = provider_error_code;
+        self.provider_error_message = provider_error_message;
+        self.upstream_reconnect_attempt = Some(upstream_reconnect_attempt);
+        self.will_reconnect = Some(will_reconnect);
+        self
     }
 
     pub fn verify_payload_hash(&self) -> bool {
@@ -1208,6 +1252,7 @@ pub fn relay_control_to_material_blocker(control: RelayControlKind) -> Option<&'
         RelayControlKind::RelayReceiverUnavailable => Some("relay_receiver_unavailable"),
         RelayControlKind::RelaySequenceGap => Some("relay_sequence_gap"),
         RelayControlKind::RelayUpstreamBlocker => Some("relay_upstream_blocker"),
+        RelayControlKind::RelayUpstreamReconnectExhausted => Some("provider_reconnect_exhausted"),
         _ => None,
     }
 }
@@ -3072,6 +3117,18 @@ fn apply_material_hunter_state_hint(
 fn material_hunter_status_class(status: &Status) -> (&'static str, bool, bool) {
     let rendered = status.to_string().to_ascii_lowercase();
     let message = status.message().to_ascii_lowercase();
+    for (needle, retryable) in [
+        ("provider_reconnect_exhausted", false),
+        ("provider_stream_closed_before_deadline", false),
+        ("provider_progress_stalled", false),
+        ("pump_progress_stalled", false),
+        ("provider_connect_failed", true),
+        ("provider_lagged_data_loss", false),
+    ] {
+        if rendered.contains(needle) || message.contains(needle) {
+            return (needle, retryable, true);
+        }
+    }
     if rendered.contains("lagged")
         || message.contains("lagged")
         || rendered.contains("unrecoverable data loss")
@@ -9424,6 +9481,24 @@ mod tests {
             verifier.observe(&frame).expect_err("corrupt frame"),
             "relay_payload_hash_mismatch"
         );
+    }
+
+    #[test]
+    fn relay_provider_blocker_status_preserves_exact_class() {
+        let exhausted = Status::data_loss(
+            "unrecoverable data loss: provider_reconnect_exhausted: provider reconnect exhausted",
+        );
+        let (class, retryable, data_loss) = material_hunter_status_class(&exhausted);
+        assert_eq!(class, "provider_reconnect_exhausted");
+        assert!(!retryable);
+        assert!(data_loss);
+
+        let closed =
+            Status::data_loss("unrecoverable data loss: provider_stream_closed_before_deadline");
+        let (class, retryable, data_loss) = material_hunter_status_class(&closed);
+        assert_eq!(class, "provider_stream_closed_before_deadline");
+        assert!(!retryable);
+        assert!(data_loss);
     }
 
     #[test]

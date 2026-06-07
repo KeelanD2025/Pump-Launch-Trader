@@ -68,7 +68,6 @@ use storage::{
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use yellowstone_grpc_proto::prelude::SubscribeUpdate;
 use yellowstone_grpc_proto::prost::Message as _;
@@ -41846,8 +41845,7 @@ async fn material_candidate_hunter_command_with_connector(
         } else {
             candidates_300
         } as usize;
-        let reconnect_allowed = stream_source != "local_relay_stream"
-            && provider_blocked_run
+        let reconnect_allowed = provider_blocked_run
             && !interrupted.load(Ordering::SeqCst)
             && run_started_at.elapsed().as_secs() < duration_seconds
             && attempt_rows.len() < max_attempted_launches.max(1)
@@ -44748,6 +44746,18 @@ struct RelayWireFrame {
     control_kind: Option<RelayControlKind>,
     #[serde(default)]
     relay_error: Option<String>,
+    #[serde(default)]
+    blocker_class: Option<String>,
+    #[serde(default)]
+    provider_status: Option<String>,
+    #[serde(default)]
+    provider_error_code: Option<String>,
+    #[serde(default)]
+    provider_error_message: Option<String>,
+    #[serde(default)]
+    upstream_reconnect_attempt: Option<u64>,
+    #[serde(default)]
+    will_reconnect: Option<bool>,
 }
 
 impl From<&RelayFrame> for RelayWireFrame {
@@ -44770,6 +44780,12 @@ impl From<&RelayFrame> for RelayWireFrame {
             payload_base64: BASE64_STANDARD.encode(&frame.payload_bytes),
             control_kind: frame.control_kind,
             relay_error: frame.relay_error.clone(),
+            blocker_class: frame.blocker_class.clone(),
+            provider_status: frame.provider_status.clone(),
+            provider_error_code: frame.provider_error_code.clone(),
+            provider_error_message: frame.provider_error_message.clone(),
+            upstream_reconnect_attempt: frame.upstream_reconnect_attempt,
+            will_reconnect: frame.will_reconnect,
         }
     }
 }
@@ -44801,6 +44817,12 @@ impl RelayWireFrame {
             payload_bytes,
             control_kind: self.control_kind,
             relay_error: self.relay_error,
+            blocker_class: self.blocker_class,
+            provider_status: self.provider_status,
+            provider_error_code: self.provider_error_code,
+            provider_error_message: self.provider_error_message,
+            upstream_reconnect_attempt: self.upstream_reconnect_attempt,
+            will_reconnect: self.will_reconnect,
         })
     }
 }
@@ -44877,7 +44899,7 @@ async fn send_relay_material_update(
 
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
-    receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>>,
+    receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>,
     subscribed: Arc<AtomicBool>,
     subscribed_notify: Arc<tokio::sync::Notify>,
 }
@@ -44885,7 +44907,7 @@ struct LocalRelayGeyserConnector {
 impl LocalRelayGeyserConnector {
     fn new(receiver: tokio::sync::mpsc::Receiver<RelayMaterialUpdate>) -> Self {
         Self {
-            receiver: Arc::new(tokio::sync::Mutex::new(Some(receiver))),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             subscribed: Arc::new(AtomicBool::new(false)),
             subscribed_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -44916,24 +44938,38 @@ impl GeyserStreamConnector for LocalRelayGeyserConnector {
         _config: &common::GeyserConfig,
         _request: yellowstone_grpc_proto::prelude::SubscribeRequest,
     ) -> Result<SubscribeUpdateStream> {
-        let mut guard = self.receiver.lock().await;
-        let receiver = guard
-            .take()
-            .ok_or_else(|| anyhow!("local relay stream already consumed"))?;
         self.subscribed.store(true, Ordering::SeqCst);
         self.subscribed_notify.notify_waiters();
-        Ok(Box::pin(ReceiverStream::new(receiver)))
+        let receiver = self.receiver.clone();
+        Ok(Box::pin(futures::stream::unfold(
+            receiver,
+            |receiver| async move {
+                let next = {
+                    let mut guard = receiver.lock().await;
+                    guard.recv().await
+                };
+                next.map(|item| (item, receiver))
+            },
+        )))
     }
 }
 
-fn relay_status_for_control(control: RelayControlKind, error: Option<&str>) -> Option<Status> {
+fn relay_status_for_control_frame(frame: &RelayFrame) -> Option<Status> {
+    let control = frame.control_kind?;
     let blocker = runtime::relay_control_to_material_blocker(control)?;
-    let message = match error {
+    let blocker = frame.blocker_class.as_deref().unwrap_or(blocker);
+    let detail = frame
+        .provider_error_message
+        .as_deref()
+        .or(frame.relay_error.as_deref());
+    let message = match detail {
         Some(error) if !error.is_empty() => format!("{blocker}:{error}"),
         _ => blocker.to_owned(),
     };
     Some(match control {
-        RelayControlKind::RelaySequenceGap | RelayControlKind::RelayUpstreamBlocker => {
+        RelayControlKind::RelaySequenceGap
+        | RelayControlKind::RelayUpstreamBlocker
+        | RelayControlKind::RelayUpstreamReconnectExhausted => {
             Status::data_loss(format!("unrecoverable data loss: {message}"))
         }
         RelayControlKind::RelayReceiverBackpressure => Status::resource_exhausted(message),
@@ -44972,6 +45008,152 @@ fn build_relay_health_summary(
         relay_receiver_available: receiver_available,
         blocker_class,
     }
+}
+
+#[derive(Debug, Clone)]
+struct RelayUpstreamBlockerInfo {
+    blocker_class: String,
+    provider_status: String,
+    provider_error_code: Option<String>,
+    provider_error_message: Option<String>,
+    recoverable: bool,
+}
+
+fn relay_sanitize_provider_error(message: impl AsRef<str>) -> String {
+    message
+        .as_ref()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn classify_relay_upstream_status(status: &Status) -> RelayUpstreamBlockerInfo {
+    let rendered = status.to_string();
+    let rendered_lower = rendered.to_ascii_lowercase();
+    let message_lower = status.message().to_ascii_lowercase();
+    let (blocker_class, recoverable) = if rendered_lower.contains("lagged")
+        || message_lower.contains("lagged")
+        || rendered_lower.contains("unrecoverable data loss")
+        || message_lower.contains("unrecoverable data loss")
+        || (rendered_lower.contains("corruption") && rendered_lower.contains("data loss"))
+        || (message_lower.contains("corruption") && message_lower.contains("data loss"))
+    {
+        ("provider_lagged_data_loss", true)
+    } else {
+        match status.code() {
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                ("provider_auth_or_permission_failed", false)
+            }
+            tonic::Code::Unimplemented => ("provider_unsupported", false),
+            tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::ResourceExhausted => ("provider_connect_failed", true),
+            _ => ("provider_stream_error", false),
+        }
+    };
+    RelayUpstreamBlockerInfo {
+        blocker_class: blocker_class.to_owned(),
+        provider_status: blocker_class.to_owned(),
+        provider_error_code: Some(format!("{:?}", status.code())),
+        provider_error_message: Some(relay_sanitize_provider_error(rendered)),
+        recoverable,
+    }
+}
+
+fn relay_stream_closed_blocker() -> RelayUpstreamBlockerInfo {
+    RelayUpstreamBlockerInfo {
+        blocker_class: "provider_stream_closed_before_deadline".to_owned(),
+        provider_status: "provider_stream_closed_before_deadline".to_owned(),
+        provider_error_code: None,
+        provider_error_message: Some("provider stream closed before relay deadline".to_owned()),
+        recoverable: true,
+    }
+}
+
+fn classify_relay_connect_error(error: &anyhow::Error) -> RelayUpstreamBlockerInfo {
+    if let Some(status) = error.downcast_ref::<Status>() {
+        return classify_relay_upstream_status(status);
+    }
+    RelayUpstreamBlockerInfo {
+        blocker_class: "provider_connect_failed".to_owned(),
+        provider_status: "provider_connect_failed".to_owned(),
+        provider_error_code: None,
+        provider_error_message: Some(relay_sanitize_provider_error(error.to_string())),
+        recoverable: true,
+    }
+}
+
+fn relay_next_backoff(config: &common::GeyserConfig, attempt: u64) -> StdDuration {
+    let backoff = config
+        .reconnect_backoff_ms
+        .get(attempt.saturating_sub(1) as usize)
+        .copied()
+        .or_else(|| config.reconnect_backoff_ms.last().copied())
+        .unwrap_or(1_000)
+        .min(config.max_reconnect_backoff_ms.max(1));
+    StdDuration::from_millis(backoff)
+}
+
+fn relay_can_reconnect(
+    deadline: Instant,
+    config: &common::GeyserConfig,
+    next_attempt: u64,
+    recoverable: bool,
+) -> (bool, StdDuration) {
+    let max_attempts = config.max_reconnect_attempts.unwrap_or(10).max(1) as u64;
+    let backoff = relay_next_backoff(config, next_attempt);
+    let now = Instant::now();
+    (
+        recoverable && next_attempt < max_attempts && now < deadline && now + backoff < deadline,
+        backoff,
+    )
+}
+
+async fn relay_emit_control_frame(
+    receiver: &mut TokioTcpStream,
+    relay_session_id: &str,
+    stream_id: &str,
+    subscription_fingerprint: &str,
+    sequence: &mut u64,
+    control_frames_forwarded: &mut u64,
+    control_kind: RelayControlKind,
+    relay_error: Option<String>,
+    blocker: Option<&RelayUpstreamBlockerInfo>,
+    upstream_reconnect_attempt: u64,
+    will_reconnect: bool,
+) -> Result<()> {
+    let mut frame = RelayFrame::control(
+        relay_session_id.to_owned(),
+        stream_id.to_owned(),
+        "geyser",
+        subscription_fingerprint.to_owned(),
+        *sequence,
+        unix_now_nanos_u128(),
+        control_kind,
+        relay_error,
+    );
+    if let Some(blocker) = blocker {
+        frame = frame.with_upstream_blocker_metadata(
+            blocker.blocker_class.clone(),
+            blocker.provider_status.clone(),
+            blocker.provider_error_code.clone(),
+            blocker.provider_error_message.clone(),
+            upstream_reconnect_attempt,
+            will_reconnect,
+        );
+    }
+    relay_write_frame(receiver, &frame).await?;
+    *sequence = sequence.saturating_add(1);
+    *control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+    Ok(())
 }
 
 fn write_relay_health_artifacts(
@@ -45032,111 +45214,312 @@ async fn run_live_vps_stream_relay(
         .await
         .with_context(|| format!("connect relay receiver at {receiver_addr}"))?;
 
-    let config = loaded.config.geyser.clone();
-    let request = GeyserIngestService::new(config.clone()).proto_subscription_request();
-    let connector = RealGeyserConnector;
-    let mut stream = connector
-        .connect_and_subscribe(&config, request)
-        .await
-        .context("connect and subscribe to geyser for VPS relay")?;
-
     let mut sequence = 1u64;
     let mut data_frames_forwarded = 0u64;
     let mut control_frames_forwarded = 0u64;
     let mut bytes_forwarded = 0u64;
     let mut upstream_errors: Vec<String> = Vec::new();
+    let mut upstream_provider_blocker_count = 0u64;
+    let mut upstream_reconnect_count = 0u64;
+    let mut upstream_reconnect_attempt = 0u64;
+    let mut provider_connected = false;
 
-    let started = RelayFrame::control(
-        relay_session_id.clone(),
-        stream_id.clone(),
-        "geyser",
-        subscription_fingerprint.clone(),
-        sequence,
-        unix_now_nanos_u128(),
+    relay_emit_control_frame(
+        &mut receiver,
+        &relay_session_id,
+        &stream_id,
+        &subscription_fingerprint,
+        &mut sequence,
+        &mut control_frames_forwarded,
         RelayControlKind::RelayStarted,
         None,
-    );
-    relay_write_frame(&mut receiver, &started).await?;
-    sequence = sequence.saturating_add(1);
-    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
-
-    let connected = RelayFrame::control(
-        relay_session_id.clone(),
-        stream_id.clone(),
-        "geyser",
-        subscription_fingerprint.clone(),
-        sequence,
-        unix_now_nanos_u128(),
-        RelayControlKind::RelayUpstreamConnected,
         None,
-    );
-    relay_write_frame(&mut receiver, &connected).await?;
-    sequence = sequence.saturating_add(1);
-    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+        0,
+        false,
+    )
+    .await?;
 
+    let config = loaded.config.geyser.clone();
+    let request = GeyserIngestService::new(config.clone()).proto_subscription_request();
+    let connector = RealGeyserConnector;
     let started_at = Instant::now();
     let deadline = started_at + StdDuration::from_secs(duration_seconds);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, stream.next()).await {
-            Ok(Some(Ok(update))) => {
-                let payload = update.encode_to_vec();
-                bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
-                let frame = RelayFrame::data(
-                    relay_session_id.clone(),
-                    stream_id.clone(),
-                    "geyser",
-                    subscription_fingerprint.clone(),
-                    sequence,
-                    unix_now_nanos_u128(),
+
+    'relay: while Instant::now() < deadline {
+        let mut stream = match connector
+            .connect_and_subscribe(&config, request.clone())
+            .await
+        {
+            Ok(stream) => {
+                provider_connected = true;
+                let control = if upstream_reconnect_attempt == 0 {
+                    RelayControlKind::RelayUpstreamConnected
+                } else {
+                    upstream_reconnect_count = upstream_reconnect_count.saturating_add(1);
+                    RelayControlKind::RelayUpstreamReconnected
+                };
+                relay_emit_control_frame(
+                    &mut receiver,
+                    &relay_session_id,
+                    &stream_id,
+                    &subscription_fingerprint,
+                    &mut sequence,
+                    &mut control_frames_forwarded,
+                    control,
                     None,
-                    "yellowstone_subscribe_update_protobuf",
-                    payload,
-                );
-                relay_write_frame(&mut receiver, &frame).await?;
-                sequence = sequence.saturating_add(1);
-                data_frames_forwarded = data_frames_forwarded.saturating_add(1);
+                    None,
+                    upstream_reconnect_attempt,
+                    false,
+                )
+                .await?;
+                stream
             }
-            Ok(Some(Err(status))) => {
-                let rendered = status.to_string();
-                upstream_errors.push(rendered.clone());
-                let blocker = RelayFrame::control(
-                    relay_session_id.clone(),
-                    stream_id.clone(),
-                    "geyser",
-                    subscription_fingerprint.clone(),
-                    sequence,
-                    unix_now_nanos_u128(),
+            Err(error) => {
+                let blocker = classify_relay_connect_error(&error);
+                upstream_errors.push(
+                    blocker
+                        .provider_error_message
+                        .clone()
+                        .unwrap_or_else(|| blocker.blocker_class.clone()),
+                );
+                upstream_provider_blocker_count = upstream_provider_blocker_count.saturating_add(1);
+                let next_attempt = upstream_reconnect_attempt.saturating_add(1);
+                let (will_reconnect, backoff) =
+                    relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
+                relay_emit_control_frame(
+                    &mut receiver,
+                    &relay_session_id,
+                    &stream_id,
+                    &subscription_fingerprint,
+                    &mut sequence,
+                    &mut control_frames_forwarded,
                     RelayControlKind::RelayUpstreamBlocker,
-                    Some(rendered),
-                );
-                relay_write_frame(&mut receiver, &blocker).await?;
-                sequence = sequence.saturating_add(1);
-                control_frames_forwarded = control_frames_forwarded.saturating_add(1);
-                summary.blocker_class = Some("relay_upstream_blocker".to_owned());
-                break;
+                    blocker.provider_error_message.clone(),
+                    Some(&blocker),
+                    next_attempt,
+                    will_reconnect,
+                )
+                .await?;
+                if will_reconnect {
+                    upstream_reconnect_attempt = next_attempt;
+                    relay_emit_control_frame(
+                        &mut receiver,
+                        &relay_session_id,
+                        &stream_id,
+                        &subscription_fingerprint,
+                        &mut sequence,
+                        &mut control_frames_forwarded,
+                        RelayControlKind::RelayUpstreamReconnectStarted,
+                        None,
+                        Some(&blocker),
+                        upstream_reconnect_attempt,
+                        true,
+                    )
+                    .await?;
+                    tokio::time::sleep(backoff).await;
+                    continue 'relay;
+                }
+                if blocker.recoverable {
+                    relay_emit_control_frame(
+                        &mut receiver,
+                        &relay_session_id,
+                        &stream_id,
+                        &subscription_fingerprint,
+                        &mut sequence,
+                        &mut control_frames_forwarded,
+                        RelayControlKind::RelayUpstreamReconnectExhausted,
+                        Some("provider reconnect exhausted".to_owned()),
+                        Some(&blocker),
+                        next_attempt,
+                        false,
+                    )
+                    .await?;
+                    summary.blocker_class = Some("provider_reconnect_exhausted".to_owned());
+                } else {
+                    summary.blocker_class = Some(blocker.blocker_class.clone());
+                }
+                break 'relay;
             }
-            Ok(None) => {
-                break;
+        };
+
+        loop {
+            if Instant::now() >= deadline {
+                break 'relay;
             }
-            Err(_) => {
-                break;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(update))) => {
+                    let payload = update.encode_to_vec();
+                    bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
+                    let frame = RelayFrame::data(
+                        relay_session_id.clone(),
+                        stream_id.clone(),
+                        "geyser",
+                        subscription_fingerprint.clone(),
+                        sequence,
+                        unix_now_nanos_u128(),
+                        None,
+                        "yellowstone_subscribe_update_protobuf",
+                        payload,
+                    );
+                    relay_write_frame(&mut receiver, &frame).await?;
+                    sequence = sequence.saturating_add(1);
+                    data_frames_forwarded = data_frames_forwarded.saturating_add(1);
+                }
+                Ok(Some(Err(status))) => {
+                    let blocker = classify_relay_upstream_status(&status);
+                    upstream_errors.push(
+                        blocker
+                            .provider_error_message
+                            .clone()
+                            .unwrap_or_else(|| blocker.blocker_class.clone()),
+                    );
+                    upstream_provider_blocker_count =
+                        upstream_provider_blocker_count.saturating_add(1);
+                    let next_attempt = upstream_reconnect_attempt.saturating_add(1);
+                    let (will_reconnect, backoff) =
+                        relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
+                    relay_emit_control_frame(
+                        &mut receiver,
+                        &relay_session_id,
+                        &stream_id,
+                        &subscription_fingerprint,
+                        &mut sequence,
+                        &mut control_frames_forwarded,
+                        RelayControlKind::RelayUpstreamBlocker,
+                        blocker.provider_error_message.clone(),
+                        Some(&blocker),
+                        next_attempt,
+                        will_reconnect,
+                    )
+                    .await?;
+                    if will_reconnect {
+                        upstream_reconnect_attempt = next_attempt;
+                        relay_emit_control_frame(
+                            &mut receiver,
+                            &relay_session_id,
+                            &stream_id,
+                            &subscription_fingerprint,
+                            &mut sequence,
+                            &mut control_frames_forwarded,
+                            RelayControlKind::RelayUpstreamReconnectStarted,
+                            None,
+                            Some(&blocker),
+                            upstream_reconnect_attempt,
+                            true,
+                        )
+                        .await?;
+                        tokio::time::sleep(backoff).await;
+                        continue 'relay;
+                    }
+                    if blocker.recoverable {
+                        relay_emit_control_frame(
+                            &mut receiver,
+                            &relay_session_id,
+                            &stream_id,
+                            &subscription_fingerprint,
+                            &mut sequence,
+                            &mut control_frames_forwarded,
+                            RelayControlKind::RelayUpstreamReconnectExhausted,
+                            Some("provider reconnect exhausted".to_owned()),
+                            Some(&blocker),
+                            next_attempt,
+                            false,
+                        )
+                        .await?;
+                        summary.blocker_class = Some("provider_reconnect_exhausted".to_owned());
+                    } else {
+                        summary.blocker_class = Some(blocker.blocker_class.clone());
+                    }
+                    break 'relay;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break 'relay;
+                    }
+                    let blocker = relay_stream_closed_blocker();
+                    upstream_errors.push(
+                        blocker
+                            .provider_error_message
+                            .clone()
+                            .unwrap_or_else(|| blocker.blocker_class.clone()),
+                    );
+                    upstream_provider_blocker_count =
+                        upstream_provider_blocker_count.saturating_add(1);
+                    let next_attempt = upstream_reconnect_attempt.saturating_add(1);
+                    let (will_reconnect, backoff) =
+                        relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
+                    relay_emit_control_frame(
+                        &mut receiver,
+                        &relay_session_id,
+                        &stream_id,
+                        &subscription_fingerprint,
+                        &mut sequence,
+                        &mut control_frames_forwarded,
+                        RelayControlKind::RelayUpstreamBlocker,
+                        blocker.provider_error_message.clone(),
+                        Some(&blocker),
+                        next_attempt,
+                        will_reconnect,
+                    )
+                    .await?;
+                    if will_reconnect {
+                        upstream_reconnect_attempt = next_attempt;
+                        relay_emit_control_frame(
+                            &mut receiver,
+                            &relay_session_id,
+                            &stream_id,
+                            &subscription_fingerprint,
+                            &mut sequence,
+                            &mut control_frames_forwarded,
+                            RelayControlKind::RelayUpstreamReconnectStarted,
+                            None,
+                            Some(&blocker),
+                            upstream_reconnect_attempt,
+                            true,
+                        )
+                        .await?;
+                        tokio::time::sleep(backoff).await;
+                        continue 'relay;
+                    }
+                    relay_emit_control_frame(
+                        &mut receiver,
+                        &relay_session_id,
+                        &stream_id,
+                        &subscription_fingerprint,
+                        &mut sequence,
+                        &mut control_frames_forwarded,
+                        RelayControlKind::RelayUpstreamReconnectExhausted,
+                        Some("provider reconnect exhausted".to_owned()),
+                        Some(&blocker),
+                        next_attempt,
+                        false,
+                    )
+                    .await?;
+                    summary.blocker_class = Some("provider_reconnect_exhausted".to_owned());
+                    break 'relay;
+                }
+                Err(_) => {
+                    break 'relay;
+                }
             }
         }
     }
 
-    let stopped = RelayFrame::control(
-        relay_session_id.clone(),
-        stream_id.clone(),
-        "geyser",
-        subscription_fingerprint.clone(),
-        sequence,
-        unix_now_nanos_u128(),
+    relay_emit_control_frame(
+        &mut receiver,
+        &relay_session_id,
+        &stream_id,
+        &subscription_fingerprint,
+        &mut sequence,
+        &mut control_frames_forwarded,
         RelayControlKind::RelayStopped,
         None,
-    );
-    relay_write_frame(&mut receiver, &stopped).await?;
-    control_frames_forwarded = control_frames_forwarded.saturating_add(1);
+        None,
+        upstream_reconnect_attempt,
+        false,
+    )
+    .await?;
     receiver.flush().await?;
 
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
@@ -45146,13 +45529,16 @@ async fn run_live_vps_stream_relay(
         "duration_seconds": duration_seconds,
         "elapsed_ms": elapsed_ms,
         "dry_run": false,
-        "provider_connected": true,
+        "provider_connected": provider_connected,
         "receiver_available": true,
         "structured_blocker": summary.blocker_class,
         "data_frames_forwarded": data_frames_forwarded,
         "control_frames_forwarded": control_frames_forwarded,
         "bytes_forwarded": bytes_forwarded,
         "upstream_errors": upstream_errors,
+        "upstream_provider_blocker_count": upstream_provider_blocker_count,
+        "upstream_reconnect_count": upstream_reconnect_count,
+        "upstream_reconnect_attempt": upstream_reconnect_attempt,
         "material_hunter_started": false,
         "material_hunter_artifacts_written": false,
         "latest_run_id_mutated": false,
@@ -45306,6 +45692,9 @@ async fn run_live_local_stream_collector(
     let mut malformed_frame_count = 0u64;
     let mut downstream_backpressure_count = 0u64;
     let mut receiver_unavailable_count = 0u64;
+    let mut upstream_provider_blocker_count = 0u64;
+    let mut upstream_reconnect_count = 0u64;
+    let mut upstream_reconnect_exhausted_count = 0u64;
     let mut relay_errors: Vec<String> = Vec::new();
     let mut relay_session_id: Option<String> = None;
     let mut subscription_fingerprint: Option<String> = None;
@@ -45361,6 +45750,25 @@ async fn run_live_local_stream_collector(
         ) {
             receiver_unavailable_count = receiver_unavailable_count.saturating_add(1);
         }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayUpstreamBlocker)
+        ) {
+            upstream_provider_blocker_count = upstream_provider_blocker_count.saturating_add(1);
+        }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayUpstreamReconnected)
+        ) {
+            upstream_reconnect_count = upstream_reconnect_count.saturating_add(1);
+        }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayUpstreamReconnectExhausted)
+        ) {
+            upstream_reconnect_exhausted_count =
+                upstream_reconnect_exhausted_count.saturating_add(1);
+        }
         if let Some(error) = frame.relay_error.as_ref() {
             relay_errors.push(error.clone());
         }
@@ -45391,10 +45799,8 @@ async fn run_live_local_stream_collector(
                     relay_errors.push("local_material_hunter_update_send_timeout".to_owned());
                     break;
                 }
-            } else if let Some(control) = frame.control_kind {
-                if let Some(status) =
-                    relay_status_for_control(control, frame.relay_error.as_deref())
-                {
+            } else if frame.control_kind.is_some() {
+                if let Some(status) = relay_status_for_control_frame(&frame) {
                     if matches!(
                         send_relay_material_update(material_tx, Err(status)).await,
                         RelayMaterialSendOutcome::TimedOut
@@ -45511,6 +45917,9 @@ async fn run_live_local_stream_collector(
         "malformed_frame_count": malformed_frame_count,
         "downstream_backpressure_count": downstream_backpressure_count,
         "receiver_unavailable_count": receiver_unavailable_count,
+        "upstream_provider_blocker_count": upstream_provider_blocker_count,
+        "upstream_reconnect_count": upstream_reconnect_count,
+        "upstream_reconnect_exhausted_count": upstream_reconnect_exhausted_count,
         "last_sequence_by_stream": last_sequence_by_stream,
         "relay_frame_shards": shard_paths
             .iter()
@@ -45545,6 +45954,9 @@ async fn run_live_local_stream_collector(
         "malformed_frame_count": malformed_frame_count,
         "downstream_backpressure_count": downstream_backpressure_count,
         "receiver_unavailable_count": receiver_unavailable_count,
+        "upstream_provider_blocker_count": upstream_provider_blocker_count,
+        "upstream_reconnect_count": upstream_reconnect_count,
+        "upstream_reconnect_exhausted_count": upstream_reconnect_exhausted_count,
         "replay_run": false,
         "backtesting_run": false,
         "threshold_tuning_run": false,
@@ -46069,6 +46481,16 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
     let counted_phase107b_result = countability["counted_phase107b_result"]
         .as_bool()
         .unwrap_or(false);
+    let clean_segment_count = countability["clean_segment_count"]
+        .as_u64()
+        .or_else(|| run_countability["clean_segment_count"].as_u64())
+        .unwrap_or(0);
+    let blocked_segment_count = countability["blocked_segment_count"]
+        .as_u64()
+        .or_else(|| run_countability["blocked_segment_count"].as_u64())
+        .unwrap_or(0);
+    let provider_gap_continuation_counted =
+        provider_data_loss_seen && counted_phase107b_result && clean_segment_count > 0;
     let r2_verified = r2_upload["verified"].as_bool().unwrap_or(false)
         || countability["r2_verified"].as_bool().unwrap_or(false);
     let safety_ok = countability["formal_backtesting_allowed"].as_bool() == Some(false)
@@ -46083,6 +46505,10 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "RELAY_LOCAL_DATASET_BLOCK_DECODE"
     } else if receiver_backpressure_count > 0 || receiver_unavailable_count > 0 {
         "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
+    } else if provider_gap_continuation_counted && !r2_verified {
+        "RELAY_LOCAL_DATASET_BLOCK_R2"
+    } else if provider_gap_continuation_counted && safety_ok {
+        "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
     } else if provider_data_loss_seen || provider_blocker_class.is_some() {
         "RELAY_LOCAL_DATASET_BLOCK_PROVIDER"
     } else if !r2_verified {
@@ -46113,10 +46539,15 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "malformed_frame_count": malformed_frame_count,
         "receiver_backpressure_count": receiver_backpressure_count,
         "receiver_unavailable_count": receiver_unavailable_count,
+        "upstream_provider_blocker_count": relay_summary["upstream_provider_blocker_count"].as_u64().unwrap_or(0),
+        "upstream_reconnect_count": relay_summary["upstream_reconnect_count"].as_u64().unwrap_or(0),
+        "upstream_reconnect_exhausted_count": relay_summary["upstream_reconnect_exhausted_count"].as_u64().unwrap_or(0),
         "attempted_launches": attempted_launches,
         "unique_attempted_mints": unique_attempted_mints,
         "provider_data_loss_seen": provider_data_loss_seen,
         "provider_blocker_class": provider_blocker_class,
+        "clean_segment_count": clean_segment_count,
+        "blocked_segment_count": blocked_segment_count,
         "rejected_dead_count": hunter_summary["rejected_dead_count"],
         "rejected_inconclusive_count": hunter_summary["rejected_inconclusive_count"],
         "candidate_checkpoint_count": countability["candidate_checkpoint_count"],
@@ -59012,6 +59443,134 @@ mod tests {
     }
 
     #[test]
+    fn phase107g_relay_upstream_blocker_metadata_survives_wire_roundtrip() {
+        let blocker = RelayUpstreamBlockerInfo {
+            blocker_class: "provider_lagged_data_loss".to_owned(),
+            provider_status: "provider_lagged_data_loss".to_owned(),
+            provider_error_code: Some("OutOfRange".to_owned()),
+            provider_error_message: Some("provider lagged behind stream".to_owned()),
+            recoverable: true,
+        };
+        let frame = RelayFrame::control(
+            "relay-session",
+            "geyser-material-hunter",
+            "geyser",
+            "fingerprint",
+            7,
+            123,
+            RelayControlKind::RelayUpstreamBlocker,
+            blocker.provider_error_message.clone(),
+        )
+        .with_upstream_blocker_metadata(
+            blocker.blocker_class.clone(),
+            blocker.provider_status.clone(),
+            blocker.provider_error_code.clone(),
+            blocker.provider_error_message.clone(),
+            2,
+            true,
+        );
+        let wire = RelayWireFrame::from(&frame);
+        let decoded = wire.into_relay_frame().expect("relay frame");
+        assert_eq!(
+            decoded.blocker_class.as_deref(),
+            Some("provider_lagged_data_loss")
+        );
+        assert_eq!(decoded.upstream_reconnect_attempt, Some(2));
+        assert_eq!(decoded.will_reconnect, Some(true));
+        let status = relay_status_for_control_frame(&decoded).expect("material status");
+        assert!(status.message().contains("provider_lagged_data_loss"));
+    }
+
+    #[test]
+    fn phase107g_relay_reconnect_controls_preserve_monotonic_sequence() {
+        let mut verifier = RelaySequenceVerifier::default();
+        let frames = [
+            RelayFrame::control(
+                "relay-session",
+                "geyser-material-hunter",
+                "geyser",
+                "fingerprint",
+                1,
+                1,
+                RelayControlKind::RelayUpstreamBlocker,
+                Some("provider lagged".to_owned()),
+            )
+            .with_upstream_blocker_metadata(
+                "provider_lagged_data_loss",
+                "provider_lagged_data_loss",
+                None,
+                Some("provider lagged".to_owned()),
+                1,
+                true,
+            ),
+            RelayFrame::control(
+                "relay-session",
+                "geyser-material-hunter",
+                "geyser",
+                "fingerprint",
+                2,
+                2,
+                RelayControlKind::RelayUpstreamReconnectStarted,
+                None,
+            ),
+            RelayFrame::control(
+                "relay-session",
+                "geyser-material-hunter",
+                "geyser",
+                "fingerprint",
+                3,
+                3,
+                RelayControlKind::RelayUpstreamReconnected,
+                None,
+            ),
+        ];
+        for frame in frames {
+            verifier.observe(&frame).expect("monotonic relay frame");
+        }
+    }
+
+    #[tokio::test]
+    async fn phase107g_local_relay_connector_resubscribes_after_provider_blocker() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8);
+        let connector = LocalRelayGeyserConnector::new(rx);
+        tx.send(Err(Status::data_loss(
+            "unrecoverable data loss: provider_lagged_data_loss",
+        )))
+        .await
+        .expect("send blocker");
+        tx.send(Ok(SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(
+                yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                        slot: 99,
+                        parent: Some(98),
+                        status: yellowstone_grpc_proto::prelude::SlotStatus::SlotConfirmed as i32,
+                        dead_error: None,
+                    },
+                ),
+            ),
+            created_at: None,
+        }))
+        .await
+        .expect("send data");
+        let loaded = load_default_config_for_test();
+        let request =
+            GeyserIngestService::new(loaded.config.geyser.clone()).proto_subscription_request();
+        let mut first = connector
+            .connect_and_subscribe(&loaded.config.geyser, request.clone())
+            .await
+            .expect("first stream");
+        assert!(matches!(first.next().await, Some(Err(_))));
+        drop(first);
+        let mut second = connector
+            .connect_and_subscribe(&loaded.config.geyser, request)
+            .await
+            .expect("second stream");
+        assert!(matches!(second.next().await, Some(Ok(_))));
+    }
+
+    #[test]
     fn phase107g_local_relay_dataset_summary_requires_relay_countability_and_r2() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
@@ -59140,6 +59699,58 @@ mod tests {
             provider_blocked["provider_blocker_class"],
             "provider_lagged_data_loss"
         );
+
+        fs::write(
+            temp.path().join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "relay_session_id": "relay-session",
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0,
+                "upstream_provider_blocker_count": 1,
+                "upstream_reconnect_count": 1,
+                "upstream_reconnect_exhausted_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("relay summary provider gap continuation");
+        fs::write(
+            temp.path().join("countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "counted_phase107b_result": true,
+                "provider_data_loss_seen": true,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "clean_segment_count": 1,
+                "blocked_segment_count": 1,
+                "off_vps_candidate_replay_allowed": false,
+                "ready_for_off_vps_candidate_replay": false,
+                "r2_verified": true,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false
+            }))
+            .expect("json"),
+        )
+        .expect("continued countability");
+        fs::write(
+            temp.path().join("run_countability_decision.json"),
+            serde_json::to_vec_pretty(&json!({
+                "clean_segment_count": 1,
+                "blocked_segment_count": 1,
+                "run_provider_data_loss_seen": true
+            }))
+            .expect("json"),
+        )
+        .expect("run countability continuation");
+        let continued = local_relay_dataset_proof_summary(temp.path()).expect("continued summary");
+        assert_eq!(
+            continued["classification"],
+            "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
+        );
+        assert_eq!(continued["upstream_provider_blocker_count"], 1);
+        assert_eq!(continued["upstream_reconnect_count"], 1);
     }
 
     #[test]
