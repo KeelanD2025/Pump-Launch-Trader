@@ -143,6 +143,10 @@ pub struct GeyserProviderSmokeSummary {
 
 #[async_trait]
 pub trait GeyserStreamConnector: Send + Sync {
+    fn requires_geyser_endpoint(&self) -> bool {
+        true
+    }
+
     async fn connect_and_subscribe(
         &self,
         config: &common::GeyserConfig,
@@ -283,6 +287,10 @@ pub struct MockDeshredConnector {
 #[cfg(test)]
 #[async_trait]
 impl GeyserStreamConnector for MockGeyserConnector {
+    fn requires_geyser_endpoint(&self) -> bool {
+        false
+    }
+
     async fn connect_and_subscribe(
         &self,
         _config: &common::GeyserConfig,
@@ -3996,7 +4004,7 @@ where
         duration_seconds: options.duration_seconds.max(1),
         ..MaterialHunterStreamSummary::default()
     };
-    if !geyser_endpoint_configured(&config) {
+    if connector.requires_geyser_endpoint() && !geyser_endpoint_configured(&config) {
         summary.provider_status = "not_attempted_missing_endpoint".to_owned();
         summary
             .errors

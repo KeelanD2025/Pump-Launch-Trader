@@ -41789,6 +41789,7 @@ async fn material_candidate_hunter_command_with_connector(
             ended_at: segment_ended_at,
             provider_status: stream_summary.provider_status.clone(),
             provider_blocker_class: stream_summary.provider_blocker_class.clone(),
+            stream_errors: stream_summary.errors.clone(),
             provider_data_loss_seen: stream_summary.provider_data_loss_seen && provider_blocked_run,
             client_backpressure_detected: stream_summary.client_backpressure_detected
                 && provider_blocked_run,
@@ -41822,11 +41823,13 @@ async fn material_candidate_hunter_command_with_connector(
         } else {
             candidates_300
         } as usize;
-        let reconnect_allowed = provider_blocked_run
+        let reconnect_allowed = stream_source != "local_relay_stream"
+            && provider_blocked_run
             && !interrupted.load(Ordering::SeqCst)
             && run_started_at.elapsed().as_secs() < duration_seconds
             && attempt_rows.len() < max_attempted_launches.max(1)
             && target_candidate_total < target_material_candidates
+            && stream_summary.provider_blocker_class.as_deref() != Some("stream_runtime_error")
             && stream_summary.provider_blocker_class.as_deref()
                 != Some("provider_reconnect_exhausted");
         if reconnect_allowed {
@@ -42694,6 +42697,7 @@ struct Phase107fSegmentRecord {
     ended_at: OffsetDateTime,
     provider_status: String,
     provider_blocker_class: Option<String>,
+    stream_errors: Vec<String>,
     provider_data_loss_seen: bool,
     client_backpressure_detected: bool,
     attempted_launches: usize,
@@ -42807,6 +42811,7 @@ fn phase107f_write_segment_artifacts(
         "ended_at": record.ended_at,
         "provider_status": record.provider_status,
         "provider_blocker_class": record.provider_blocker_class,
+        "stream_errors": record.stream_errors.clone(),
         "provider_data_loss_seen": record.provider_data_loss_seen,
         "client_backpressure_detected": record.client_backpressure_detected,
         "attempted_launches": record.attempted_launches,
@@ -42845,6 +42850,7 @@ fn phase107f_write_segment_artifacts(
         "counted_phase107b_result": record.counted_phase107b_result,
         "provider_status": record.provider_status,
         "provider_blocker_class": record.provider_blocker_class,
+        "stream_errors": record.stream_errors.clone(),
         "provider_data_loss_seen": record.provider_data_loss_seen,
         "client_backpressure_detected": record.client_backpressure_detected,
         "blocker_class": record.provider_blocker_class,
@@ -42885,6 +42891,7 @@ fn phase107f_write_run_segment_artifacts(
                 "segment_id": record.segment_id,
                 "provider_status": record.provider_status,
                 "provider_blocker_class": record.provider_blocker_class,
+                "stream_errors": record.stream_errors.clone(),
                 "blocker_class": record.provider_blocker_class,
                 "blocker_source": record.blocker_snapshot.as_ref().map(|snapshot| snapshot.blocker_source.as_str()).unwrap_or(""),
                 "blocker_snapshot_available": record.blocker_snapshot.is_some(),
@@ -42912,6 +42919,7 @@ fn phase107f_write_run_segment_artifacts(
             "segment_id",
             "provider_status",
             "provider_blocker_class",
+            "stream_errors",
             "blocker_class",
             "blocker_source",
             "blocker_snapshot_available",
@@ -42941,6 +42949,7 @@ fn phase107f_write_run_segment_artifacts(
                 "ended_at": record.ended_at,
                 "provider_status": record.provider_status,
                 "provider_blocker_class": record.provider_blocker_class,
+                "stream_errors": record.stream_errors.clone(),
                 "blocker_class": record.provider_blocker_class,
                 "blocker_snapshot_available": record.blocker_snapshot.is_some(),
                 "provider_data_loss_seen": record.provider_data_loss_seen,
@@ -42963,6 +42972,7 @@ fn phase107f_write_run_segment_artifacts(
             "ended_at",
             "provider_status",
             "provider_blocker_class",
+            "stream_errors",
             "blocker_class",
             "blocker_snapshot_available",
             "provider_data_loss_seen",
@@ -44848,6 +44858,10 @@ impl LocalRelayGeyserConnector {
 
 #[async_trait]
 impl GeyserStreamConnector for LocalRelayGeyserConnector {
+    fn requires_geyser_endpoint(&self) -> bool {
+        false
+    }
+
     async fn connect_and_subscribe(
         &self,
         _config: &common::GeyserConfig,
@@ -57973,6 +57987,7 @@ mod tests {
             ended_at,
             provider_status: "provider_lagged_data_loss".to_owned(),
             provider_blocker_class: Some("provider_lagged_data_loss".to_owned()),
+            stream_errors: Vec::new(),
             provider_data_loss_seen: true,
             client_backpressure_detected: false,
             attempted_launches: 1,
@@ -57990,6 +58005,7 @@ mod tests {
             ended_at: ended_at + time::Duration::seconds(900),
             provider_status: "completed".to_owned(),
             provider_blocker_class: None,
+            stream_errors: Vec::new(),
             provider_data_loss_seen: false,
             client_backpressure_detected: false,
             attempted_launches: 1,
@@ -58176,6 +58192,7 @@ mod tests {
             ended_at: started_at + time::Duration::seconds(10),
             provider_status: "client_backpressure_detected".to_owned(),
             provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            stream_errors: Vec::new(),
             provider_data_loss_seen: false,
             client_backpressure_detected: true,
             attempted_launches: 1,
@@ -58226,6 +58243,7 @@ mod tests {
             ended_at: started_at + time::Duration::seconds(10),
             provider_status: "client_backpressure_detected".to_owned(),
             provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            stream_errors: Vec::new(),
             provider_data_loss_seen: false,
             client_backpressure_detected: true,
             attempted_launches: 1,
@@ -58243,6 +58261,7 @@ mod tests {
             ended_at: blocked.ended_at + time::Duration::seconds(20),
             provider_status: "stopped_by_hunter".to_owned(),
             provider_blocker_class: None,
+            stream_errors: Vec::new(),
             provider_data_loss_seen: false,
             client_backpressure_detected: false,
             attempted_launches: 1,
@@ -58292,6 +58311,7 @@ mod tests {
             ended_at: started_at + time::Duration::seconds(10),
             provider_status: "client_backpressure_detected".to_owned(),
             provider_blocker_class: Some("client_backpressure_detected".to_owned()),
+            stream_errors: Vec::new(),
             provider_data_loss_seen: false,
             client_backpressure_detected: true,
             attempted_launches: 1,
