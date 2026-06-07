@@ -44819,13 +44819,30 @@ async fn send_relay_material_update(
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
     receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>>,
+    subscribed: Arc<AtomicBool>,
+    subscribed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LocalRelayGeyserConnector {
     fn new(receiver: tokio::sync::mpsc::Receiver<RelayMaterialUpdate>) -> Self {
         Self {
             receiver: Arc::new(tokio::sync::Mutex::new(Some(receiver))),
+            subscribed: Arc::new(AtomicBool::new(false)),
+            subscribed_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    async fn wait_for_subscription(&self, timeout: StdDuration) -> Result<()> {
+        if self.subscribed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, self.subscribed_notify.notified())
+            .await
+            .context("local material hunter did not subscribe to relay stream before timeout")?;
+        if !self.subscribed.load(Ordering::SeqCst) {
+            bail!("local material hunter subscription readiness signal was not set");
+        }
+        Ok(())
     }
 }
 
@@ -44840,6 +44857,8 @@ impl GeyserStreamConnector for LocalRelayGeyserConnector {
         let receiver = guard
             .take()
             .ok_or_else(|| anyhow!("local relay stream already consumed"))?;
+        self.subscribed.store(true, Ordering::SeqCst);
+        self.subscribed_notify.notify_waiters();
         Ok(Box::pin(ReceiverStream::new(receiver)))
     }
 }
@@ -45550,27 +45569,13 @@ async fn local_stream_collector_command(
                 tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8_192);
             let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
             let material_duration_seconds = material_duration_seconds.unwrap_or(duration_seconds);
-            let reader_loaded = loaded.clone();
-            let reader_output = output_path.clone();
-            let reader_listen_url = listen_url.to_owned();
-            let reader_task = tokio::spawn(async move {
-                run_live_local_stream_collector(
-                    &reader_loaded,
-                    &reader_listen_url,
-                    duration_seconds,
-                    &reader_output,
-                    Some(material_tx),
-                    false,
-                )
-                .await
-            });
             let run_id = run_id.or_else(|| {
                 Some(format!(
                     "local-relay-material-hunter-{}",
                     OffsetDateTime::now_utc().unix_timestamp_nanos()
                 ))
             });
-            let hunter_result = material_candidate_hunter_command_with_connector(
+            let mut hunter_future = Box::pin(material_candidate_hunter_command_with_connector(
                 loaded,
                 material_duration_seconds,
                 max_attempted_launches,
@@ -45582,13 +45587,27 @@ async fn local_stream_collector_command(
                 verify_r2,
                 output_dir,
                 run_id,
-                connector,
+                connector.clone(),
                 "local_relay_stream",
-            )
-            .await;
-            let reader_result = reader_task
-                .await
-                .map_err(|error| anyhow!("local relay reader task failed: {error}"))?;
+            ));
+            tokio::select! {
+                result = &mut hunter_future => {
+                    result?;
+                    bail!("local material hunter exited before subscribing to relay stream");
+                }
+                wait = connector.wait_for_subscription(StdDuration::from_secs(60)) => {
+                    wait?;
+                }
+            }
+            let reader_future = run_live_local_stream_collector(
+                loaded,
+                listen_url,
+                duration_seconds,
+                &output_path,
+                Some(material_tx),
+                false,
+            );
+            let (reader_result, hunter_result) = tokio::join!(reader_future, hunter_future);
             reader_result?;
             hunter_result?;
             let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
