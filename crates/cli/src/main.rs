@@ -44799,6 +44799,23 @@ fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
 
 type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
 
+enum RelayMaterialSendOutcome {
+    Sent,
+    Closed,
+    TimedOut,
+}
+
+async fn send_relay_material_update(
+    material_tx: &tokio::sync::mpsc::Sender<RelayMaterialUpdate>,
+    update: RelayMaterialUpdate,
+) -> RelayMaterialSendOutcome {
+    match tokio::time::timeout(StdDuration::from_secs(15), material_tx.send(update)).await {
+        Ok(Ok(())) => RelayMaterialSendOutcome::Sent,
+        Ok(Err(_)) => RelayMaterialSendOutcome::Closed,
+        Err(_) => RelayMaterialSendOutcome::TimedOut,
+    }
+}
+
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
     receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>>,
@@ -45284,12 +45301,27 @@ async fn run_live_local_stream_collector(
         if let Some(material_tx) = material_update_tx.as_ref() {
             if let Some(error) = verification_error.as_ref() {
                 let status = Status::data_loss(format!("unrecoverable data loss: {error}"));
-                let _ = material_tx.try_send(Err(status));
+                if matches!(
+                    send_relay_material_update(material_tx, Err(status)).await,
+                    RelayMaterialSendOutcome::TimedOut
+                ) {
+                    downstream_backpressure_count = downstream_backpressure_count.saturating_add(1);
+                    relay_errors.push("local_material_hunter_update_send_timeout".to_owned());
+                    break;
+                }
             } else if let Some(control) = frame.control_kind {
                 if let Some(status) =
                     relay_status_for_control(control, frame.relay_error.as_deref())
                 {
-                    let _ = material_tx.try_send(Err(status));
+                    if matches!(
+                        send_relay_material_update(material_tx, Err(status)).await,
+                        RelayMaterialSendOutcome::TimedOut
+                    ) {
+                        downstream_backpressure_count =
+                            downstream_backpressure_count.saturating_add(1);
+                        relay_errors.push("local_material_hunter_update_send_timeout".to_owned());
+                        break;
+                    }
                 }
             } else {
                 let payload = if frame.payload_compressed {
@@ -45298,9 +45330,22 @@ async fn run_live_local_stream_collector(
                         Err(error) => {
                             malformed_frame_count = malformed_frame_count.saturating_add(1);
                             relay_errors.push(format!("relay_payload_decompress_failed:{error}"));
-                            let _ = material_tx.try_send(Err(Status::data_loss(format!(
-                                "unrecoverable data loss: relay_payload_decompress_failed:{error}"
-                            ))));
+                            if matches!(
+                                send_relay_material_update(
+                                    material_tx,
+                                    Err(Status::data_loss(format!(
+                                        "unrecoverable data loss: relay_payload_decompress_failed:{error}"
+                                    ))),
+                                )
+                                .await,
+                                RelayMaterialSendOutcome::TimedOut
+                            ) {
+                                downstream_backpressure_count =
+                                    downstream_backpressure_count.saturating_add(1);
+                                relay_errors
+                                    .push("local_material_hunter_update_send_timeout".to_owned());
+                                break;
+                            }
                             Vec::new()
                         }
                     }
@@ -45310,19 +45355,17 @@ async fn run_live_local_stream_collector(
                 if !payload.is_empty() {
                     match SubscribeUpdate::decode(payload.as_slice()) {
                         Ok(update) => {
-                            match material_tx.try_send(Ok(update)) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            match send_relay_material_update(material_tx, Ok(update)).await {
+                                RelayMaterialSendOutcome::Sent => {}
+                                RelayMaterialSendOutcome::TimedOut => {
                                     downstream_backpressure_count =
                                         downstream_backpressure_count.saturating_add(1);
-                                    relay_errors
-                                        .push("local_material_hunter_update_queue_full".to_owned());
-                                    let _ = material_tx.try_send(Err(Status::resource_exhausted(
-                                        "relay_downstream_backpressure",
-                                    )));
+                                    relay_errors.push(
+                                        "local_material_hunter_update_send_timeout".to_owned(),
+                                    );
                                     break;
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                RelayMaterialSendOutcome::Closed => {
                                     // The material-hunter proof may stop early after satisfying
                                     // conservative caps. Keep verifying and sharding relay frames.
                                 }
@@ -45331,9 +45374,22 @@ async fn run_live_local_stream_collector(
                         Err(error) => {
                             malformed_frame_count = malformed_frame_count.saturating_add(1);
                             relay_errors.push(format!("relay_payload_decode_failed:{error}"));
-                            let _ = material_tx.try_send(Err(Status::data_loss(format!(
-                                "unrecoverable data loss: relay_payload_decode_failed:{error}"
-                            ))));
+                            if matches!(
+                                send_relay_material_update(
+                                    material_tx,
+                                    Err(Status::data_loss(format!(
+                                        "unrecoverable data loss: relay_payload_decode_failed:{error}"
+                                    ))),
+                                )
+                                .await,
+                                RelayMaterialSendOutcome::TimedOut
+                            ) {
+                                downstream_backpressure_count =
+                                    downstream_backpressure_count.saturating_add(1);
+                                relay_errors
+                                    .push("local_material_hunter_update_send_timeout".to_owned());
+                                break;
+                            }
                         }
                     }
                 }
