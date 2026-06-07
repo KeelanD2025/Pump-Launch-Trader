@@ -45563,62 +45563,85 @@ async fn local_stream_collector_command(
                     "local-stream-collector dataset mode requires --upload-r2 for R2-primary proof"
                 );
             }
-            let output_path = PathBuf::from(output_dir);
-            fs::create_dir_all(&output_path)?;
-            let (material_tx, material_rx) =
-                tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8_192);
-            let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
-            let material_duration_seconds = material_duration_seconds.unwrap_or(duration_seconds);
-            let run_id = run_id.or_else(|| {
-                Some(format!(
-                    "local-relay-material-hunter-{}",
-                    OffsetDateTime::now_utc().unix_timestamp_nanos()
-                ))
-            });
-            let mut hunter_future = Box::pin(material_candidate_hunter_command_with_connector(
-                loaded,
-                material_duration_seconds,
-                max_attempted_launches,
-                target_material_candidates,
-                max_concurrent_tracked_mints,
-                no_live_trading,
-                no_rpc,
-                upload_r2,
-                verify_r2,
-                output_dir,
-                run_id,
-                connector.clone(),
-                "local_relay_stream",
-            ));
-            tokio::select! {
-                result = &mut hunter_future => {
-                    result?;
-                    bail!("local material hunter exited before subscribing to relay stream");
-                }
-                wait = connector.wait_for_subscription(StdDuration::from_secs(60)) => {
-                    wait?;
-                }
-            }
-            let reader_future = run_live_local_stream_collector(
-                loaded,
-                listen_url,
-                duration_seconds,
-                &output_path,
-                Some(material_tx),
-                false,
-            );
-            let (reader_result, hunter_result) = tokio::join!(reader_future, hunter_future);
-            reader_result?;
-            hunter_result?;
-            let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
-            atomic_write_path(
-                &output_path.join("local_relay_dataset_proof_summary.json"),
-                &serde_json::to_vec_pretty(&proof_summary)?,
-            )?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&proof_summary)?);
-            }
-            return Ok(());
+            let dataset_loaded = loaded.clone();
+            let listen_url = listen_url.to_owned();
+            let output_dir = output_dir.to_owned();
+            return tokio::task::LocalSet::new()
+                .run_until(async move {
+                    let output_path = PathBuf::from(&output_dir);
+                    fs::create_dir_all(&output_path)?;
+                    let (material_tx, material_rx) =
+                        tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8_192);
+                    let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
+                    let material_duration_seconds =
+                        material_duration_seconds.unwrap_or(duration_seconds);
+                    let run_id = run_id.or_else(|| {
+                        Some(format!(
+                            "local-relay-material-hunter-{}",
+                            OffsetDateTime::now_utc().unix_timestamp_nanos()
+                        ))
+                    });
+                    let hunter_loaded = dataset_loaded.clone();
+                    let hunter_output = output_dir.clone();
+                    let hunter_connector = connector.clone();
+                    let mut hunter_task = tokio::task::spawn_local(async move {
+                        material_candidate_hunter_command_with_connector(
+                            &hunter_loaded,
+                            material_duration_seconds,
+                            max_attempted_launches,
+                            target_material_candidates,
+                            max_concurrent_tracked_mints,
+                            no_live_trading,
+                            no_rpc,
+                            upload_r2,
+                            verify_r2,
+                            &hunter_output,
+                            run_id,
+                            hunter_connector,
+                            "local_relay_stream",
+                        )
+                        .await
+                    });
+                    tokio::select! {
+                        result = &mut hunter_task => {
+                            let inner = result.map_err(|error| {
+                                anyhow!("local material hunter task failed before subscription: {error}")
+                            })?;
+                            inner?;
+                            bail!("local material hunter exited before subscribing to relay stream");
+                        }
+                        wait = connector.wait_for_subscription(StdDuration::from_secs(60)) => {
+                            if let Err(error) = wait {
+                                hunter_task.abort();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    let reader_result = run_live_local_stream_collector(
+                        &dataset_loaded,
+                        &listen_url,
+                        duration_seconds,
+                        &output_path,
+                        Some(material_tx),
+                        false,
+                    )
+                    .await;
+                    let hunter_result = hunter_task
+                        .await
+                        .map_err(|error| anyhow!("local material hunter task failed: {error}"))?;
+                    reader_result?;
+                    hunter_result?;
+                    let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
+                    atomic_write_path(
+                        &output_path.join("local_relay_dataset_proof_summary.json"),
+                        &serde_json::to_vec_pretty(&proof_summary)?,
+                    )?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&proof_summary)?);
+                    }
+                    Ok(())
+                })
+                .await;
         }
         return run_live_local_stream_collector(
             loaded,
