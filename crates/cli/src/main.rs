@@ -45561,6 +45561,40 @@ async fn run_live_local_stream_collector(
     Ok(())
 }
 
+fn local_relay_write_service_exit_status(
+    output_dir: &Path,
+    run_id: &str,
+    hunter_exit_status: i32,
+    service_exit_reason: &str,
+    finalization_written_by_wrapper: bool,
+) -> Result<()> {
+    let status = json!({
+        "schema_version": "phase107e.service_exit_status.v1",
+        "run_id": run_id,
+        "hunter_exit_status": hunter_exit_status,
+        "service_exit_reason": service_exit_reason,
+        "finalization_written_by_wrapper": finalization_written_by_wrapper,
+        "countability_decision_exists": output_dir.join("countability_decision.json").exists(),
+        "hunter_summary_exists": output_dir.join("hunter_summary.json").exists(),
+        "hunter_summary_interrupted_exists": output_dir.join("hunter_summary_interrupted.json").exists(),
+        "threshold_tuning_allowed": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    atomic_write_path(
+        &output_dir.join("service_exit_status.json"),
+        &serde_json::to_vec_pretty(&status)?,
+    )?;
+    let markdown = format!(
+        "# Phase 107E Service Exit Status\n\n- run_id: `{run_id}`\n- hunter_exit_status: `{hunter_exit_status}`\n- service_exit_reason: `{service_exit_reason}`\n- finalization_written_by_wrapper: `{finalization_written_by_wrapper}`\n- countability_decision_exists: `{}`\n- threshold_tuning_allowed: `false`\n",
+        status["countability_decision_exists"]
+    );
+    atomic_write_path(
+        &output_dir.join("service_exit_status.md"),
+        markdown.as_bytes(),
+    )?;
+    Ok(())
+}
+
 async fn local_stream_collector_command(
     loaded: &LoadedConfig,
     listen_url: Option<&str>,
@@ -45612,12 +45646,13 @@ async fn local_stream_collector_command(
                     let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
                     let material_duration_seconds =
                         material_duration_seconds.unwrap_or(duration_seconds);
-                    let run_id = run_id.or_else(|| {
-                        Some(format!(
+                    let material_run_id = run_id.unwrap_or_else(|| {
+                        format!(
                             "local-relay-material-hunter-{}",
                             OffsetDateTime::now_utc().unix_timestamp_nanos()
-                        ))
+                        )
                     });
+                    let run_id = Some(material_run_id.clone());
                     let hunter_loaded = dataset_loaded.clone();
                     let hunter_output = output_dir.clone();
                     let hunter_connector = connector.clone();
@@ -45666,8 +45701,33 @@ async fn local_stream_collector_command(
                     let hunter_result = hunter_task
                         .await
                         .map_err(|error| anyhow!("local material hunter task failed: {error}"))?;
-                    reader_result?;
-                    hunter_result?;
+                    if let Err(error) = reader_result {
+                        let _ = local_relay_write_service_exit_status(
+                            &output_path,
+                            &material_run_id,
+                            1,
+                            "local_relay_reader_failed",
+                            false,
+                        );
+                        return Err(error);
+                    }
+                    if let Err(error) = hunter_result {
+                        let _ = local_relay_write_service_exit_status(
+                            &output_path,
+                            &material_run_id,
+                            1,
+                            "local_material_hunter_failed",
+                            false,
+                        );
+                        return Err(error);
+                    }
+                    local_relay_write_service_exit_status(
+                        &output_path,
+                        &material_run_id,
+                        0,
+                        "local_relay_collector_completed",
+                        false,
+                    )?;
                     let proof_summary = local_relay_dataset_proof_summary(&output_path)?;
                     atomic_write_path(
                         &output_path.join("local_relay_dataset_proof_summary.json"),
@@ -58800,6 +58860,29 @@ mod tests {
             blocked["classification"],
             "RELAY_LOCAL_DATASET_BLOCK_SEQUENCE_GAP"
         );
+    }
+
+    #[test]
+    fn phase107g_local_relay_writes_service_exit_status_for_validator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("countability_decision.json"), "{}").expect("countability");
+        fs::write(temp.path().join("hunter_summary.json"), "{}").expect("summary");
+        local_relay_write_service_exit_status(
+            temp.path(),
+            "relay-local-dataset-test",
+            0,
+            "local_relay_collector_completed",
+            false,
+        )
+        .expect("service exit");
+        let status = read_json_file_or_empty(&temp.path().join("service_exit_status.json"));
+        assert_eq!(status["schema_version"], "phase107e.service_exit_status.v1");
+        assert_eq!(status["run_id"], "relay-local-dataset-test");
+        assert_eq!(status["hunter_exit_status"], 0);
+        assert_eq!(status["countability_decision_exists"], true);
+        assert_eq!(status["hunter_summary_exists"], true);
+        assert_eq!(status["threshold_tuning_allowed"], false);
+        assert!(temp.path().join("service_exit_status.md").exists());
     }
 
     #[test]
