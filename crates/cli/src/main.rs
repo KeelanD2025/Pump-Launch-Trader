@@ -40960,11 +40960,34 @@ fn phase107f_upload_r2_checkpoint_blocking(
     verify_r2: bool,
     reason: &str,
 ) -> Result<bool> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(phase107f_upload_r2_checkpoint(
-            loaded, output_dir, run_id, verify_r2, reason,
+    let loaded = loaded.clone();
+    let output_dir = output_dir.to_path_buf();
+    let run_id = run_id.to_owned();
+    let reason = reason.to_owned();
+    std::thread::spawn(move || -> Result<bool> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build phase107f checkpoint helper runtime")?;
+        runtime.block_on(phase107f_upload_r2_checkpoint(
+            &loaded,
+            &output_dir,
+            &run_id,
+            verify_r2,
+            &reason,
         ))
     })
+    .join()
+    .map_err(|panic| {
+        let detail = if let Some(message) = panic.downcast_ref::<&str>() {
+            *message
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else {
+            "unknown panic"
+        };
+        anyhow!("phase107f checkpoint helper panicked: {detail}")
+    })?
 }
 
 async fn material_candidate_hunter_command(
