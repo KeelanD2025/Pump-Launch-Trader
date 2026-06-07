@@ -368,6 +368,112 @@ Pump trade/instruction traffic is prefiltered before deep worker processing. `pu
 
 Worker-side lag must be diagnosed by partition and update class before launch caps are raised. Slot/liveness traffic and empty untracked account updates are reader-side cheap-counted and must not enter the heavy partition worker path. A `client_backpressure_detected` blocker should include the triggering partition, update class, observed lag, threshold, and bounded top-key summaries so the next patch can distinguish hot-key skew from unnecessary worker traffic.
 
+## VPS Relay-Only Architecture
+
+The existing service-owned VPS material-hunter mode remains valid but stays gated by the full
+disk/artifact readiness policy. Relay-only mode is a separate opt-in architecture for cases where
+the VPS is whitelisted for provider streams but should not be the material-hunter processing or
+artifact host.
+
+In relay-only mode, the VPS acts only as stream ingress. It connects to the configured
+Geyser/SREDs provider, drains updates as fast as possible, wraps each update in a stable
+`RelayFrame`, and forwards frames to a local collector over `mtls_grpc_over_private_tunnel`
+transport. The relay writes only capped operational health such as `relay_health_summary.json` and
+`relay_exit_status.json` under `/run/pump-launch-quant/stream-relay` or another explicit relay
+health directory. It must not create `phase107b_material_candidate_hunter` run directories, attempt
+ledgers, candidate summaries, rejected summaries, segment summaries, run countability decisions, R2
+manifests, or final material-hunter artifacts on the VPS. It must not mutate
+`phase107b_material_candidate_hunter/latest_run_id`.
+
+The local machine owns material-hunter processing in relay mode. `local-stream-collector` receives
+relayed frames, verifies per-stream sequence monotonicity and payload hashes, maps relay control
+frames into the material-hunter blocker taxonomy, and runs the classified dispatcher, partition
+workers, active-mint state machine, segmenting, countability, artifact writing, and R2 uploads
+locally. `local-collector-preflight` must pass before accepting relay data; it validates writable
+local output, local free disk, stream-only safety, R2 readiness when upload is requested, disabled
+holder RPC, non-canonical RPC mint supply, and disabled replay/backtesting/tuning/trading.
+
+`RelayFrame` fields include `schema_version`, `relay_session_id`, `stream_id`, `provider`,
+`source_kind`, `subscription_fingerprint`, `sequence`, `received_at_unix_nanos`, optional `slot`,
+optional `commitment`, `payload_codec`, `payload_compressed`, `payload_hash`, `payload_len`,
+`payload_bytes`, optional `control_kind`, and optional `relay_error`. Control frames include
+`relay_started`, `relay_heartbeat`, `relay_upstream_connected`, `relay_upstream_reconnected`,
+`relay_upstream_blocker`, `relay_receiver_backpressure`, `relay_receiver_unavailable`,
+`relay_stopped`, `relay_sequence_gap`, and `relay_shutdown`.
+
+Relay gaps are label-boundary events. `relay_sequence_gap`, `relay_receiver_unavailable`, and
+`relay_downstream_backpressure` are mapped to structured material-hunter blockers. Any active mint
+whose observation window crosses a relay gap is finalized as `terminal_inconclusive` for that
+segment and cannot become replay-eligible. Clean post-gap local segments may become countable only
+when normal countability criteria are met and the local `countability_decision.json` allows it.
+R2 success from the local machine cannot override relay blockers.
+
+Workflow relay control uses the separate `relay_control_action` input and the separate
+`pump-launch-quant-stream-relay` service name. It must not start the material-hunter service, stop
+the material-hunter service, inspect the wrong material-hunter slice, or overwrite material-hunter
+`latest_run_id`. Relay mode has its own smaller relay health/disk policy and does not lower the
+existing VPS material-hunter disk floors.
+
+Local helper scripts:
+
+```bash
+./scripts/local_stream_collector_preflight.sh
+./scripts/local_stream_collector_run.sh
+./scripts/local_stream_collector_validate_artifacts.sh
+```
+
+### Local Collector Storage Modes
+
+`local-collector-preflight` supports explicit storage modes so the local collector does not treat
+every relay proof as a full local artifact mirror:
+
+- `local_mirror`: local disk is the primary artifact store. This is the conservative fallback and
+  still requires `50000 MB` free for normal collection by default. R2 may upload copies, but local
+  artifacts remain durable locally.
+- `r2_primary`: R2 is the durable artifact store. Local disk is bounded staging/spool plus compact
+  manifests, pointers, countability summaries, exit status, and verification summaries. R2 upload
+  and R2 health verification are mandatory before any material-hunter artifacts are produced.
+- `r2_primary` with `collector_proof`: short proof mode. It requires `5000 MB` by default and emits
+  a warning that it is not sufficient for repeated collection.
+- `r2_primary` with `collection`: capped collection mode. It requires `10000 MB` by default.
+- `extended_local_mirror` and `extended_r2_primary`: longer modes with higher disk expectations.
+
+The old `50000 MB` threshold applies to `local_mirror` collection, not R2-primary collector proof.
+For example, `21421 MB` free local disk is enough for `r2_primary` collector proof and capped
+R2-primary collection when R2 upload is enabled and verified, but it still blocks `local_mirror`
+collection.
+
+R2-primary writes bulk artifacts as bounded chunks/shards such as
+`attempt_ledger/part-000001.ndjson`, `candidate_summary/part-000001.ndjson`,
+`rejected_summary/part-000001.ndjson`, `provider_liveness/part-000001.csv`, and
+`checkpoint_status/part-000001.csv`. The local spool has a configured maximum size
+(`2048 MB` for proof and `8192 MB` for capped collection by default). If the spool fills or R2 upload
+backpressure prevents verification, the collector must stop or segment-block safely with
+`r2_local_spool_full`, `r2_upload_backpressure`, `r2_checkpoint_failed`, or
+`r2_final_upload_failed`; it must never silently continue into unbounded local storage.
+
+Before a live R2-primary collector proof, run preflight with live R2 health verification, for
+example `./scripts/local_stream_collector_preflight.sh --storage-mode r2-primary --mode
+collector-proof --verify-r2-health-live`. The live check writes a small health object under the
+managed R2 research prefix, verifies it through the existing R2 object verifier, and fails closed
+without printing secrets if credentials, bucket, prefix, upload, or verification are invalid.
+
+Retention modes are explicit:
+
+- `keep_all`: keeps local artifacts and therefore needs larger disk.
+- `keep_manifests_after_verified_r2`: preferred for R2-primary. Verified bulk chunks may be removed
+  after R2 object verification while local manifests, pointer files, countability decisions, exit
+  status, R2 verification summaries, and final manifests are retained.
+- `delete_verified_bulk_artifacts`: removes verified bulk chunks after R2 verification. It is
+  forbidden when R2 upload is disabled or unverified.
+
+Local artifact consistency may validate from the R2 manifest in R2-primary mode. R2 success still
+cannot make a blocked run countable, cannot make degraded or terminal-inconclusive mints
+replay-eligible, and cannot enable replay, formal backtesting, threshold tuning, or live trading.
+
+Relay-only mode is not the default. Existing full VPS material-hunter mode remains available for
+fallback, but it is still blocked whenever the VPS disk/artifact gate is below threshold.
+
 ## Gap-Segmented Artifact Policy
 
 Provider gaps are label-boundary events. When a slice observes `provider_lagged_data_loss`, early stream close, reconnect exhaustion, progress stall, or client backpressure, any active mint whose observation window crosses that gap must be finalized as `terminal_inconclusive` for that segment and cannot become replay-eligible.

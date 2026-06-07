@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use common::config::ResearchWorkerPnlSanityConfig;
 use common::{
     EventPayload, FillEvent, LoadedConfig, NormalizedEvent, ReasonCode, RuntimeModeName,
@@ -29,11 +29,12 @@ use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
     DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
     LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
-    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RuntimeMode, RuntimeReplayProfile,
-    RuntimeResolvedConfig, Supervisor, build_fixture_scenario, builtin_fixture_suite,
-    builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events, load_fixture_spec,
-    material_hunter_subscription_fingerprint, run_material_hunter_stream_with_progress,
-    smoke_deshred_provider, smoke_geyser_provider, write_report,
+    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RelayHealthSummary, RuntimeMode,
+    RuntimeReplayProfile, RuntimeResolvedConfig, Supervisor, build_fixture_scenario,
+    builtin_fixture_suite, builtin_shred_exit_fixture_suite, collect_fresh_launch_canary_events,
+    load_fixture_spec, material_hunter_subscription_fingerprint,
+    run_material_hunter_stream_with_progress, smoke_deshred_provider, smoke_geyser_provider,
+    write_report,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -433,6 +434,67 @@ enum Command {
         report_dir: Option<String>,
         #[arg(long)]
         enable_checkpoint_simulation: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    VpsStreamRelay {
+        #[arg(long)]
+        receiver_url: Option<String>,
+        #[arg(long, default_value_t = 900)]
+        duration_seconds: u64,
+        #[arg(long, default_value = "/run/pump-launch-quant/stream-relay")]
+        health_dir: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    LocalStreamCollector {
+        #[arg(long)]
+        listen_url: Option<String>,
+        #[arg(long, default_value_t = 900)]
+        duration_seconds: u64,
+        #[arg(long, default_value = "research_output/local_stream_collector")]
+        output_dir: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    RelayHealthProbe {
+        #[arg(long)]
+        receiver_url: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        duration_seconds: u64,
+        #[arg(
+            long,
+            default_value = "/run/pump-launch-quant/stream-relay/health_probe"
+        )]
+        health_dir: String,
+        #[arg(long)]
+        json: bool,
+    },
+    LocalCollectorPreflight {
+        #[arg(long, default_value = "research_output/local_stream_collector")]
+        output_dir: String,
+        #[arg(long)]
+        spool_dir: Option<String>,
+        #[arg(long)]
+        min_free_mb: Option<u64>,
+        #[arg(long, value_enum, default_value_t = LocalCollectorStorageMode::LocalMirror)]
+        storage_mode: LocalCollectorStorageMode,
+        #[arg(long, value_enum, default_value_t = LocalCollectorPreflightMode::Collection)]
+        mode: LocalCollectorPreflightMode,
+        #[arg(long)]
+        r2_spool_max_mb: Option<u64>,
+        #[arg(long)]
+        r2_upload_required: Option<bool>,
+        #[arg(long, value_enum)]
+        retention_mode: Option<LocalCollectorRetentionMode>,
+        #[arg(long)]
+        upload_r2: bool,
+        #[arg(long)]
+        verify_r2_health_live: bool,
         #[arg(long)]
         json: bool,
     },
@@ -4495,6 +4557,84 @@ async fn main() -> Result<()> {
                 progress_stall_seconds,
                 report_dir.as_deref(),
                 enable_checkpoint_simulation,
+                json,
+            )
+            .await
+        }
+        Command::VpsStreamRelay {
+            receiver_url,
+            duration_seconds,
+            health_dir,
+            dry_run,
+            json,
+        } => {
+            vps_stream_relay_command(
+                &loaded,
+                receiver_url.as_deref(),
+                duration_seconds,
+                &health_dir,
+                dry_run,
+                json,
+            )
+            .await
+        }
+        Command::LocalStreamCollector {
+            listen_url,
+            duration_seconds,
+            output_dir,
+            dry_run,
+            json,
+        } => {
+            local_stream_collector_command(
+                &loaded,
+                listen_url.as_deref(),
+                duration_seconds,
+                &output_dir,
+                dry_run,
+                json,
+            )
+            .await
+        }
+        Command::RelayHealthProbe {
+            receiver_url,
+            duration_seconds,
+            health_dir,
+            json,
+        } => {
+            relay_health_probe_command(
+                &loaded,
+                receiver_url.as_deref(),
+                duration_seconds,
+                &health_dir,
+                json,
+            )
+            .await
+        }
+        Command::LocalCollectorPreflight {
+            output_dir,
+            spool_dir,
+            min_free_mb,
+            storage_mode,
+            mode,
+            r2_spool_max_mb,
+            r2_upload_required,
+            retention_mode,
+            upload_r2,
+            verify_r2_health_live,
+            json,
+        } => {
+            local_collector_preflight_command(
+                &loaded,
+                &output_dir,
+                spool_dir.as_deref(),
+                min_free_mb,
+                storage_mode,
+                mode,
+                r2_spool_max_mb,
+                r2_upload_required,
+                retention_mode,
+                upload_r2,
+                verify_r2_health_live,
                 json,
             )
             .await
@@ -44328,6 +44468,42 @@ fn phase107f_static_preflight_report(
     if !workflow.contains("health/last_checkpoint.json") {
         blockers.push("workflow_startup_r2_checkpoint_check_missing".to_owned());
     }
+    if !workflow.contains("relay_control_action") {
+        blockers.push("relay_workflow_input_missing".to_owned());
+    }
+    if !workflow.contains("pump-launch-quant-stream-relay") {
+        blockers.push("relay_service_name_missing".to_owned());
+    }
+    if workflow.contains("relay_control_action != ''")
+        && workflow
+            .split("- name: Run relay-only control action on VPS")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("- name: Download relay-only health reports from VPS")
+                    .next()
+            })
+            .map(|step| {
+                step.contains("phase107b_material_candidate_hunter/latest_run_id")
+                    && step.contains("printf '%s\\n'")
+            })
+            .unwrap_or(false)
+    {
+        blockers.push("relay_workflow_mutates_material_hunter_latest_run_id".to_owned());
+    }
+    if workflow
+        .split("- name: Run relay-only control action on VPS")
+        .nth(1)
+        .and_then(|value| {
+            value
+                .split("- name: Download relay-only health reports from VPS")
+                .next()
+        })
+        .map(|step| step.contains("pump-launch-quant-material-hunter-${RUN_ID}.service"))
+        .unwrap_or(false)
+    {
+        blockers.push("relay_workflow_starts_material_hunter".to_owned());
+    }
 
     let artifact_consistency = if let Some(artifact_dir) = artifact_dir {
         let report = validate_material_hunter_artifact_consistency(artifact_dir)?;
@@ -44378,6 +44554,772 @@ fn material_hunter_preflight_command(
     }
     if !report["ok"].as_bool().unwrap_or(false) {
         bail!("material hunter preflight failed: {}", report["blockers"]);
+    }
+    Ok(())
+}
+
+fn relay_redact_receiver_url(receiver_url: Option<&str>) -> String {
+    receiver_url
+        .map(|value| {
+            if let Some((scheme, rest)) = value.split_once("://") {
+                let host = rest.split('/').next().unwrap_or(rest);
+                format!("{scheme}://{host}/<redacted>")
+            } else {
+                "<redacted>".to_owned()
+            }
+        })
+        .unwrap_or_else(|| "<not_configured>".to_owned())
+}
+
+fn relay_health_dir_is_safe(path: &Path) -> bool {
+    let rendered = path.to_string_lossy();
+    !rendered.contains("phase107b_material_candidate_hunter")
+        && !rendered.contains("research_output")
+        && !rendered.contains("candidate_summary.csv")
+        && !rendered.contains("attempt_ledger.csv")
+}
+
+fn build_relay_health_summary(
+    loaded: &LoadedConfig,
+    relay_session_id: &str,
+    mode: &str,
+    receiver_url: Option<&str>,
+    receiver_available: bool,
+    blocker_class: Option<String>,
+) -> RelayHealthSummary {
+    RelayHealthSummary {
+        schema_version: "phase107g.relay_health.v1".to_owned(),
+        relay_session_id: relay_session_id.to_owned(),
+        mode: mode.to_owned(),
+        provider: "geyser".to_owned(),
+        subscription_fingerprint: material_hunter_subscription_fingerprint(loaded)
+            .unwrap_or_else(|error| format!("fingerprint_error:{error}")),
+        transport: "mtls_grpc_over_private_tunnel".to_owned(),
+        receiver_url_redacted: relay_redact_receiver_url(receiver_url),
+        material_hunter_started: false,
+        material_hunter_artifacts_written: false,
+        latest_run_id_mutated: false,
+        r2_upload_attempted: false,
+        replay_run: false,
+        backtesting_run: false,
+        threshold_tuning_run: false,
+        live_trading_enabled: false,
+        holder_rpc_used: false,
+        rpc_mint_supply_canonical: false,
+        relay_receiver_available: receiver_available,
+        blocker_class,
+    }
+}
+
+fn write_relay_health_artifacts(
+    health_dir: &Path,
+    summary: &RelayHealthSummary,
+    exit_status: &serde_json::Value,
+) -> Result<()> {
+    if !relay_health_dir_is_safe(health_dir) {
+        bail!(
+            "relay health dir must not point at material-hunter artifact storage: {}",
+            health_dir.display()
+        );
+    }
+    fs::create_dir_all(health_dir)
+        .with_context(|| format!("create relay health dir {}", health_dir.display()))?;
+    atomic_write_path(
+        &health_dir.join("relay_health_summary.json"),
+        &serde_json::to_vec_pretty(summary)?,
+    )?;
+    atomic_write_path(
+        &health_dir.join("relay_exit_status.json"),
+        &serde_json::to_vec_pretty(exit_status)?,
+    )?;
+    Ok(())
+}
+
+async fn vps_stream_relay_command(
+    loaded: &LoadedConfig,
+    receiver_url: Option<&str>,
+    duration_seconds: u64,
+    health_dir: &str,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if duration_seconds == 0 {
+        bail!("vps-stream-relay duration must be positive");
+    }
+    let health_dir = Path::new(health_dir);
+    let receiver_available = receiver_url.is_some();
+    let blocker = if receiver_available {
+        None
+    } else {
+        Some("relay_receiver_unavailable".to_owned())
+    };
+    let relay_session_id = derived_run_id("vps-stream-relay");
+    let summary = build_relay_health_summary(
+        loaded,
+        &relay_session_id,
+        "vps_stream_relay",
+        receiver_url,
+        receiver_available,
+        blocker.clone(),
+    );
+    let exit_status = json!({
+        "schema_version": "phase107g.relay_exit_status.v1",
+        "relay_session_id": relay_session_id,
+        "duration_seconds": duration_seconds,
+        "dry_run": dry_run,
+        "provider_connected": false,
+        "receiver_available": receiver_available,
+        "structured_blocker": blocker,
+        "material_hunter_started": false,
+        "material_hunter_artifacts_written": false,
+        "latest_run_id_mutated": false,
+        "r2_upload_attempted": false,
+        "replay_run": false,
+        "backtesting_run": false,
+        "threshold_tuning_run": false,
+        "live_trading_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+    });
+    write_relay_health_artifacts(health_dir, &summary, &exit_status)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "vps stream relay session={} receiver_available={} dry_run={}",
+            summary.relay_session_id, summary.relay_receiver_available, dry_run
+        );
+    }
+    if !dry_run && !receiver_available {
+        bail!("relay receiver unavailable; refusing to start VPS stream relay");
+    }
+    if !dry_run {
+        bail!(
+            "live relay transport is gated until mTLS/private receiver config is supplied and explicitly proven"
+        );
+    }
+    Ok(())
+}
+
+async fn relay_health_probe_command(
+    loaded: &LoadedConfig,
+    receiver_url: Option<&str>,
+    duration_seconds: u64,
+    health_dir: &str,
+    json_output: bool,
+) -> Result<()> {
+    vps_stream_relay_command(
+        loaded,
+        receiver_url,
+        duration_seconds,
+        health_dir,
+        true,
+        json_output,
+    )
+    .await
+}
+
+async fn local_stream_collector_command(
+    loaded: &LoadedConfig,
+    listen_url: Option<&str>,
+    duration_seconds: u64,
+    output_dir: &str,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if duration_seconds == 0 {
+        bail!("local-stream-collector duration must be positive");
+    }
+    let report = local_collector_preflight_report(
+        loaded,
+        Path::new(output_dir),
+        None,
+        Some(1),
+        LocalCollectorStorageMode::LocalMirror,
+        LocalCollectorPreflightMode::RelayProof,
+        None,
+        Some(false),
+        Some(LocalCollectorRetentionMode::KeepAll),
+        false,
+    )?;
+    let listener_ready = listen_url.is_some();
+    let summary = json!({
+        "schema_version": "phase107g.local_stream_collector.v1",
+        "output_dir": output_dir,
+        "listen_url_redacted": relay_redact_receiver_url(listen_url),
+        "duration_seconds": duration_seconds,
+        "dry_run": dry_run,
+        "listener_ready": listener_ready,
+        "preflight": report,
+        "material_hunter_artifacts_local_only": true,
+        "vps_material_hunter_artifacts_written": false,
+        "countability_decision_source_of_truth": "local",
+        "off_vps_candidate_replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "local stream collector listener_ready={} dry_run={}",
+            listener_ready, dry_run
+        );
+    }
+    if !dry_run && !listener_ready {
+        bail!("local collector listener URL missing; refusing to accept relay frames");
+    }
+    if !dry_run {
+        bail!("live local relay ingestion is gated until relay proof is explicitly requested");
+    }
+    Ok(())
+}
+
+fn local_free_mb(path: &Path) -> Option<u64> {
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let output = ProcessCommand::new("df")
+        .arg("-Pm")
+        .arg(target)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum LocalCollectorStorageMode {
+    #[value(name = "local-mirror")]
+    LocalMirror,
+    #[value(name = "r2-primary")]
+    R2Primary,
+    #[value(name = "extended-local-mirror")]
+    ExtendedLocalMirror,
+    #[value(name = "extended-r2-primary")]
+    ExtendedR2Primary,
+}
+
+impl LocalCollectorStorageMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalMirror => "local_mirror",
+            Self::R2Primary => "r2_primary",
+            Self::ExtendedLocalMirror => "extended_local_mirror",
+            Self::ExtendedR2Primary => "extended_r2_primary",
+        }
+    }
+
+    fn is_r2_primary(self) -> bool {
+        matches!(self, Self::R2Primary | Self::ExtendedR2Primary)
+    }
+
+    fn is_local_mirror(self) -> bool {
+        matches!(self, Self::LocalMirror | Self::ExtendedLocalMirror)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum LocalCollectorPreflightMode {
+    #[value(name = "relay-proof")]
+    RelayProof,
+    #[value(name = "collector-proof")]
+    CollectorProof,
+    #[value(name = "collection")]
+    Collection,
+    #[value(name = "extended")]
+    Extended,
+}
+
+impl LocalCollectorPreflightMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RelayProof => "relay_proof",
+            Self::CollectorProof => "collector_proof",
+            Self::Collection => "collection",
+            Self::Extended => "extended",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum LocalCollectorRetentionMode {
+    #[value(name = "keep-all")]
+    KeepAll,
+    #[value(name = "keep-manifests-after-verified-r2")]
+    KeepManifestsAfterVerifiedR2,
+    #[value(name = "delete-verified-bulk-artifacts")]
+    DeleteVerifiedBulkArtifacts,
+}
+
+impl LocalCollectorRetentionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepAll => "keep_all",
+            Self::KeepManifestsAfterVerifiedR2 => "keep_manifests_after_verified_r2",
+            Self::DeleteVerifiedBulkArtifacts => "delete_verified_bulk_artifacts",
+        }
+    }
+
+    fn deletes_bulk(self) -> bool {
+        matches!(
+            self,
+            Self::KeepManifestsAfterVerifiedR2 | Self::DeleteVerifiedBulkArtifacts
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LocalCollectorR2ChunkManifest {
+    schema_version: String,
+    storage_mode: String,
+    artifact_class: String,
+    part_index: u64,
+    local_path: String,
+    payload_len: u64,
+    payload_sha256: String,
+    r2_verified: bool,
+    r2_object_key: Option<String>,
+    retained_locally: bool,
+}
+
+#[allow(dead_code)]
+struct LocalCollectorR2Spool {
+    root: PathBuf,
+    max_bytes: u64,
+    retention_mode: LocalCollectorRetentionMode,
+}
+
+impl LocalCollectorR2Spool {
+    #[allow(dead_code)]
+    fn new(root: PathBuf, max_mb: u64, retention_mode: LocalCollectorRetentionMode) -> Self {
+        Self {
+            root,
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            retention_mode,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn current_size_bytes(path: &Path) -> Result<u64> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                total = total.saturating_add(Self::current_size_bytes(&entry.path())?);
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(total)
+    }
+
+    #[allow(dead_code)]
+    fn write_chunk(
+        &self,
+        artifact_class: &str,
+        part_index: u64,
+        payload: &[u8],
+    ) -> Result<LocalCollectorR2ChunkManifest> {
+        let current = Self::current_size_bytes(&self.root)?;
+        let next = current.saturating_add(payload.len() as u64);
+        if next > self.max_bytes {
+            bail!("r2_local_spool_full:{}>{}", next, self.max_bytes);
+        }
+        let class_dir = self.root.join(artifact_class);
+        fs::create_dir_all(&class_dir)
+            .with_context(|| format!("create local R2 spool dir {}", class_dir.display()))?;
+        let local_path = class_dir.join(format!("part-{part_index:06}.ndjson"));
+        atomic_write_path(&local_path, payload)?;
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        Ok(LocalCollectorR2ChunkManifest {
+            schema_version: "phase107g.local_collector_r2_chunk.v1".to_owned(),
+            storage_mode: LocalCollectorStorageMode::R2Primary.as_str().to_owned(),
+            artifact_class: artifact_class.to_owned(),
+            part_index,
+            local_path: local_path.display().to_string(),
+            payload_len: payload.len() as u64,
+            payload_sha256: format!("{:x}", hasher.finalize()),
+            r2_verified: false,
+            r2_object_key: None,
+            retained_locally: true,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn mark_verified(
+        &self,
+        mut manifest: LocalCollectorR2ChunkManifest,
+        r2_object_key: &str,
+    ) -> Result<LocalCollectorR2ChunkManifest> {
+        let local_path = Path::new(&manifest.local_path);
+        if !local_path.exists() {
+            bail!(
+                "cannot verify missing local spool chunk {}",
+                local_path.display()
+            );
+        }
+        manifest.r2_verified = true;
+        manifest.r2_object_key = Some(r2_object_key.to_owned());
+        if self.retention_mode.deletes_bulk() {
+            fs::remove_file(local_path).with_context(|| {
+                format!("delete verified local spool chunk {}", local_path.display())
+            })?;
+            manifest.retained_locally = false;
+        }
+        Ok(manifest)
+    }
+}
+
+fn local_collector_default_required_mb(
+    storage_mode: LocalCollectorStorageMode,
+    preflight_mode: LocalCollectorPreflightMode,
+) -> u64 {
+    match (storage_mode, preflight_mode) {
+        (_, LocalCollectorPreflightMode::RelayProof) => 1_000,
+        (LocalCollectorStorageMode::R2Primary, LocalCollectorPreflightMode::CollectorProof) => {
+            5_000
+        }
+        (LocalCollectorStorageMode::R2Primary, LocalCollectorPreflightMode::Collection) => 10_000,
+        (LocalCollectorStorageMode::R2Primary, LocalCollectorPreflightMode::Extended) => 25_000,
+        (
+            LocalCollectorStorageMode::ExtendedR2Primary,
+            LocalCollectorPreflightMode::CollectorProof,
+        ) => 10_000,
+        (LocalCollectorStorageMode::ExtendedR2Primary, LocalCollectorPreflightMode::Collection) => {
+            25_000
+        }
+        (LocalCollectorStorageMode::ExtendedR2Primary, LocalCollectorPreflightMode::Extended) => {
+            50_000
+        }
+        (LocalCollectorStorageMode::LocalMirror, LocalCollectorPreflightMode::CollectorProof) => {
+            50_000
+        }
+        (LocalCollectorStorageMode::LocalMirror, LocalCollectorPreflightMode::Collection) => 50_000,
+        (LocalCollectorStorageMode::LocalMirror, LocalCollectorPreflightMode::Extended) => 100_000,
+        (
+            LocalCollectorStorageMode::ExtendedLocalMirror,
+            LocalCollectorPreflightMode::CollectorProof,
+        ) => 100_000,
+        (
+            LocalCollectorStorageMode::ExtendedLocalMirror,
+            LocalCollectorPreflightMode::Collection,
+        ) => 100_000,
+        (LocalCollectorStorageMode::ExtendedLocalMirror, LocalCollectorPreflightMode::Extended) => {
+            150_000
+        }
+    }
+}
+
+fn local_collector_default_spool_max_mb(
+    storage_mode: LocalCollectorStorageMode,
+    preflight_mode: LocalCollectorPreflightMode,
+) -> u64 {
+    if !storage_mode.is_r2_primary() {
+        return 0;
+    }
+    match preflight_mode {
+        LocalCollectorPreflightMode::RelayProof => 512,
+        LocalCollectorPreflightMode::CollectorProof => 2_048,
+        LocalCollectorPreflightMode::Collection => 8_192,
+        LocalCollectorPreflightMode::Extended => 16_384,
+    }
+}
+
+fn local_collector_preflight_decision(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    spool_dir: &Path,
+    free_mb_output: Option<u64>,
+    free_mb_spool: Option<u64>,
+    min_free_mb: Option<u64>,
+    storage_mode: LocalCollectorStorageMode,
+    preflight_mode: LocalCollectorPreflightMode,
+    r2_spool_max_mb: Option<u64>,
+    r2_upload_required: Option<bool>,
+    retention_mode: Option<LocalCollectorRetentionMode>,
+    upload_r2: bool,
+    r2_live_health_verified: Option<bool>,
+) -> serde_json::Value {
+    let required_mb = min_free_mb
+        .unwrap_or_else(|| local_collector_default_required_mb(storage_mode, preflight_mode));
+    let spool_max_mb = r2_spool_max_mb
+        .unwrap_or_else(|| local_collector_default_spool_max_mb(storage_mode, preflight_mode));
+    let retention = retention_mode.unwrap_or(if storage_mode.is_r2_primary() {
+        LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2
+    } else {
+        LocalCollectorRetentionMode::KeepAll
+    });
+    let material_artifacts_expected = preflight_mode != LocalCollectorPreflightMode::RelayProof;
+    let derived_r2_required = storage_mode.is_r2_primary() && material_artifacts_expected;
+    let r2_required = r2_upload_required.unwrap_or(derived_r2_required);
+    let r2_upload_requested = upload_r2 || r2_required;
+    let r2_config_health_verified = loaded.config.r2.enabled && loaded.config.r2.upload_enabled;
+    let r2_health_verified = r2_live_health_verified.unwrap_or(r2_config_health_verified);
+    let mut blockers = Vec::<String>::new();
+    let mut warnings = Vec::<String>::new();
+
+    if free_mb_output
+        .map(|value| value < required_mb)
+        .unwrap_or(true)
+    {
+        blockers.push(format!(
+            "local_output_disk_below_required:{}<{}",
+            free_mb_output.unwrap_or(0),
+            required_mb
+        ));
+    }
+    if storage_mode.is_r2_primary()
+        && free_mb_spool
+            .map(|value| value < required_mb)
+            .unwrap_or(true)
+    {
+        blockers.push(format!(
+            "local_spool_disk_below_required:{}<{}",
+            free_mb_spool.unwrap_or(0),
+            required_mb
+        ));
+    }
+    if storage_mode.is_r2_primary() && material_artifacts_expected && !r2_upload_requested {
+        blockers.push("r2_primary_requires_r2_upload".to_owned());
+    }
+    if r2_required && !loaded.config.r2.upload_enabled {
+        blockers.push("r2_primary_requires_r2_upload".to_owned());
+    }
+    if r2_required && !r2_health_verified {
+        blockers.push("r2_primary_r2_health_not_verified".to_owned());
+    }
+    if retention.deletes_bulk() && !r2_required {
+        blockers.push("retention_delete_requires_verified_r2".to_owned());
+    }
+    if storage_mode.is_r2_primary() && preflight_mode == LocalCollectorPreflightMode::CollectorProof
+    {
+        warnings.push("r2_primary_proof_not_sufficient_for_repeated_collection".to_owned());
+    }
+    if storage_mode.is_r2_primary() && retention == LocalCollectorRetentionMode::KeepAll {
+        warnings.push("r2_primary_keep_all_requires_larger_local_disk".to_owned());
+    }
+    if storage_mode.is_local_mirror() && r2_upload_requested {
+        warnings
+            .push("local_mirror_keeps_local_artifacts_even_when_r2_upload_is_enabled".to_owned());
+    }
+
+    let stream_only = loaded.stream_only_validation_summary();
+    if !stream_only.passed {
+        blockers.push("stream_only_validation_failed".to_owned());
+    }
+    if stream_only.holder_rpc_calls_allowed || stream_only.top_holder_rpc_calls_allowed {
+        blockers.push("holder_rpc_allowed_by_config".to_owned());
+    }
+    if stream_only.live_execution_enabled
+        || stream_only.send_rpc_allowed
+        || stream_only.use_rpc_send
+    {
+        blockers.push("live_trading_or_send_rpc_enabled".to_owned());
+    }
+
+    json!({
+        "schema_version": "phase107g.local_collector_preflight.v2",
+        "storage_mode": storage_mode.as_str(),
+        "preflight_mode": preflight_mode.as_str(),
+        "output_dir": output_dir.display().to_string(),
+        "spool_dir": spool_dir.display().to_string(),
+        "free_mb_output": free_mb_output,
+        "free_mb_spool": free_mb_spool,
+        "required_mb": required_mb,
+        "r2_spool_max_mb": spool_max_mb,
+        "r2_upload_required": r2_required,
+        "r2_upload_requested": r2_upload_requested,
+        "r2_upload_enabled": loaded.config.r2.upload_enabled,
+        "r2_config_enabled": loaded.config.r2.enabled,
+        "r2_health_verified": r2_health_verified,
+        "r2_health_check_mode": if r2_live_health_verified.is_some() { "live_object" } else { "config" },
+        "r2_config_health_verified": r2_config_health_verified,
+        "retention_mode": retention.as_str(),
+        "local_output_primary": storage_mode.is_local_mirror(),
+        "r2_durable_primary": storage_mode.is_r2_primary(),
+        "relay_only_material_artifacts_expected": material_artifacts_expected,
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "holder_rpc_enabled": false,
+        "rpc_mint_supply_canonical": false,
+        "blockers": blockers,
+        "warnings": warnings,
+        "ok": blockers.is_empty(),
+    })
+}
+
+fn local_collector_preflight_report(
+    loaded: &LoadedConfig,
+    output_dir: &Path,
+    spool_dir: Option<&Path>,
+    min_free_mb: Option<u64>,
+    storage_mode: LocalCollectorStorageMode,
+    preflight_mode: LocalCollectorPreflightMode,
+    r2_spool_max_mb: Option<u64>,
+    r2_upload_required: Option<bool>,
+    retention_mode: Option<LocalCollectorRetentionMode>,
+    upload_r2: bool,
+) -> Result<serde_json::Value> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create local collector output dir {}", output_dir.display()))?;
+    let default_spool_dir = output_dir.join(".r2_spool");
+    let spool_dir = spool_dir.unwrap_or(&default_spool_dir);
+    fs::create_dir_all(spool_dir)
+        .with_context(|| format!("create local collector spool dir {}", spool_dir.display()))?;
+    let probe_path = output_dir.join(".local_collector_preflight_write_probe");
+    atomic_write_path(&probe_path, b"ok")?;
+    let _ = fs::remove_file(&probe_path);
+    let spool_probe_path = spool_dir.join(".local_collector_spool_write_probe");
+    atomic_write_path(&spool_probe_path, b"ok")?;
+    let _ = fs::remove_file(&spool_probe_path);
+    Ok(local_collector_preflight_decision(
+        loaded,
+        output_dir,
+        spool_dir,
+        local_free_mb(output_dir),
+        local_free_mb(spool_dir),
+        min_free_mb,
+        storage_mode,
+        preflight_mode,
+        r2_spool_max_mb,
+        r2_upload_required,
+        retention_mode,
+        upload_r2,
+        None,
+    ))
+}
+
+async fn local_collector_r2_live_health_check(
+    loaded: &LoadedConfig,
+    spool_dir: &Path,
+) -> Result<bool> {
+    fs::create_dir_all(spool_dir).with_context(|| {
+        format!(
+            "create local collector R2 health dir {}",
+            spool_dir.display()
+        )
+    })?;
+    let client = r2_client_for_command(loaded, false, true, false)?;
+    let bucket = client.bucket_for_reports()?;
+    let payload = json!({
+        "schema_version": "phase107g.local_collector_r2_health.v1",
+        "created_at": OffsetDateTime::now_utc().to_string(),
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+    });
+    let local_path = spool_dir.join("local_collector_r2_health_probe.json");
+    atomic_write_path(&local_path, &serde_json::to_vec_pretty(&payload)?)?;
+    let key = client.managed_key(
+        &research_remote_base_prefix(&client),
+        &format!(
+            "local_collector_health/{}/local_collector_r2_health_probe.json",
+            derived_run_id("local-collector-r2-health")
+        ),
+    );
+    let prepared = client.prepare_upload(
+        &local_path,
+        bucket,
+        key,
+        "application/json",
+        BTreeMap::from([
+            ("purpose".to_owned(), "local_collector_r2_health".to_owned()),
+            ("schema_version".to_owned(), "phase107g".to_owned()),
+        ]),
+        Some(false),
+    )?;
+    let result = client.upload_prepared(&prepared, Some(true)).await?;
+    Ok(result.uploaded && result.verified)
+}
+
+async fn local_collector_preflight_command(
+    loaded: &LoadedConfig,
+    output_dir: &str,
+    spool_dir: Option<&str>,
+    min_free_mb: Option<u64>,
+    storage_mode: LocalCollectorStorageMode,
+    preflight_mode: LocalCollectorPreflightMode,
+    r2_spool_max_mb: Option<u64>,
+    r2_upload_required: Option<bool>,
+    retention_mode: Option<LocalCollectorRetentionMode>,
+    upload_r2: bool,
+    verify_r2_health_live: bool,
+    json_output: bool,
+) -> Result<()> {
+    let output_path = Path::new(output_dir);
+    let default_spool_dir = output_path.join(".r2_spool");
+    let spool_path = spool_dir.map(PathBuf::from).unwrap_or(default_spool_dir);
+    let r2_live_health_verified = if verify_r2_health_live {
+        Some(local_collector_r2_live_health_check(loaded, &spool_path).await?)
+    } else {
+        None
+    };
+    let report = local_collector_preflight_report(
+        loaded,
+        output_path,
+        Some(spool_path.as_path()),
+        min_free_mb,
+        storage_mode,
+        preflight_mode,
+        r2_spool_max_mb,
+        r2_upload_required,
+        retention_mode,
+        upload_r2,
+    )?;
+    let report = if r2_live_health_verified.is_some() {
+        local_collector_preflight_decision(
+            loaded,
+            output_path,
+            spool_path.as_path(),
+            local_free_mb(output_path),
+            local_free_mb(spool_path.as_path()),
+            min_free_mb,
+            storage_mode,
+            preflight_mode,
+            r2_spool_max_mb,
+            r2_upload_required,
+            retention_mode,
+            upload_r2,
+            r2_live_health_verified,
+        )
+    } else {
+        report
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "local collector preflight ok={} storage_mode={} required_mb={} free_mb_output={}",
+            report["ok"], report["storage_mode"], report["required_mb"], report["free_mb_output"]
+        );
+    }
+    if !report["ok"].as_bool().unwrap_or(false) {
+        bail!("local collector preflight failed: {}", report["blockers"]);
     }
     Ok(())
 }
@@ -56662,6 +57604,341 @@ mod tests {
         assert!(summarize_step.contains("stream_acceptance_probe_stage_results.json"));
         assert!(summarize_step.contains("material_hunter_collection_allowed"));
         assert!(summarize_step.contains("launch_caps_raise_allowed"));
+    }
+
+    #[test]
+    fn phase107g_relay_health_writes_no_material_hunter_artifacts() {
+        let loaded = load_default_config_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let summary = build_relay_health_summary(
+            &loaded,
+            "relay-session",
+            "vps_stream_relay",
+            Some("https://relay.internal:9443/ingest"),
+            true,
+            None,
+        );
+        let exit_status = json!({
+            "schema_version": "phase107g.relay_exit_status.v1",
+            "material_hunter_started": false,
+            "latest_run_id_mutated": false,
+            "r2_upload_attempted": false
+        });
+        write_relay_health_artifacts(temp.path(), &summary, &exit_status).expect("write relay");
+        assert!(temp.path().join("relay_health_summary.json").exists());
+        assert!(temp.path().join("relay_exit_status.json").exists());
+        assert!(!temp.path().join("attempt_ledger.csv").exists());
+        assert!(!temp.path().join("candidate_summary.csv").exists());
+        assert!(!temp.path().join("rejected_summary.csv").exists());
+        assert!(!temp.path().join("run_countability_decision.json").exists());
+    }
+
+    #[test]
+    fn phase107g_relay_health_rejects_material_hunter_artifact_dir() {
+        let loaded = load_default_config_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let unsafe_dir = temp
+            .path()
+            .join("phase107b_material_candidate_hunter")
+            .join("relay");
+        let summary = build_relay_health_summary(
+            &loaded,
+            "relay-session",
+            "vps_stream_relay",
+            None,
+            false,
+            Some("relay_receiver_unavailable".to_owned()),
+        );
+        let result = write_relay_health_artifacts(&unsafe_dir, &summary, &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn phase107g_local_collector_preflight_keeps_dangerous_modes_disabled() {
+        let loaded = load_default_config_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report = local_collector_preflight_report(
+            &loaded,
+            temp.path(),
+            None,
+            Some(1),
+            LocalCollectorStorageMode::LocalMirror,
+            LocalCollectorPreflightMode::RelayProof,
+            None,
+            Some(false),
+            Some(LocalCollectorRetentionMode::KeepAll),
+            false,
+        )
+        .expect("preflight");
+        assert_eq!(report["replay_allowed"], false);
+        assert_eq!(report["formal_backtesting_allowed"], false);
+        assert_eq!(report["threshold_tuning_allowed"], false);
+        assert_eq!(report["live_trading_enabled"], false);
+        assert_eq!(report["holder_rpc_enabled"], false);
+        assert_eq!(report["rpc_mint_supply_canonical"], false);
+    }
+
+    #[test]
+    fn phase107g_r2_primary_proof_passes_with_21421_mb_when_r2_healthy() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.r2.enabled = true;
+        loaded.config.r2.upload_enabled = true;
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(21_421),
+            Some(21_421),
+            None,
+            LocalCollectorStorageMode::R2Primary,
+            LocalCollectorPreflightMode::CollectorProof,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["required_mb"], 5_000);
+        assert_eq!(report["r2_upload_required"], true);
+        assert_eq!(report["r2_health_verified"], true);
+    }
+
+    #[test]
+    fn phase107g_r2_primary_collection_passes_with_21421_mb_when_r2_healthy() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.r2.enabled = true;
+        loaded.config.r2.upload_enabled = true;
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(21_421),
+            Some(21_421),
+            None,
+            LocalCollectorStorageMode::R2Primary,
+            LocalCollectorPreflightMode::Collection,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["required_mb"], 10_000);
+    }
+
+    #[test]
+    fn phase107g_local_mirror_collection_blocks_with_21421_mb() {
+        let loaded = load_default_config_for_test();
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(21_421),
+            Some(21_421),
+            None,
+            LocalCollectorStorageMode::LocalMirror,
+            LocalCollectorPreflightMode::Collection,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["required_mb"], 50_000);
+        assert!(report["blockers"].as_array().unwrap().iter().any(|value| {
+            value
+                .as_str()
+                .unwrap()
+                .starts_with("local_output_disk_below_required:21421<50000")
+        }));
+    }
+
+    #[test]
+    fn phase107g_r2_primary_blocks_when_r2_upload_disabled() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.r2.enabled = true;
+        loaded.config.r2.upload_enabled = false;
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(21_421),
+            Some(21_421),
+            None,
+            LocalCollectorStorageMode::R2Primary,
+            LocalCollectorPreflightMode::CollectorProof,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("r2_primary_requires_r2_upload"))
+        );
+    }
+
+    #[test]
+    fn phase107g_r2_primary_blocks_when_r2_health_fails() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.r2.enabled = false;
+        loaded.config.r2.upload_enabled = true;
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(21_421),
+            Some(21_421),
+            None,
+            LocalCollectorStorageMode::R2Primary,
+            LocalCollectorPreflightMode::CollectorProof,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("r2_primary_r2_health_not_verified"))
+        );
+    }
+
+    #[test]
+    fn phase107g_relay_only_proof_can_run_without_r2_upload() {
+        let mut loaded = load_default_config_for_test();
+        loaded.config.r2.enabled = false;
+        loaded.config.r2.upload_enabled = false;
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(2_000),
+            Some(2_000),
+            None,
+            LocalCollectorStorageMode::R2Primary,
+            LocalCollectorPreflightMode::RelayProof,
+            None,
+            Some(false),
+            Some(LocalCollectorRetentionMode::KeepAll),
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["r2_upload_required"], false);
+        assert_eq!(report["relay_only_material_artifacts_expected"], false);
+    }
+
+    #[test]
+    fn phase107g_r2_primary_spool_deletes_only_verified_bulk_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spool = LocalCollectorR2Spool::new(
+            temp.path().join("spool"),
+            1,
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        );
+        let manifest = spool
+            .write_chunk("attempt_ledger", 1, b"{\"mint\":\"mint\"}\n")
+            .expect("write chunk");
+        assert!(Path::new(&manifest.local_path).exists());
+        assert!(!manifest.r2_verified);
+        let verified = spool
+            .mark_verified(manifest, "runs/proof/attempt_ledger/part-000001.ndjson")
+            .expect("verified");
+        assert!(verified.r2_verified);
+        assert!(!verified.retained_locally);
+        assert!(!Path::new(&verified.local_path).exists());
+    }
+
+    #[test]
+    fn phase107g_r2_primary_spool_full_is_structured_blocker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spool = LocalCollectorR2Spool::new(
+            temp.path().join("spool"),
+            0,
+            LocalCollectorRetentionMode::KeepAll,
+        );
+        let error = spool
+            .write_chunk("candidate_summary", 1, b"too large")
+            .expect_err("spool full");
+        assert!(format!("{error:#}").contains("r2_local_spool_full"));
+    }
+
+    #[test]
+    fn phase107g_retention_mode_cannot_delete_without_r2_required() {
+        let loaded = load_default_config_for_test();
+        let report = local_collector_preflight_decision(
+            &loaded,
+            Path::new("research_output/local_stream_collector"),
+            Path::new("research_output/local_stream_collector/.r2_spool"),
+            Some(100_000),
+            Some(100_000),
+            None,
+            LocalCollectorStorageMode::LocalMirror,
+            LocalCollectorPreflightMode::Collection,
+            None,
+            Some(false),
+            Some(LocalCollectorRetentionMode::DeleteVerifiedBulkArtifacts),
+            false,
+            None,
+        );
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("retention_delete_requires_verified_r2"))
+        );
+    }
+
+    #[test]
+    fn phase107g_relay_workflow_does_not_start_material_hunter_or_latest_run() {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/build-linux-cli.yml");
+        let workflow = fs::read_to_string(workflow_path).expect("workflow");
+        let relay_step = workflow
+            .split("- name: Run relay-only control action on VPS")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("- name: Download relay-only health reports from VPS")
+                    .next()
+            })
+            .expect("relay step");
+        assert!(workflow.contains("relay_control_action"));
+        assert!(relay_step.contains("pump-launch-quant-stream-relay"));
+        assert!(!relay_step.contains("pump-launch-quant-material-hunter-${RUN_ID}.service"));
+        assert!(!relay_step.contains("printf '%s\\n' \"${RUN_ID}\" > \"${LATEST_FILE}\""));
+        assert!(!relay_step.contains("upload-artifacts-r2"));
+    }
+
+    #[test]
+    fn phase107g_relay_receiver_unavailable_maps_to_structured_blocker() {
+        assert_eq!(
+            runtime::relay_control_to_material_blocker(
+                runtime::RelayControlKind::RelayReceiverUnavailable
+            ),
+            Some("relay_receiver_unavailable")
+        );
+        assert_eq!(
+            runtime::relay_control_to_material_blocker(
+                runtime::RelayControlKind::RelayReceiverBackpressure
+            ),
+            Some("relay_downstream_backpressure")
+        );
     }
 
     #[test]

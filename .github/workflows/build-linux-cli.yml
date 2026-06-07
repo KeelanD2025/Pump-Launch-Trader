@@ -78,11 +78,11 @@ on:
         required: false
         default: false
         type: boolean
-      run_geyser_diagnostic:
-        description: Run a short provider stream diagnostic after deploy
+      relay_control_action:
+        description: Relay-only control action (deploy, start, status, stop, collect_health, probe)
         required: false
-        default: false
-        type: boolean
+        default: ""
+        type: string
       run_provider_health_probe:
         description: Run provider-health-probe on VPS without starting material hunter
         required: false
@@ -233,7 +233,7 @@ jobs:
 
   deploy-to-vps:
     name: Deploy prebuilt CLI to VPS
-    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' || github.event.inputs.run_housekeeping_only == 'true' }}
+    if: ${{ github.event.inputs.deploy_to_vps == 'true' || github.event.inputs.run_provider_health_probe == 'true' || github.event.inputs.run_material_hunter_stream_acceptance_probe == 'true' || github.event.inputs.check_material_candidate_hunter_status == 'true' || github.event.inputs.stop_material_candidate_hunter_service == 'true' || github.event.inputs.collect_material_candidate_hunter_artifacts == 'true' || github.event.inputs.run_housekeeping_only == 'true' || github.event.inputs.relay_control_action != '' }}
     needs: build-linux-cli
     runs-on: ubuntu-22.04
 
@@ -852,6 +852,137 @@ jobs:
         with:
           name: phase100-provider-unblock
           path: phase100-provider-unblock
+          if-no-files-found: error
+
+      - name: Run relay-only control action on VPS
+        if: ${{ github.event.inputs.relay_control_action != '' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          RELAY_CONTROL_ACTION: ${{ github.event.inputs.relay_control_action }}
+          RELAY_RECEIVER_URL: ${{ secrets.RELAY_RECEIVER_URL }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          ACTION="${RELAY_CONTROL_ACTION}"
+          case "${ACTION}" in
+            deploy|start|status|stop|collect_health|probe) ;;
+            *)
+              echo "::error::Unsupported relay_control_action=${ACTION}"
+              exit 1
+              ;;
+          esac
+
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" \
+            APP_DIR="${APP_DIR}" ACTION="${ACTION}" RELAY_RECEIVER_URL="${RELAY_RECEIVER_URL:-}" 'bash -se' <<'EOF'
+          set -euo pipefail
+          APP_DIR="${APP_DIR}"
+          BIN="${APP_DIR}/target/release/cli"
+          VALIDATE_CONFIG=(--config "${APP_DIR}/config/default.toml" --config-override "${APP_DIR}/config/local.toml")
+          ENV_FILE="/home/ubuntu/pump-launch-quant.env"
+          HEALTH_DIR="/run/pump-launch-quant/stream-relay"
+          SERVICE_NAME="pump-launch-quant-stream-relay.service"
+
+          if [[ -f "${ENV_FILE}" ]]; then
+            set -a
+            source "${ENV_FILE}"
+            set +a
+          fi
+
+          if sudo systemctl list-units --type=service --state=running 'pump-launch-quant-material-hunter-*.service' --no-legend | grep -q .; then
+            echo "::error::Material hunter service is running; relay control refuses to overlap"
+            exit 1
+          fi
+
+          case "${ACTION}" in
+            deploy|status|collect_health)
+              mkdir -p "${HEALTH_DIR}"
+              "${BIN}" vps-stream-relay "${VALIDATE_CONFIG[@]}" \
+                --receiver-url "${RELAY_RECEIVER_URL:-}" \
+                --health-dir "${HEALTH_DIR}" \
+                --dry-run \
+                --json > "${HEALTH_DIR}/relay_control_summary.json"
+              ;;
+            probe)
+              mkdir -p "${HEALTH_DIR}/probe"
+              "${BIN}" relay-health-probe "${VALIDATE_CONFIG[@]}" \
+                --receiver-url "${RELAY_RECEIVER_URL:-}" \
+                --health-dir "${HEALTH_DIR}/probe" \
+                --json > "${HEALTH_DIR}/probe/relay_health_probe_stdout.json"
+              ;;
+            start)
+              if [[ -z "${RELAY_RECEIVER_URL:-}" ]]; then
+                echo "::error::RELAY_RECEIVER_URL secret is required before relay start"
+                exit 1
+              fi
+              cat > "/tmp/pump-launch-quant-stream-relay-wrapper.sh" <<'WRAP'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "${APP_DIR}/target/release/cli" vps-stream-relay \
+            --config "${APP_DIR}/config/default.toml" \
+            --config-override "${APP_DIR}/config/local.toml" \
+            --receiver-url "${RELAY_RECEIVER_URL}" \
+            --health-dir "/run/pump-launch-quant/stream-relay" \
+            --duration-seconds 900 \
+            --json
+          WRAP
+              chmod +x "/tmp/pump-launch-quant-stream-relay-wrapper.sh"
+              sudo systemd-run \
+                --unit="${SERVICE_NAME%.service}" \
+                --property=RuntimeMaxSec=1020 \
+                --property=WorkingDirectory="${APP_DIR}" \
+                --property=Environment="APP_DIR=${APP_DIR}" \
+                --property=Environment="RELAY_RECEIVER_URL=${RELAY_RECEIVER_URL}" \
+                "/tmp/pump-launch-quant-stream-relay-wrapper.sh"
+              ;;
+            stop)
+              sudo systemctl stop "${SERVICE_NAME}" || true
+              ;;
+          esac
+
+          if [[ -f "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" ]]; then
+            cp "${APP_DIR}/data/reports/phase107b_material_candidate_hunter/latest_run_id" "${HEALTH_DIR}/material_hunter_latest_run_id_observed"
+          fi
+          test ! -f "${HEALTH_DIR}/attempt_ledger.csv"
+          test ! -f "${HEALTH_DIR}/candidate_summary.csv"
+          test ! -f "${HEALTH_DIR}/rejected_summary.csv"
+          EOF
+
+      - name: Download relay-only health reports from VPS
+        if: ${{ always() && github.event.inputs.relay_control_action != '' }}
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${VPS_PORT:-22}"
+          APP_DIR="${VPS_APP_DIR:-/home/ubuntu/pump-launch-quant}"
+          LOCAL_RELAY_DIR="vps-stream-relay-health"
+          rm -rf "${LOCAL_RELAY_DIR}"
+          mkdir -p "${LOCAL_RELAY_DIR}"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" APP_DIR="${APP_DIR}" 'bash -se' <<'EOF' | tar -xzf - -C "${LOCAL_RELAY_DIR}" --strip-components=1
+          set -euo pipefail
+          HEALTH_DIR="/run/pump-launch-quant/stream-relay"
+          if [[ ! -d "${HEALTH_DIR}" ]]; then
+            echo "relay health directory not found: ${HEALTH_DIR}" >&2
+            exit 1
+          fi
+          tar -czf - -C /run/pump-launch-quant stream-relay
+          EOF
+
+      - name: Upload relay-only health reports
+        if: ${{ always() && github.event.inputs.relay_control_action != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-stream-relay-health
+          path: vps-stream-relay-health
           if-no-files-found: error
 
       - name: Run provider health probe on VPS

@@ -1028,6 +1028,206 @@ impl Default for FastClassifiedUpdate {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySourceKind {
+    Geyser,
+    Sreds,
+    Other,
+}
+
+impl Default for RelaySourceKind {
+    fn default() -> Self {
+        Self::Geyser
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayControlKind {
+    RelayStarted,
+    RelayHeartbeat,
+    RelayUpstreamConnected,
+    RelayUpstreamReconnected,
+    RelayUpstreamBlocker,
+    RelayReceiverBackpressure,
+    RelayReceiverUnavailable,
+    RelayStopped,
+    RelaySequenceGap,
+    RelayShutdown,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayFrame {
+    pub schema_version: String,
+    pub relay_session_id: String,
+    pub stream_id: String,
+    pub provider: String,
+    pub source_kind: RelaySourceKind,
+    pub subscription_fingerprint: String,
+    pub sequence: u64,
+    pub received_at_unix_nanos: u128,
+    #[serde(default)]
+    pub slot: Option<u64>,
+    #[serde(default)]
+    pub commitment: Option<String>,
+    pub payload_codec: String,
+    pub payload_compressed: bool,
+    pub payload_hash: String,
+    pub payload_len: usize,
+    #[serde(default)]
+    pub payload_bytes: Vec<u8>,
+    #[serde(default)]
+    pub control_kind: Option<RelayControlKind>,
+    #[serde(default)]
+    pub relay_error: Option<String>,
+}
+
+impl RelayFrame {
+    pub fn data(
+        relay_session_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        provider: impl Into<String>,
+        subscription_fingerprint: impl Into<String>,
+        sequence: u64,
+        received_at_unix_nanos: u128,
+        slot: Option<u64>,
+        payload_codec: impl Into<String>,
+        payload_bytes: Vec<u8>,
+    ) -> Self {
+        let payload_hash = relay_payload_sha256(&payload_bytes);
+        Self {
+            schema_version: "phase107g.relay_frame.v1".to_owned(),
+            relay_session_id: relay_session_id.into(),
+            stream_id: stream_id.into(),
+            provider: provider.into(),
+            source_kind: RelaySourceKind::Geyser,
+            subscription_fingerprint: subscription_fingerprint.into(),
+            sequence,
+            received_at_unix_nanos,
+            slot,
+            commitment: None,
+            payload_codec: payload_codec.into(),
+            payload_compressed: false,
+            payload_hash,
+            payload_len: payload_bytes.len(),
+            payload_bytes,
+            control_kind: None,
+            relay_error: None,
+        }
+    }
+
+    pub fn control(
+        relay_session_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        provider: impl Into<String>,
+        subscription_fingerprint: impl Into<String>,
+        sequence: u64,
+        received_at_unix_nanos: u128,
+        control_kind: RelayControlKind,
+        relay_error: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: "phase107g.relay_frame.v1".to_owned(),
+            relay_session_id: relay_session_id.into(),
+            stream_id: stream_id.into(),
+            provider: provider.into(),
+            source_kind: RelaySourceKind::Geyser,
+            subscription_fingerprint: subscription_fingerprint.into(),
+            sequence,
+            received_at_unix_nanos,
+            slot: None,
+            commitment: None,
+            payload_codec: "control_json".to_owned(),
+            payload_compressed: false,
+            payload_hash: relay_payload_sha256(&[]),
+            payload_len: 0,
+            payload_bytes: Vec::new(),
+            control_kind: Some(control_kind),
+            relay_error,
+        }
+    }
+
+    pub fn verify_payload_hash(&self) -> bool {
+        self.payload_len == self.payload_bytes.len()
+            && self.payload_hash == relay_payload_sha256(&self.payload_bytes)
+    }
+}
+
+pub fn relay_payload_sha256(payload: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(payload);
+    hex::encode(digest)
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RelaySequenceVerifier {
+    #[serde(default)]
+    last_sequence_by_stream: BTreeMap<String, u64>,
+}
+
+impl RelaySequenceVerifier {
+    pub fn observe(&mut self, frame: &RelayFrame) -> Result<(), String> {
+        if !frame.verify_payload_hash() {
+            return Err("relay_payload_hash_mismatch".to_owned());
+        }
+        match self.last_sequence_by_stream.get(&frame.stream_id).copied() {
+            None => {
+                if frame.sequence != 1 {
+                    return Err(format!(
+                        "relay_sequence_gap:{}:{}",
+                        frame.stream_id, frame.sequence
+                    ));
+                }
+            }
+            Some(last) => {
+                if frame.sequence != last.saturating_add(1) {
+                    return Err(format!(
+                        "relay_sequence_gap:{}:{}>{}",
+                        frame.stream_id, last, frame.sequence
+                    ));
+                }
+            }
+        }
+        self.last_sequence_by_stream
+            .insert(frame.stream_id.clone(), frame.sequence);
+        Ok(())
+    }
+}
+
+pub fn relay_control_to_material_blocker(control: RelayControlKind) -> Option<&'static str> {
+    match control {
+        RelayControlKind::RelayReceiverBackpressure => Some("relay_downstream_backpressure"),
+        RelayControlKind::RelayReceiverUnavailable => Some("relay_receiver_unavailable"),
+        RelayControlKind::RelaySequenceGap => Some("relay_sequence_gap"),
+        RelayControlKind::RelayUpstreamBlocker => Some("relay_upstream_blocker"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayHealthSummary {
+    pub schema_version: String,
+    pub relay_session_id: String,
+    pub mode: String,
+    pub provider: String,
+    pub subscription_fingerprint: String,
+    pub transport: String,
+    pub receiver_url_redacted: String,
+    pub material_hunter_started: bool,
+    pub material_hunter_artifacts_written: bool,
+    pub latest_run_id_mutated: bool,
+    pub r2_upload_attempted: bool,
+    pub replay_run: bool,
+    pub backtesting_run: bool,
+    pub threshold_tuning_run: bool,
+    pub live_trading_enabled: bool,
+    pub holder_rpc_used: bool,
+    pub rpc_mint_supply_canonical: bool,
+    pub relay_receiver_available: bool,
+    #[serde(default)]
+    pub blocker_class: Option<String>,
+}
+
 #[allow(dead_code)]
 struct CriticalLaunchModule;
 #[allow(dead_code)]
@@ -9163,6 +9363,108 @@ mod tests {
         assert_eq!(
             MaterialUpdateClass::from_legacy_name("transaction_untracked_pump"),
             MaterialUpdateClass::TransactionUntrackedPump
+        );
+    }
+
+    #[test]
+    fn relay_frame_sequence_numbers_are_monotonic() {
+        let mut verifier = RelaySequenceVerifier::default();
+        let first = RelayFrame::data(
+            "relay",
+            "geyser-0",
+            "provider",
+            "fingerprint",
+            1,
+            10,
+            Some(42),
+            "yellowstone_subscribe_update_prost",
+            b"frame-one".to_vec(),
+        );
+        let second = RelayFrame::data(
+            "relay",
+            "geyser-0",
+            "provider",
+            "fingerprint",
+            2,
+            11,
+            Some(43),
+            "yellowstone_subscribe_update_prost",
+            b"frame-two".to_vec(),
+        );
+        verifier.observe(&first).expect("first frame");
+        verifier.observe(&second).expect("second frame");
+    }
+
+    #[test]
+    fn relay_frame_hash_verification_catches_corruption() {
+        let mut frame = RelayFrame::data(
+            "relay",
+            "geyser-0",
+            "provider",
+            "fingerprint",
+            1,
+            10,
+            None,
+            "yellowstone_subscribe_update_prost",
+            b"clean".to_vec(),
+        );
+        assert!(frame.verify_payload_hash());
+        frame.payload_bytes = b"dirty".to_vec();
+        assert!(!frame.verify_payload_hash());
+        let mut verifier = RelaySequenceVerifier::default();
+        assert_eq!(
+            verifier.observe(&frame).expect_err("corrupt frame"),
+            "relay_payload_hash_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_collector_detects_relay_sequence_gaps() {
+        let mut verifier = RelaySequenceVerifier::default();
+        let first = RelayFrame::data(
+            "relay",
+            "geyser-0",
+            "provider",
+            "fingerprint",
+            1,
+            10,
+            None,
+            "yellowstone_subscribe_update_prost",
+            b"one".to_vec(),
+        );
+        let third = RelayFrame::data(
+            "relay",
+            "geyser-0",
+            "provider",
+            "fingerprint",
+            3,
+            12,
+            None,
+            "yellowstone_subscribe_update_prost",
+            b"three".to_vec(),
+        );
+        verifier.observe(&first).expect("first");
+        assert!(
+            verifier
+                .observe(&third)
+                .expect_err("gap")
+                .starts_with("relay_sequence_gap:geyser-0:1>3")
+        );
+    }
+
+    #[test]
+    fn relay_control_frames_map_to_material_blockers() {
+        assert_eq!(
+            relay_control_to_material_blocker(RelayControlKind::RelayReceiverBackpressure),
+            Some("relay_downstream_backpressure")
+        );
+        assert_eq!(
+            relay_control_to_material_blocker(RelayControlKind::RelayReceiverUnavailable),
+            Some("relay_receiver_unavailable")
+        );
+        assert_eq!(
+            relay_control_to_material_blocker(RelayControlKind::RelayHeartbeat),
+            None
         );
     }
 }
