@@ -44963,6 +44963,12 @@ fn local_relay_material_forward_expired(now: Instant, deadline: Option<Instant>)
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
+fn local_relay_terminal_close_status(reason: &str) -> Status {
+    Status::data_loss(format!(
+        "unrecoverable data loss: provider_reconnect_exhausted: {reason}"
+    ))
+}
+
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
     receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>,
@@ -45784,6 +45790,22 @@ async fn run_live_local_stream_collector(
             Err(_) => break,
         };
         if bytes_read == 0 {
+            if let Some(material_tx) = material_update_tx.as_ref() {
+                if local_relay_material_forward_open(Instant::now(), material_forward_deadline) {
+                    let status = local_relay_terminal_close_status(
+                        "local relay stream closed before material deadline",
+                    );
+                    if matches!(
+                        send_relay_material_update(material_tx, Err(status)).await,
+                        RelayMaterialSendOutcome::TimedOut
+                    ) {
+                        downstream_backpressure_count =
+                            downstream_backpressure_count.saturating_add(1);
+                        relay_errors
+                            .push("local_material_hunter_terminal_close_send_timeout".to_owned());
+                    }
+                }
+            }
             break;
         }
         let trimmed = line.trim_end();
@@ -59678,6 +59700,12 @@ mod tests {
         ));
         assert!(local_relay_material_forward_expired(now, Some(now)));
         assert!(!local_relay_material_forward_expired(now, None));
+        let status = local_relay_terminal_close_status("unit_test");
+        assert!(
+            status
+                .message()
+                .contains("provider_reconnect_exhausted: unit_test")
+        );
     }
 
     #[test]
