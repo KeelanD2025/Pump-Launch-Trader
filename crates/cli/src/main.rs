@@ -44955,6 +44955,7 @@ fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
 }
 
 type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
+const LOCAL_RELAY_PLANNED_STOP_MATERIAL_GRACE: StdDuration = StdDuration::from_secs(30);
 
 enum RelayMaterialSendOutcome {
     Sent,
@@ -44985,6 +44986,28 @@ fn local_relay_terminal_close_status(reason: &str) -> Status {
     Status::data_loss(format!(
         "unrecoverable data loss: provider_reconnect_exhausted: {reason}"
     ))
+}
+
+fn local_relay_should_signal_terminal_close(
+    now: Instant,
+    deadline: Option<Instant>,
+    clean_relay_stop_seen: bool,
+) -> bool {
+    !clean_relay_stop_seen && local_relay_material_forward_open(now, deadline)
+}
+
+fn local_relay_planned_stop_grace_deadline(
+    material_forward_deadline: Option<Instant>,
+    collector_deadline: Instant,
+) -> Option<Instant> {
+    material_forward_deadline.map(|deadline| {
+        let grace_deadline = deadline + LOCAL_RELAY_PLANNED_STOP_MATERIAL_GRACE;
+        if grace_deadline < collector_deadline {
+            grace_deadline
+        } else {
+            collector_deadline
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -45749,7 +45772,7 @@ async fn run_live_local_stream_collector(
     listen_url: &str,
     duration_seconds: u64,
     output_dir: &Path,
-    mut material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
+    material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
     material_forward_duration_seconds: Option<u64>,
     json_output: bool,
 ) -> Result<()> {
@@ -45796,6 +45819,9 @@ async fn run_live_local_stream_collector(
     let mut relay_session_id: Option<String> = None;
     let mut subscription_fingerprint: Option<String> = None;
     let mut last_sequence_by_stream: BTreeMap<String, u64> = BTreeMap::new();
+    let mut clean_relay_stop_seen = false;
+    let planned_stop_grace_deadline =
+        local_relay_planned_stop_grace_deadline(material_forward_deadline, deadline);
 
     let mut line = String::new();
     while Instant::now() < deadline {
@@ -45809,7 +45835,11 @@ async fn run_live_local_stream_collector(
         };
         if bytes_read == 0 {
             if let Some(material_tx) = material_update_tx.as_ref() {
-                if local_relay_material_forward_open(Instant::now(), material_forward_deadline) {
+                if local_relay_should_signal_terminal_close(
+                    Instant::now(),
+                    material_forward_deadline,
+                    clean_relay_stop_seen,
+                ) {
                     let status = local_relay_terminal_close_status(
                         "local relay stream closed before material deadline",
                     );
@@ -45821,6 +45851,14 @@ async fn run_live_local_stream_collector(
                             downstream_backpressure_count.saturating_add(1);
                         relay_errors
                             .push("local_material_hunter_terminal_close_send_timeout".to_owned());
+                    }
+                }
+            }
+            if clean_relay_stop_seen {
+                if let Some(grace_deadline) = planned_stop_grace_deadline {
+                    let remaining = grace_deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        tokio::time::sleep(remaining).await;
                     }
                 }
             }
@@ -45850,6 +45888,12 @@ async fn run_live_local_stream_collector(
             control_frames_received = control_frames_received.saturating_add(1);
         } else {
             data_frames_received = data_frames_received.saturating_add(1);
+        }
+        if matches!(
+            frame.control_kind,
+            Some(RelayControlKind::RelayStopped | RelayControlKind::RelayShutdown)
+        ) {
+            clean_relay_stop_seen = true;
         }
         if matches!(
             frame.control_kind,
@@ -45902,11 +45946,6 @@ async fn run_live_local_stream_collector(
             }
         };
         if local_relay_material_forward_expired(Instant::now(), material_forward_deadline) {
-            if material_update_tx.is_some() {
-                // Keep the relay verifier alive for the receiver safety margin,
-                // but close the material hot path so finalization/R2 can finish.
-                material_update_tx = None;
-            }
             material_forward_skipped_after_deadline =
                 material_forward_skipped_after_deadline.saturating_add(1);
         } else if let Some(material_tx) = material_update_tx.as_ref() {
@@ -59764,6 +59803,36 @@ mod tests {
         ));
         assert!(local_relay_material_forward_expired(now, Some(now)));
         assert!(!local_relay_material_forward_expired(now, None));
+        assert!(local_relay_should_signal_terminal_close(
+            now,
+            Some(now + StdDuration::from_secs(1)),
+            false
+        ));
+        assert!(!local_relay_should_signal_terminal_close(
+            now,
+            Some(now + StdDuration::from_secs(1)),
+            true
+        ));
+        assert!(!local_relay_should_signal_terminal_close(
+            now,
+            Some(now),
+            false
+        ));
+        let collector_deadline = now + StdDuration::from_secs(60);
+        assert_eq!(
+            local_relay_planned_stop_grace_deadline(
+                Some(now + StdDuration::from_secs(10)),
+                collector_deadline
+            ),
+            Some(now + StdDuration::from_secs(40))
+        );
+        assert_eq!(
+            local_relay_planned_stop_grace_deadline(
+                Some(now + StdDuration::from_secs(50)),
+                collector_deadline
+            ),
+            Some(collector_deadline)
+        );
         let status = local_relay_terminal_close_status("unit_test");
         assert!(
             status
