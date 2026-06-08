@@ -33953,6 +33953,7 @@ fn collect_report_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 const PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS: usize = 4;
+const PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 
 fn phase_report_r2_retry_backoff(attempt_index: usize) -> StdDuration {
     match attempt_index {
@@ -34000,11 +34001,13 @@ async fn upload_phase_report_dir_to_r2(
         let mut result = None;
         let mut last_error = None::<String>;
         for attempt_index in 0..PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
-            match client
-                .upload_prepared(&prepared, verify_r2.then_some(true))
-                .await
-            {
-                Ok(upload_result) => {
+            let upload = tokio::time::timeout(
+                PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
+                client.upload_prepared(&prepared, verify_r2.then_some(true)),
+            )
+            .await;
+            match upload {
+                Ok(Ok(upload_result)) => {
                     if attempt_index > 0 {
                         retried_files.push(json!({
                             "remote_key": remote_key.clone(),
@@ -34015,8 +34018,17 @@ async fn upload_phase_report_dir_to_r2(
                     result = Some(upload_result);
                     break;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     last_error = Some(error.to_string());
+                    if attempt_index + 1 < PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
+                        tokio::time::sleep(phase_report_r2_retry_backoff(attempt_index)).await;
+                    }
+                }
+                Err(_) => {
+                    last_error = Some(format!(
+                        "r2_upload_attempt_timeout_after_{}s",
+                        PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT.as_secs()
+                    ));
                     if attempt_index + 1 < PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
                         tokio::time::sleep(phase_report_r2_retry_backoff(attempt_index)).await;
                     }
@@ -59671,6 +59683,10 @@ mod tests {
     #[test]
     fn phase107g_phase_report_r2_retry_schedule_is_bounded() {
         assert_eq!(PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS, 4);
+        assert_eq!(
+            PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
+            StdDuration::from_secs(90)
+        );
         assert_eq!(
             phase_report_r2_retry_backoff(0),
             StdDuration::from_millis(250)
