@@ -44901,6 +44901,10 @@ fn local_relay_material_forward_open(now: Instant, deadline: Option<Instant>) ->
     deadline.is_none_or(|deadline| now < deadline)
 }
 
+fn local_relay_material_forward_expired(now: Instant, deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
     receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>,
@@ -45663,7 +45667,7 @@ async fn run_live_local_stream_collector(
     listen_url: &str,
     duration_seconds: u64,
     output_dir: &Path,
-    material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
+    mut material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
     material_forward_duration_seconds: Option<u64>,
     json_output: bool,
 ) -> Result<()> {
@@ -45682,6 +45686,7 @@ async fn run_live_local_stream_collector(
         .as_ref()
         .and_then(|_| material_forward_duration_seconds)
         .map(|seconds| started_at + StdDuration::from_secs(seconds));
+    let material_hunter_processing_ran = material_update_tx.is_some();
     let (socket, peer_addr) =
         tokio::time::timeout(StdDuration::from_secs(duration_seconds), listener.accept())
             .await
@@ -45798,7 +45803,15 @@ async fn run_live_local_stream_collector(
                 Some(error)
             }
         };
-        if let Some(material_tx) = material_update_tx.as_ref() {
+        if local_relay_material_forward_expired(Instant::now(), material_forward_deadline) {
+            if material_update_tx.is_some() {
+                // Keep the relay verifier alive for the receiver safety margin,
+                // but close the material hot path so finalization/R2 can finish.
+                material_update_tx = None;
+            }
+            material_forward_skipped_after_deadline =
+                material_forward_skipped_after_deadline.saturating_add(1);
+        } else if let Some(material_tx) = material_update_tx.as_ref() {
             if !local_relay_material_forward_open(Instant::now(), material_forward_deadline) {
                 material_forward_skipped_after_deadline =
                     material_forward_skipped_after_deadline.saturating_add(1);
@@ -45980,10 +45993,10 @@ async fn run_live_local_stream_collector(
             .map(|path| path.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
         "local_hash_probe": local_hash_probe,
-        "material_hunter_artifacts_local_only": material_update_tx.is_some(),
-        "material_hunter_processing_ran": material_update_tx.is_some(),
+        "material_hunter_artifacts_local_only": material_hunter_processing_ran,
+        "material_hunter_processing_ran": material_hunter_processing_ran,
         "countability_decision_written": output_dir.join("countability_decision.json").exists(),
-        "countability_decision_source_of_truth": if material_update_tx.is_some() { "local" } else { "not_run_relay_frame_proof_only" },
+        "countability_decision_source_of_truth": if material_hunter_processing_ran { "local" } else { "not_run_relay_frame_proof_only" },
         "off_vps_candidate_replay_allowed": false,
         "formal_backtesting_allowed": false,
         "threshold_tuning_allowed": false,
@@ -59593,10 +59606,20 @@ mod tests {
             now,
             Some(now + StdDuration::from_secs(1))
         ));
+        assert!(!local_relay_material_forward_expired(
+            now,
+            Some(now + StdDuration::from_secs(1))
+        ));
         assert!(!local_relay_material_forward_open(
             now,
             Some(now - StdDuration::from_secs(1))
         ));
+        assert!(local_relay_material_forward_expired(
+            now,
+            Some(now - StdDuration::from_secs(1))
+        ));
+        assert!(local_relay_material_forward_expired(now, Some(now)));
+        assert!(!local_relay_material_forward_expired(now, None));
     }
 
     #[tokio::test]
