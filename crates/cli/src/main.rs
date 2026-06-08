@@ -33980,12 +33980,20 @@ async fn upload_phase_report_dir_to_r2(
     let mut failed_files = Vec::<String>::new();
     let mut retried_files = Vec::<serde_json::Value>::new();
     let mut upload_errors = Vec::<serde_json::Value>::new();
+    let mut skipped_files = Vec::<serde_json::Value>::new();
     for path in paths {
         let relative = path
             .strip_prefix(output_dir)
             .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
+        if let Some(reason) = phase_report_upload_skip_reason(phase_prefix, &relative) {
+            skipped_files.push(json!({
+                "relative_path": relative,
+                "reason": reason,
+            }));
+            continue;
+        }
         let remote_key = client.managed_key(
             &research_remote_base_prefix(&client),
             &format!("{phase_prefix}/{run_or_mint}/{relative}"),
@@ -34063,8 +34071,18 @@ async fn upload_phase_report_dir_to_r2(
         "failed_files": failed_files,
         "retried_files": retried_files,
         "upload_errors": upload_errors,
+        "skipped_files": skipped_files,
         "verified": verify_r2 && !verified_files.is_empty() && failed_files.is_empty(),
     }))
+}
+
+fn phase_report_upload_skip_reason(phase_prefix: &str, relative: &str) -> Option<&'static str> {
+    if phase_prefix == "phase107b_material_candidate_hunter"
+        && (relative == "relay_frames" || relative.starts_with("relay_frames/"))
+    {
+        return Some("local_relay_raw_frames_transient_not_material_artifact");
+    }
+    None
 }
 
 async fn upload_phase_report_dir_r2_command(
@@ -46429,6 +46447,20 @@ fn local_relay_r2_verified_contains(verified_files: &BTreeSet<String>, relative:
     verified_files.iter().any(|key| key.ends_with(relative))
 }
 
+fn local_relay_frame_integrity_verified(output_dir: &Path) -> bool {
+    let summary = read_json_file_or_empty(&output_dir.join("local_collector_summary.json"));
+    summary["frames_received"].as_u64().unwrap_or(0) > 0
+        && summary["sequence_gap_count"].as_u64().unwrap_or(1) == 0
+        && summary["hash_mismatch_count"].as_u64().unwrap_or(1) == 0
+        && summary["malformed_frame_count"].as_u64().unwrap_or(1) == 0
+        && summary["downstream_backpressure_count"]
+            .as_u64()
+            .unwrap_or(1)
+            == 0
+        && summary["receiver_unavailable_count"].as_u64().unwrap_or(1) == 0
+        && output_dir.join("relay_frame_manifest.json").exists()
+}
+
 fn local_relay_apply_r2_primary_retention(
     output_dir: &Path,
     retention_mode: LocalCollectorRetentionMode,
@@ -46446,6 +46478,7 @@ fn local_relay_apply_r2_primary_retention(
     let mut skipped_paths = Vec::<serde_json::Value>::new();
     let mut deleted_bytes = 0u64;
     let retention_enabled = retention_mode.deletes_bulk();
+    let relay_frame_integrity_verified = local_relay_frame_integrity_verified(output_dir);
 
     let bulk_candidates = [
         output_dir.join("relay_frames"),
@@ -46458,6 +46491,36 @@ fn local_relay_apply_r2_primary_retention(
     if retention_enabled && r2_verified {
         for candidate in bulk_candidates {
             if !candidate.exists() {
+                continue;
+            }
+            let is_relay_frames = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "relay_frames");
+            if is_relay_frames && relay_frame_integrity_verified {
+                let bytes = path_size_bytes(&candidate);
+                let files = local_relay_collect_files(&candidate)?;
+                let deleted_file_count = files.len();
+                fs::remove_dir_all(&candidate).with_context(|| {
+                    format!(
+                        "delete locally verified transient relay frame dir {}",
+                        candidate.display()
+                    )
+                })?;
+                deleted_bytes = deleted_bytes.saturating_add(bytes);
+                deleted_paths.push(json!({
+                    "path": candidate.display().to_string(),
+                    "bytes": bytes,
+                    "deleted_file_count": deleted_file_count,
+                    "reason": "local_relay_integrity_verified_transient_raw_frames_removed_after_r2_compact_verification",
+                }));
+                continue;
+            }
+            if is_relay_frames && !relay_frame_integrity_verified {
+                skipped_paths.push(json!({
+                    "path": candidate.display().to_string(),
+                    "reason": "relay_frame_integrity_summary_missing_or_not_clean",
+                }));
                 continue;
             }
             let files = local_relay_collect_files(&candidate)?;
@@ -46541,6 +46604,7 @@ fn local_relay_apply_r2_primary_retention(
         "retention_mode": retention_mode.as_str(),
         "retention_enabled": retention_enabled,
         "r2_verified": r2_verified,
+        "relay_frame_integrity_verified_locally": relay_frame_integrity_verified,
         "deleted_bulk_paths": deleted_paths,
         "deleted_bulk_bytes": deleted_bytes,
         "skipped_paths": skipped_paths,
@@ -59724,6 +59788,31 @@ mod tests {
         assert_eq!(phase_report_r2_retry_backoff(99), StdDuration::from_secs(3));
     }
 
+    #[test]
+    fn phase107g_phase107b_upload_skips_transient_raw_relay_frames() {
+        assert_eq!(
+            phase_report_upload_skip_reason(
+                "phase107b_material_candidate_hunter",
+                "relay_frames/part-000001.ndjson"
+            ),
+            Some("local_relay_raw_frames_transient_not_material_artifact")
+        );
+        assert_eq!(
+            phase_report_upload_skip_reason(
+                "phase107b_material_candidate_hunter",
+                "attempt_ledger.csv"
+            ),
+            None
+        );
+        assert_eq!(
+            phase_report_upload_skip_reason(
+                "phase107g_relay_proof",
+                "relay_frames/part-000001.ndjson"
+            ),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn phase107g_local_relay_connector_resubscribes_after_provider_blocker() {
         let (tx, rx) = tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8);
@@ -60355,6 +60444,29 @@ mod tests {
             "{\"sequence\":1}\n",
         )
         .expect("relay frame");
+        fs::write(
+            root.join("local_collector_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "frames_received": 1,
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "downstream_backpressure_count": 0,
+                "receiver_unavailable_count": 0
+            }))
+            .expect("json"),
+        )
+        .expect("local collector summary");
+        fs::write(
+            root.join("relay_frame_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "phase107g.relay_frame_manifest.v1",
+                "frames_received": 1,
+                "shards": ["relay_frames/part-000001.ndjson"]
+            }))
+            .expect("json"),
+        )
+        .expect("relay frame manifest");
         fs::create_dir_all(root.join("rejected").join("mint-a")).expect("rejected dir");
         fs::write(
             root.join("rejected")
@@ -60388,6 +60500,7 @@ mod tests {
         )
         .expect("retention");
         assert_eq!(summary["ok"], true);
+        assert_eq!(summary["relay_frame_integrity_verified_locally"], true);
         assert!(summary["deleted_bulk_bytes"].as_u64().unwrap() > 0);
         assert!(!temp.path().join("relay_frames").exists());
         assert!(!temp.path().join("rejected").exists());
@@ -60437,7 +60550,7 @@ mod tests {
     }
 
     #[test]
-    fn phase107g_r2_primary_retention_deletes_verified_files_and_keeps_unverified_tail() {
+    fn phase107g_r2_primary_retention_removes_clean_transient_relay_frames() {
         let temp = tempfile::tempdir().expect("tempdir");
         phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
         fs::write(
@@ -60472,17 +60585,8 @@ mod tests {
                 .join("part-000001.ndjson")
                 .exists()
         );
-        assert!(
-            temp.path()
-                .join("relay_frames")
-                .join("part-000002.ndjson")
-                .exists()
-        );
-        assert!(
-            summary["skipped_paths"]
-                .to_string()
-                .contains("relay_frames/part-000002.ndjson")
-        );
+        assert!(!temp.path().join("relay_frames").exists());
+        assert_eq!(summary["relay_frame_integrity_verified_locally"], true);
         assert!(!temp.path().join("rejected").exists());
     }
 
