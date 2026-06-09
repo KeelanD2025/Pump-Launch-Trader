@@ -45011,6 +45011,37 @@ fn local_relay_planned_stop_grace_deadline(
     })
 }
 
+fn local_relay_material_terminal_artifacts_exist(output_dir: &Path) -> bool {
+    output_dir.join("hunter_summary.json").exists()
+        && output_dir.join("countability_decision.json").exists()
+}
+
+fn local_relay_handle_material_send_timeout(
+    now: Instant,
+    material_forward_deadline: Option<Instant>,
+    output_dir: &Path,
+    material_forward_completed: &mut bool,
+    material_forward_skipped_after_completion: &mut u64,
+    material_forward_skipped_after_deadline: &mut u64,
+    downstream_backpressure_count: &mut u64,
+    relay_errors: &mut Vec<String>,
+) -> bool {
+    if *material_forward_completed || local_relay_material_terminal_artifacts_exist(output_dir) {
+        *material_forward_completed = true;
+        *material_forward_skipped_after_completion =
+            material_forward_skipped_after_completion.saturating_add(1);
+        return false;
+    }
+    if local_relay_material_forward_open(now, material_forward_deadline) {
+        *downstream_backpressure_count = downstream_backpressure_count.saturating_add(1);
+        relay_errors.push("local_material_hunter_update_send_timeout".to_owned());
+        return true;
+    }
+    *material_forward_skipped_after_deadline =
+        material_forward_skipped_after_deadline.saturating_add(1);
+    false
+}
+
 #[derive(Clone)]
 struct LocalRelayGeyserConnector {
     receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RelayMaterialUpdate>>>,
@@ -45815,6 +45846,8 @@ async fn run_live_local_stream_collector(
     let mut upstream_provider_blocker_count = 0u64;
     let mut upstream_reconnect_count = 0u64;
     let mut upstream_reconnect_exhausted_count = 0u64;
+    let mut material_forward_completed = false;
+    let mut material_forward_skipped_after_completion = 0u64;
     let mut material_forward_skipped_after_deadline = 0u64;
     let mut relay_errors: Vec<String> = Vec::new();
     let mut relay_session_id: Option<String> = None;
@@ -45946,7 +45979,11 @@ async fn run_live_local_stream_collector(
                 Some(error)
             }
         };
-        if local_relay_material_forward_expired(Instant::now(), material_forward_deadline) {
+        if material_forward_completed || local_relay_material_terminal_artifacts_exist(output_dir) {
+            material_forward_completed = true;
+            material_forward_skipped_after_completion =
+                material_forward_skipped_after_completion.saturating_add(1);
+        } else if local_relay_material_forward_expired(Instant::now(), material_forward_deadline) {
             material_forward_skipped_after_deadline =
                 material_forward_skipped_after_deadline.saturating_add(1);
         } else if let Some(material_tx) = material_update_tx.as_ref() {
@@ -45959,15 +45996,18 @@ async fn run_live_local_stream_collector(
                     send_relay_material_update(material_tx, Err(status)).await,
                     RelayMaterialSendOutcome::TimedOut
                 ) {
-                    if local_relay_material_forward_open(Instant::now(), material_forward_deadline)
-                    {
-                        downstream_backpressure_count =
-                            downstream_backpressure_count.saturating_add(1);
-                        relay_errors.push("local_material_hunter_update_send_timeout".to_owned());
+                    if local_relay_handle_material_send_timeout(
+                        Instant::now(),
+                        material_forward_deadline,
+                        output_dir,
+                        &mut material_forward_completed,
+                        &mut material_forward_skipped_after_completion,
+                        &mut material_forward_skipped_after_deadline,
+                        &mut downstream_backpressure_count,
+                        &mut relay_errors,
+                    ) {
                         break;
                     }
-                    material_forward_skipped_after_deadline =
-                        material_forward_skipped_after_deadline.saturating_add(1);
                 }
             } else if frame.control_kind.is_some() {
                 if let Some(status) = relay_status_for_control_frame(&frame) {
@@ -45975,18 +46015,18 @@ async fn run_live_local_stream_collector(
                         send_relay_material_update(material_tx, Err(status)).await,
                         RelayMaterialSendOutcome::TimedOut
                     ) {
-                        if local_relay_material_forward_open(
+                        if local_relay_handle_material_send_timeout(
                             Instant::now(),
                             material_forward_deadline,
+                            output_dir,
+                            &mut material_forward_completed,
+                            &mut material_forward_skipped_after_completion,
+                            &mut material_forward_skipped_after_deadline,
+                            &mut downstream_backpressure_count,
+                            &mut relay_errors,
                         ) {
-                            downstream_backpressure_count =
-                                downstream_backpressure_count.saturating_add(1);
-                            relay_errors
-                                .push("local_material_hunter_update_send_timeout".to_owned());
                             break;
                         }
-                        material_forward_skipped_after_deadline =
-                            material_forward_skipped_after_deadline.saturating_add(1);
                     }
                 }
             } else {
@@ -46006,19 +46046,18 @@ async fn run_live_local_stream_collector(
                                 .await,
                                 RelayMaterialSendOutcome::TimedOut
                             ) {
-                                if local_relay_material_forward_open(
+                                if local_relay_handle_material_send_timeout(
                                     Instant::now(),
                                     material_forward_deadline,
+                                    output_dir,
+                                    &mut material_forward_completed,
+                                    &mut material_forward_skipped_after_completion,
+                                    &mut material_forward_skipped_after_deadline,
+                                    &mut downstream_backpressure_count,
+                                    &mut relay_errors,
                                 ) {
-                                    downstream_backpressure_count =
-                                        downstream_backpressure_count.saturating_add(1);
-                                    relay_errors.push(
-                                        "local_material_hunter_update_send_timeout".to_owned(),
-                                    );
                                     break;
                                 }
-                                material_forward_skipped_after_deadline =
-                                    material_forward_skipped_after_deadline.saturating_add(1);
                             }
                             Vec::new()
                         }
@@ -46032,23 +46071,23 @@ async fn run_live_local_stream_collector(
                             match send_relay_material_update(material_tx, Ok(update)).await {
                                 RelayMaterialSendOutcome::Sent => {}
                                 RelayMaterialSendOutcome::TimedOut => {
-                                    if local_relay_material_forward_open(
+                                    if local_relay_handle_material_send_timeout(
                                         Instant::now(),
                                         material_forward_deadline,
+                                        output_dir,
+                                        &mut material_forward_completed,
+                                        &mut material_forward_skipped_after_completion,
+                                        &mut material_forward_skipped_after_deadline,
+                                        &mut downstream_backpressure_count,
+                                        &mut relay_errors,
                                     ) {
-                                        downstream_backpressure_count =
-                                            downstream_backpressure_count.saturating_add(1);
-                                        relay_errors.push(
-                                            "local_material_hunter_update_send_timeout".to_owned(),
-                                        );
                                         break;
                                     }
-                                    material_forward_skipped_after_deadline =
-                                        material_forward_skipped_after_deadline.saturating_add(1);
                                 }
                                 RelayMaterialSendOutcome::Closed => {
                                     // The material-hunter proof may stop early after satisfying
                                     // conservative caps. Keep verifying and sharding relay frames.
+                                    material_forward_completed = true;
                                 }
                             }
                         }
@@ -46065,19 +46104,18 @@ async fn run_live_local_stream_collector(
                                 .await,
                                 RelayMaterialSendOutcome::TimedOut
                             ) {
-                                if local_relay_material_forward_open(
+                                if local_relay_handle_material_send_timeout(
                                     Instant::now(),
                                     material_forward_deadline,
+                                    output_dir,
+                                    &mut material_forward_completed,
+                                    &mut material_forward_skipped_after_completion,
+                                    &mut material_forward_skipped_after_deadline,
+                                    &mut downstream_backpressure_count,
+                                    &mut relay_errors,
                                 ) {
-                                    downstream_backpressure_count =
-                                        downstream_backpressure_count.saturating_add(1);
-                                    relay_errors.push(
-                                        "local_material_hunter_update_send_timeout".to_owned(),
-                                    );
                                     break;
                                 }
-                                material_forward_skipped_after_deadline =
-                                    material_forward_skipped_after_deadline.saturating_add(1);
                             }
                         }
                     }
@@ -46124,6 +46162,8 @@ async fn run_live_local_stream_collector(
         "material_forward_duration_seconds": material_forward_duration_seconds,
         "material_forward_deadline_elapsed": material_forward_deadline
             .is_some_and(|deadline| Instant::now() >= deadline),
+        "material_forward_completed": material_forward_completed,
+        "material_forward_skipped_after_completion": material_forward_skipped_after_completion,
         "material_forward_skipped_after_deadline": material_forward_skipped_after_deadline,
         "last_sequence_by_stream": last_sequence_by_stream,
         "relay_frame_shards": shard_paths
@@ -59844,6 +59884,52 @@ mod tests {
                 .message()
                 .contains("provider_reconnect_exhausted: unit_test")
         );
+    }
+
+    #[test]
+    fn phase107g_material_send_timeout_after_terminal_artifacts_is_graceful() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = Instant::now();
+        let deadline = Some(now + StdDuration::from_secs(60));
+        let mut completed = false;
+        let mut skipped_after_completion = 0;
+        let mut skipped_after_deadline = 0;
+        let mut backpressure = 0;
+        let mut errors = Vec::new();
+
+        assert!(local_relay_handle_material_send_timeout(
+            now,
+            deadline,
+            temp.path(),
+            &mut completed,
+            &mut skipped_after_completion,
+            &mut skipped_after_deadline,
+            &mut backpressure,
+            &mut errors,
+        ));
+        assert!(!completed);
+        assert_eq!(skipped_after_completion, 0);
+        assert_eq!(skipped_after_deadline, 0);
+        assert_eq!(backpressure, 1);
+        assert_eq!(errors, vec!["local_material_hunter_update_send_timeout"]);
+
+        fs::write(temp.path().join("hunter_summary.json"), "{}").expect("hunter summary");
+        fs::write(temp.path().join("countability_decision.json"), "{}").expect("countability");
+        assert!(local_relay_material_terminal_artifacts_exist(temp.path()));
+        assert!(!local_relay_handle_material_send_timeout(
+            now,
+            deadline,
+            temp.path(),
+            &mut completed,
+            &mut skipped_after_completion,
+            &mut skipped_after_deadline,
+            &mut backpressure,
+            &mut errors,
+        ));
+        assert!(completed);
+        assert_eq!(skipped_after_completion, 1);
+        assert_eq!(skipped_after_deadline, 0);
+        assert_eq!(backpressure, 1);
     }
 
     #[test]
