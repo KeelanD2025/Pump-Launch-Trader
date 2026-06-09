@@ -44955,6 +44955,7 @@ fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
 }
 
 type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
+const LOCAL_RELAY_MATERIAL_SUBSCRIPTION_TIMEOUT: StdDuration = StdDuration::from_secs(150);
 const LOCAL_RELAY_PLANNED_STOP_MATERIAL_GRACE: StdDuration = StdDuration::from_secs(30);
 
 enum RelayMaterialSendOutcome {
@@ -46324,7 +46325,7 @@ async fn local_stream_collector_command(
                             inner?;
                             bail!("local material hunter exited before subscribing to relay stream");
                         }
-                        wait = connector.wait_for_subscription(StdDuration::from_secs(60)) => {
+                        wait = connector.wait_for_subscription(LOCAL_RELAY_MATERIAL_SUBSCRIPTION_TIMEOUT) => {
                             if let Err(error) = wait {
                                 hunter_task.abort();
                                 return Err(error);
@@ -59819,6 +59820,10 @@ mod tests {
             false
         ));
         let collector_deadline = now + StdDuration::from_secs(60);
+        assert_eq!(
+            LOCAL_RELAY_MATERIAL_SUBSCRIPTION_TIMEOUT,
+            StdDuration::from_secs(150)
+        );
         assert_eq!(
             local_relay_planned_stop_grace_deadline(
                 Some(now + StdDuration::from_secs(10)),
