@@ -58,9 +58,11 @@ def load_env_file(path: pathlib.Path) -> dict[str, str]:
 
 
 def merged_env(env_file: pathlib.Path | None) -> dict[str, str]:
-    env = os.environ.copy()
+    env: dict[str, str] = {}
     if env_file is not None:
         env.update(load_env_file(env_file))
+    # Explicit shell exports should take precedence over local env-file defaults.
+    env.update(os.environ.copy())
     return env
 
 
