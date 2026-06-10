@@ -51,6 +51,8 @@ def load_env_file(path: pathlib.Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
+        if key.startswith("export "):
+            key = key.removeprefix("export ").strip()
         value = value.strip().strip("'\"")
         if key:
             env[key] = value
