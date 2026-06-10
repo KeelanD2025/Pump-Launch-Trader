@@ -341,6 +341,13 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         or run_countability.get("blocked_segment_count")
         or 0,
         "gap_count": summary.get("gap_count") or run_countability.get("gap_count") or 0,
+        "provider_blocker_class": summary.get("provider_blocker_class")
+        or countability.get("provider_blocker_class")
+        or hunter.get("provider_blocker_class"),
+        "provider_data_loss_seen": summary.get("provider_data_loss_seen")
+        if "provider_data_loss_seen" in summary
+        else countability.get("provider_data_loss_seen"),
+        "partial_outputs_audit_only": countability.get("partial_outputs_audit_only"),
         "attempted_launches": summary.get("attempted_launches") or hunter.get("attempted_launches") or 0,
         "unique_attempted_mints": summary.get("unique_attempted_mints")
         or countability.get("unique_attempted_mint_count")
@@ -389,6 +396,44 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
     ):
         blockers.append("candidate_review_required")
     return result, blockers
+
+
+def is_safe_provider_quarantine(result: dict[str, Any], blockers: list[str]) -> bool:
+    """True when a provider-only dirty slice is complete but intentionally non-counted.
+
+    This does not make the slice countable. It only allows the batch supervisor to
+    keep collecting replacement slices when the local/R2/VPS path is healthy and
+    the only reason the slice did not count is a quarantined provider boundary.
+    """
+    if set(blockers) != {"not_counted"}:
+        return False
+    if result.get("provider_blocker_class") not in {
+        "provider_lagged_data_loss",
+        "provider_reconnect_exhausted",
+    }:
+        return False
+    if result.get("provider_data_loss_seen") is not True:
+        return False
+    if result.get("partial_outputs_audit_only") is not True:
+        return False
+    if int(result.get("upstream_provider_blocker_count") or 0) < 1:
+        return False
+    if result.get("artifact_consistency_ok") is not True:
+        return False
+    if int(result.get("r2_failed") or 0) != 0:
+        return False
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if int(result.get(key) or 0) != 0:
+            return False
+    if result.get("off_vps_candidate_replay_allowed") is True:
+        return False
+    return True
 
 
 def classify_slice(result: dict[str, Any]) -> str:
@@ -515,10 +560,6 @@ def run_slice(
         blockers.append("vps_forbidden_artifacts")
     if args.expected_latest_run_id and safety.get("latest_run_id") != args.expected_latest_run_id:
         blockers.append("latest_run_id_changed")
-    summary_path = batch_log_dir / "batch_summary.ndjson"
-    with summary_path.open("a") as handle:
-        handle.write(json.dumps(result, sort_keys=True) + "\n")
-    print("SLICE_SUMMARY", json.dumps(result, sort_keys=True), flush=True)
     return result, blockers
 
 
@@ -530,7 +571,13 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_slices": len(results),
         "counted_slices": sum(1 for item in results if item.get("counted_phase107b_result") is True),
         "provider_gap_continued_slices": sum(
-            1 for item in results if int(item.get("upstream_provider_blocker_count") or 0) > 0
+            1
+            for item in results
+            if int(item.get("upstream_provider_blocker_count") or 0) > 0
+            and item.get("counted_phase107b_result") is True
+        ),
+        "safe_provider_quarantined_slices": sum(
+            1 for item in results if item.get("safe_provider_quarantine_no_count") is True
         ),
         "blocked_slices": 0,
         "total_frames": total("frames_received"),
@@ -559,6 +606,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--slices", type=int, default=20)
     parser.add_argument("--start-index", type=int, default=1)
+    parser.add_argument("--counted-slices-target", type=int, default=None)
+    parser.add_argument("--max-total-slices", type=int, default=None)
+    parser.add_argument(
+        "--replace-safe-provider-quarantine",
+        action="store_true",
+        help=(
+            "Allow fully validated provider-only audit slices to be recorded and "
+            "replaced until --counted-slices-target is reached."
+        ),
+    )
     parser.add_argument("--duration-seconds", type=int, default=900)
     parser.add_argument("--local-receiver-window-seconds", type=int, default=1020)
     parser.add_argument("--max-attempted-launches", type=int, default=15)
@@ -589,6 +646,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.slices < 1:
         parser.error("--slices must be positive")
+    if args.counted_slices_target is None:
+        args.counted_slices_target = args.slices
+    if args.counted_slices_target < 1:
+        parser.error("--counted-slices-target must be positive")
+    if args.max_total_slices is None:
+        args.max_total_slices = args.slices
+        if args.replace_safe_provider_quarantine:
+            args.max_total_slices += max(3, args.slices // 2)
+    if args.max_total_slices < args.counted_slices_target:
+        parser.error("--max-total-slices must be >= --counted-slices-target")
     if not args.vps_ssh_target:
         parser.error("--vps-ssh-target or PUMP_RELAY_VPS_SSH_TARGET is required")
     if args.local_receiver_window_seconds < args.duration_seconds:
@@ -614,15 +681,30 @@ def main(argv: list[str]) -> int:
     print("VPS_SAFETY", json.dumps(safety, sort_keys=True), flush=True)
 
     passed: list[dict[str, Any]] = []
-    for idx in range(args.start_index, args.start_index + args.slices):
+    counted_slices = 0
+    attempted_slices = 0
+    while attempted_slices < args.max_total_slices and counted_slices < args.counted_slices_target:
+        idx = args.start_index + attempted_slices
+        attempted_slices += 1
         print(f"=== batch_slice={idx} start={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
         result, blockers = run_slice(args, env, args.batch_log_dir, idx)
-        if blockers:
+        safe_provider_quarantine = is_safe_provider_quarantine(result, blockers)
+        if safe_provider_quarantine:
+            result["safe_provider_quarantine_no_count"] = True
+            result["classification"] = "RELAY_COLLECTION_PASS_PROVIDER_GAP_QUARANTINED_NO_COUNT"
+            blockers = []
+            print("SLICE_PROVIDER_QUARANTINED", json.dumps(result, sort_keys=True), flush=True)
+        elif blockers:
             stop = {"slice": idx, "blockers": blockers, "result": result}
             (args.batch_log_dir / "batch_stop.json").write_text(json.dumps(stop, indent=2, sort_keys=True))
             print("BATCH_STOP", json.dumps(stop, sort_keys=True), flush=True)
             return 2
+        with (args.batch_log_dir / "batch_summary.ndjson").open("a") as handle:
+            handle.write(json.dumps(result, sort_keys=True) + "\n")
+        print("SLICE_SUMMARY", json.dumps(result, sort_keys=True), flush=True)
         passed.append(result)
+        if result.get("counted_phase107b_result") is True:
+            counted_slices += 1
         if result["classification"] == "RELAY_COLLECTION_PASS_REVIEW_CANDIDATE":
             stop = {"slice": idx, "reason": "candidate_review_required", "result": result}
             (args.batch_log_dir / "batch_stop.json").write_text(json.dumps(stop, indent=2, sort_keys=True))
@@ -631,6 +713,19 @@ def main(argv: list[str]) -> int:
         print(f"=== batch_slice={idx} pass={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
 
     final = rollup(passed)
+    if counted_slices < args.counted_slices_target:
+        final["blocked_slices"] = args.counted_slices_target - counted_slices
+        final["counted_slices_target"] = args.counted_slices_target
+        stop = {
+            "reason": "counted_slice_target_not_met",
+            "counted_slices": counted_slices,
+            "counted_slices_target": args.counted_slices_target,
+            "max_total_slices": args.max_total_slices,
+            "rollup": final,
+        }
+        (args.batch_log_dir / "batch_stop.json").write_text(json.dumps(stop, indent=2, sort_keys=True))
+        print("BATCH_STOP", json.dumps(stop, sort_keys=True), flush=True)
+        return 4
     (args.batch_log_dir / "batch_rollup.json").write_text(json.dumps(final, indent=2, sort_keys=True))
     print("BATCH_ROLLUP", json.dumps(final, sort_keys=True), flush=True)
     return 0
