@@ -44993,6 +44993,28 @@ fn local_relay_terminal_close_status(reason: &str) -> Status {
     ))
 }
 
+fn local_relay_record_terminal_provider_close(
+    recorded: &mut bool,
+    upstream_provider_blocker_count: &mut u64,
+    upstream_reconnect_exhausted_count: &mut u64,
+    relay_errors: &mut Vec<String>,
+    reason: &str,
+) {
+    if *recorded {
+        return;
+    }
+    *recorded = true;
+    *upstream_provider_blocker_count = upstream_provider_blocker_count.saturating_add(1);
+    *upstream_reconnect_exhausted_count = upstream_reconnect_exhausted_count.saturating_add(1);
+    relay_errors.push(format!(
+        "relay_terminal_provider_reconnect_exhausted:{reason}"
+    ));
+}
+
+fn local_relay_is_truncated_terminal_frame(line: &str, error: &serde_json::Error) -> bool {
+    !line.ends_with('\n') && error.is_eof()
+}
+
 fn local_relay_should_signal_terminal_close(
     now: Instant,
     deadline: Option<Instant>,
@@ -45858,6 +45880,7 @@ async fn run_live_local_stream_collector(
     let mut subscription_fingerprint: Option<String> = None;
     let mut last_sequence_by_stream: BTreeMap<String, u64> = BTreeMap::new();
     let mut clean_relay_stop_seen = false;
+    let mut terminal_provider_close_recorded = false;
     let planned_stop_grace_deadline =
         local_relay_planned_stop_grace_deadline(material_forward_deadline, deadline);
 
@@ -45878,6 +45901,13 @@ async fn run_live_local_stream_collector(
                     material_forward_deadline,
                     clean_relay_stop_seen,
                 ) {
+                    local_relay_record_terminal_provider_close(
+                        &mut terminal_provider_close_recorded,
+                        &mut upstream_provider_blocker_count,
+                        &mut upstream_reconnect_exhausted_count,
+                        &mut relay_errors,
+                        "stream_closed_before_material_deadline",
+                    );
                     let status = local_relay_terminal_close_status(
                         "local relay stream closed before material deadline",
                     );
@@ -45906,6 +45936,40 @@ async fn run_live_local_stream_collector(
         let wire: RelayWireFrame = match serde_json::from_str(trimmed) {
             Ok(frame) => frame,
             Err(error) => {
+                if local_relay_is_truncated_terminal_frame(&line, &error) {
+                    let reason = "truncated_relay_frame_before_stream_close";
+                    local_relay_record_terminal_provider_close(
+                        &mut terminal_provider_close_recorded,
+                        &mut upstream_provider_blocker_count,
+                        &mut upstream_reconnect_exhausted_count,
+                        &mut relay_errors,
+                        reason,
+                    );
+                    if let Some(material_tx) = material_update_tx.as_ref() {
+                        if local_relay_should_signal_terminal_close(
+                            Instant::now(),
+                            material_forward_deadline,
+                            clean_relay_stop_seen,
+                        ) && matches!(
+                            send_relay_material_update(
+                                material_tx,
+                                Err(local_relay_terminal_close_status(
+                                    "local relay stream ended during relay frame",
+                                )),
+                            )
+                            .await,
+                            RelayMaterialSendOutcome::TimedOut
+                        ) {
+                            downstream_backpressure_count =
+                                downstream_backpressure_count.saturating_add(1);
+                            relay_errors.push(
+                                "local_material_hunter_truncated_terminal_close_send_timeout"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    break;
+                }
                 malformed_frame_count = malformed_frame_count.saturating_add(1);
                 relay_errors.push(format!("malformed_relay_frame:{error}"));
                 continue;
@@ -59888,6 +59952,41 @@ mod tests {
                 .message()
                 .contains("provider_reconnect_exhausted: unit_test")
         );
+        let mut recorded = false;
+        let mut blocker_count = 0;
+        let mut reconnect_exhausted_count = 0;
+        let mut errors = Vec::new();
+        local_relay_record_terminal_provider_close(
+            &mut recorded,
+            &mut blocker_count,
+            &mut reconnect_exhausted_count,
+            &mut errors,
+            "unit_test",
+        );
+        local_relay_record_terminal_provider_close(
+            &mut recorded,
+            &mut blocker_count,
+            &mut reconnect_exhausted_count,
+            &mut errors,
+            "unit_test_duplicate",
+        );
+        assert!(recorded);
+        assert_eq!(blocker_count, 1);
+        assert_eq!(reconnect_exhausted_count, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("provider_reconnect_exhausted:unit_test"));
+        let truncated_error = serde_json::from_str::<serde_json::Value>("{\"partial\":\"frame")
+            .expect_err("truncated json should fail");
+        assert!(local_relay_is_truncated_terminal_frame(
+            "{\"partial\":\"frame",
+            &truncated_error
+        ));
+        let malformed_error = serde_json::from_str::<serde_json::Value>("{not json}\n")
+            .expect_err("malformed json should fail");
+        assert!(!local_relay_is_truncated_terminal_frame(
+            "{not json}\n",
+            &malformed_error
+        ));
     }
 
     #[test]

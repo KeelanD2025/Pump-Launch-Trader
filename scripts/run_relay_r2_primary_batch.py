@@ -405,7 +405,11 @@ def is_safe_provider_quarantine(result: dict[str, Any], blockers: list[str]) -> 
     keep collecting replacement slices when the local/R2/VPS path is healthy and
     the only reason the slice did not count is a quarantined provider boundary.
     """
-    if set(blockers) != {"not_counted"}:
+    tolerated_blockers = {"not_counted", "remote_rc"}
+    if not set(blockers).issubset(tolerated_blockers) or "not_counted" not in blockers:
+        return False
+    remote_rc = result.get("remote_rc")
+    if "remote_rc" in blockers and remote_rc not in {None, 1}:
         return False
     if result.get("provider_blocker_class") not in {
         "provider_lagged_data_loss",
@@ -553,7 +557,16 @@ def run_slice(
     if local_rc != 0:
         blockers.append("local_rc")
     if remote_rc != "0":
-        blockers.append("remote_rc")
+        refreshed = ssh(
+            args,
+            f"cat {shlex.quote(health_dir)}/relay_command_rc 2>/dev/null || true",
+            check=False,
+        ).stdout.strip()
+        if refreshed:
+            remote_rc = refreshed
+            result["remote_rc"] = int(remote_rc) if remote_rc.isdigit() else None
+        if remote_rc != "0":
+            blockers.append("remote_rc")
     safety = verify_vps_safety(args)
     result["vps_safety"] = safety
     if safety.get("forbidden_recent") != 0:
