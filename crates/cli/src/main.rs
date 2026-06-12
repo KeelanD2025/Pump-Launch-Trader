@@ -33952,14 +33952,18 @@ fn collect_report_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-const PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS: usize = 4;
+const PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS: usize = 8;
 const PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 
 fn phase_report_r2_retry_backoff(attempt_index: usize) -> StdDuration {
     match attempt_index {
         0 => StdDuration::from_millis(250),
         1 => StdDuration::from_secs(1),
-        _ => StdDuration::from_secs(3),
+        2 => StdDuration::from_secs(3),
+        3 => StdDuration::from_secs(10),
+        4 => StdDuration::from_secs(20),
+        5 => StdDuration::from_secs(30),
+        _ => StdDuration::from_secs(60),
     }
 }
 
@@ -59934,7 +59938,7 @@ mod tests {
 
     #[test]
     fn phase107g_phase_report_r2_retry_schedule_is_bounded() {
-        assert_eq!(PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS, 4);
+        assert_eq!(PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS, 8);
         assert_eq!(
             PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
             StdDuration::from_secs(90)
@@ -59945,7 +59949,13 @@ mod tests {
         );
         assert_eq!(phase_report_r2_retry_backoff(1), StdDuration::from_secs(1));
         assert_eq!(phase_report_r2_retry_backoff(2), StdDuration::from_secs(3));
-        assert_eq!(phase_report_r2_retry_backoff(99), StdDuration::from_secs(3));
+        assert_eq!(phase_report_r2_retry_backoff(3), StdDuration::from_secs(10));
+        assert_eq!(phase_report_r2_retry_backoff(4), StdDuration::from_secs(20));
+        assert_eq!(phase_report_r2_retry_backoff(5), StdDuration::from_secs(30));
+        assert_eq!(
+            phase_report_r2_retry_backoff(99),
+            StdDuration::from_secs(60)
+        );
     }
 
     #[test]
