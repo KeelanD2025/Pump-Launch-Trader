@@ -45037,14 +45037,80 @@ fn local_relay_planned_stop_grace_deadline(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LocalRelayMaterialCompletionCaps {
+    max_attempted_launches: Option<usize>,
+    target_material_candidates: Option<usize>,
+}
+
 fn local_relay_material_terminal_artifacts_exist(output_dir: &Path) -> bool {
     output_dir.join("hunter_summary.json").exists()
         && output_dir.join("countability_decision.json").exists()
 }
 
+fn local_relay_json_u64(path: &Path, keys: &[&str]) -> Option<u64> {
+    let value = read_json_file_or_empty(path);
+    keys.iter().find_map(|key| value[*key].as_u64())
+}
+
+fn local_relay_material_completion_cap_reached(
+    output_dir: &Path,
+    caps: Option<LocalRelayMaterialCompletionCaps>,
+) -> bool {
+    let Some(caps) = caps else {
+        return false;
+    };
+    let progress_files = [
+        output_dir.join("health/heartbeat.json"),
+        output_dir.join("progress_heartbeat.json"),
+        output_dir.join("progress_manifest.json"),
+        output_dir.join("hunter_summary.json"),
+        output_dir.join("countability_decision.json"),
+    ];
+    if let Some(max_attempted_launches) = caps.max_attempted_launches {
+        let max_attempted_launches = max_attempted_launches as u64;
+        if max_attempted_launches > 0
+            && progress_files.iter().any(|path| {
+                local_relay_json_u64(path, &["attempted_launches", "attempts_written"])
+                    .is_some_and(|attempts| attempts >= max_attempted_launches)
+            })
+        {
+            return true;
+        }
+    }
+    if let Some(target_material_candidates) = caps.target_material_candidates {
+        let target_material_candidates = target_material_candidates as u64;
+        if target_material_candidates > 0
+            && progress_files.iter().any(|path| {
+                local_relay_json_u64(
+                    path,
+                    &[
+                        "candidate_checkpoint_count",
+                        "candidate_count",
+                        "replay_eligible_candidate_count",
+                    ],
+                )
+                .is_some_and(|candidates| candidates >= target_material_candidates)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn local_relay_material_forward_complete(
+    output_dir: &Path,
+    caps: Option<LocalRelayMaterialCompletionCaps>,
+) -> bool {
+    local_relay_material_terminal_artifacts_exist(output_dir)
+        || local_relay_material_completion_cap_reached(output_dir, caps)
+}
+
 fn local_relay_handle_material_send_timeout(
     now: Instant,
     material_forward_deadline: Option<Instant>,
+    material_completion_caps: Option<LocalRelayMaterialCompletionCaps>,
     output_dir: &Path,
     material_forward_completed: &mut bool,
     material_forward_skipped_after_completion: &mut u64,
@@ -45052,7 +45118,9 @@ fn local_relay_handle_material_send_timeout(
     downstream_backpressure_count: &mut u64,
     relay_errors: &mut Vec<String>,
 ) -> bool {
-    if *material_forward_completed || local_relay_material_terminal_artifacts_exist(output_dir) {
+    if *material_forward_completed
+        || local_relay_material_forward_complete(output_dir, material_completion_caps)
+    {
         *material_forward_completed = true;
         *material_forward_skipped_after_completion =
             material_forward_skipped_after_completion.saturating_add(1);
@@ -45832,6 +45900,7 @@ async fn run_live_local_stream_collector(
     output_dir: &Path,
     material_update_tx: Option<tokio::sync::mpsc::Sender<RelayMaterialUpdate>>,
     material_forward_duration_seconds: Option<u64>,
+    material_completion_caps: Option<LocalRelayMaterialCompletionCaps>,
     json_output: bool,
 ) -> Result<()> {
     let listen_addr = relay_tcp_addr_from_url(listen_url)?;
@@ -46047,7 +46116,9 @@ async fn run_live_local_stream_collector(
                 Some(error)
             }
         };
-        if material_forward_completed || local_relay_material_terminal_artifacts_exist(output_dir) {
+        if material_forward_completed
+            || local_relay_material_forward_complete(output_dir, material_completion_caps)
+        {
             material_forward_completed = true;
             material_forward_skipped_after_completion =
                 material_forward_skipped_after_completion.saturating_add(1);
@@ -46067,6 +46138,7 @@ async fn run_live_local_stream_collector(
                     if local_relay_handle_material_send_timeout(
                         Instant::now(),
                         material_forward_deadline,
+                        material_completion_caps,
                         output_dir,
                         &mut material_forward_completed,
                         &mut material_forward_skipped_after_completion,
@@ -46086,6 +46158,7 @@ async fn run_live_local_stream_collector(
                         if local_relay_handle_material_send_timeout(
                             Instant::now(),
                             material_forward_deadline,
+                            material_completion_caps,
                             output_dir,
                             &mut material_forward_completed,
                             &mut material_forward_skipped_after_completion,
@@ -46117,6 +46190,7 @@ async fn run_live_local_stream_collector(
                                 if local_relay_handle_material_send_timeout(
                                     Instant::now(),
                                     material_forward_deadline,
+                                    material_completion_caps,
                                     output_dir,
                                     &mut material_forward_completed,
                                     &mut material_forward_skipped_after_completion,
@@ -46142,6 +46216,7 @@ async fn run_live_local_stream_collector(
                                     if local_relay_handle_material_send_timeout(
                                         Instant::now(),
                                         material_forward_deadline,
+                                        material_completion_caps,
                                         output_dir,
                                         &mut material_forward_completed,
                                         &mut material_forward_skipped_after_completion,
@@ -46175,6 +46250,7 @@ async fn run_live_local_stream_collector(
                                 if local_relay_handle_material_send_timeout(
                                     Instant::now(),
                                     material_forward_deadline,
+                                    material_completion_caps,
                                     output_dir,
                                     &mut material_forward_completed,
                                     &mut material_forward_skipped_after_completion,
@@ -46447,6 +46523,10 @@ async fn local_stream_collector_command(
                         &output_path,
                         Some(material_tx),
                         Some(material_duration_seconds),
+                        Some(LocalRelayMaterialCompletionCaps {
+                            max_attempted_launches: Some(max_attempted_launches),
+                            target_material_candidates: Some(target_material_candidates),
+                        }),
                         false,
                     )
                     .await;
@@ -46501,6 +46581,7 @@ async fn local_stream_collector_command(
             listen_url,
             duration_seconds,
             Path::new(output_dir),
+            None,
             None,
             None,
             json_output,
@@ -60003,6 +60084,7 @@ mod tests {
         assert!(local_relay_handle_material_send_timeout(
             now,
             deadline,
+            None,
             temp.path(),
             &mut completed,
             &mut skipped_after_completion,
@@ -60022,6 +60104,7 @@ mod tests {
         assert!(!local_relay_handle_material_send_timeout(
             now,
             deadline,
+            None,
             temp.path(),
             &mut completed,
             &mut skipped_after_completion,
@@ -60033,6 +60116,55 @@ mod tests {
         assert_eq!(skipped_after_completion, 1);
         assert_eq!(skipped_after_deadline, 0);
         assert_eq!(backpressure, 1);
+    }
+
+    #[test]
+    fn phase107g_material_send_timeout_after_attempt_cap_is_graceful() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("health")).expect("health dir");
+        fs::write(
+            temp.path().join("health/heartbeat.json"),
+            r#"{"attempted_launches":15}"#,
+        )
+        .expect("heartbeat");
+        fs::write(
+            temp.path().join("progress_manifest.json"),
+            r#"{"attempts_written":15,"candidate_count":0}"#,
+        )
+        .expect("progress manifest");
+        let now = Instant::now();
+        let deadline = Some(now + StdDuration::from_secs(60));
+        let caps = Some(LocalRelayMaterialCompletionCaps {
+            max_attempted_launches: Some(15),
+            target_material_candidates: Some(2),
+        });
+        let mut completed = false;
+        let mut skipped_after_completion = 0;
+        let mut skipped_after_deadline = 0;
+        let mut backpressure = 0;
+        let mut errors = Vec::new();
+
+        assert!(local_relay_material_completion_cap_reached(
+            temp.path(),
+            caps
+        ));
+        assert!(local_relay_material_forward_complete(temp.path(), caps));
+        assert!(!local_relay_handle_material_send_timeout(
+            now,
+            deadline,
+            caps,
+            temp.path(),
+            &mut completed,
+            &mut skipped_after_completion,
+            &mut skipped_after_deadline,
+            &mut backpressure,
+            &mut errors,
+        ));
+        assert!(completed);
+        assert_eq!(skipped_after_completion, 1);
+        assert_eq!(skipped_after_deadline, 0);
+        assert_eq!(backpressure, 0);
+        assert!(errors.is_empty());
     }
 
     #[test]
