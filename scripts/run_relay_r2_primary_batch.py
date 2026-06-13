@@ -189,7 +189,7 @@ def verify_vps_safety(args: argparse.Namespace, *, recent_minutes: int = 30) -> 
         material_b=$(systemctl is-active pump-launch-quant-material-hunter.service 2>/dev/null || true)
         latest=$({latest_run_id_remote_command(args)})
         forbidden=$(find /home/ubuntu -mmin -{int(recent_minutes)} \\( {' -o '.join(f'-name {shlex.quote(name)}' for name in FORBIDDEN_VPS_ARTIFACT_NAMES)} \\) 2>/dev/null | wc -l | tr -d ' ')
-        relay_running=$(ps -eo args= | grep -E '[v]ps-stream-relay' | wc -l | tr -d ' ')
+        relay_running=$(ps -eo args= | grep -E '[t]arget/release/cli .*vps-stream-relay' | wc -l | tr -d ' ')
         printf '{{"material_candidate_service":"%s","material_hunter_service":"%s","latest_run_id":"%s","forbidden_recent":%s,"relay_running":%s}}\\n' "$material_a" "$material_b" "$latest" "$forbidden" "$relay_running"
         [ "$material_a" != active ] || exit 10
         [ "$material_b" != active ] || exit 11
@@ -280,7 +280,7 @@ def collect_remote_after(args: argparse.Namespace, health_dir: str, log_path: pa
         cd {shlex.quote(args.vps_repo_dir)}
         echo material_candidate_active=$(systemctl is-active pump-launch-quant-material-candidate-hunter.service 2>/dev/null || true)
         echo material_hunter_active=$(systemctl is-active pump-launch-quant-material-hunter.service 2>/dev/null || true)
-        echo relay_proc_count=$(pgrep -af '[v]ps-stream-relay' | wc -l | tr -d ' ')
+        echo relay_proc_count=$(pgrep -af '[t]arget/release/cli .*vps-stream-relay' | wc -l | tr -d ' ')
         echo latest_run_id=$({latest_run_id_remote_command(args)})
         """
     ).strip()
