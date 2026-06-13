@@ -440,6 +440,58 @@ def is_safe_provider_quarantine(result: dict[str, Any], blockers: list[str]) -> 
     return True
 
 
+def can_recover_missing_remote_rc(
+    result: dict[str, Any],
+    blockers: list[str],
+    safety: dict[str, Any],
+    expected_latest_run_id: str,
+) -> bool:
+    """Recover when only the tiny remote RC artifact is missing.
+
+    The relay writes health artifacts on the VPS only for operational
+    observability. Local collector sequence/hash checks, material-hunter
+    countability, R2 verification, artifact validation, and explicit VPS safety
+    checks are the source of truth for the data slice. If the VPS root disk is
+    tight, the detached wrapper can leave an empty relay_command_rc even though
+    the relay stopped and the local/R2 dataset is complete. Treat that as
+    recoverable only when every data and safety signal is clean.
+    """
+    if blockers != ["remote_rc"]:
+        return False
+    if result.get("remote_rc") is not None:
+        return False
+    if result.get("local_rc") != 0:
+        return False
+    if result.get("counted_phase107b_result") is not True:
+        return False
+    if result.get("artifact_consistency_ok") is not True:
+        return False
+    if int(result.get("r2_failed") or 0) != 0:
+        return False
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if int(result.get(key) or 0) != 0:
+            return False
+    if result.get("off_vps_candidate_replay_allowed") is True:
+        return False
+    if int(safety.get("forbidden_recent") or 0) != 0:
+        return False
+    if int(safety.get("relay_running") or 0) != 0:
+        return False
+    if safety.get("material_candidate_service") == "active":
+        return False
+    if safety.get("material_hunter_service") == "active":
+        return False
+    if expected_latest_run_id and safety.get("latest_run_id") != expected_latest_run_id:
+        return False
+    return True
+
+
 def classify_slice(result: dict[str, Any]) -> str:
     if (
         result.get("replay_eligible_candidate_count", 0) > 0
@@ -462,7 +514,7 @@ def run_slice(
     log_dir = args.output_root / f"{run_id}-logs"
     health_dir = f"{args.vps_health_root.rstrip('/')}/pump-launch-quant-stream-relay-{run_id}"
     remote_script_local = log_dir / "remote_relay.sh"
-    remote_script_remote = f"/tmp/{run_id}-remote-relay.sh"
+    remote_script_remote = f"{health_dir}/remote_relay.sh"
     out.mkdir(parents=True, exist_ok=False)
     log_dir.mkdir(parents=True, exist_ok=False)
     remote_script_local.write_text(make_remote_script(args, run_id, health_dir))
@@ -512,6 +564,7 @@ def run_slice(
     try:
         wait_for_listener(args.listen_port, local_proc.pid, args.listen_timeout_seconds)
         print(f"slice={idx} listen_ready=true", flush=True)
+        ssh(args, f"mkdir -p {shlex.quote(health_dir)} && chmod 700 {shlex.quote(health_dir)}", check=True)
         scp_cmd = scp_base(args) + [
             str(remote_script_local),
             f"{args.vps_ssh_target}:{remote_script_remote}",
@@ -573,6 +626,10 @@ def run_slice(
         blockers.append("vps_forbidden_artifacts")
     if args.expected_latest_run_id and safety.get("latest_run_id") != args.expected_latest_run_id:
         blockers.append("latest_run_id_changed")
+    if can_recover_missing_remote_rc(result, blockers, safety, args.expected_latest_run_id):
+        result["remote_rc_recovered_from_local_validation"] = True
+        result["remote_rc_recovery_reason"] = "missing_remote_rc_with_clean_local_r2_and_vps_safety"
+        blockers = []
     return result, blockers
 
 
@@ -644,7 +701,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--vps-config-override", default="config/local.toml")
     parser.add_argument("--vps-env-file", default="/home/ubuntu/pump-launch-quant.env")
     parser.add_argument("--vps-repo-dir", default="/home/ubuntu/pump-launch-quant")
-    parser.add_argument("--vps-health-root", default="/tmp")
+    parser.add_argument(
+        "--vps-health-root",
+        default=os.environ.get("PUMP_RELAY_VPS_HEALTH_ROOT", "/run/user/1000"),
+        help=(
+            "Remote tmpfs root for relay health and wrapper scripts. Keep this "
+            "off the VPS root-backed /tmp path so relay-only operation does not "
+            "depend on material-hunter disk headroom."
+        ),
+    )
     parser.add_argument("--vps-ssh-target", default=os.environ.get("PUMP_RELAY_VPS_SSH_TARGET", ""))
     parser.add_argument("--ssh-key", type=pathlib.Path, default=os.environ.get("PUMP_RELAY_SSH_KEY"))
     parser.add_argument("--ssh-option", action="append", default=[])
