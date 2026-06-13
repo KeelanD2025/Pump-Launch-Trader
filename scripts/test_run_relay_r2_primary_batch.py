@@ -65,6 +65,26 @@ class RelaySupervisorTests(unittest.TestCase):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", script)
         self.assertNotIn("R2_SECRET", script)
 
+    def test_parse_args_reads_vps_config_from_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "relay.env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "PUMP_RELAY_VPS_SSH_TARGET=ubuntu@example.invalid",
+                        "PUMP_RELAY_SSH_KEY=/tmp/relay-key",
+                        "EXPECTED_MATERIAL_LATEST_RUN_ID=material-candidate-hunter-stable",
+                        "CONFIG_OVERRIDE=config/local.relay.toml",
+                    ]
+                )
+            )
+            with mock.patch.dict(relay_supervisor.os.environ, {}, clear=True):
+                args = relay_supervisor.parse_args(["proof", "--env-file", str(env_file)])
+            self.assertEqual(args.vps_ssh_target, "ubuntu@example.invalid")
+            self.assertEqual(str(args.ssh_key), "/tmp/relay-key")
+            self.assertEqual(args.expected_latest_run_id, "material-candidate-hunter-stable")
+            self.assertEqual(args.config_override, "config/local.relay.toml")
+
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(
             relay_supervisor.classify_blockers(["local_finalization_timeout"], {}),

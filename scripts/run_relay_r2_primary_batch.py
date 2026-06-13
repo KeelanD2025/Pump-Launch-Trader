@@ -915,6 +915,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cleanup-min-age-minutes", type=int, default=60)
     args = parser.parse_args(argv)
     args.command = command
+    env_file_defaults: dict[str, str] = {}
+    if args.env_file is not None:
+        try:
+            env_file_defaults = load_env_file(args.env_file)
+        except BatchError as exc:
+            parser.error(str(exc))
+    if not args.vps_ssh_target:
+        args.vps_ssh_target = env_file_defaults.get("PUMP_RELAY_VPS_SSH_TARGET", "")
+    if args.ssh_key is None and env_file_defaults.get("PUMP_RELAY_SSH_KEY"):
+        args.ssh_key = pathlib.Path(env_file_defaults["PUMP_RELAY_SSH_KEY"])
+    if not args.expected_latest_run_id:
+        args.expected_latest_run_id = env_file_defaults.get("EXPECTED_MATERIAL_LATEST_RUN_ID", "")
+    if args.vps_health_root == "/run/user/1000" and env_file_defaults.get("PUMP_RELAY_VPS_HEALTH_ROOT"):
+        args.vps_health_root = env_file_defaults["PUMP_RELAY_VPS_HEALTH_ROOT"]
+    if args.config_override == "config/local.example.toml" and env_file_defaults.get("CONFIG_OVERRIDE"):
+        args.config_override = env_file_defaults["CONFIG_OVERRIDE"]
     if command == "proof":
         args.slices = 1
         args.counted_slices_target = 1
