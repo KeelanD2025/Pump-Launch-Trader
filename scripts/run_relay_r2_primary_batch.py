@@ -18,6 +18,7 @@ import tempfile
 import textwrap
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -30,6 +31,16 @@ FORBIDDEN_VPS_ARTIFACT_NAMES = (
     "run_countability_decision.json",
     "countability_decision.json",
     "r2_upload_result.json",
+)
+SUPERVISOR_COMMANDS = {"proof", "batch", "recover", "cleanup-aborted", "status"}
+REQUIRED_FINAL_FILES = (
+    "local_relay_dataset_proof_summary.json",
+    "local_collector_summary.json",
+    "service_exit_status.json",
+    "countability_decision.json",
+    "run_countability_decision.json",
+    "r2_upload_result.json",
+    "local_retention_summary.json",
 )
 
 
@@ -162,6 +173,47 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def parse_tcp_url(url: str) -> tuple[str, int]:
+    parsed = urlparse(url)
+    if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+        raise BatchError(f"expected tcp://host:port URL, got {url!r}")
+    return parsed.hostname, int(parsed.port)
+
+
+def classify_blockers(blockers: list[str], result: dict[str, Any] | None = None) -> str:
+    result = result or {}
+    blocker_set = set(blockers)
+    if not blockers:
+        if int(result.get("upstream_provider_blocker_count") or 0) > 0:
+            return "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
+        return "RELAY_LOCAL_DATASET_PASS"
+    if "sequence_gap_count" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_SEQUENCE_GAP"
+    if "hash_mismatch_count" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_HASH_MISMATCH"
+    if "receiver_backpressure_count" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
+    if "receiver_unavailable_count" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_UNAVAILABLE"
+    if "r2_failed" in blocker_set or "retention_not_ok" in blocker_set or "r2_timeout" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_R2"
+    if "r2_local_spool_full" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_SPOOL"
+    if "artifact_consistency" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_ARTIFACT_CONSISTENCY"
+    if "vps_forbidden_artifacts" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_VPS_FORBIDDEN_ARTIFACTS"
+    if "not_counted" in blocker_set and result.get("provider_blocker_class"):
+        return "RELAY_LOCAL_DATASET_BLOCK_PROVIDER"
+    if "not_counted" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_COUNTABILITY"
+    if blocker_set & {"local_rc", "remote_rc", "local_finalization_timeout", "remote_relay_timeout"}:
+        return "RELAY_LOCAL_DATASET_BLOCK_ORCHESTRATION"
+    if "missing_final_artifacts" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_STRUCTURAL"
+    return "RELAY_LOCAL_DATASET_BLOCK_STRUCTURAL"
+
+
 def latest_run_id_remote_command(args: argparse.Namespace) -> str:
     candidates = [
         "data/reports/phase107b_material_candidate_hunter/latest_run_id",
@@ -232,6 +284,43 @@ def wait_for_listener(port: int, pid: int, timeout_seconds: int) -> None:
             raise BatchError("local collector exited before listener was ready") from exc
         time.sleep(1)
     raise BatchError(f"local collector did not bind port {port} within {timeout_seconds}s")
+
+
+def verify_remote_receiver(args: argparse.Namespace) -> dict[str, Any]:
+    host, port = parse_tcp_url(args.receiver_url)
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise BatchError(f"receiver URL must use VPS loopback, got host {host!r}")
+    remote = textwrap.dedent(
+        f"""
+        set -eu
+        host={shlex.quote(host)}
+        port={int(port)}
+        if ! command -v ss >/dev/null 2>&1; then
+          printf '{{"ok":false,"blocker":"ss_unavailable","host":"%s","port":%s}}\\n' "$host" "$port"
+          exit 20
+        fi
+        listeners=$(ss -H -ltn "sport = :$port" 2>/dev/null || true)
+        if [ -z "$listeners" ]; then
+          printf '{{"ok":false,"blocker":"receiver_not_bound","host":"%s","port":%s}}\\n' "$host" "$port"
+          exit 22
+        fi
+        if printf '%s\\n' "$listeners" | grep -Eq '(^|[[:space:]])(0\\.0\\.0\\.0|\\*|\\[::\\]):'; then
+          printf '{{"ok":false,"blocker":"receiver_bound_publicly","host":"%s","port":%s}}\\n' "$host" "$port"
+          exit 21
+        fi
+        python3 - "$host" "$port" "$listeners" <<'PY'
+import json
+import sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+listeners = sys.argv[3]
+print(json.dumps({"ok": True, "host": host, "port": port, "listener": listeners}))
+PY
+        """
+    ).strip()
+    proc = ssh(args, remote, check=True)
+    line = proc.stdout.strip().splitlines()[-1]
+    return json.loads(line)
 
 
 def make_remote_script(args: argparse.Namespace, run_id: str, health_dir: str) -> str:
@@ -503,6 +592,90 @@ def classify_slice(result: dict[str, Any]) -> str:
     return "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE"
 
 
+def missing_required_final_files(out: pathlib.Path) -> list[str]:
+    return [name for name in REQUIRED_FINAL_FILES if not (out / name).exists()]
+
+
+def r2_result_verified(out: pathlib.Path) -> bool:
+    r2 = read_json(out / "r2_upload_result.json")
+    return r2.get("verified") is True and not r2.get("failed_files")
+
+
+def recover_run(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
+    if not args.run_id:
+        raise BatchError("--run-id is required for recover")
+    out = pathlib.Path(args.run_id)
+    if not out.is_absolute():
+        out = args.output_root / args.run_id
+    result, blockers = validate_slice(out)
+    result["run"] = out.name
+    result["output_dir"] = str(out)
+    missing = missing_required_final_files(out)
+    if missing:
+        result["missing_final_files"] = missing
+        blockers.append("missing_final_artifacts")
+    result["classification"] = classify_blockers(blockers, result)
+    return result, blockers
+
+
+def cleanup_aborted(args: argparse.Namespace) -> dict[str, Any]:
+    root = args.output_root
+    now = time.time()
+    min_age_seconds = int(args.cleanup_min_age_minutes) * 60
+    candidates: list[dict[str, Any]] = []
+    deleted: list[str] = []
+    for out in sorted(root.glob("relay-r2-primary-*")):
+        if not out.is_dir() or out.name.endswith("-logs"):
+            continue
+        age_seconds = max(0, int(now - out.stat().st_mtime))
+        if age_seconds < min_age_seconds:
+            continue
+        verified = r2_result_verified(out)
+        has_final_summary = (out / "local_relay_dataset_proof_summary.json").exists()
+        if verified or has_final_summary:
+            continue
+        logs = out.with_name(f"{out.name}-logs")
+        entry = {
+            "output_dir": str(out),
+            "logs_dir": str(logs) if logs.exists() else None,
+            "age_seconds": age_seconds,
+            "reason": "missing_final_summary_and_unverified_r2",
+        }
+        candidates.append(entry)
+        if not args.dry_run:
+            import shutil
+
+            shutil.rmtree(out, ignore_errors=True)
+            if logs.exists():
+                shutil.rmtree(logs, ignore_errors=True)
+            deleted.append(str(out))
+    return {
+        "dry_run": args.dry_run,
+        "candidate_count": len(candidates),
+        "deleted_count": len(deleted),
+        "candidates": candidates,
+        "deleted": deleted,
+    }
+
+
+def status(args: argparse.Namespace, env: dict[str, str]) -> dict[str, Any]:
+    result: dict[str, Any] = {"schema_version": "phase107g.relay_supervisor_status.v1"}
+    if not args.skip_preflight:
+        try:
+            result["local_preflight"] = local_preflight(args, env)
+        except Exception as exc:  # noqa: BLE001 - surfaced as structured status.
+            result["local_preflight"] = {"ok": False, "error": str(exc)}
+    try:
+        result["vps_safety"] = verify_vps_safety(args)
+    except Exception as exc:  # noqa: BLE001 - surfaced as structured status.
+        result["vps_safety"] = {"ok": False, "error": str(exc)}
+    try:
+        result["remote_receiver"] = verify_remote_receiver(args)
+    except Exception as exc:  # noqa: BLE001 - receiver is expected to be absent unless tunnel/listener is up.
+        result["remote_receiver"] = {"ok": False, "error": str(exc)}
+    return result
+
+
 def run_slice(
     args: argparse.Namespace,
     env: dict[str, str],
@@ -564,6 +737,8 @@ def run_slice(
     try:
         wait_for_listener(args.listen_port, local_proc.pid, args.listen_timeout_seconds)
         print(f"slice={idx} listen_ready=true", flush=True)
+        remote_receiver = verify_remote_receiver(args)
+        print(f"slice={idx} remote_receiver={json.dumps(remote_receiver, sort_keys=True)}", flush=True)
         ssh(args, f"mkdir -p {shlex.quote(health_dir)} && chmod 700 {shlex.quote(health_dir)}", check=True)
         scp_cmd = scp_base(args) + [
             str(remote_script_local),
@@ -588,7 +763,11 @@ def run_slice(
                 break
             time.sleep(1)
         print(f"slice={idx} remote_rc={remote_rc or 'missing'}", flush=True)
-        local_rc = local_proc.wait()
+        try:
+            local_rc = local_proc.wait(timeout=args.local_finalization_timeout_seconds)
+        except subprocess.TimeoutExpired:
+            local_rc = -1
+            print(f"slice={idx} local_finalization_timeout=true", flush=True)
         print(f"slice={idx} local_rc={local_rc}", flush=True)
     finally:
         if local_proc.poll() is None:
@@ -609,6 +788,8 @@ def run_slice(
     result["classification"] = classify_slice(result) if not blockers else result.get("classification")
     if local_rc != 0:
         blockers.append("local_rc")
+    if local_rc == -1:
+        blockers.append("local_finalization_timeout")
     if remote_rc != "0":
         refreshed = ssh(
             args,
@@ -673,8 +854,12 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    command = "batch"
+    if argv and argv[0] in SUPERVISOR_COMMANDS:
+        command = argv[0]
+        argv = argv[1:]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--slices", type=int, default=20)
+    parser.add_argument("--slices", type=int, default=1 if command == "proof" else 20)
     parser.add_argument("--start-index", type=int, default=1)
     parser.add_argument("--counted-slices-target", type=int, default=None)
     parser.add_argument("--max-total-slices", type=int, default=None)
@@ -691,7 +876,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-attempted-launches", type=int, default=15)
     parser.add_argument("--target-candidates", type=int, default=2)
     parser.add_argument("--max-concurrent-tracked-mints", type=int, default=3)
-    parser.add_argument("--run-prefix", default="relay-r2-primary-batch")
+    parser.add_argument(
+        "--run-prefix",
+        default="relay-r2-primary-proof" if command == "proof" else "relay-r2-primary-batch",
+    )
     parser.add_argument("--output-root", type=pathlib.Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--batch-log-dir", type=pathlib.Path, default=None)
     parser.add_argument("--env-file", type=pathlib.Path, default=None)
@@ -719,22 +907,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--listen-port", type=int, default=19097)
     parser.add_argument("--listen-timeout-seconds", type=int, default=180)
     parser.add_argument("--remote-completion-grace-seconds", type=int, default=360)
+    parser.add_argument("--local-finalization-timeout-seconds", type=int, default=900)
     parser.add_argument("--expected-latest-run-id", default=os.environ.get("EXPECTED_MATERIAL_LATEST_RUN_ID", ""))
     parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--cleanup-min-age-minutes", type=int, default=60)
     args = parser.parse_args(argv)
-    if args.slices < 1:
+    args.command = command
+    if command == "proof":
+        args.slices = 1
+        args.counted_slices_target = 1
+        args.max_total_slices = 1
+    if args.slices < 1 and command in {"proof", "batch"}:
         parser.error("--slices must be positive")
     if args.counted_slices_target is None:
         args.counted_slices_target = args.slices
-    if args.counted_slices_target < 1:
+    if args.counted_slices_target < 1 and command in {"proof", "batch"}:
         parser.error("--counted-slices-target must be positive")
     if args.max_total_slices is None:
         args.max_total_slices = args.slices
         if args.replace_safe_provider_quarantine:
             args.max_total_slices += max(3, args.slices // 2)
-    if args.max_total_slices < args.counted_slices_target:
+    if args.max_total_slices < args.counted_slices_target and command in {"proof", "batch"}:
         parser.error("--max-total-slices must be >= --counted-slices-target")
-    if not args.vps_ssh_target:
+    if not args.vps_ssh_target and command in {"proof", "batch", "status"}:
         parser.error("--vps-ssh-target or PUMP_RELAY_VPS_SSH_TARGET is required")
     if args.local_receiver_window_seconds < args.duration_seconds:
         parser.error("--local-receiver-window-seconds must be >= --duration-seconds")
@@ -749,6 +946,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     env = merged_env(args.env_file)
+    if args.command == "recover":
+        result, blockers = recover_run(args)
+        payload = {"blockers": blockers, "result": result}
+        print("RECOVER", json.dumps(payload, sort_keys=True), flush=True)
+        return 0 if not blockers else 2
+    if args.command == "cleanup-aborted":
+        payload = cleanup_aborted(args)
+        print("CLEANUP_ABORTED", json.dumps(payload, sort_keys=True), flush=True)
+        return 0
+    if args.command == "status":
+        payload = status(args, env)
+        print("STATUS", json.dumps(payload, sort_keys=True), flush=True)
+        safety_ok = not payload.get("vps_safety", {}).get("error")
+        preflight_ok = args.skip_preflight or payload.get("local_preflight", {}).get("ok") is True
+        return 0 if safety_ok and preflight_ok else 2
+
     args.batch_log_dir.mkdir(parents=True, exist_ok=True)
     print(f"batch_log_dir={args.batch_log_dir}", flush=True)
     if not args.skip_preflight:
@@ -773,6 +986,7 @@ def main(argv: list[str]) -> int:
             blockers = []
             print("SLICE_PROVIDER_QUARANTINED", json.dumps(result, sort_keys=True), flush=True)
         elif blockers:
+            result["classification"] = classify_blockers(blockers, result)
             stop = {"slice": idx, "blockers": blockers, "result": result}
             (args.batch_log_dir / "batch_stop.json").write_text(json.dumps(stop, indent=2, sort_keys=True))
             print("BATCH_STOP", json.dumps(stop, sort_keys=True), flush=True)
@@ -791,6 +1005,14 @@ def main(argv: list[str]) -> int:
         print(f"=== batch_slice={idx} pass={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
 
     final = rollup(passed)
+    if args.command == "proof":
+        final["classification"] = (
+            "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
+            if final["provider_gap_continued_slices"] > 0
+            else "RELAY_LOCAL_DATASET_PASS"
+        )
+    else:
+        final["classification"] = "RELAY_R2_PRIMARY_BATCH_PASS_WITH_GAP_CONTINUATION"
     if counted_slices < args.counted_slices_target:
         final["blocked_slices"] = args.counted_slices_target - counted_slices
         final["counted_slices_target"] = args.counted_slices_target
