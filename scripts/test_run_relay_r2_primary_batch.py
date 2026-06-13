@@ -85,6 +85,14 @@ class RelaySupervisorTests(unittest.TestCase):
             self.assertEqual(args.expected_latest_run_id, "material-candidate-hunter-stable")
             self.assertEqual(args.config_override, "config/local.relay.toml")
 
+    def test_remote_receiver_verifier_parses_listener_status(self) -> None:
+        stdout = '{"ok":true,"host":"127.0.0.1","port":19097,"listener":"LISTEN 0 128 127.0.0.1:19097"}\n'
+        with mock.patch.object(relay_supervisor, "ssh", return_value=types.SimpleNamespace(stdout=stdout)):
+            result = relay_supervisor.verify_remote_receiver(dummy_args())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["host"], "127.0.0.1")
+        self.assertEqual(result["port"], 19097)
+
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(
             relay_supervisor.classify_blockers(["local_finalization_timeout"], {}),

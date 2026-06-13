@@ -304,7 +304,8 @@ def verify_remote_receiver(args: argparse.Namespace) -> dict[str, Any]:
           printf '{{"ok":false,"blocker":"receiver_not_bound","host":"%s","port":%s}}\\n' "$host" "$port"
           exit 22
         fi
-        if printf '%s\\n' "$listeners" | grep -Eq '(^|[[:space:]])(0\\.0\\.0\\.0|\\*|\\[::\\]):'; then
+        local_addrs=$(printf '%s\\n' "$listeners" | awk '{{print $4}}')
+        if printf '%s\\n' "$local_addrs" | grep -Eq '^(0\\.0\\.0\\.0|\\*|\\[::\\]|::):'; then
           printf '{{"ok":false,"blocker":"receiver_bound_publicly","host":"%s","port":%s}}\\n' "$host" "$port"
           exit 21
         fi
@@ -314,7 +315,7 @@ import sys
 host = sys.argv[1]
 port = int(sys.argv[2])
 listeners = sys.argv[3]
-print(json.dumps({"ok": True, "host": host, "port": port, "listener": listeners}))
+print(json.dumps({{"ok": True, "host": host, "port": port, "listener": listeners}}))
 PY
         """
     ).strip()
