@@ -25,10 +25,16 @@ def dummy_args(**overrides: object) -> types.SimpleNamespace:
         "vps_env_file": "/home/ubuntu/pump-launch-quant.env",
         "vps_repo_dir": "/home/ubuntu/pump-launch-quant",
         "receiver_url": "tcp://127.0.0.1:19097",
+        "listen_url": "tcp://127.0.0.1:19097",
         "duration_seconds": 900,
         "expected_latest_run_id": "material-candidate-hunter-stable",
+        "ssh_key": None,
+        "ssh_option": [],
+        "vps_ssh_target": "ubuntu@example.invalid",
         "dry_run": True,
         "cleanup_min_age_minutes": 0,
+        "manage_reverse_tunnel": True,
+        "tunnel_timeout_seconds": 60,
     }
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -87,11 +93,41 @@ class RelaySupervisorTests(unittest.TestCase):
 
     def test_remote_receiver_verifier_parses_listener_status(self) -> None:
         stdout = '{"ok":true,"host":"127.0.0.1","port":19097,"listener":"LISTEN 0 128 127.0.0.1:19097"}\n'
-        with mock.patch.object(relay_supervisor, "ssh", return_value=types.SimpleNamespace(stdout=stdout)):
+        with mock.patch.object(
+            relay_supervisor,
+            "ssh",
+            return_value=types.SimpleNamespace(stdout=stdout, stderr="", returncode=0),
+        ):
             result = relay_supervisor.verify_remote_receiver(dummy_args())
         self.assertTrue(result["ok"])
         self.assertEqual(result["host"], "127.0.0.1")
         self.assertEqual(result["port"], 19097)
+
+    def test_reverse_tunnel_command_uses_private_loopback_remote_bind(self) -> None:
+        command = relay_supervisor.reverse_tunnel_command(dummy_args())
+        rendered = " ".join(command)
+        self.assertIn("ExitOnForwardFailure=yes", rendered)
+        self.assertIn("127.0.0.1:19097:127.0.0.1:19097", command)
+        self.assertNotIn("0.0.0.0:19097", rendered)
+
+    def test_reverse_tunnel_rejects_public_remote_bind(self) -> None:
+        with self.assertRaises(relay_supervisor.BatchError):
+            relay_supervisor.reverse_tunnel_command(
+                dummy_args(receiver_url="tcp://0.0.0.0:19097")
+            )
+
+    def test_reverse_tunnel_reuses_existing_remote_receiver(self) -> None:
+        ready = {"ok": True, "host": "127.0.0.1", "port": 19097}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(relay_supervisor, "verify_remote_receiver", return_value=ready):
+                proc, stdout, stderr, result = relay_supervisor.start_or_reuse_reverse_tunnel(
+                    dummy_args(),
+                    pathlib.Path(tmp),
+                )
+        self.assertIsNone(proc)
+        self.assertIsNone(stdout)
+        self.assertIsNone(stderr)
+        self.assertTrue(result["tunnel_reused"])
 
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(

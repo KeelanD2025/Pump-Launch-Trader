@@ -319,9 +319,88 @@ print(json.dumps({{"ok": True, "host": host, "port": port, "listener": listeners
 PY
         """
     ).strip()
-    proc = ssh(args, remote, check=True)
-    line = proc.stdout.strip().splitlines()[-1]
-    return json.loads(line)
+    proc = ssh(args, remote, check=False)
+    try:
+        line = proc.stdout.strip().splitlines()[-1]
+        payload = json.loads(line)
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise BatchError(
+            f"remote receiver probe failed rc={proc.returncode}: stdout={proc.stdout[:1000]} stderr={proc.stderr[:1000]}"
+        ) from exc
+    if proc.returncode != 0 or payload.get("ok") is not True:
+        raise BatchError(f"remote receiver not ready: {json.dumps(payload, sort_keys=True)}")
+    return payload
+
+
+def reverse_tunnel_command(args: argparse.Namespace) -> list[str]:
+    remote_host, remote_port = parse_tcp_url(args.receiver_url)
+    local_host, local_port = parse_tcp_url(args.listen_url)
+    if remote_host not in {"127.0.0.1", "localhost"}:
+        raise BatchError(f"reverse tunnel remote bind must be IPv4 loopback, got {remote_host!r}")
+    if local_host not in {"127.0.0.1", "localhost"}:
+        raise BatchError(f"reverse tunnel local target must be IPv4 loopback, got {local_host!r}")
+    return ssh_base(args) + [
+        "-N",
+        "-T",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-R",
+        f"{remote_host}:{remote_port}:{local_host}:{local_port}",
+    ]
+
+
+def start_or_reuse_reverse_tunnel(
+    args: argparse.Namespace,
+    log_dir: pathlib.Path,
+) -> tuple[subprocess.Popen[str] | None, Any, Any, dict[str, Any]]:
+    try:
+        receiver = verify_remote_receiver(args)
+        receiver["tunnel_reused"] = True
+        return None, None, None, receiver
+    except BatchError as exc:
+        rendered = str(exc)
+        if "receiver_bound_publicly" in rendered:
+            raise
+        if not args.manage_reverse_tunnel:
+            raise
+
+    tunnel_stdout = (log_dir / "reverse_tunnel.log").open("w")
+    tunnel_stderr = (log_dir / "reverse_tunnel.err").open("w")
+    proc = subprocess.Popen(
+        reverse_tunnel_command(args),
+        cwd=REPO,
+        stdout=tunnel_stdout,
+        stderr=tunnel_stderr,
+        text=True,
+    )
+    deadline = time.time() + args.tunnel_timeout_seconds
+    last_error = ""
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            tunnel_stdout.flush()
+            tunnel_stderr.flush()
+            tunnel_stdout.close()
+            tunnel_stderr.close()
+            raise BatchError(f"reverse tunnel exited before receiver became ready rc={proc.returncode}")
+        try:
+            receiver = verify_remote_receiver(args)
+            receiver["tunnel_started"] = True
+            return proc, tunnel_stdout, tunnel_stderr, receiver
+        except BatchError as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    tunnel_stdout.close()
+    tunnel_stderr.close()
+    raise BatchError(f"reverse tunnel did not become ready within {args.tunnel_timeout_seconds}s: {last_error}")
 
 
 def make_remote_script(args: argparse.Namespace, run_id: str, health_dir: str) -> str:
@@ -734,11 +813,14 @@ def run_slice(
         stderr=local_err,
         text=True,
     )
+    tunnel_proc: subprocess.Popen[str] | None = None
+    tunnel_log = None
+    tunnel_err = None
     print(f"slice={idx} run_id={run_id} out={out.relative_to(REPO)} local_pid={local_proc.pid}", flush=True)
     try:
         wait_for_listener(args.listen_port, local_proc.pid, args.listen_timeout_seconds)
         print(f"slice={idx} listen_ready=true", flush=True)
-        remote_receiver = verify_remote_receiver(args)
+        tunnel_proc, tunnel_log, tunnel_err, remote_receiver = start_or_reuse_reverse_tunnel(args, log_dir)
         print(f"slice={idx} remote_receiver={json.dumps(remote_receiver, sort_keys=True)}", flush=True)
         ssh(args, f"mkdir -p {shlex.quote(health_dir)} && chmod 700 {shlex.quote(health_dir)}", check=True)
         scp_cmd = scp_base(args) + [
@@ -771,6 +853,16 @@ def run_slice(
             print(f"slice={idx} local_finalization_timeout=true", flush=True)
         print(f"slice={idx} local_rc={local_rc}", flush=True)
     finally:
+        if tunnel_proc is not None and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+            try:
+                tunnel_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                tunnel_proc.kill()
+        if tunnel_log is not None:
+            tunnel_log.close()
+        if tunnel_err is not None:
+            tunnel_err.close()
         if local_proc.poll() is None:
             local_proc.terminate()
             try:
@@ -907,6 +999,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--receiver-url", default="tcp://127.0.0.1:19097")
     parser.add_argument("--listen-port", type=int, default=19097)
     parser.add_argument("--listen-timeout-seconds", type=int, default=180)
+    parser.add_argument("--tunnel-timeout-seconds", type=int, default=60)
+    parser.add_argument("--no-manage-reverse-tunnel", dest="manage_reverse_tunnel", action="store_false")
+    parser.set_defaults(manage_reverse_tunnel=True)
     parser.add_argument("--remote-completion-grace-seconds", type=int, default=360)
     parser.add_argument("--local-finalization-timeout-seconds", type=int, default=900)
     parser.add_argument("--expected-latest-run-id", default=os.environ.get("EXPECTED_MATERIAL_LATEST_RUN_ID", ""))
