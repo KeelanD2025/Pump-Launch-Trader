@@ -23,8 +23,9 @@ use metrics::init_tracing;
 use r2_storage::{
     ArtifactManifest, ArtifactManifestDataGapSummary, ArtifactManifestEntry,
     ArtifactManifestPruningSummary, ArtifactManifestSegmentState, ArtifactManifestSegmentSummary,
-    ArtifactManifestUploadSummary, R2Client, SegmentIntegrityValidationOptions,
-    SegmentIntegrityValidationReport, SegmentIntegrityValidator, load_manifest, write_manifest,
+    ArtifactManifestUploadSummary, PreparedUpload, R2Client, R2UploadResult,
+    SegmentIntegrityValidationOptions, SegmentIntegrityValidationReport, SegmentIntegrityValidator,
+    load_manifest, write_manifest,
 };
 use reqwest as http_transport;
 use risk::RiskEngine;
@@ -33953,6 +33954,8 @@ fn collect_report_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 const PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS: usize = 8;
+const PHASE_REPORT_R2_RESCUE_SWEEPS: usize = 3;
+const PHASE_REPORT_R2_RESCUE_ATTEMPTS_PER_SWEEP: usize = 2;
 const PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 
 fn phase_report_r2_retry_backoff(attempt_index: usize) -> StdDuration {
@@ -33965,6 +33968,75 @@ fn phase_report_r2_retry_backoff(attempt_index: usize) -> StdDuration {
         5 => StdDuration::from_secs(30),
         _ => StdDuration::from_secs(60),
     }
+}
+
+fn phase_report_r2_rescue_backoff(sweep_index: usize) -> StdDuration {
+    match sweep_index {
+        0 => StdDuration::from_secs(5),
+        1 => StdDuration::from_secs(20),
+        _ => StdDuration::from_secs(60),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PhaseReportR2PendingUpload {
+    remote_key: String,
+    prepared: PreparedUpload,
+    attempts: usize,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct PhaseReportR2UploadAttempt {
+    result: Option<R2UploadResult>,
+    attempts: usize,
+    last_error: Option<String>,
+}
+
+async fn phase_report_upload_with_retries(
+    client: &R2Client,
+    prepared: &PreparedUpload,
+    verify_r2: bool,
+    max_attempts: usize,
+) -> PhaseReportR2UploadAttempt {
+    let mut last_error = None::<String>;
+    for attempt_index in 0..max_attempts {
+        let upload = tokio::time::timeout(
+            PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
+            client.upload_prepared(prepared, verify_r2.then_some(true)),
+        )
+        .await;
+        match upload {
+            Ok(Ok(upload_result)) => {
+                return PhaseReportR2UploadAttempt {
+                    result: Some(upload_result),
+                    attempts: attempt_index + 1,
+                    last_error,
+                };
+            }
+            Ok(Err(error)) => {
+                last_error = Some(error.to_string());
+            }
+            Err(_) => {
+                last_error = Some(format!(
+                    "r2_upload_attempt_timeout_after_{}s",
+                    PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT.as_secs()
+                ));
+            }
+        }
+        if attempt_index + 1 < max_attempts {
+            tokio::time::sleep(phase_report_r2_retry_backoff(attempt_index)).await;
+        }
+    }
+    PhaseReportR2UploadAttempt {
+        result: None,
+        attempts: max_attempts,
+        last_error,
+    }
+}
+
+fn phase_report_r2_upload_complete(result: &R2UploadResult, verify_r2: bool) -> bool {
+    result.uploaded && (!verify_r2 || result.verified)
 }
 
 async fn upload_phase_report_dir_to_r2(
@@ -33985,6 +34057,7 @@ async fn upload_phase_report_dir_to_r2(
     let mut retried_files = Vec::<serde_json::Value>::new();
     let mut upload_errors = Vec::<serde_json::Value>::new();
     let mut skipped_files = Vec::<serde_json::Value>::new();
+    let mut pending_uploads = Vec::<PhaseReportR2PendingUpload>::new();
     for path in paths {
         let relative = path
             .strip_prefix(output_dir)
@@ -34010,61 +34083,95 @@ async fn upload_phase_report_dir_to_r2(
             BTreeMap::new(),
             Some(false),
         )?;
-        let mut result = None;
-        let mut last_error = None::<String>;
-        for attempt_index in 0..PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
-            let upload = tokio::time::timeout(
-                PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
-                client.upload_prepared(&prepared, verify_r2.then_some(true)),
-            )
-            .await;
-            match upload {
-                Ok(Ok(upload_result)) => {
-                    if attempt_index > 0 {
-                        retried_files.push(json!({
-                            "remote_key": remote_key.clone(),
-                            "attempts": attempt_index + 1,
-                            "last_error": last_error,
-                        }));
-                    }
-                    result = Some(upload_result);
-                    break;
-                }
-                Ok(Err(error)) => {
-                    last_error = Some(error.to_string());
-                    if attempt_index + 1 < PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
-                        tokio::time::sleep(phase_report_r2_retry_backoff(attempt_index)).await;
-                    }
-                }
-                Err(_) => {
-                    last_error = Some(format!(
-                        "r2_upload_attempt_timeout_after_{}s",
-                        PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT.as_secs()
-                    ));
-                    if attempt_index + 1 < PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS {
-                        tokio::time::sleep(phase_report_r2_retry_backoff(attempt_index)).await;
-                    }
+        let attempt = phase_report_upload_with_retries(
+            &client,
+            &prepared,
+            verify_r2,
+            PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS,
+        )
+        .await;
+        let complete = attempt
+            .result
+            .as_ref()
+            .is_some_and(|result| phase_report_r2_upload_complete(result, verify_r2));
+        if complete {
+            if attempt.attempts > 1 {
+                retried_files.push(json!({
+                    "remote_key": remote_key.clone(),
+                    "attempts": attempt.attempts,
+                    "last_error": attempt.last_error,
+                }));
+            }
+            if let Some(result) = attempt.result {
+                uploaded_files.push(remote_key.clone());
+                if verify_r2 && result.verified {
+                    verified_files.push(remote_key.clone());
                 }
             }
-        }
-        let Some(result) = result else {
-            failed_files.push(remote_key.clone());
-            upload_errors.push(json!({
-                "remote_key": remote_key,
-                "attempts": PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS,
-                "last_error": last_error,
-            }));
             continue;
-        };
-        if result.uploaded {
-            uploaded_files.push(remote_key.clone());
         }
-        if verify_r2 && result.verified {
-            verified_files.push(remote_key.clone());
+
+        let last_error = attempt
+            .last_error
+            .or_else(|| Some("r2_upload_or_verification_incomplete".to_owned()));
+        pending_uploads.push(PhaseReportR2PendingUpload {
+            remote_key,
+            prepared,
+            attempts: attempt.attempts,
+            last_error,
+        });
+    }
+
+    for sweep_index in 0..PHASE_REPORT_R2_RESCUE_SWEEPS {
+        if pending_uploads.is_empty() {
+            break;
         }
-        if verify_r2 && !result.verified {
-            failed_files.push(remote_key);
+        tokio::time::sleep(phase_report_r2_rescue_backoff(sweep_index)).await;
+        let mut still_pending = Vec::<PhaseReportR2PendingUpload>::new();
+        for mut pending in pending_uploads {
+            let attempt = phase_report_upload_with_retries(
+                &client,
+                &pending.prepared,
+                verify_r2,
+                PHASE_REPORT_R2_RESCUE_ATTEMPTS_PER_SWEEP,
+            )
+            .await;
+            pending.attempts = pending.attempts.saturating_add(attempt.attempts);
+            let complete = attempt
+                .result
+                .as_ref()
+                .is_some_and(|result| phase_report_r2_upload_complete(result, verify_r2));
+            if complete {
+                retried_files.push(json!({
+                    "remote_key": pending.remote_key.clone(),
+                    "attempts": pending.attempts,
+                    "rescue_sweep": sweep_index + 1,
+                    "last_error": pending.last_error.or(attempt.last_error),
+                }));
+                if let Some(result) = attempt.result {
+                    uploaded_files.push(pending.remote_key.clone());
+                    if verify_r2 && result.verified {
+                        verified_files.push(pending.remote_key);
+                    }
+                }
+                continue;
+            }
+            pending.last_error = attempt
+                .last_error
+                .or_else(|| Some("r2_upload_or_verification_incomplete".to_owned()));
+            still_pending.push(pending);
         }
+        pending_uploads = still_pending;
+    }
+
+    for pending in pending_uploads {
+        failed_files.push(pending.remote_key.clone());
+        upload_errors.push(json!({
+            "remote_key": pending.remote_key,
+            "attempts": pending.attempts,
+            "last_error": pending.last_error,
+            "rescue_sweeps": PHASE_REPORT_R2_RESCUE_SWEEPS,
+        }));
     }
     Ok(json!({
         "schema_version": "phase95.r2_upload_result.v1",
@@ -60170,6 +60277,8 @@ mod tests {
     #[test]
     fn phase107g_phase_report_r2_retry_schedule_is_bounded() {
         assert_eq!(PHASE_REPORT_R2_MAX_UPLOAD_ATTEMPTS, 8);
+        assert_eq!(PHASE_REPORT_R2_RESCUE_SWEEPS, 3);
+        assert_eq!(PHASE_REPORT_R2_RESCUE_ATTEMPTS_PER_SWEEP, 2);
         assert_eq!(
             PHASE_REPORT_R2_UPLOAD_ATTEMPT_TIMEOUT,
             StdDuration::from_secs(90)
@@ -60185,6 +60294,15 @@ mod tests {
         assert_eq!(phase_report_r2_retry_backoff(5), StdDuration::from_secs(30));
         assert_eq!(
             phase_report_r2_retry_backoff(99),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(phase_report_r2_rescue_backoff(0), StdDuration::from_secs(5));
+        assert_eq!(
+            phase_report_r2_rescue_backoff(1),
+            StdDuration::from_secs(20)
+        );
+        assert_eq!(
+            phase_report_r2_rescue_backoff(99),
             StdDuration::from_secs(60)
         );
     }

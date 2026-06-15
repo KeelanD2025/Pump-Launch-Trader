@@ -3,7 +3,7 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     Client,
-    config::Builder as S3ConfigBuilder,
+    config::{Builder as S3ConfigBuilder, timeout::TimeoutConfig},
     error::{DisplayErrorContext, ProvideErrorMetadata},
     primitives::ByteStream,
 };
@@ -16,6 +16,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
+    time::Duration as StdDuration,
 };
 use time::OffsetDateTime;
 
@@ -752,9 +753,11 @@ impl R2Client {
             .credentials_provider(credentials)
             .load()
             .await;
+        let timeout_config = r2_sdk_timeout_config(self.config.upload_timeout_seconds);
         let config = S3ConfigBuilder::from(&shared)
             .endpoint_url(self.resolved.endpoint.clone())
             .force_path_style(self.resolved.force_path_style)
+            .timeout_config(timeout_config)
             .build();
         Ok(Client::from_conf(config))
     }
@@ -764,6 +767,16 @@ impl R2Client {
             .or_else(|| self.config.dry_run.then(|| format!("<{env_name}>")))
             .ok_or_else(|| anyhow!("{env_name} is not configured"))
     }
+}
+
+fn r2_sdk_timeout_config(upload_timeout_seconds: u64) -> TimeoutConfig {
+    let upload_timeout_seconds = upload_timeout_seconds.max(1);
+    let connect_timeout_seconds = (upload_timeout_seconds / 10).clamp(10, 30);
+    let operation_attempt_timeout_seconds = upload_timeout_seconds.clamp(30, 600);
+    TimeoutConfig::builder()
+        .connect_timeout(StdDuration::from_secs(connect_timeout_seconds))
+        .operation_attempt_timeout(StdDuration::from_secs(operation_attempt_timeout_seconds))
+        .build()
 }
 
 fn describe_sdk_error<E, R>(operation: &str, error: &aws_sdk_s3::error::SdkError<E, R>) -> String
@@ -967,6 +980,29 @@ mod tests {
 
     fn config() -> R2Config {
         R2Config::default()
+    }
+
+    #[test]
+    fn sdk_timeout_config_uses_bounded_r2_upload_timeout() {
+        let default_timeout = r2_sdk_timeout_config(600);
+        assert_eq!(
+            default_timeout.connect_timeout(),
+            Some(StdDuration::from_secs(30))
+        );
+        assert_eq!(
+            default_timeout.operation_attempt_timeout(),
+            Some(StdDuration::from_secs(600))
+        );
+
+        let short_timeout = r2_sdk_timeout_config(5);
+        assert_eq!(
+            short_timeout.connect_timeout(),
+            Some(StdDuration::from_secs(10))
+        );
+        assert_eq!(
+            short_timeout.operation_attempt_timeout(),
+            Some(StdDuration::from_secs(30))
+        );
     }
 
     #[test]
