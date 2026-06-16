@@ -215,6 +215,26 @@ class StrategyReadinessTests(unittest.TestCase):
         self.assertFalse(survivor["runs_replay"])
         self.assertFalse(survivor["trades"])
 
+    def test_survivor_extension_proof_classifies_clean_counted_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "relay-r2-primary-proof"
+            run.mkdir()
+            (run / "survivor_extension_mode.json").write_text('{"enabled":true}')
+            rows = [
+                {
+                    "source_path": str(run),
+                    "included": True,
+                    "counted_phase107b_result": True,
+                    "replay_eligible_candidate_count": 0,
+                }
+            ]
+            survivor_runs = sr.survivor_extension_runs(rows)
+        self.assertEqual(len(survivor_runs), 1)
+        self.assertEqual(
+            sr.survivor_extension_proof_classification(survivor_runs),
+            "SURVIVOR_EXTENSION_PROOF_PASS",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

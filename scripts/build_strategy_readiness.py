@@ -52,6 +52,7 @@ DATASET_FIELDS = [
     "malformed_frame_count",
     "provider_blocker_count",
     "upstream_reconnect_count",
+    "frames_received",
     "attempted_launches",
     "unique_attempted_mints",
     "attempt_ledger_rows",
@@ -64,6 +65,9 @@ DATASET_FIELDS = [
     "terminal_inconclusive_count",
     "candidate_checkpoint_count",
     "replay_eligible_candidate_count",
+    "r2_uploaded",
+    "retention_deleted_bytes",
+    "local_retained_bytes",
     "holder_rpc_disabled",
     "rpc_mint_supply_non_canonical",
     "replay_disabled",
@@ -513,6 +517,10 @@ def inspect_run(run_dir: pathlib.Path, exporter: Any, batch_map: dict[str, str])
         "counted_phase107b_result": counted,
         "r2_verified": r2_ok,
         "artifact_consistency_ok": artifact_ok,
+        "frames_received": int_or_zero(proof.get("frames_received") or local.get("frames_received")),
+        "r2_uploaded": len(keys),
+        "retention_deleted_bytes": int_or_zero(retention.get("deleted_bulk_bytes")),
+        "local_retained_bytes": int_or_zero(retention.get("local_retained_bytes")),
         "attempt_ledger_rows": len(attempt_rows),
         "rejected_summary_rows": len(rejected_rows),
         "candidate_summary_rows": len(candidate_rows),
@@ -925,6 +933,37 @@ def write_score_report(path: pathlib.Path, title: str, rows: list[dict[str, Any]
     path.write_text("\n".join(lines) + "\n")
 
 
+def survivor_extension_runs(inventory: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    for row in inventory:
+        source = pathlib.Path(str(row.get("source_path") or ""))
+        policy = read_json(source / "survivor_extension_mode.json")
+        if not boolish(policy.get("enabled")):
+            continue
+        runs.append({**row, "survivor_extension_policy": policy})
+    return runs
+
+
+def survivor_extension_proof_classification(runs: list[dict[str, Any]]) -> str:
+    if not runs:
+        return "NOT_RUN_SOURCE_READY"
+    if any(int_or_zero(row.get("replay_eligible_candidate_count")) > 0 for row in runs):
+        return "CANDIDATE_REVIEW_TRIGGERED"
+    if any(boolish(row.get("included")) and boolish(row.get("counted_phase107b_result")) for row in runs):
+        return "SURVIVOR_EXTENSION_PROOF_PASS"
+    return "SURVIVOR_EXTENSION_BLOCK"
+
+
+def survivor_int(row: dict[str, Any], flat_key: str, nested_key: str, nested_field: str) -> int:
+    flat = int_or_zero(row.get(flat_key))
+    if flat:
+        return flat
+    nested = row.get(nested_key)
+    if isinstance(nested, dict):
+        return int_or_zero(nested.get(nested_field))
+    return 0
+
+
 def leakage_audit(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]], labels: list[dict[str, Any]], splits: dict[str, Any] | None = None) -> dict[str, Any]:
     blockers: list[str] = []
     feature_columns = set(ASOF_FIELDS)
@@ -1119,6 +1158,17 @@ def write_reports(
     early_decisions = Counter(row["decision"] for row in early_scores)
     continue_decisions = Counter(row["decision"] for row in continue_scores)
     eligibility_decisions = Counter(row["decision"] for row in eligibility_scores)
+    survivor_runs = survivor_extension_runs(inventory)
+    survivor_classification = survivor_extension_proof_classification(survivor_runs)
+    survivor_frames = sum(survivor_int(row, "frames_received", "proof", "frames_received") for row in survivor_runs)
+    survivor_attempts = sum(int_or_zero(row.get("attempted_launches")) for row in survivor_runs)
+    survivor_rejected = sum(int_or_zero(row.get("rejected_dead_count")) for row in survivor_runs)
+    survivor_inconclusive = sum(int_or_zero(row.get("terminal_inconclusive_count")) for row in survivor_runs)
+    survivor_r2 = sum(survivor_int(row, "r2_uploaded", "r2", "uploaded_files") for row in survivor_runs)
+    survivor_retention_deleted = sum(
+        survivor_int(row, "retention_deleted_bytes", "retention", "deleted_bulk_bytes")
+        for row in survivor_runs
+    )
 
     readiness_lines = [
         "# Strategy Readiness Report",
@@ -1248,11 +1298,20 @@ def write_reports(
             [
                 "# Survivor Extension Proof Report",
                 "",
-                "Classification: NOT_RUN_SOURCE_READY",
+                f"Classification: {survivor_classification}",
                 "",
-                "Survivor extension mode is defined as research-only and disabled by default. It must not raise launch caps, run replay, run backtesting, tune thresholds, trade, or call wallet/RPC execution paths.",
+                "Survivor extension mode is research-only and disabled by default. Proof runs must not raise launch caps, run replay, run backtesting, tune thresholds, trade, or call wallet/RPC execution paths.",
                 "",
-                "Proof command should use the committed relay supervisor with the same 900s duration, max_attempted_launches=15, target_candidates=2, R2-primary retention, and explicit survivor-extension metadata. Gap-crossing mints remain terminal_inconclusive and never replay-eligible.",
+                f"Survivor proof runs discovered: {len(survivor_runs)}",
+                f"Frames: {survivor_frames}",
+                f"Attempts: {survivor_attempts}",
+                f"Rejected/dead: {survivor_rejected}",
+                f"Terminal inconclusive: {survivor_inconclusive}",
+                f"Replay-eligible candidates: {sum(int_or_zero(row.get('replay_eligible_candidate_count')) for row in survivor_runs)}",
+                f"R2 uploaded/verified objects: {survivor_r2}",
+                f"Retention deleted bytes: {survivor_retention_deleted}",
+                "",
+                "Gap-crossing mints remain terminal_inconclusive and never replay-eligible. Candidate review is required before any replay/backtesting if a replay-eligible candidate appears.",
             ]
         )
         + "\n"
@@ -1407,8 +1466,10 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         "threshold_tuning_ready": readiness["threshold_tuning_ready"],
         "live_trading_ready": readiness["live_trading_ready"],
         "launch_caps_remain_blocked": True,
-        "survivor_extension_mode_enabled": False,
-        "survivor_extension_proof_classification": "NOT_RUN_SOURCE_READY",
+        "survivor_extension_mode_enabled": bool(survivor_extension_runs(inventory)),
+        "survivor_extension_proof_classification": survivor_extension_proof_classification(
+            survivor_extension_runs(inventory)
+        ),
     }
     write_json(output_dir / "strategy_readiness_summary.json", summary)
     errors = validate_outputs(output_dir)
