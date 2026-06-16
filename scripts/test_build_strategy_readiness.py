@@ -235,6 +235,58 @@ class StrategyReadinessTests(unittest.TestCase):
             "SURVIVOR_EXTENSION_PROOF_PASS",
         )
 
+    def test_candidate_eligibility_v1_emits_detailed_reasons(self) -> None:
+        label = {
+            "final_outcome": "early_rejected_dead",
+            "rejection_reason": "volume_evaporated",
+            "clean_negative_label": True,
+            "censored_label": False,
+            "candidate_checkpoint_seen": False,
+            "replay_eligible": False,
+        }
+        features = {
+            "tracked_at_least_horizon": True,
+            "data_quality_provider_gap_exposed": False,
+            "data_quality_relay_gap_exposed": False,
+            "data_quality_sequence_gap": False,
+            "data_quality_hash_mismatch": False,
+            "data_quality_receiver_backpressure": False,
+            "data_quality_degraded_active_mint": False,
+        }
+        reasons = sr.v1_reason_codes(features, label)
+        self.assertIn("early_rejection_reason_volume_evaporated", reasons)
+        self.assertIn("candidate_checkpoint_absent", reasons)
+        self.assertIn("missing_trade_delta_features", reasons)
+        self.assertIn("replay_not_countability_allowed", reasons)
+        self.assertEqual(
+            sr.first_failed_candidate_gate(reasons),
+            "early_rejection_reason_volume_evaporated",
+        )
+
+    def test_continue_gap_classifies_missing_asof_features(self) -> None:
+        label = {"clean_negative_label": False, "censored_label": False}
+        self.assertEqual(
+            sr.classify_continue_gap(label, ["missing_trade_delta_features"]),
+            "MISSING_ASOF_FEATURES",
+        )
+
+    def test_extended_asof_placeholders_do_not_mark_features_available(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            labels = [
+                {
+                    "mint": "mint",
+                    "slice_id": "slice",
+                    "segment_id": "1",
+                    "relay_session_id": "relay",
+                }
+            ]
+            completeness = sr.write_extended_asof_feature_placeholders(Path(td), labels)
+            with (Path(td) / "asof_features" / "asof_trade_delta_features_060s.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertFalse(completeness["groups"]["trade_delta"]["available"])
+        self.assertEqual(rows[0]["feature_available"], "false")
+        self.assertEqual(rows[0]["future_collection_required"], "true")
+
 
 if __name__ == "__main__":
     unittest.main()

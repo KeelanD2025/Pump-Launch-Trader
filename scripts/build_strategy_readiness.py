@@ -174,6 +174,79 @@ CANDIDATE_ELIGIBILITY_SCORE_FIELDS = [
     "trade_action",
 ]
 
+CANDIDATE_ELIGIBILITY_V1_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "horizon_seconds",
+    "decision",
+    "score",
+    "reason_codes",
+    "first_failed_candidate_gate",
+    "replay_eligible",
+    "candidate_checkpoint_seen",
+    "label_quality",
+    "final_outcome",
+    "trade_action",
+]
+
+CONTINUE_TO_CANDIDATE_GAP_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "final_outcome",
+    "censored_label",
+    "rejection_reason",
+    "terminal_inconclusive_reason",
+    "candidate_eligibility_decision",
+    "candidate_eligibility_reason_codes",
+    "first_failed_candidate_gate",
+    "observation_horizon_reached",
+    "as_of_feature_available",
+    "provider_relay_data_quality_exposure",
+    "high_throughput_mint",
+    "degraded_active_mint",
+    "why_not_candidate",
+    "gap_classification",
+]
+
+SURVIVOR_DIAGNOSTIC_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "continued_reason",
+    "observed_seconds",
+    "horizons_reached",
+    "candidate_gates_passed",
+    "first_failed_candidate_gate",
+    "censored",
+    "data_quality_excluded",
+    "high_throughput_mint",
+    "degraded_active_mint",
+    "missing_asof_features_prevented_evaluation",
+    "candidate_eligibility_decision",
+    "candidate_eligibility_reason_codes",
+]
+
+EXTENDED_ASOF_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "horizon_seconds",
+    "feature_available",
+    "asof_safe",
+    "source_artifact",
+    "missing_reason",
+    "future_collection_required",
+]
+
+MISSING_ASOF_GROUPS = {
+    "trade_delta": "per-mint event-time transaction/trade deltas are not retained in compact artifacts yet",
+    "holder_state": "stream-authoritative holder/account/token-state fixed-horizon snapshots are not retained yet; holder RPC remains disabled",
+    "vault_curve": "bonding curve/vault/liquidity fixed-horizon snapshots are not retained yet",
+}
+
 
 def utc_stamp() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -918,6 +991,364 @@ def score_strategy_gates(output_dir: pathlib.Path, asof_rows: list[dict[str, Any
     return early_rows, continue_rows, eligibility_rows
 
 
+def label_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(row.get("mint") or ""), str(row.get("slice_id") or ""), str(row.get("segment_id") or ""))
+
+
+def asof_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(row.get("mint") or ""), str(row.get("slice_id") or ""), str(row.get("segment_id") or ""))
+
+
+def label_for_asof(row: dict[str, Any], labels_by_key: dict[tuple[str, str, str], dict[str, Any]]) -> dict[str, Any]:
+    return labels_by_key.get(asof_key(row), {})
+
+
+def v1_reason_codes(features: dict[str, Any], label: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if boolish(features.get("data_quality_provider_gap_exposed")) or boolish(label.get("provider_gap_exposed")):
+        reasons.append("provider_gap_exposed")
+    if boolish(features.get("data_quality_relay_gap_exposed")) or boolish(label.get("relay_gap_exposed")):
+        reasons.append("relay_gap_exposed")
+    if boolish(features.get("data_quality_sequence_gap")):
+        reasons.append("relay_sequence_gap")
+    if boolish(features.get("data_quality_hash_mismatch")):
+        reasons.append("hash_mismatch_exposed")
+    if boolish(features.get("data_quality_receiver_backpressure")):
+        reasons.append("receiver_backpressure_exposed")
+    if str(label.get("final_outcome") or "") == "terminal_inconclusive" or boolish(label.get("censored_label")):
+        reasons.append("terminal_inconclusive")
+    if boolish(features.get("data_quality_degraded_active_mint")) or boolish(label.get("degraded_active_mint")):
+        reasons.append("degraded_audit_only")
+    if not boolish(features.get("tracked_at_least_horizon")):
+        reasons.append("insufficient_observation_horizon")
+        reasons.append("no_survival_to_required_horizon")
+    if boolish(label.get("clean_negative_label")):
+        reason = str(label.get("rejection_reason") or label.get("final_outcome_reason") or "")
+        if reason:
+            normalized = re.sub(r"[^a-z0-9]+", "_", reason.lower()).strip("_")
+            reasons.append(f"early_rejection_reason_{normalized}")
+        else:
+            reasons.append("early_rejection_reason_unknown")
+    if not boolish(label.get("candidate_checkpoint_seen")):
+        reasons.append("candidate_checkpoint_absent")
+    if not boolish(label.get("replay_eligible")):
+        reasons.append("replay_not_countability_allowed")
+    reasons.extend(
+        [
+            "missing_trade_delta_features",
+            "missing_holder_snapshot_features",
+            "missing_vault_curve_features",
+        ]
+    )
+    if not boolish(label.get("clean_negative_label")) and not boolish(label.get("censored_label")):
+        reasons.append("gate_too_strict_review")
+    # Preserve order but remove duplicates.
+    return list(dict.fromkeys(reasons))
+
+
+def first_failed_candidate_gate(reasons: list[str]) -> str:
+    gate_order = [
+        "provider_gap_exposed",
+        "relay_gap_exposed",
+        "relay_sequence_gap",
+        "hash_mismatch_exposed",
+        "receiver_backpressure_exposed",
+        "terminal_inconclusive",
+        "degraded_audit_only",
+        "insufficient_observation_horizon",
+        "no_survival_to_required_horizon",
+        "early_rejection_reason_volume_evaporated",
+        "early_rejection_reason_no_buy_followthrough",
+        "early_rejection_reason_top_holder_or_dev_dumped",
+        "early_rejection_reason_holder_collapse",
+        "early_rejection_reason_rug_like_by_60s",
+        "early_rejection_reason_rug_like_by_300s",
+        "early_rejection_reason_liquidity_exit_proxy",
+        "early_rejection_reason_unknown",
+        "missing_trade_delta_features",
+        "missing_holder_snapshot_features",
+        "missing_vault_curve_features",
+        "candidate_checkpoint_absent",
+        "replay_not_countability_allowed",
+        "gate_too_strict_review",
+    ]
+    for gate in gate_order:
+        if gate in reasons:
+            return gate
+    for reason in reasons:
+        if reason.startswith("early_rejection_reason_"):
+            return reason
+    return ""
+
+
+def candidate_decision_from_reasons(label: dict[str, Any], reasons: list[str]) -> str:
+    if boolish(label.get("replay_eligible")) and not reasons:
+        return "candidate_eligible_research_only"
+    if boolish(label.get("censored_label")) or any(
+        reason
+        in {
+            "provider_gap_exposed",
+            "relay_gap_exposed",
+            "relay_sequence_gap",
+            "hash_mismatch_exposed",
+            "receiver_backpressure_exposed",
+            "terminal_inconclusive",
+            "degraded_audit_only",
+        }
+        for reason in reasons
+    ):
+        return "censored"
+    return "not_eligible"
+
+
+def score_candidate_eligibility_v1(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    asof_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    labels_by_key = {label_key(row): row for row in labels}
+    scoring_rows = [row for row in asof_rows if int_or_zero(row.get("horizon_seconds")) == 60]
+    rows: list[dict[str, Any]] = []
+    for features in scoring_rows:
+        label = label_for_asof(features, labels_by_key)
+        reasons = v1_reason_codes(features, label)
+        decision = candidate_decision_from_reasons(label, reasons)
+        rows.append(
+            {
+                "mint": features.get("mint"),
+                "slice_id": features.get("slice_id"),
+                "segment_id": features.get("segment_id"),
+                "horizon_seconds": features.get("horizon_seconds"),
+                "decision": decision,
+                "score": "MEDIUM",
+                "reason_codes": "|".join(reasons),
+                "first_failed_candidate_gate": first_failed_candidate_gate(reasons),
+                "replay_eligible": boolish(label.get("replay_eligible")),
+                "candidate_checkpoint_seen": boolish(label.get("candidate_checkpoint_seen")),
+                "label_quality": label.get("label_quality", ""),
+                "final_outcome": label.get("final_outcome", ""),
+                "trade_action": "none",
+            }
+        )
+    write_csv(output_dir / "candidate_eligibility_v1_scores.csv", rows, CANDIDATE_ELIGIBILITY_V1_FIELDS)
+    write_score_report(
+        output_dir / "candidate_eligibility_v1_report.md",
+        "CandidateEligibilityGate v1",
+        rows,
+        "Diagnostic-only v1 eligibility. It diagnoses missing gates/features and does not loosen eligibility, tune thresholds, or emit trade actions.",
+    )
+    return rows
+
+
+def classify_continue_gap(label: dict[str, Any], reasons: list[str]) -> str:
+    if any(reason in reasons for reason in ("provider_gap_exposed", "relay_gap_exposed", "relay_sequence_gap", "hash_mismatch_exposed", "receiver_backpressure_exposed")):
+        return "DATA_QUALITY_EXCLUDED"
+    if boolish(label.get("censored_label")) or "terminal_inconclusive" in reasons:
+        return "CENSORED_OR_INCOMPLETE"
+    if any(reason.startswith("early_rejection_reason_") for reason in reasons):
+        return "FAILED_BEHAVIOR"
+    if any(reason.startswith("missing_") for reason in reasons):
+        return "MISSING_ASOF_FEATURES"
+    if "gate_too_strict_review" in reasons:
+        return "GATE_TOO_STRICT_REVIEW"
+    return "UNKNOWN_NEEDS_TELEMETRY"
+
+
+def continue_to_candidate_gap_analysis(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    asof_rows: list[dict[str, Any]],
+    continue_scores: list[dict[str, Any]],
+    v1_scores: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    labels_by_key = {label_key(row): row for row in labels}
+    asof_by_key = {asof_key(row): row for row in asof_rows if int_or_zero(row.get("horizon_seconds")) == 60}
+    v1_by_key = {label_key(row): row for row in v1_scores}
+    rows: list[dict[str, Any]] = []
+    for score in continue_scores:
+        if score.get("decision") != "continue_tracking":
+            continue
+        key = label_key(score)
+        label = labels_by_key.get(key, {})
+        asof = asof_by_key.get(key, {})
+        v1 = v1_by_key.get(key, {})
+        reasons = [part for part in str(v1.get("reason_codes") or "").split("|") if part]
+        failed_gate = str(v1.get("first_failed_candidate_gate") or first_failed_candidate_gate(reasons))
+        gap_class = classify_continue_gap(label, reasons)
+        rows.append(
+            {
+                "mint": score.get("mint"),
+                "slice_id": score.get("slice_id"),
+                "segment_id": score.get("segment_id"),
+                "final_outcome": label.get("final_outcome", ""),
+                "censored_label": boolish(label.get("censored_label")),
+                "rejection_reason": label.get("rejection_reason", ""),
+                "terminal_inconclusive_reason": label.get("terminal_inconclusive_reason", ""),
+                "candidate_eligibility_decision": v1.get("decision", ""),
+                "candidate_eligibility_reason_codes": v1.get("reason_codes", ""),
+                "first_failed_candidate_gate": failed_gate,
+                "observation_horizon_reached": boolish(asof.get("tracked_at_least_horizon")),
+                "as_of_feature_available": boolish(asof.get("feature_available")),
+                "provider_relay_data_quality_exposure": any(
+                    boolish(label.get(field))
+                    for field in (
+                        "provider_gap_exposed",
+                        "relay_gap_exposed",
+                        "sequence_gap_exposed",
+                        "hash_mismatch_exposed",
+                        "receiver_backpressure_exposed",
+                    )
+                ),
+                "high_throughput_mint": boolish(label.get("high_throughput_mint")),
+                "degraded_active_mint": boolish(label.get("degraded_active_mint")),
+                "why_not_candidate": failed_gate or "no_replay_eligible_candidate_checkpoint",
+                "gap_classification": gap_class,
+            }
+        )
+    write_csv(output_dir / "continue_to_candidate_gap_analysis.csv", rows, CONTINUE_TO_CANDIDATE_GAP_FIELDS)
+    classes = Counter(row["gap_classification"] for row in rows)
+    gates = Counter(row["first_failed_candidate_gate"] for row in rows)
+    lines = [
+        "# Continue-To-Candidate Gap Analysis",
+        "",
+        f"Continue-tracking rows analyzed: {len(rows)}",
+        "",
+        "## Gap Classes",
+        *[f"- {key}: {count}" for key, count in sorted(classes.items())],
+        "",
+        "## First Failed Candidate Gates",
+        *[f"- {key}: {count}" for key, count in gates.most_common(20)],
+        "",
+        "This is diagnostic only. No gates were loosened, no replay/backtesting/tuning/trading was run, and terminal_inconclusive remains censored.",
+    ]
+    (output_dir / "continue_to_candidate_gap_analysis.md").write_text("\n".join(lines) + "\n")
+    return rows
+
+
+def write_extended_asof_feature_placeholders(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+) -> dict[str, Any]:
+    asof_dir = output_dir / "asof_features"
+    completeness: dict[str, Any] = {
+        "schema_version": "phase107h.asof_feature_completeness.v1",
+        "groups": {},
+        "future_collection_required": True,
+    }
+    for group, missing_reason in MISSING_ASOF_GROUPS.items():
+        total_rows = 0
+        for horizon in HORIZONS:
+            rows = [
+                {
+                    "mint": label["mint"],
+                    "slice_id": label["slice_id"],
+                    "segment_id": label["segment_id"],
+                    "relay_session_id": label["relay_session_id"],
+                    "horizon_seconds": horizon,
+                    "feature_available": False,
+                    "asof_safe": True,
+                    "source_artifact": "future_stream_authoritative_asof_snapshot_shards",
+                    "missing_reason": missing_reason,
+                    "future_collection_required": True,
+                }
+                for label in labels
+            ]
+            total_rows += len(rows)
+            write_csv(asof_dir / f"asof_{group}_features_{horizon:03d}s.csv", rows, EXTENDED_ASOF_FIELDS)
+        completeness["groups"][group] = {
+            "available": False,
+            "rows": total_rows,
+            "missing_reason": missing_reason,
+            "future_collection_required": True,
+        }
+    write_json(asof_dir / "asof_feature_completeness_report.json", completeness)
+    lines = ["# As-Of Feature Completeness Report", ""]
+    for group, payload in completeness["groups"].items():
+        lines.append(f"## {group}")
+        lines.append(f"- available: {str(payload['available']).lower()}")
+        lines.append(f"- rows: {payload['rows']}")
+        lines.append(f"- missing_reason: {payload['missing_reason']}")
+        lines.append("- future_collection_required: true")
+        lines.append("")
+    lines.append("No holder RPC or canonical RPC mint supply was introduced. Missing groups must be retained from stream-authoritative local collector state in future slices before alpha/backtesting use.")
+    (output_dir / "asof_feature_completeness_report.md").write_text("\n".join(lines) + "\n")
+    (asof_dir / "asof_feature_completeness_report.md").write_text("\n".join(lines) + "\n")
+    return completeness
+
+
+def survivor_extension_diagnostics(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    asof_rows: list[dict[str, Any]],
+    continue_scores: list[dict[str, Any]],
+    v1_scores: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    labels_by_key = {label_key(row): row for row in labels}
+    asof_by_mint = defaultdict(list)
+    for row in asof_rows:
+        asof_by_mint[asof_key(row)].append(row)
+    continue_by_key = {label_key(row): row for row in continue_scores}
+    v1_by_key = {label_key(row): row for row in v1_scores}
+    survivor_slice_ids = {
+        path.parent.name
+        for path in COLLECTOR_ROOT.glob("*/survivor_extension_mode.json")
+        if boolish(read_json(path).get("enabled"))
+    }
+    rows: list[dict[str, Any]] = []
+    for key, label in labels_by_key.items():
+        if label.get("slice_id") not in survivor_slice_ids:
+            continue
+        asofs = asof_by_mint.get(key, [])
+        reached = sorted(int_or_zero(row.get("horizon_seconds")) for row in asofs if boolish(row.get("tracked_at_least_horizon")))
+        continue_score = continue_by_key.get(key, {})
+        v1 = v1_by_key.get(key, {})
+        reasons = [part for part in str(v1.get("reason_codes") or "").split("|") if part]
+        first_failed = str(v1.get("first_failed_candidate_gate") or first_failed_candidate_gate(reasons))
+        data_quality_excluded = any(
+            boolish(label.get(field))
+            for field in (
+                "provider_gap_exposed",
+                "relay_gap_exposed",
+                "sequence_gap_exposed",
+                "hash_mismatch_exposed",
+                "receiver_backpressure_exposed",
+            )
+        )
+        rows.append(
+            {
+                "mint": label.get("mint"),
+                "slice_id": label.get("slice_id"),
+                "segment_id": label.get("segment_id"),
+                "continued_reason": continue_score.get("reason_codes") or "survivor_extension_same_caps_research_only",
+                "observed_seconds": int_or_zero(label.get("time_to_rejection_ms") or label.get("time_to_terminal_ms")) // 1000,
+                "horizons_reached": "|".join(str(item) for item in reached),
+                "candidate_gates_passed": "counted_clean_segment" if not data_quality_excluded else "",
+                "first_failed_candidate_gate": first_failed,
+                "censored": boolish(label.get("censored_label")),
+                "data_quality_excluded": data_quality_excluded,
+                "high_throughput_mint": boolish(label.get("high_throughput_mint")),
+                "degraded_active_mint": boolish(label.get("degraded_active_mint")),
+                "missing_asof_features_prevented_evaluation": any(reason.startswith("missing_") for reason in reasons),
+                "candidate_eligibility_decision": v1.get("decision", ""),
+                "candidate_eligibility_reason_codes": v1.get("reason_codes", ""),
+            }
+        )
+    write_csv(output_dir / "survivor_extension_diagnostics.csv", rows, SURVIVOR_DIAGNOSTIC_FIELDS)
+    failures = Counter(row["first_failed_candidate_gate"] for row in rows)
+    lines = [
+        "# Survivor Extension Diagnostics",
+        "",
+        f"Rows: {len(rows)}",
+        "",
+        "## First Failed Candidate Gates",
+        *[f"- {key}: {count}" for key, count in failures.most_common(20)],
+        "",
+        "Diagnostics are research-only. Survivor extension does not raise caps, run replay, run backtesting, tune thresholds, or trade.",
+    ]
+    (output_dir / "survivor_extension_diagnostics.md").write_text("\n".join(lines) + "\n")
+    return rows
+
+
 def write_score_report(path: pathlib.Path, title: str, rows: list[dict[str, Any]], intro: str) -> None:
     counts = Counter(str(row.get("decision") or "") for row in rows)
     reasons = Counter()
@@ -1414,6 +1845,22 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     splits = build_splits(labels, output_dir)
     leakage = leakage_audit(output_dir, asof_rows, labels, splits)
     early_scores, continue_scores, eligibility_scores = score_strategy_gates(output_dir, asof_rows)
+    v1_scores = score_candidate_eligibility_v1(output_dir, labels, asof_rows)
+    gap_rows = continue_to_candidate_gap_analysis(
+        output_dir,
+        labels,
+        asof_rows,
+        continue_scores,
+        v1_scores,
+    )
+    completeness = write_extended_asof_feature_placeholders(output_dir, labels)
+    survivor_diagnostics = survivor_extension_diagnostics(
+        output_dir,
+        labels,
+        asof_rows,
+        continue_scores,
+        v1_scores,
+    )
     modules = write_strategy_modules(output_dir)
     readiness = readiness_decision(labels, leakage, modules, asof_rows)
 
@@ -1453,7 +1900,9 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": "phase107h.strategy_readiness_summary.v1",
         "generated_at": utc_stamp(),
-        "classification": "CANDIDATE_DISCOVERY_READY_PASS" if readiness["buy_strategy_build_ready"] and early_scores and continue_scores and eligibility_scores else "STRATEGY_RESEARCH_READY_PASS",
+        "classification": "CANDIDATE_DISCOVERY_READY_PASS"
+        if readiness["buy_strategy_build_ready"] and early_scores and continue_scores and eligibility_scores and v1_scores and gap_rows is not None and survivor_diagnostics is not None
+        else "STRATEGY_RESEARCH_READY_PASS",
         "included_slices": len(included),
         "total_mints": len(labels),
         "clean_negative_count": readiness["clean_negative_count"],
@@ -1470,6 +1919,12 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         "survivor_extension_proof_classification": survivor_extension_proof_classification(
             survivor_extension_runs(inventory)
         ),
+        "candidate_eligibility_v1_rows": len(v1_scores),
+        "continue_to_candidate_gap_rows": len(gap_rows),
+        "survivor_extension_diagnostic_rows": len(survivor_diagnostics),
+        "asof_trade_delta_features_available": bool(completeness["groups"]["trade_delta"]["available"]),
+        "asof_holder_state_features_available": bool(completeness["groups"]["holder_state"]["available"]),
+        "asof_vault_curve_features_available": bool(completeness["groups"]["vault_curve"]["available"]),
     }
     write_json(output_dir / "strategy_readiness_summary.json", summary)
     errors = validate_outputs(output_dir)
