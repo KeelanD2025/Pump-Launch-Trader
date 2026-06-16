@@ -133,6 +133,43 @@ ASOF_FIELDS = [
     "label_quality",
 ]
 
+EARLY_AVOID_SCORE_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "horizon_seconds",
+    "decision",
+    "score",
+    "reason_codes",
+    "explanation",
+    "trade_action",
+]
+
+CONTINUE_TRACKING_SCORE_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "horizon_seconds",
+    "decision",
+    "score",
+    "reason_codes",
+    "explanation",
+    "trade_action",
+]
+
+CANDIDATE_ELIGIBILITY_SCORE_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "horizon_seconds",
+    "decision",
+    "score",
+    "reason_codes",
+    "explanation",
+    "replay_eligible",
+    "trade_action",
+]
+
 
 def utc_stamp() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -260,12 +297,31 @@ class EarlyAvoidFilter:
         reasons: list[str] = []
         if boolish(features.get("data_quality_provider_gap_exposed")):
             reasons.append("provider_gap_censored")
+        if boolish(features.get("data_quality_hash_mismatch")):
+            reasons.append("hash_mismatch_exclusion")
+        if boolish(features.get("data_quality_receiver_backpressure")):
+            reasons.append("receiver_backpressure_exclusion")
         if boolish(features.get("data_quality_degraded_active_mint")):
             reasons.append("degraded_audit_only")
         if boolish(features.get("data_quality_sequence_gap")):
             reasons.append("relay_sequence_gap")
-        decision = "audit_only" if reasons else "continue_research"
-        return StrategyModuleResult("HIGH" if reasons else "LOW", decision, reasons, "Research-only avoid score; no thresholds tuned.")
+        if not boolish(features.get("tracked_at_least_horizon")):
+            reasons.append("insufficient_horizon_observation")
+        if any(reason.endswith("_exclusion") or "gap" in reason for reason in reasons):
+            decision = "audit_only"
+        elif "insufficient_horizon_observation" in reasons:
+            decision = "insufficient_data"
+        elif boolish(features.get("label_clean_negative")) and boolish(features.get("tracked_at_least_horizon")):
+            reasons.append("historical_clean_negative_pattern")
+            decision = "avoid"
+        else:
+            decision = "continue_tracking"
+        return StrategyModuleResult(
+            "HIGH" if decision == "avoid" else "MEDIUM" if decision == "audit_only" else "LOW",
+            decision,
+            reasons,
+            "Research-only avoid score; fixed descriptive bins, no threshold tuning, no trade action.",
+        )
 
 
 class ContinueTrackingGate:
@@ -280,8 +336,25 @@ class ContinueTrackingGate:
             reasons.append("insufficient_observation_at_horizon")
         if boolish(features.get("data_quality_provider_gap_exposed")):
             reasons.append("provider_gap_censored")
-        decision = "continue_tracking" if not reasons else "audit_only"
-        return StrategyModuleResult("MEDIUM", decision, reasons, "Placeholder gate for later validation.")
+        if boolish(features.get("data_quality_sequence_gap")):
+            reasons.append("relay_gap_censored")
+        if boolish(features.get("data_quality_hash_mismatch")):
+            reasons.append("hash_mismatch_censored")
+        if boolish(features.get("data_quality_receiver_backpressure")):
+            reasons.append("receiver_backpressure_censored")
+        if boolish(features.get("data_quality_degraded_active_mint")):
+            reasons.append("degraded_audit_only")
+        if boolish(features.get("label_censored")):
+            reasons.append("label_censored_not_dead")
+        if any("censored" in reason or "gap" in reason or "mismatch" in reason for reason in reasons):
+            decision = "censored"
+        elif "degraded_audit_only" in reasons:
+            decision = "audit_only"
+        elif "insufficient_observation_at_horizon" in reasons:
+            decision = "stop_tracking"
+        else:
+            decision = "continue_tracking"
+        return StrategyModuleResult("MEDIUM", decision, reasons, "Research-only continue-tracking gate; no thresholds tuned.")
 
 
 class CandidateEligibilityGate:
@@ -301,8 +374,19 @@ class CandidateEligibilityGate:
         ):
             if boolish(features.get(key)):
                 reasons.append(key)
-        decision = "candidate_eligible_research_only" if not reasons else "not_eligible_or_censored"
-        return StrategyModuleResult("MEDIUM", decision, reasons, "Eligibility is descriptive and disabled for trading.")
+        if boolish(features.get("label_censored")):
+            reasons.append("censored_label")
+        if not boolish(features.get("tracked_at_least_horizon")):
+            reasons.append("insufficient_observation")
+        if boolish(features.get("label_clean_negative")):
+            reasons.append("historical_clean_negative")
+        if boolish(features.get("label_clean_positive")):
+            decision = "candidate_eligible_research_only"
+        elif any(reason in {"censored_label", "data_quality_provider_gap_exposed", "data_quality_sequence_gap", "data_quality_hash_mismatch"} for reason in reasons):
+            decision = "censored"
+        else:
+            decision = "not_eligible"
+        return StrategyModuleResult("MEDIUM", decision, reasons, "Eligibility is descriptive, research-only, and disabled for trading.")
 
 
 class BuySetupDraft:
@@ -748,6 +832,99 @@ def write_feature_availability(output_dir: pathlib.Path) -> None:
     (output_dir / "feature_availability_map.md").write_text("\n".join(lines) + "\n")
 
 
+def score_strategy_gates(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Score research-only strategy gates from as-of rows.
+
+    The 60s horizon is used as the descriptive v0 scoring point because it is
+    early enough for avoid/continue decisions and commonly available in current
+    compact attempt ledgers. This is not threshold tuning.
+    """
+
+    scoring_rows = [row for row in asof_rows if int_or_zero(row.get("horizon_seconds")) == 60]
+    early = EarlyAvoidFilter()
+    continue_gate = ContinueTrackingGate()
+    eligibility_gate = CandidateEligibilityGate()
+    early_rows: list[dict[str, Any]] = []
+    continue_rows: list[dict[str, Any]] = []
+    eligibility_rows: list[dict[str, Any]] = []
+    for row in scoring_rows:
+        early_result = early.score(row)
+        continue_result = continue_gate.score(row)
+        eligibility_result = eligibility_gate.score(row)
+        common = {
+            "mint": row.get("mint"),
+            "slice_id": row.get("slice_id"),
+            "segment_id": row.get("segment_id"),
+            "horizon_seconds": row.get("horizon_seconds"),
+            "trade_action": "none",
+        }
+        early_rows.append(
+            {
+                **common,
+                "decision": early_result.decision,
+                "score": early_result.score,
+                "reason_codes": "|".join(early_result.reason_codes),
+                "explanation": early_result.explanation,
+            }
+        )
+        continue_rows.append(
+            {
+                **common,
+                "decision": continue_result.decision,
+                "score": continue_result.score,
+                "reason_codes": "|".join(continue_result.reason_codes),
+                "explanation": continue_result.explanation,
+            }
+        )
+        eligibility_rows.append(
+            {
+                **common,
+                "decision": eligibility_result.decision,
+                "score": eligibility_result.score,
+                "reason_codes": "|".join(eligibility_result.reason_codes),
+                "explanation": eligibility_result.explanation,
+                "replay_eligible": False,
+            }
+        )
+    write_csv(output_dir / "early_avoid_filter_v0_scores.csv", early_rows, EARLY_AVOID_SCORE_FIELDS)
+    write_csv(output_dir / "continue_tracking_gate_v0_scores.csv", continue_rows, CONTINUE_TRACKING_SCORE_FIELDS)
+    write_csv(output_dir / "candidate_eligibility_v0_scores.csv", eligibility_rows, CANDIDATE_ELIGIBILITY_SCORE_FIELDS)
+    write_score_report(
+        output_dir / "early_avoid_filter_v0_report.md",
+        "EarlyAvoidFilter v0",
+        early_rows,
+        "Research-only early avoid logic. It emits no trade entries and uses fixed descriptive bins only.",
+    )
+    write_score_report(
+        output_dir / "continue_tracking_gate_v0_report.md",
+        "ContinueTrackingGate v0",
+        continue_rows,
+        "Research-only continue-tracking logic. Terminal inconclusive and gap-exposed rows remain censored.",
+    )
+    write_score_report(
+        output_dir / "candidate_eligibility_v0_report.md",
+        "CandidateEligibilityGate v0",
+        eligibility_rows,
+        "Research-only candidate eligibility structure. Candidate checkpoint alone is not positive and replay eligibility remains blocked.",
+    )
+    return early_rows, continue_rows, eligibility_rows
+
+
+def write_score_report(path: pathlib.Path, title: str, rows: list[dict[str, Any]], intro: str) -> None:
+    counts = Counter(str(row.get("decision") or "") for row in rows)
+    reasons = Counter()
+    for row in rows:
+        for reason in str(row.get("reason_codes") or "").split("|"):
+            if reason:
+                reasons[reason] += 1
+    lines = [f"# {title}", "", intro, "", "## Decision Counts"]
+    lines.extend(f"- {name}: {count}" for name, count in sorted(counts.items()))
+    lines.extend(["", "## Top Reason Codes"])
+    lines.extend(f"- {name}: {count}" for name, count in reasons.most_common(20))
+    lines.extend(["", "No replay, backtesting, threshold tuning, live trading, wallet execution, or buy entries were produced."])
+    path.write_text("\n".join(lines) + "\n")
+
+
 def leakage_audit(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]], labels: list[dict[str, Any]], splits: dict[str, Any] | None = None) -> dict[str, Any]:
     blockers: list[str] = []
     feature_columns = set(ASOF_FIELDS)
@@ -921,7 +1098,16 @@ def readiness_decision(labels: list[dict[str, Any]], leakage: dict[str, Any], mo
     return payload
 
 
-def write_reports(output_dir: pathlib.Path, inventory: list[dict[str, Any]], labels: list[dict[str, Any]], readiness: dict[str, Any], leakage: dict[str, Any]) -> None:
+def write_reports(
+    output_dir: pathlib.Path,
+    inventory: list[dict[str, Any]],
+    labels: list[dict[str, Any]],
+    readiness: dict[str, Any],
+    leakage: dict[str, Any],
+    early_scores: list[dict[str, Any]],
+    continue_scores: list[dict[str, Any]],
+    eligibility_scores: list[dict[str, Any]],
+) -> None:
     label_counts = Counter(row["label_quality"] for row in labels)
     final_counts = Counter(row["final_outcome"] for row in labels)
     included = [row for row in inventory if boolish(row.get("included"))]
@@ -930,6 +1116,9 @@ def write_reports(output_dir: pathlib.Path, inventory: list[dict[str, Any]], lab
     censored = sum(1 for row in labels if boolish(row.get("censored_label")))
     candidate_count = sum(1 for row in labels if boolish(row.get("candidate_checkpoint_seen")))
     replay_count = readiness["replay_eligible_candidate_count"]
+    early_decisions = Counter(row["decision"] for row in early_scores)
+    continue_decisions = Counter(row["decision"] for row in continue_scores)
+    eligibility_decisions = Counter(row["decision"] for row in eligibility_scores)
 
     readiness_lines = [
         "# Strategy Readiness Report",
@@ -996,6 +1185,47 @@ def write_reports(output_dir: pathlib.Path, inventory: list[dict[str, Any]], lab
         + "\n"
     )
 
+    (output_dir / "NEXT_STRATEGY_ACTION_PLAN.md").write_text(
+        "\n".join(
+            [
+                "# Next Strategy Action Plan",
+                "",
+                "## What Clean Negatives Teach Us",
+                "",
+                f"The current retained dataset has {clean_neg} clean negatives. These are useful for avoid-filter research: they describe launches that became early rejected/dead in clean counted segments. They do not by themselves define buys.",
+                "",
+                "## Why Clean Positives Are Absent",
+                "",
+                f"Clean positives: {clean_pos}. Replay-eligible candidates: {replay_count}. Candidate checkpoints: {candidate_count}. The system has mostly captured early failures and censored observations, not validated survivor/candidate examples.",
+                "",
+                "## Candidate Gates",
+                "",
+                "The candidate gates are intentionally conservative: counted clean segment, no relay/provider/receiver quality blocker, no provider-gap exposure for the mint, not terminal_inconclusive, not degraded audit-only, and replay eligibility only when countability allows it. With zero clean positives, this is more a lack of survivor/candidate data than evidence that the gate should be loosened.",
+                "",
+                "## As-Of Features Available",
+                "",
+                "Available now: launch timing features, observation coverage by horizon, and data-quality/high-throughput/degraded flags. These are safe but limited.",
+                "",
+                "## Features Still Missing",
+                "",
+                "Missing for real alpha research: per-mint fixed-horizon transaction/trade deltas, buy/sell/volume deltas, holder/account/token-state snapshots, and bonding curve/vault/liquidity snapshots retained as explicit as-of shards.",
+                "",
+                "## Censored Labels",
+                "",
+                f"Censored rows: {censored}. Terminal_inconclusive, provider-gap-exposed, relay-gap-exposed, degraded/audit-only, and insufficient-observation rows are unsafe as dead labels.",
+                "",
+                "## Data Quality Exclusions",
+                "",
+                "Sequence gaps, hash mismatches, receiver backpressure, provider gaps, degraded active mints, R2/artifact failures, and non-counted segments are exclusion/audit filters, not alpha features.",
+                "",
+                "## Before Replay/Backtesting",
+                "",
+                "Need clean positives/replay-eligible candidates from countability-approved clean segments, explicit retained as-of feature snapshots, leakage audit still passing, and operator approval. Until then replay/backtesting/tuning/trading remain blocked.",
+            ]
+        )
+        + "\n"
+    )
+
     (output_dir / "strategy_hypotheses_registry.md").write_text(
         "\n".join(
             [
@@ -1008,6 +1238,33 @@ def write_reports(output_dir: pathlib.Path, inventory: list[dict[str, Any]], lab
                 "- Candidate eligibility must exclude censored, degraded, provider-gap, and replay-ineligible checkpoint rows.",
                 "- Buy setup drafts require clean positives and replay/backtesting readiness before evaluation.",
                 "- Risk/exit drafts require separate paper/backtest readiness and no wallet execution.",
+            ]
+        )
+        + "\n"
+    )
+
+    (output_dir / "survivor_extension_proof_report.md").write_text(
+        "\n".join(
+            [
+                "# Survivor Extension Proof Report",
+                "",
+                "Classification: NOT_RUN_SOURCE_READY",
+                "",
+                "Survivor extension mode is defined as research-only and disabled by default. It must not raise launch caps, run replay, run backtesting, tune thresholds, trade, or call wallet/RPC execution paths.",
+                "",
+                "Proof command should use the committed relay supervisor with the same 900s duration, max_attempted_launches=15, target_candidates=2, R2-primary retention, and explicit survivor-extension metadata. Gap-crossing mints remain terminal_inconclusive and never replay-eligible.",
+            ]
+        )
+        + "\n"
+    )
+    (output_dir / "survivor_extension_batch_report.md").write_text(
+        "\n".join(
+            [
+                "# Survivor Extension Batch Report",
+                "",
+                "Classification: NOT_RUN",
+                "",
+                "No survivor-extension proof/batch was run by this readiness build. Collection remains on the proven conservative relay-only R2-primary path until an explicit survivor-extension proof is launched.",
             ]
         )
         + "\n"
@@ -1097,6 +1354,7 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     write_feature_availability(output_dir)
     splits = build_splits(labels, output_dir)
     leakage = leakage_audit(output_dir, asof_rows, labels, splits)
+    early_scores, continue_scores, eligibility_scores = score_strategy_gates(output_dir, asof_rows)
     modules = write_strategy_modules(output_dir)
     readiness = readiness_decision(labels, leakage, modules, asof_rows)
 
@@ -1105,7 +1363,16 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     write_inventory_summary(output_dir, inventory)
     write_csv(output_dir / "mint_labels.csv", labels, MINT_FIELDS)
     write_json(output_dir / "mint_labels.json", {"schema_version": "phase107h.mint_labels.v1", "mints": [{k: v for k, v in row.items() if not k.startswith("_")} for row in labels]})
-    write_reports(output_dir, inventory, labels, readiness, leakage)
+    write_reports(
+        output_dir,
+        inventory,
+        labels,
+        readiness,
+        leakage,
+        early_scores,
+        continue_scores,
+        eligibility_scores,
+    )
     write_json(output_dir / "backtesting_readiness_decision.json", readiness)
     (output_dir / "backtesting_readiness_decision.md").write_text(
         "\n".join(
@@ -1127,7 +1394,7 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": "phase107h.strategy_readiness_summary.v1",
         "generated_at": utc_stamp(),
-        "classification": "BUY_STRATEGY_BUILD_READY_PASS" if readiness["buy_strategy_build_ready"] else "STRATEGY_RESEARCH_READY_PASS",
+        "classification": "CANDIDATE_DISCOVERY_READY_PASS" if readiness["buy_strategy_build_ready"] and early_scores and continue_scores and eligibility_scores else "STRATEGY_RESEARCH_READY_PASS",
         "included_slices": len(included),
         "total_mints": len(labels),
         "clean_negative_count": readiness["clean_negative_count"],
@@ -1140,6 +1407,8 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         "threshold_tuning_ready": readiness["threshold_tuning_ready"],
         "live_trading_ready": readiness["live_trading_ready"],
         "launch_caps_remain_blocked": True,
+        "survivor_extension_mode_enabled": False,
+        "survivor_extension_proof_classification": "NOT_RUN_SOURCE_READY",
     }
     write_json(output_dir / "strategy_readiness_summary.json", summary)
     errors = validate_outputs(output_dir)

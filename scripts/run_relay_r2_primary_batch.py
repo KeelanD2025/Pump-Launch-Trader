@@ -770,6 +770,25 @@ def run_slice(
     remote_script_remote = f"{health_dir}/remote_relay.sh"
     out.mkdir(parents=True, exist_ok=False)
     log_dir.mkdir(parents=True, exist_ok=False)
+    if args.survivor_extension_mode:
+        survivor_policy = {
+            "schema_version": "phase107h.survivor_extension_mode.v1",
+            "enabled": True,
+            "research_only": True,
+            "raises_launch_caps": False,
+            "runs_replay": False,
+            "runs_backtesting": False,
+            "runs_threshold_tuning": False,
+            "runs_live_trading": False,
+            "wallet_execution_enabled": False,
+            "max_attempted_launches": args.max_attempted_launches,
+            "target_candidates": args.target_candidates,
+            "max_concurrent_tracked_mints": args.max_concurrent_tracked_mints,
+            "reason": "candidate_discovery_research_only_same_caps",
+        }
+        (out / "survivor_extension_mode.json").write_text(
+            json.dumps(survivor_policy, indent=2, sort_keys=True) + "\n"
+        )
     remote_script_local.write_text(make_remote_script(args, run_id, health_dir))
     remote_script_local.chmod(0o700)
 
@@ -879,6 +898,8 @@ def run_slice(
     result["remote_rc"] = int(remote_rc) if remote_rc.isdigit() else None
     result["local_rc"] = local_rc
     result["classification"] = classify_slice(result) if not blockers else result.get("classification")
+    result["survivor_extension_mode_enabled"] = bool(args.survivor_extension_mode)
+    result["survivor_extension_mode_same_caps"] = bool(args.survivor_extension_mode)
     if local_rc != 0:
         blockers.append("local_rc")
     if local_rc == -1:
@@ -1009,6 +1030,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--cleanup-min-age-minutes", type=int, default=60)
+    parser.add_argument(
+        "--survivor-extension-mode",
+        action="store_true",
+        help=(
+            "Mark the slice as a research-only survivor-extension proof "
+            "without raising caps or enabling replay/backtesting/tuning/trading."
+        ),
+    )
     args = parser.parse_args(argv)
     args.command = command
     env_file_defaults: dict[str, str] = {}

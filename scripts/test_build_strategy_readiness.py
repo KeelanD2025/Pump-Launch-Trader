@@ -152,6 +152,69 @@ class StrategyReadinessTests(unittest.TestCase):
         self.assertFalse(decision["backtesting_ready"])
         self.assertFalse(decision["replay_ready"])
 
+    def test_early_avoid_filter_does_not_output_trade_entries(self) -> None:
+        result = sr.EarlyAvoidFilter().score(
+            {
+                "tracked_at_least_horizon": True,
+                "label_clean_negative": True,
+                "data_quality_provider_gap_exposed": False,
+            }
+        )
+        self.assertEqual(result.decision, "avoid")
+        self.assertFalse(sr.EarlyAvoidFilter.tradeable)
+
+    def test_early_avoid_filter_does_not_need_future_outcome_fields(self) -> None:
+        features = set(sr.ASOF_FIELDS)
+        self.assertNotIn("final_outcome", features)
+        self.assertNotIn("rejection_reason", features)
+
+    def test_continue_tracking_treats_terminal_inconclusive_as_censored(self) -> None:
+        result = sr.ContinueTrackingGate().score(
+            {
+                "tracked_at_least_horizon": True,
+                "label_censored": True,
+            }
+        )
+        self.assertEqual(result.decision, "censored")
+        self.assertIn("label_censored_not_dead", result.reason_codes)
+
+    def test_candidate_eligibility_rejects_provider_gap_exposed_mints(self) -> None:
+        result = sr.CandidateEligibilityGate().score(
+            {
+                "tracked_at_least_horizon": True,
+                "data_quality_provider_gap_exposed": True,
+            }
+        )
+        self.assertEqual(result.decision, "censored")
+        self.assertIn("data_quality_provider_gap_exposed", result.reason_codes)
+
+    def test_candidate_eligibility_requires_countability_for_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run = fake_run(
+                Path(td),
+                [
+                    {
+                        "mint": "mint4",
+                        "final_state": "candidate_checkpoint",
+                        "tracked_until_seconds": "300",
+                        "launch_timestamp": "2026-06-16 12:00:00 +00:00:00",
+                    }
+                ],
+            )
+            run["candidate_rows"] = [{"mint": "mint4", "candidate_checkpoint": "true", "replay_eligible": "true"}]
+            labels, _ = sr.build_labels([run])
+        self.assertFalse(labels[0]["replay_eligible"])
+        self.assertFalse(labels[0]["clean_positive_label"])
+
+    def test_survivor_extension_defaults_do_not_raise_caps_or_run_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            modules = sr.write_strategy_modules(Path(td))
+        survivor = modules["SurvivorExtensionMode"]
+        self.assertEqual(survivor["status"], "disabled_by_default")
+        self.assertFalse(survivor["raises_launch_caps"])
+        self.assertFalse(survivor["runs_replay"])
+        self.assertFalse(survivor["trades"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -91,6 +91,41 @@ class RelaySupervisorTests(unittest.TestCase):
             self.assertEqual(args.expected_latest_run_id, "material-candidate-hunter-stable")
             self.assertEqual(args.config_override, "config/local.relay.toml")
 
+    def test_survivor_extension_mode_defaults_disabled(self) -> None:
+        with mock.patch.dict(
+            relay_supervisor.os.environ,
+            {
+                "PUMP_RELAY_VPS_SSH_TARGET": "ubuntu@example.invalid",
+                "EXPECTED_MATERIAL_LATEST_RUN_ID": "material-candidate-hunter-stable",
+            },
+            clear=True,
+        ):
+            args = relay_supervisor.parse_args(["proof"])
+        self.assertFalse(args.survivor_extension_mode)
+
+    def test_survivor_extension_mode_preserves_same_caps(self) -> None:
+        with mock.patch.dict(
+            relay_supervisor.os.environ,
+            {
+                "PUMP_RELAY_VPS_SSH_TARGET": "ubuntu@example.invalid",
+                "EXPECTED_MATERIAL_LATEST_RUN_ID": "material-candidate-hunter-stable",
+            },
+            clear=True,
+        ):
+            args = relay_supervisor.parse_args(
+                [
+                    "proof",
+                    "--survivor-extension-mode",
+                    "--max-attempted-launches",
+                    "15",
+                    "--target-candidates",
+                    "2",
+                ]
+            )
+        self.assertTrue(args.survivor_extension_mode)
+        self.assertEqual(args.max_attempted_launches, 15)
+        self.assertEqual(args.target_candidates, 2)
+
     def test_remote_receiver_verifier_parses_listener_status(self) -> None:
         stdout = '{"ok":true,"host":"127.0.0.1","port":19097,"listener":"LISTEN 0 128 127.0.0.1:19097"}\n'
         with mock.patch.object(
