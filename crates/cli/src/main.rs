@@ -44807,15 +44807,13 @@ fn phase107f_read_csv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>>
     let Some(header_line) = lines.next() else {
         return Ok(Vec::new());
     };
-    let headers = header_line
-        .split(',')
-        .map(|header| header.trim().to_owned())
-        .collect::<Vec<_>>();
+    let headers = phase107f_parse_csv_line(header_line);
     let mut rows = Vec::new();
     for line in lines {
         let mut row = BTreeMap::new();
-        for (header, value) in headers.iter().zip(line.split(',')) {
-            row.insert(header.clone(), value.trim().to_owned());
+        let values = phase107f_parse_csv_line(line);
+        for (header, value) in headers.iter().zip(values) {
+            row.insert(header.clone(), value);
         }
         rows.push(row);
     }
@@ -44830,12 +44828,33 @@ fn phase107f_read_csv_header(path: &Path) -> Result<Vec<String>> {
     Ok(text
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| {
-            line.split(',')
-                .map(|header| header.trim().to_owned())
-                .collect()
-        })
+        .map(phase107f_parse_csv_line)
         .unwrap_or_default())
+}
+
+fn phase107f_parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                let _ = chars.next();
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_owned());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field.trim().to_owned());
+    fields
 }
 
 fn phase107h_validate_asof_alpha_artifacts(
@@ -61854,6 +61873,38 @@ mod tests {
                 .iter()
                 .any(|blocker| { blocker == "asof_alpha_forbidden_feature_column:final_outcome" })
         );
+    }
+
+    #[test]
+    fn phase107h_asof_alpha_validator_handles_quoted_reason_lists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let asof_dir = temp.path().join("asof_alpha_features");
+        fs::create_dir_all(&asof_dir).expect("asof dir");
+        fs::write(
+            asof_dir.join("asof_alpha_features_060s.csv"),
+            "mint,horizon_seconds,feature_asof_timestamp,mint_first_seen_timestamp,horizon_reached,data_complete_for_horizon,candidate_failed_gate_reason_codes_asof,holder_rpc_used,rpc_mint_supply_canonical,threshold_tuning_allowed,live_trading_enabled\nmint-a,60,2026-06-16T12:01:00Z,2026-06-16T12:00:00Z,true,true,\"missing_trade_delta_features,missing_holder_snapshot_features\",false,false,false,false\n",
+        )
+        .expect("table");
+        fs::write(
+            asof_dir.join("asof_alpha_feature_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "feature_tables": [{"path": "asof_alpha_features/asof_alpha_features_060s.csv"}],
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false
+            }))
+            .expect("json"),
+        )
+        .expect("manifest");
+        fs::write(asof_dir.join("asof_alpha_feature_completeness.json"), "{}")
+            .expect("completeness");
+        let (exists, row_count, blockers) =
+            phase107h_validate_asof_alpha_artifacts(temp.path(), None).expect("validate alpha");
+        assert!(exists);
+        assert_eq!(row_count, 1);
+        assert!(blockers.is_empty(), "{blockers:?}");
     }
 
     #[test]
