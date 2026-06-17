@@ -255,6 +255,7 @@ class RelaySupervisorTests(unittest.TestCase):
     def test_missing_remote_rc_recovery_requires_clean_safety(self) -> None:
         clean_result = {
             "remote_rc": None,
+            "remote_rc_poll_timeout_seen": True,
             "local_rc": 0,
             "counted_phase107b_result": True,
             "artifact_consistency_ok": True,

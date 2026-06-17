@@ -857,9 +857,20 @@ def run_slice(
         remote_start = ssh(args, start_remote, check=True)
         print(remote_start.stdout, end="", flush=True)
         remote_rc = ""
+        remote_poll_timeout_seen = False
         deadline = time.time() + args.duration_seconds + args.remote_completion_grace_seconds
         while time.time() < deadline:
-            proc = ssh(args, f"cat {shlex.quote(health_dir)}/relay_command_rc 2>/dev/null || true", check=False)
+            try:
+                proc = ssh(
+                    args,
+                    f"cat {shlex.quote(health_dir)}/relay_command_rc 2>/dev/null || true",
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                remote_poll_timeout_seen = True
+                print(f"slice={idx} remote_rc_poll_timeout=true", flush=True)
+                time.sleep(5)
+                continue
             remote_rc = proc.stdout.strip()
             if remote_rc:
                 break
@@ -896,6 +907,7 @@ def run_slice(
     result["slice_index"] = idx
     result["run"] = run_id
     result["remote_rc"] = int(remote_rc) if remote_rc.isdigit() else None
+    result["remote_rc_poll_timeout_seen"] = remote_poll_timeout_seen
     result["local_rc"] = local_rc
     result["classification"] = classify_slice(result) if not blockers else result.get("classification")
     result["survivor_extension_mode_enabled"] = bool(args.survivor_extension_mode)
@@ -905,11 +917,16 @@ def run_slice(
     if local_rc == -1:
         blockers.append("local_finalization_timeout")
     if remote_rc != "0":
-        refreshed = ssh(
-            args,
-            f"cat {shlex.quote(health_dir)}/relay_command_rc 2>/dev/null || true",
-            check=False,
-        ).stdout.strip()
+        try:
+            refreshed = ssh(
+                args,
+                f"cat {shlex.quote(health_dir)}/relay_command_rc 2>/dev/null || true",
+                check=False,
+            ).stdout.strip()
+        except subprocess.TimeoutExpired:
+            refreshed = ""
+            remote_poll_timeout_seen = True
+            result["remote_rc_poll_timeout_seen"] = True
         if refreshed:
             remote_rc = refreshed
             result["remote_rc"] = int(remote_rc) if remote_rc.isdigit() else None
