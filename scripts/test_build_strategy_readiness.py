@@ -287,6 +287,90 @@ class StrategyReadinessTests(unittest.TestCase):
         self.assertEqual(rows[0]["feature_available"], "false")
         self.assertEqual(rows[0]["future_collection_required"], "true")
 
+    def test_asof_alpha_features_mark_groups_available(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "relay-alpha-run"
+            alpha_dir = run_dir / "asof_alpha_features"
+            alpha_dir.mkdir(parents=True)
+            (alpha_dir / "asof_alpha_feature_manifest.json").write_text('{"schema_version":"phase107h.asof_alpha_feature_manifest.v1"}')
+            for horizon in sr.HORIZONS:
+                rows = []
+                if horizon == 60:
+                    rows = [
+                        {
+                            "mint": "mint-alpha",
+                            "slice_id": "relay-alpha-run",
+                            "segment_id": "1",
+                            "relay_session_id": "relay",
+                            "horizon_seconds": "60",
+                            "feature_asof_timestamp": "2026-06-16T12:01:00+00:00",
+                            "mint_first_seen_timestamp": "2026-06-16T12:00:00+00:00",
+                            "horizon_reached": "true",
+                            "data_complete_for_horizon": "true",
+                            "trade_update_count_asof": "3",
+                            "buy_count_delta_asof": "2",
+                            "sell_count_delta_asof": "1",
+                            "holder_update_count_asof": "2",
+                            "unique_holder_accounts_seen_asof": "2",
+                            "vault_update_count_asof": "1",
+                            "bonding_curve_update_count_asof": "1",
+                            "curve_progress_proxy_asof": "0.2",
+                            "holder_rpc_used": "false",
+                            "rpc_mint_supply_canonical": "false",
+                            "threshold_tuning_allowed": "false",
+                            "live_trading_enabled": "false",
+                        }
+                    ]
+                write_csv(alpha_dir / f"asof_alpha_features_{horizon:03d}s.csv", rows, sr.ASOF_ALPHA_FIELDS)
+            runs = [
+                {
+                    "source_path": str(run_dir),
+                    "batch_id": "batch",
+                    "slice_id": "relay-alpha-run",
+                    "relay_session_id": "relay",
+                }
+            ]
+            alpha_rows, alpha_completeness = sr.collect_asof_alpha_features(runs, root / "out")
+            labels = [{"mint": "mint-alpha", "slice_id": "relay-alpha-run", "segment_id": "1", "relay_session_id": "relay"}]
+            completeness = sr.write_extended_asof_feature_placeholders(root / "out", labels, alpha_rows, alpha_completeness)
+        self.assertTrue(completeness["groups"]["trade_delta"]["available"])
+        self.assertTrue(completeness["groups"]["holder_state"]["available"])
+        self.assertTrue(completeness["groups"]["vault_curve"]["available"])
+
+    def test_candidate_v1_uses_alpha_available_reason_codes(self) -> None:
+        features = {
+            "tracked_at_least_horizon": True,
+            "asof_alpha_trade_delta_available": True,
+            "asof_alpha_holder_state_available": True,
+            "asof_alpha_vault_curve_available": True,
+        }
+        label = {"clean_negative_label": False, "censored_label": False, "candidate_checkpoint_seen": False, "replay_eligible": False}
+        reasons = sr.v1_reason_codes(features, label)
+        self.assertIn("feature_available_in_new_asof_alpha_slices:trade_delta", reasons)
+        self.assertNotIn("missing_trade_delta_features", reasons)
+
+    def test_leakage_audit_rejects_post_horizon_alpha_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            payload = sr.leakage_audit(
+                Path(td),
+                [],
+                [],
+                None,
+                [
+                    {
+                        "mint": "mint-alpha",
+                        "horizon_seconds": "60",
+                        "mint_first_seen_timestamp": "2026-06-16T12:00:00+00:00",
+                        "feature_asof_timestamp": "2026-06-16T12:02:30+00:00",
+                        "holder_rpc_used": "false",
+                        "rpc_mint_supply_canonical": "false",
+                    }
+                ],
+            )
+        self.assertFalse(payload["passed"])
+        self.assertTrue(any(blocker.startswith("post_horizon_asof_alpha_timestamp") for blocker in payload["blockers"]))
+
 
 if __name__ == "__main__":
     unittest.main()

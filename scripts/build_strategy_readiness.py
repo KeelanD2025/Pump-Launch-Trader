@@ -137,6 +137,67 @@ ASOF_FIELDS = [
     "label_quality",
 ]
 
+ASOF_ALPHA_FIELDS = [
+    "mint",
+    "batch_id",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "horizon_seconds",
+    "feature_asof_timestamp",
+    "mint_first_seen_timestamp",
+    "age_ms_at_horizon",
+    "horizon_reached",
+    "data_complete_for_horizon",
+    "data_quality_exclusion",
+    "provider_gap_exposed",
+    "relay_gap_exposed",
+    "sequence_gap_exposed",
+    "hash_mismatch_exposed",
+    "receiver_backpressure_exposed",
+    "terminal_inconclusive_before_horizon",
+    "rejected_before_horizon",
+    "degraded_audit_only_before_horizon",
+    "high_throughput_before_horizon",
+    "trade_update_count_asof",
+    "transaction_active_mint_count_asof",
+    "pump_trade_active_mint_count_asof",
+    "buy_count_delta_asof",
+    "sell_count_delta_asof",
+    "net_buy_sell_delta_asof",
+    "volume_delta_asof",
+    "unique_trade_accounts_asof",
+    "last_trade_age_ms_asof",
+    "trade_burst_score_asof",
+    "trade_direction_imbalance_asof",
+    "holder_update_count_asof",
+    "unique_holder_accounts_seen_asof",
+    "top_holder_concentration_asof",
+    "dev_or_creator_holding_proxy_asof",
+    "holder_churn_proxy_asof",
+    "holder_collapse_proxy_asof",
+    "new_holder_count_delta_asof",
+    "exiting_holder_count_delta_asof",
+    "vault_update_count_asof",
+    "bonding_curve_update_count_asof",
+    "liquidity_delta_asof",
+    "reserve_delta_asof",
+    "curve_progress_proxy_asof",
+    "liquidity_exit_proxy_asof",
+    "price_or_curve_move_proxy_asof",
+    "early_avoid_decision_asof",
+    "continue_tracking_decision_asof",
+    "candidate_gate_status_asof",
+    "candidate_first_failed_gate_asof",
+    "candidate_failed_gate_reason_codes_asof",
+    "survivor_extension_active_asof",
+    "survival_horizon_reached_asof",
+    "holder_rpc_used",
+    "rpc_mint_supply_canonical",
+    "threshold_tuning_allowed",
+    "live_trading_enabled",
+]
+
 EARLY_AVOID_SCORE_FIELDS = [
     "mint",
     "slice_id",
@@ -331,7 +392,7 @@ def parse_mints(value: Any) -> set[str]:
 def parse_timestamp(value: str) -> datetime | None:
     if not value:
         return None
-    cleaned = value.replace(" +00:00:00", "+00:00")
+    cleaned = value.replace(" +00:00:00", "+00:00").replace(" UTC", "+00:00")
     try:
         return datetime.fromisoformat(cleaned)
     except ValueError:
@@ -797,7 +858,156 @@ def build_asof_features(labels: list[dict[str, Any]], output_dir: pathlib.Path) 
     return all_rows
 
 
-def feature_availability() -> list[dict[str, Any]]:
+def alpha_feature_key(row: dict[str, Any]) -> tuple[str, str, str, int]:
+    return (
+        str(row.get("mint") or ""),
+        str(row.get("slice_id") or ""),
+        str(row.get("segment_id") or ""),
+        int_or_zero(row.get("horizon_seconds")),
+    )
+
+
+def alpha_group_available(row: dict[str, Any], group: str) -> bool:
+    fields = {
+        "trade_delta": ("trade_update_count_asof", "buy_count_delta_asof", "sell_count_delta_asof"),
+        "holder_state": ("holder_update_count_asof", "unique_holder_accounts_seen_asof", "top_holder_concentration_asof"),
+        "vault_curve": ("vault_update_count_asof", "bonding_curve_update_count_asof", "curve_progress_proxy_asof"),
+    }[group]
+    return boolish(row.get("data_complete_for_horizon")) and any(str(row.get(field) or "").strip() for field in fields)
+
+
+def collect_asof_alpha_features(
+    runs: list[dict[str, Any]],
+    output_dir: pathlib.Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    alpha_dir = output_dir / "asof_alpha_features"
+    alpha_dir.mkdir(parents=True, exist_ok=True)
+    all_rows: list[dict[str, Any]] = []
+    source_runs: list[dict[str, Any]] = []
+    for run in runs:
+        run_dir = pathlib.Path(run["source_path"])
+        run_alpha_dir = run_dir / "asof_alpha_features"
+        manifest = read_json(run_alpha_dir / "asof_alpha_feature_manifest.json")
+        if not manifest:
+            continue
+        run_rows = 0
+        for horizon in HORIZONS:
+            for row in read_csv(run_alpha_dir / f"asof_alpha_features_{horizon:03d}s.csv"):
+                enriched = dict(row)
+                enriched["batch_id"] = run.get("batch_id", "")
+                enriched["slice_id"] = enriched.get("slice_id") or run.get("slice_id", "")
+                enriched["relay_session_id"] = enriched.get("relay_session_id") or run.get("relay_session_id", "")
+                enriched["source_path"] = str(run_dir)
+                all_rows.append(enriched)
+                run_rows += 1
+        source_runs.append(
+            {
+                "slice_id": run.get("slice_id", ""),
+                "source_path": str(run_dir),
+                "rows": run_rows,
+                "manifest": str(run_alpha_dir / "asof_alpha_feature_manifest.json"),
+            }
+        )
+
+    for horizon in HORIZONS:
+        rows = [row for row in all_rows if int_or_zero(row.get("horizon_seconds")) == horizon]
+        write_csv(alpha_dir / f"asof_alpha_features_{horizon:03d}s.csv", rows, ASOF_ALPHA_FIELDS)
+
+    groups: dict[str, Any] = {}
+    for group in MISSING_ASOF_GROUPS:
+        rows_with_group = [row for row in all_rows if alpha_group_available(row, group)]
+        groups[group] = {
+            "available": bool(rows_with_group),
+            "rows": len(rows_with_group),
+            "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv" if rows_with_group else "legacy_slices_without_asof_alpha_features",
+            "stream_authoritative": True,
+            "as_of_safe": True,
+            "missing_reason": "" if rows_with_group else "feature_unavailable_in_prior_slices",
+            "future_collection_required": not bool(rows_with_group),
+        }
+
+    completeness = {
+        "schema_version": "phase107h.strategy_asof_alpha_feature_completeness.v1",
+        "total_rows": len(all_rows),
+        "source_run_count": len(source_runs),
+        "source_runs": source_runs,
+        "groups": groups,
+        "future_collection_required": any(not payload["available"] for payload in groups.values()),
+        "holder_rpc_used": False,
+        "rpc_mint_supply_canonical": False,
+    }
+    manifest = {
+        "schema_version": "phase107h.strategy_asof_alpha_feature_manifest.v1",
+        "horizons_seconds": list(HORIZONS),
+        "total_rows": len(all_rows),
+        "feature_tables": [
+            {
+                "horizon_seconds": horizon,
+                "path": str(alpha_dir / f"asof_alpha_features_{horizon:03d}s.csv"),
+                "rows": sum(1 for row in all_rows if int_or_zero(row.get("horizon_seconds")) == horizon),
+            }
+            for horizon in HORIZONS
+        ],
+        "source_run_count": len(source_runs),
+        "holder_rpc_used": False,
+        "rpc_mint_supply_canonical": False,
+    }
+    write_json(alpha_dir / "asof_alpha_feature_manifest.json", manifest)
+    write_json(alpha_dir / "asof_alpha_feature_completeness.json", completeness)
+    lines = [
+        "# As-Of Alpha Feature Source Map",
+        "",
+        "These feature groups are retained from stream-authoritative local collector state only. No holder RPC or canonical RPC mint supply is used.",
+        "",
+        "## Groups",
+    ]
+    for group, payload in groups.items():
+        lines.append(f"- {group}: available=`{str(payload['available']).lower()}` rows=`{payload['rows']}` source=`{payload['source_artifact']}` missing_reason=`{payload['missing_reason']}`")
+    lines.extend(["", "## Source Runs", *[f"- {row['slice_id']}: rows={row['rows']}" for row in source_runs[:200]]])
+    (output_dir / "asof_alpha_feature_source_map.md").write_text("\n".join(lines) + "\n")
+    write_json(
+        output_dir / "asof_alpha_feature_source_map.json",
+        {
+            "schema_version": "phase107h.asof_alpha_feature_source_map.v1",
+            "groups": groups,
+            "source_runs": source_runs,
+            "holder_rpc_used": False,
+            "rpc_mint_supply_canonical": False,
+        },
+    )
+    return all_rows, completeness
+
+
+def merge_asof_alpha_into_base(
+    asof_rows: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    alpha_by_key = {alpha_feature_key(row): row for row in alpha_rows}
+    merged: list[dict[str, Any]] = []
+    for row in asof_rows:
+        next_row = dict(row)
+        alpha = alpha_by_key.get(alpha_feature_key(row))
+        next_row["asof_alpha_feature_available"] = bool(alpha)
+        for group in MISSING_ASOF_GROUPS:
+            next_row[f"asof_alpha_{group}_available"] = bool(alpha and alpha_group_available(alpha, group))
+        if alpha:
+            next_row["asof_alpha_source_artifact"] = alpha.get("source_path", "")
+            next_row["feature_available"] = True
+            next_row["tracked_at_least_horizon"] = boolish(alpha.get("horizon_reached"))
+            next_row["data_quality_provider_gap_exposed"] = boolish(alpha.get("provider_gap_exposed"))
+            next_row["data_quality_relay_gap_exposed"] = boolish(alpha.get("relay_gap_exposed"))
+            next_row["data_quality_sequence_gap"] = boolish(alpha.get("sequence_gap_exposed"))
+            next_row["data_quality_hash_mismatch"] = boolish(alpha.get("hash_mismatch_exposed"))
+            next_row["data_quality_receiver_backpressure"] = boolish(alpha.get("receiver_backpressure_exposed"))
+        merged.append(next_row)
+    return merged
+
+
+def feature_availability(alpha_completeness: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    alpha_groups = (alpha_completeness or {}).get("groups") or {}
+    trade_available = boolish(alpha_groups.get("trade_delta", {}).get("available"))
+    holder_available = boolish(alpha_groups.get("holder_state", {}).get("available"))
+    vault_available = boolish(alpha_groups.get("vault_curve", {}).get("available"))
     return [
         {
             "name": "launch_hour_utc",
@@ -843,45 +1053,45 @@ def feature_availability() -> list[dict[str, Any]]:
         },
         {
             "name": "early_transaction_trade_count_deltas",
-            "description": "Future fixed-horizon trade/transaction deltas.",
-            "source_artifact": "future_asof_snapshot_shards",
+            "description": "Fixed-horizon trade/transaction deltas retained from stream-authoritative local collector state.",
+            "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv" if trade_available else "legacy_slices_without_asof_alpha_features",
             "stream_authoritative": True,
-            "as_of_safe": False,
+            "as_of_safe": trade_available,
             "requires_future_data": False,
-            "allowed_for_strategy_research": False,
-            "allowed_for_backtest_alpha": False,
+            "allowed_for_strategy_research": trade_available,
+            "allowed_for_backtest_alpha": trade_available,
             "audit_only": False,
             "data_quality_only": False,
-            "missing_reason": "not retained as per-mint fixed-horizon snapshots in compact artifacts",
-            "future_collection_required": True,
+            "missing_reason": "" if trade_available else "feature_unavailable_in_prior_slices",
+            "future_collection_required": not trade_available,
         },
         {
             "name": "holder_account_token_state",
             "description": "Stream-authoritative holder/account deltas; holder RPC remains disabled.",
-            "source_artifact": "future_asof_snapshot_shards",
+            "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv" if holder_available else "legacy_slices_without_asof_alpha_features",
             "stream_authoritative": True,
-            "as_of_safe": False,
+            "as_of_safe": holder_available,
             "requires_future_data": False,
-            "allowed_for_strategy_research": False,
-            "allowed_for_backtest_alpha": False,
+            "allowed_for_strategy_research": holder_available,
+            "allowed_for_backtest_alpha": holder_available,
             "audit_only": False,
             "data_quality_only": False,
-            "missing_reason": "not retained as fixed-horizon snapshots",
-            "future_collection_required": True,
+            "missing_reason": "" if holder_available else "feature_unavailable_in_prior_slices",
+            "future_collection_required": not holder_available,
         },
         {
             "name": "bonding_curve_vault_liquidity",
             "description": "Stream-authoritative vault/curve/liquidity deltas.",
-            "source_artifact": "future_asof_snapshot_shards",
+            "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv" if vault_available else "legacy_slices_without_asof_alpha_features",
             "stream_authoritative": True,
-            "as_of_safe": False,
+            "as_of_safe": vault_available,
             "requires_future_data": False,
-            "allowed_for_strategy_research": False,
-            "allowed_for_backtest_alpha": False,
+            "allowed_for_strategy_research": vault_available,
+            "allowed_for_backtest_alpha": vault_available,
             "audit_only": False,
             "data_quality_only": False,
-            "missing_reason": "not retained as fixed-horizon snapshots",
-            "future_collection_required": True,
+            "missing_reason": "" if vault_available else "feature_unavailable_in_prior_slices",
+            "future_collection_required": not vault_available,
         },
         {
             "name": "data_quality_*",
@@ -900,8 +1110,8 @@ def feature_availability() -> list[dict[str, Any]]:
     ]
 
 
-def write_feature_availability(output_dir: pathlib.Path) -> None:
-    rows = feature_availability()
+def write_feature_availability(output_dir: pathlib.Path, alpha_completeness: dict[str, Any] | None = None) -> None:
+    rows = feature_availability(alpha_completeness)
     write_json(output_dir / "feature_availability_map.json", {"schema_version": "phase107h.feature_availability.v1", "features": rows})
     lines = ["# Feature Availability Map", ""]
     lines.append("| name | as_of_safe | research | backtest_alpha | audit_only | data_quality_only | missing_reason |")
@@ -1033,13 +1243,17 @@ def v1_reason_codes(features: dict[str, Any], label: dict[str, Any]) -> list[str
         reasons.append("candidate_checkpoint_absent")
     if not boolish(label.get("replay_eligible")):
         reasons.append("replay_not_countability_allowed")
-    reasons.extend(
-        [
-            "missing_trade_delta_features",
-            "missing_holder_snapshot_features",
-            "missing_vault_curve_features",
-        ]
-    )
+    feature_groups = [
+        ("trade_delta", "missing_trade_delta_features"),
+        ("holder_state", "missing_holder_snapshot_features"),
+        ("vault_curve", "missing_vault_curve_features"),
+    ]
+    for group, missing_code in feature_groups:
+        if boolish(features.get(f"asof_alpha_{group}_available")):
+            reasons.append(f"feature_available_in_new_asof_alpha_slices:{group}")
+        else:
+            reasons.append(f"feature_unavailable_in_prior_slices:{group}")
+            reasons.append(missing_code)
     if not boolish(label.get("clean_negative_label")) and not boolish(label.get("censored_label")):
         reasons.append("gate_too_strict_review")
     # Preserve order but remove duplicates.
@@ -1068,6 +1282,9 @@ def first_failed_candidate_gate(reasons: list[str]) -> str:
         "missing_trade_delta_features",
         "missing_holder_snapshot_features",
         "missing_vault_curve_features",
+        "feature_unavailable_in_prior_slices:trade_delta",
+        "feature_unavailable_in_prior_slices:holder_state",
+        "feature_unavailable_in_prior_slices:vault_curve",
         "candidate_checkpoint_absent",
         "replay_not_countability_allowed",
         "gate_too_strict_review",
@@ -1147,7 +1364,7 @@ def classify_continue_gap(label: dict[str, Any], reasons: list[str]) -> str:
         return "CENSORED_OR_INCOMPLETE"
     if any(reason.startswith("early_rejection_reason_") for reason in reasons):
         return "FAILED_BEHAVIOR"
-    if any(reason.startswith("missing_") for reason in reasons):
+    if any(reason.startswith("missing_") or reason.startswith("feature_unavailable_in_prior_slices") for reason in reasons):
         return "MISSING_ASOF_FEATURES"
     if "gate_too_strict_review" in reasons:
         return "GATE_TOO_STRICT_REVIEW"
@@ -1228,8 +1445,13 @@ def continue_to_candidate_gap_analysis(
 def write_extended_asof_feature_placeholders(
     output_dir: pathlib.Path,
     labels: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]] | None = None,
+    alpha_completeness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     asof_dir = output_dir / "asof_features"
+    alpha_rows = alpha_rows or []
+    alpha_by_key = {alpha_feature_key(row): row for row in alpha_rows}
+    alpha_groups = (alpha_completeness or {}).get("groups") or {}
     completeness: dict[str, Any] = {
         "schema_version": "phase107h.asof_feature_completeness.v1",
         "groups": {},
@@ -1237,40 +1459,52 @@ def write_extended_asof_feature_placeholders(
     }
     for group, missing_reason in MISSING_ASOF_GROUPS.items():
         total_rows = 0
+        available_rows = 0
         for horizon in HORIZONS:
-            rows = [
-                {
+            rows = []
+            for label in labels:
+                alpha = alpha_by_key.get((label["mint"], label["slice_id"], str(label["segment_id"]), horizon))
+                available = bool(alpha and alpha_group_available(alpha, group))
+                if available:
+                    available_rows += 1
+                rows.append(
+                    {
                     "mint": label["mint"],
                     "slice_id": label["slice_id"],
                     "segment_id": label["segment_id"],
                     "relay_session_id": label["relay_session_id"],
                     "horizon_seconds": horizon,
-                    "feature_available": False,
+                    "feature_available": available,
                     "asof_safe": True,
-                    "source_artifact": "future_stream_authoritative_asof_snapshot_shards",
-                    "missing_reason": missing_reason,
-                    "future_collection_required": True,
+                    "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv" if available else "legacy_slices_without_asof_alpha_features",
+                    "missing_reason": "" if available else missing_reason,
+                    "future_collection_required": not available,
                 }
-                for label in labels
-            ]
+                )
             total_rows += len(rows)
             write_csv(asof_dir / f"asof_{group}_features_{horizon:03d}s.csv", rows, EXTENDED_ASOF_FIELDS)
+        group_available = boolish(alpha_groups.get(group, {}).get("available")) or available_rows > 0
         completeness["groups"][group] = {
-            "available": False,
+            "available": group_available,
             "rows": total_rows,
-            "missing_reason": missing_reason,
-            "future_collection_required": True,
+            "available_rows": available_rows,
+            "missing_reason": "" if group_available else missing_reason,
+            "future_collection_required": not group_available,
         }
+    completeness["future_collection_required"] = any(
+        payload["future_collection_required"] for payload in completeness["groups"].values()
+    )
     write_json(asof_dir / "asof_feature_completeness_report.json", completeness)
     lines = ["# As-Of Feature Completeness Report", ""]
     for group, payload in completeness["groups"].items():
         lines.append(f"## {group}")
         lines.append(f"- available: {str(payload['available']).lower()}")
         lines.append(f"- rows: {payload['rows']}")
+        lines.append(f"- available_rows: {payload['available_rows']}")
         lines.append(f"- missing_reason: {payload['missing_reason']}")
-        lines.append("- future_collection_required: true")
+        lines.append(f"- future_collection_required: {str(payload['future_collection_required']).lower()}")
         lines.append("")
-    lines.append("No holder RPC or canonical RPC mint supply was introduced. Missing groups must be retained from stream-authoritative local collector state in future slices before alpha/backtesting use.")
+    lines.append("No holder RPC or canonical RPC mint supply was introduced. Legacy slices without alpha shards remain label-usable but feature-incomplete for alpha research.")
     (output_dir / "asof_feature_completeness_report.md").write_text("\n".join(lines) + "\n")
     (asof_dir / "asof_feature_completeness_report.md").write_text("\n".join(lines) + "\n")
     return completeness
@@ -1395,9 +1629,17 @@ def survivor_int(row: dict[str, Any], flat_key: str, nested_key: str, nested_fie
     return 0
 
 
-def leakage_audit(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]], labels: list[dict[str, Any]], splits: dict[str, Any] | None = None) -> dict[str, Any]:
+def leakage_audit(
+    output_dir: pathlib.Path,
+    asof_rows: list[dict[str, Any]],
+    labels: list[dict[str, Any]],
+    splits: dict[str, Any] | None = None,
+    alpha_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     blockers: list[str] = []
     feature_columns = set(ASOF_FIELDS)
+    alpha_rows = alpha_rows or []
+    alpha_feature_columns = set(ASOF_ALPHA_FIELDS)
     forbidden = {
         "final_outcome",
         "final_outcome_reason",
@@ -1411,6 +1653,23 @@ def leakage_audit(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]], lab
     overlap = feature_columns & forbidden
     if overlap:
         blockers.append("forbidden_label_or_artifact_columns_in_features:" + ",".join(sorted(overlap)))
+    alpha_overlap = alpha_feature_columns & forbidden
+    if alpha_overlap:
+        blockers.append("forbidden_label_or_artifact_columns_in_asof_alpha_features:" + ",".join(sorted(alpha_overlap)))
+    for row in alpha_rows:
+        if boolish(row.get("holder_rpc_used")):
+            blockers.append(f"holder_rpc_used_in_asof_alpha:{row.get('mint', '')}")
+        if boolish(row.get("rpc_mint_supply_canonical")):
+            blockers.append(f"canonical_rpc_supply_in_asof_alpha:{row.get('mint', '')}")
+        if boolish(row.get("threshold_tuning_allowed")) or boolish(row.get("live_trading_enabled")):
+            blockers.append(f"execution_or_tuning_enabled_in_asof_alpha:{row.get('mint', '')}")
+        asof_ts = parse_timestamp(str(row.get("feature_asof_timestamp") or ""))
+        first_seen = parse_timestamp(str(row.get("mint_first_seen_timestamp") or ""))
+        horizon = int_or_zero(row.get("horizon_seconds"))
+        if asof_ts and first_seen and horizon:
+            delta = (asof_ts - first_seen).total_seconds()
+            if delta > horizon + 1:
+                blockers.append(f"post_horizon_asof_alpha_timestamp:{row.get('mint', '')}:{horizon}")
     if any(row.get("final_outcome") == "terminal_inconclusive" and boolish(row.get("clean_negative_label")) for row in labels):
         blockers.append("terminal_inconclusive_treated_as_dead")
     if any(boolish(row.get("candidate_checkpoint_seen")) and boolish(row.get("clean_positive_label")) and not boolish(row.get("replay_eligible")) for row in labels):
@@ -1430,6 +1689,8 @@ def leakage_audit(output_dir: pathlib.Path, asof_rows: list[dict[str, Any]], lab
         "passed": not blockers,
         "blockers": blockers,
         "audited_feature_columns": sorted(feature_columns),
+        "audited_asof_alpha_feature_columns": sorted(alpha_feature_columns),
+        "asof_alpha_rows_audited": len(alpha_rows),
         "rules": [
             "final outcomes/reasons cannot enter features",
             "candidate/replay fields cannot enter features",
@@ -1841,9 +2102,11 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
 
     labels, _segment_maps = build_labels(included)
     asof_rows = build_asof_features(labels, output_dir)
-    write_feature_availability(output_dir)
+    alpha_rows, alpha_completeness = collect_asof_alpha_features(included, output_dir)
+    asof_rows = merge_asof_alpha_into_base(asof_rows, alpha_rows)
+    write_feature_availability(output_dir, alpha_completeness)
     splits = build_splits(labels, output_dir)
-    leakage = leakage_audit(output_dir, asof_rows, labels, splits)
+    leakage = leakage_audit(output_dir, asof_rows, labels, splits, alpha_rows)
     early_scores, continue_scores, eligibility_scores = score_strategy_gates(output_dir, asof_rows)
     v1_scores = score_candidate_eligibility_v1(output_dir, labels, asof_rows)
     gap_rows = continue_to_candidate_gap_analysis(
@@ -1853,7 +2116,12 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         continue_scores,
         v1_scores,
     )
-    completeness = write_extended_asof_feature_placeholders(output_dir, labels)
+    completeness = write_extended_asof_feature_placeholders(
+        output_dir,
+        labels,
+        alpha_rows,
+        alpha_completeness,
+    )
     survivor_diagnostics = survivor_extension_diagnostics(
         output_dir,
         labels,
@@ -1941,8 +2209,11 @@ def run_leakage_only(args: argparse.Namespace) -> dict[str, Any]:
     asof_rows: list[dict[str, Any]] = []
     for table in (args.output_root / "asof_features").glob("asof_features_*.csv"):
         asof_rows.extend(read_csv(table))
+    alpha_rows: list[dict[str, Any]] = []
+    for table in (args.output_root / "asof_alpha_features").glob("asof_alpha_features_*.csv"):
+        alpha_rows.extend(read_csv(table))
     splits = read_json(args.output_root / "splits.json")
-    return leakage_audit(args.output_root, asof_rows, labels, splits)
+    return leakage_audit(args.output_root, asof_rows, labels, splits, alpha_rows)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

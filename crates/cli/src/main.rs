@@ -41275,6 +41275,7 @@ async fn material_candidate_hunter_command_with_connector(
     let mut rejected_rows = Vec::<serde_json::Value>::new();
     let mut candidate_rows = Vec::<serde_json::Value>::new();
     let mut unavailable_rows = Vec::<serde_json::Value>::new();
+    let mut asof_alpha_rows = Vec::<serde_json::Value>::new();
     let mut candidates_300 = 0u64;
     let mut candidates_900 = 0u64;
     let mut candidates_1800 = 0u64;
@@ -41517,6 +41518,13 @@ async fn material_candidate_hunter_command_with_connector(
                 }
                 if decision.provider_confirmed_bundle {
                     provider_confirmed_bundle_count = provider_confirmed_bundle_count.saturating_add(1);
+                }
+                if should_finalize {
+                    asof_alpha_rows.extend(phase107h_asof_alpha_rows_for_segment(
+                        &analysis.asof_alpha_rows,
+                        active.segment_id,
+                        &decision,
+                    ));
                 }
                 if decision.final_state.starts_with("early_rejected") {
                     stream_state_hint.tombstoned_mints.push(mint.clone());
@@ -41863,6 +41871,11 @@ async fn material_candidate_hunter_command_with_connector(
                 provider_confirmed_bundle: false,
             };
             rejected_inconclusive = rejected_inconclusive.saturating_add(1);
+            asof_alpha_rows.extend(phase107h_asof_alpha_rows_for_segment(
+                &analysis.asof_alpha_rows,
+                active.segment_id,
+                &decision,
+            ));
             phase107b_write_rejected_token(
                 &output_dir,
                 &run_id,
@@ -42173,6 +42186,7 @@ async fn material_candidate_hunter_command_with_connector(
         &["mint", "run_id", "unavailable_reason"],
         &unavailable_rows,
     )?;
+    phase107h_write_asof_alpha_artifacts(&output_dir, &asof_alpha_rows)?;
 
     let attempted_launches = attempt_rows.len() as u64;
     let (candidate_checkpoint_count, _replay_eligible_candidate_count) =
@@ -42239,6 +42253,8 @@ async fn material_candidate_hunter_command_with_connector(
         "affected_mints_at_gaps": affected_mints_at_gaps,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "asof_alpha_feature_rows": asof_alpha_rows.len(),
+        "asof_alpha_feature_manifest_exists": output_dir.join("asof_alpha_features").join("asof_alpha_feature_manifest.json").exists(),
         "target_material_candidates": target_material_candidates,
         "code_path_failures": 0,
         "missing_evidence_became_zero": false,
@@ -42289,6 +42305,8 @@ async fn material_candidate_hunter_command_with_connector(
         "candidates_1800s_count": candidates_1800,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "asof_alpha_feature_rows": asof_alpha_rows.len(),
+        "asof_alpha_feature_manifest_path": "asof_alpha_features/asof_alpha_feature_manifest.json",
         "segment_count": segment_count,
         "clean_segment_count": clean_segment_count,
         "blocked_segment_count": blocked_segment_count,
@@ -42594,6 +42612,7 @@ async fn material_candidate_hunter_command_with_connector(
 #[derive(Debug, Clone)]
 struct Phase107bTokenAnalysis {
     observed_horizon_seconds: u64,
+    asof_alpha_rows: Vec<serde_json::Value>,
     risk_timeline_rows: Vec<serde_json::Value>,
     pre_entry_rows: Vec<serde_json::Value>,
     post_event_rows: Vec<serde_json::Value>,
@@ -42620,6 +42639,634 @@ struct Phase107bDecision {
     survived_1800: bool,
     promoted: bool,
     provider_confirmed_bundle: bool,
+}
+
+const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 7] = [5, 10, 30, 60, 120, 300, 900];
+
+const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
+    "mint",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "horizon_seconds",
+    "feature_asof_timestamp",
+    "mint_first_seen_timestamp",
+    "age_ms_at_horizon",
+    "horizon_reached",
+    "data_complete_for_horizon",
+    "data_quality_exclusion",
+    "provider_gap_exposed",
+    "relay_gap_exposed",
+    "sequence_gap_exposed",
+    "hash_mismatch_exposed",
+    "receiver_backpressure_exposed",
+    "terminal_inconclusive_before_horizon",
+    "rejected_before_horizon",
+    "degraded_audit_only_before_horizon",
+    "high_throughput_before_horizon",
+    "trade_update_count_asof",
+    "transaction_active_mint_count_asof",
+    "pump_trade_active_mint_count_asof",
+    "buy_count_delta_asof",
+    "sell_count_delta_asof",
+    "net_buy_sell_delta_asof",
+    "volume_delta_asof",
+    "unique_trade_accounts_asof",
+    "last_trade_age_ms_asof",
+    "trade_burst_score_asof",
+    "trade_direction_imbalance_asof",
+    "holder_update_count_asof",
+    "unique_holder_accounts_seen_asof",
+    "top_holder_concentration_asof",
+    "dev_or_creator_holding_proxy_asof",
+    "holder_churn_proxy_asof",
+    "holder_collapse_proxy_asof",
+    "new_holder_count_delta_asof",
+    "exiting_holder_count_delta_asof",
+    "vault_update_count_asof",
+    "bonding_curve_update_count_asof",
+    "liquidity_delta_asof",
+    "reserve_delta_asof",
+    "curve_progress_proxy_asof",
+    "liquidity_exit_proxy_asof",
+    "price_or_curve_move_proxy_asof",
+    "early_avoid_decision_asof",
+    "continue_tracking_decision_asof",
+    "candidate_gate_status_asof",
+    "candidate_first_failed_gate_asof",
+    "candidate_failed_gate_reason_codes_asof",
+    "survivor_extension_active_asof",
+    "survival_horizon_reached_asof",
+    "holder_rpc_used",
+    "rpc_mint_supply_canonical",
+    "threshold_tuning_allowed",
+    "live_trading_enabled",
+];
+
+fn phase107h_decimal_ratio(numerator: Decimal, denominator: Decimal) -> Option<Decimal> {
+    if denominator == Decimal::ZERO {
+        None
+    } else {
+        Some(numerator / denominator)
+    }
+}
+
+fn phase107h_dec_to_json(value: Decimal) -> serde_json::Value {
+    decimal_to_json(Some(value))
+}
+
+fn phase107h_opt_dec_to_json(value: Option<Decimal>) -> serde_json::Value {
+    decimal_to_json(value)
+}
+
+fn phase107h_event_counts(events: &[NormalizedEvent]) -> (u64, u64, u64, u64) {
+    let mut transactions = 0u64;
+    let mut pump_trades = 0u64;
+    let mut holders = 0u64;
+    let mut curves = 0u64;
+    for event in events {
+        match &event.payload {
+            EventPayload::ObservedTransaction(_) => transactions = transactions.saturating_add(1),
+            EventPayload::PumpBuy(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                pump_trades = pump_trades.saturating_add(1);
+            }
+            EventPayload::PumpSell(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                pump_trades = pump_trades.saturating_add(1);
+            }
+            EventPayload::HolderBalanceUpdate(_) => holders = holders.saturating_add(1),
+            EventPayload::BondingCurveUpdate(_) => curves = curves.saturating_add(1),
+            _ => {}
+        }
+    }
+    (transactions, pump_trades, holders, curves)
+}
+
+fn phase107h_window_gate_reasons(
+    early_rule_rows: &[serde_json::Value],
+    horizon: u64,
+) -> Vec<String> {
+    early_rule_rows
+        .iter()
+        .filter(|row| row["window_seconds"].as_u64().unwrap_or(u64::MAX) <= horizon)
+        .filter(|row| row["rule_fired"].as_bool().unwrap_or(false))
+        .filter_map(|row| row["rule_id"].as_str())
+        .filter(|rule| *rule != "same_slot_bundle_like_plus_holder_concentration")
+        .map(|rule| {
+            format!(
+                "early_rejection_reason_{}",
+                rule.replace("_by_", "_").replace("_before_", "_")
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn phase107h_build_asof_alpha_rows(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    mint: &str,
+    create: &NormalizedEvent,
+    scoped_events: &[NormalizedEvent],
+    observed_horizon_seconds: u64,
+    early_rule_rows: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    let launch_at = create.meta.received_at_wall_time;
+    let mut rows = Vec::new();
+    for horizon in PHASE107H_ASOF_ALPHA_HORIZONS {
+        let horizon_reached = observed_horizon_seconds >= horizon;
+        let cutoff = launch_at + time::Duration::seconds(horizon as i64);
+        let window_events = if horizon_reached {
+            scoped_events
+                .iter()
+                .filter(|event| event.meta.received_at_wall_time <= cutoff)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut state_engine = StateEngine::new(loaded.config.ttl.clone());
+        for event in &window_events {
+            state_engine.apply_event(event)?;
+        }
+        let snapshot = state_engine.snapshot();
+        let token = snapshot.tokens.get(mint);
+        let data_complete = horizon_reached && token.is_some();
+        let gate_reasons = if data_complete {
+            phase107h_window_gate_reasons(early_rule_rows, horizon)
+        } else {
+            Vec::new()
+        };
+        let early_avoid_decision = if !horizon_reached {
+            "insufficient_data"
+        } else if !gate_reasons.is_empty() {
+            "avoid"
+        } else if data_complete {
+            "continue_tracking"
+        } else {
+            "insufficient_data"
+        };
+        let continue_tracking_decision = if !horizon_reached {
+            "insufficient_data"
+        } else if !gate_reasons.is_empty() {
+            "stop_tracking"
+        } else if data_complete {
+            "continue_tracking"
+        } else {
+            "audit_only"
+        };
+        let candidate_gate_status = if data_complete {
+            "not_eligible"
+        } else {
+            "insufficient_data"
+        };
+        let first_failed_gate = gate_reasons.first().cloned().unwrap_or_else(|| {
+            if data_complete {
+                "candidate_checkpoint_absent".to_owned()
+            } else {
+                "insufficient_observation_horizon".to_owned()
+            }
+        });
+        let failed_reason_codes = if gate_reasons.is_empty() {
+            if data_complete {
+                "candidate_checkpoint_absent|replay_not_countability_allowed".to_owned()
+            } else {
+                "insufficient_observation_horizon".to_owned()
+            }
+        } else {
+            gate_reasons.join("|")
+        };
+
+        let (transaction_count, pump_trade_count, holder_update_count, curve_update_count) =
+            phase107h_event_counts(&window_events);
+        let mut base = serde_json::Map::new();
+        base.insert("mint".to_owned(), json!(mint));
+        base.insert("slice_id".to_owned(), json!(run_id));
+        base.insert("segment_id".to_owned(), json!(""));
+        base.insert("relay_session_id".to_owned(), json!(""));
+        base.insert("horizon_seconds".to_owned(), json!(horizon));
+        base.insert(
+            "feature_asof_timestamp".to_owned(),
+            if horizon_reached {
+                json!(cutoff)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        base.insert("mint_first_seen_timestamp".to_owned(), json!(launch_at));
+        base.insert(
+            "age_ms_at_horizon".to_owned(),
+            if horizon_reached {
+                json!((cutoff - launch_at).whole_milliseconds().max(0))
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        base.insert("horizon_reached".to_owned(), json!(horizon_reached));
+        base.insert("data_complete_for_horizon".to_owned(), json!(data_complete));
+        base.insert("data_quality_exclusion".to_owned(), json!(false));
+        base.insert("provider_gap_exposed".to_owned(), json!(false));
+        base.insert("relay_gap_exposed".to_owned(), json!(false));
+        base.insert("sequence_gap_exposed".to_owned(), json!(false));
+        base.insert("hash_mismatch_exposed".to_owned(), json!(false));
+        base.insert("receiver_backpressure_exposed".to_owned(), json!(false));
+        base.insert(
+            "terminal_inconclusive_before_horizon".to_owned(),
+            json!(false),
+        );
+        base.insert(
+            "rejected_before_horizon".to_owned(),
+            json!(!gate_reasons.is_empty()),
+        );
+        base.insert(
+            "degraded_audit_only_before_horizon".to_owned(),
+            json!(false),
+        );
+        base.insert("high_throughput_before_horizon".to_owned(), json!(false));
+        base.insert(
+            "transaction_active_mint_count_asof".to_owned(),
+            json!(transaction_count),
+        );
+        base.insert(
+            "pump_trade_active_mint_count_asof".to_owned(),
+            json!(pump_trade_count),
+        );
+        base.insert(
+            "holder_update_count_asof".to_owned(),
+            json!(holder_update_count),
+        );
+        base.insert(
+            "vault_update_count_asof".to_owned(),
+            json!(curve_update_count),
+        );
+        base.insert(
+            "bonding_curve_update_count_asof".to_owned(),
+            json!(curve_update_count),
+        );
+        base.insert(
+            "early_avoid_decision_asof".to_owned(),
+            json!(early_avoid_decision),
+        );
+        base.insert(
+            "continue_tracking_decision_asof".to_owned(),
+            json!(continue_tracking_decision),
+        );
+        base.insert(
+            "candidate_gate_status_asof".to_owned(),
+            json!(candidate_gate_status),
+        );
+        base.insert(
+            "candidate_first_failed_gate_asof".to_owned(),
+            json!(first_failed_gate),
+        );
+        base.insert(
+            "candidate_failed_gate_reason_codes_asof".to_owned(),
+            json!(failed_reason_codes),
+        );
+        base.insert("survivor_extension_active_asof".to_owned(), json!(false));
+        base.insert(
+            "survival_horizon_reached_asof".to_owned(),
+            json!(horizon_reached),
+        );
+        base.insert("holder_rpc_used".to_owned(), json!(false));
+        base.insert("rpc_mint_supply_canonical".to_owned(), json!(false));
+        base.insert("threshold_tuning_allowed".to_owned(), json!(false));
+        base.insert("live_trading_enabled".to_owned(), json!(false));
+
+        if let Some(token) = token {
+            let trade_update_count = token
+                .trade_stats
+                .buy_count
+                .saturating_add(token.trade_stats.sell_count);
+            let total_volume =
+                token.trade_stats.buy_volume_quote + token.trade_stats.sell_volume_quote;
+            let trade_accounts = token
+                .trade_stats
+                .unique_buyers
+                .union(&token.trade_stats.unique_sellers)
+                .count();
+            let last_trade_at = token
+                .trade_stats
+                .last_buy_at
+                .into_iter()
+                .chain(token.trade_stats.last_sell_at)
+                .max();
+            let last_trade_age_ms =
+                last_trade_at.map(|seen_at| (cutoff - seen_at).whole_milliseconds().max(0));
+            let trade_burst = phase107h_decimal_ratio(
+                Decimal::from(trade_update_count),
+                Decimal::from(horizon.max(1)),
+            );
+            let trade_imbalance = phase107h_decimal_ratio(
+                Decimal::from(
+                    token.trade_stats.buy_count as i64 - token.trade_stats.sell_count as i64,
+                ),
+                Decimal::from(trade_update_count.max(1)),
+            );
+            let owner_balance_total = token
+                .holder_state
+                .owner_balances
+                .values()
+                .map(|balance| balance.balance.max(Decimal::ZERO))
+                .sum::<Decimal>();
+            let creator_holding = token
+                .creator
+                .as_ref()
+                .and_then(|creator| token.holder_state.owner_balances.get(&creator.to_string()))
+                .and_then(|balance| {
+                    phase107h_decimal_ratio(balance.balance.max(Decimal::ZERO), owner_balance_total)
+                });
+            let liquidity_proxy = token.reserve_state.real_quote_reserves
+                + token.reserve_state.virtual_quote_reserves;
+            let reserve_proxy = token.reserve_state.real_token_reserves
+                + token.reserve_state.virtual_token_reserves;
+            let curve_move = token.reserve_state.launch_price.and_then(|launch| {
+                if launch == Decimal::ZERO {
+                    None
+                } else {
+                    Some((token.reserve_state.latest_price - launch) / launch)
+                }
+            });
+
+            base.insert(
+                "trade_update_count_asof".to_owned(),
+                json!(trade_update_count),
+            );
+            base.insert(
+                "buy_count_delta_asof".to_owned(),
+                json!(token.trade_stats.buy_count),
+            );
+            base.insert(
+                "sell_count_delta_asof".to_owned(),
+                json!(token.trade_stats.sell_count),
+            );
+            base.insert(
+                "net_buy_sell_delta_asof".to_owned(),
+                json!(token.trade_stats.buy_count as i64 - token.trade_stats.sell_count as i64),
+            );
+            base.insert(
+                "volume_delta_asof".to_owned(),
+                phase107h_dec_to_json(total_volume),
+            );
+            base.insert(
+                "unique_trade_accounts_asof".to_owned(),
+                json!(trade_accounts),
+            );
+            base.insert(
+                "last_trade_age_ms_asof".to_owned(),
+                json!(last_trade_age_ms),
+            );
+            base.insert(
+                "trade_burst_score_asof".to_owned(),
+                phase107h_opt_dec_to_json(trade_burst),
+            );
+            base.insert(
+                "trade_direction_imbalance_asof".to_owned(),
+                phase107h_opt_dec_to_json(trade_imbalance),
+            );
+            base.insert(
+                "unique_holder_accounts_seen_asof".to_owned(),
+                json!(token.holder_state.nonzero_holder_count),
+            );
+            base.insert(
+                "top_holder_concentration_asof".to_owned(),
+                phase107h_opt_dec_to_json(
+                    token
+                        .holder_state
+                        .top_holders
+                        .first()
+                        .map(|holder| holder.pct_supply_proxy),
+                ),
+            );
+            base.insert(
+                "dev_or_creator_holding_proxy_asof".to_owned(),
+                phase107h_opt_dec_to_json(creator_holding),
+            );
+            base.insert(
+                "holder_churn_proxy_asof".to_owned(),
+                phase107h_dec_to_json(token.holder_state.holder_churn_rate),
+            );
+            base.insert(
+                "holder_collapse_proxy_asof".to_owned(),
+                json!(token.holder_state.holder_churn_rate >= Decimal::new(50, 2)),
+            );
+            base.insert(
+                "new_holder_count_delta_asof".to_owned(),
+                json!(token.holder_state.net_holder_change.max(0)),
+            );
+            base.insert(
+                "exiting_holder_count_delta_asof".to_owned(),
+                json!(token.holder_state.exited_holder_count_zero_balance),
+            );
+            base.insert(
+                "liquidity_delta_asof".to_owned(),
+                phase107h_dec_to_json(liquidity_proxy),
+            );
+            base.insert(
+                "reserve_delta_asof".to_owned(),
+                phase107h_dec_to_json(reserve_proxy),
+            );
+            base.insert(
+                "curve_progress_proxy_asof".to_owned(),
+                phase107h_opt_dec_to_json(token.reserve_state.curve_progress_pct),
+            );
+            base.insert(
+                "liquidity_exit_proxy_asof".to_owned(),
+                json!(liquidity_proxy <= Decimal::ZERO),
+            );
+            base.insert(
+                "price_or_curve_move_proxy_asof".to_owned(),
+                phase107h_opt_dec_to_json(curve_move),
+            );
+        }
+        rows.push(serde_json::Value::Object(base));
+    }
+    Ok(rows)
+}
+
+fn phase107h_asof_alpha_rows_for_segment(
+    rows: &[serde_json::Value],
+    segment_id: usize,
+    decision: &Phase107bDecision,
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .cloned()
+        .map(|mut row| {
+            if let Some(map) = row.as_object_mut() {
+                let horizon = map
+                    .get("horizon_seconds")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                map.insert("segment_id".to_owned(), json!(segment_id));
+                map.insert(
+                    "terminal_inconclusive_before_horizon".to_owned(),
+                    json!(
+                        decision.final_state == "terminal_inconclusive"
+                            && decision.tracked_until_seconds <= horizon
+                    ),
+                );
+                map.insert(
+                    "rejected_before_horizon".to_owned(),
+                    json!(
+                        decision.final_state.starts_with("early_rejected")
+                            && decision.tracked_until_seconds <= horizon
+                    ),
+                );
+                if decision.reason.contains("provider") || decision.reason.contains("gap") {
+                    map.insert("provider_gap_exposed".to_owned(), json!(true));
+                    map.insert("data_quality_exclusion".to_owned(), json!(true));
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+fn phase107h_write_asof_alpha_artifacts(
+    output_dir: &Path,
+    rows: &[serde_json::Value],
+) -> Result<()> {
+    let asof_dir = output_dir.join("asof_alpha_features");
+    fs::create_dir_all(&asof_dir)?;
+    let mut manifest_tables = Vec::new();
+    let mut groups = BTreeMap::<String, serde_json::Value>::new();
+    let mut total_rows = 0usize;
+    for horizon in PHASE107H_ASOF_ALPHA_HORIZONS {
+        let horizon_rows = rows
+            .iter()
+            .filter(|row| row["horizon_seconds"].as_u64() == Some(horizon))
+            .cloned()
+            .collect::<Vec<_>>();
+        total_rows = total_rows.saturating_add(horizon_rows.len());
+        let filename = format!("asof_alpha_features_{horizon:03}s.csv");
+        write_json_rows_csv(
+            &asof_dir.join(&filename),
+            PHASE107H_ASOF_ALPHA_FIELDS,
+            &horizon_rows,
+        )?;
+        manifest_tables.push(json!({
+            "horizon_seconds": horizon,
+            "path": format!("asof_alpha_features/{filename}"),
+            "rows": horizon_rows.len(),
+        }));
+    }
+    for (group, fields) in [
+        (
+            "trade_delta",
+            &[
+                "trade_update_count_asof",
+                "buy_count_delta_asof",
+                "sell_count_delta_asof",
+            ][..],
+        ),
+        (
+            "holder_state",
+            &[
+                "holder_update_count_asof",
+                "unique_holder_accounts_seen_asof",
+                "top_holder_concentration_asof",
+            ][..],
+        ),
+        (
+            "vault_curve",
+            &[
+                "vault_update_count_asof",
+                "bonding_curve_update_count_asof",
+                "curve_progress_proxy_asof",
+            ][..],
+        ),
+    ] {
+        let populated = rows.iter().any(|row| {
+            fields.iter().any(|field| {
+                row.get(*field)
+                    .map(|value| {
+                        !value.is_null()
+                            && value
+                                .as_str()
+                                .map(|item| !item.trim().is_empty())
+                                .unwrap_or(true)
+                    })
+                    .unwrap_or(false)
+            })
+        });
+        groups.insert(
+            group.to_owned(),
+            json!({
+                "available": populated,
+                "rows": total_rows,
+                "source_artifact": "asof_alpha_features/asof_alpha_features_<horizon>.csv",
+                "stream_authoritative": true,
+                "as_of_safe": true,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "missing_reason": if populated { "" } else { "still_missing_stream_state_or_no_horizon_reached" },
+                "future_collection_required": !populated,
+            }),
+        );
+    }
+    let manifest = json!({
+        "schema_version": "phase107h.asof_alpha_feature_manifest.v1",
+        "horizons_seconds": PHASE107H_ASOF_ALPHA_HORIZONS,
+        "feature_tables": manifest_tables,
+        "total_rows": total_rows,
+        "feature_columns": PHASE107H_ASOF_ALPHA_FIELDS,
+        "no_future_data_policy": "rows are reconstructed from stream events received at or before feature_asof_timestamp",
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        asof_dir.join("asof_alpha_feature_manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    let future_collection_required = groups.values().any(|value| {
+        !value
+            .get("available")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false)
+    });
+    let completeness = json!({
+        "schema_version": "phase107h.asof_alpha_feature_completeness.v1",
+        "total_rows": total_rows,
+        "groups": groups,
+        "future_collection_required": future_collection_required,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        asof_dir.join("asof_alpha_feature_completeness.json"),
+        serde_json::to_vec_pretty(&completeness)?,
+    )?;
+    let mut lines = vec![
+        "# As-Of Alpha Feature Completeness".to_owned(),
+        String::new(),
+        format!("- total_rows: `{total_rows}`"),
+        "- holder_rpc_used: `false`".to_owned(),
+        "- rpc_mint_supply_canonical: `false`".to_owned(),
+        String::new(),
+        "## Groups".to_owned(),
+    ];
+    for (group, payload) in completeness["groups"].as_object().into_iter().flatten() {
+        lines.push(format!(
+            "- {group}: available=`{}` rows=`{}` missing_reason=`{}`",
+            payload["available"],
+            payload["rows"],
+            payload["missing_reason"].as_str().unwrap_or("")
+        ));
+    }
+    fs::write(
+        asof_dir.join("asof_alpha_feature_completeness.md"),
+        lines.join("\n") + "\n",
+    )?;
+    Ok(())
 }
 
 fn phase107b_write_incremental_checkpoint(
@@ -43514,8 +44161,18 @@ fn phase107b_analyze_token(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let asof_alpha_rows = phase107h_build_asof_alpha_rows(
+        loaded,
+        run_id,
+        mint,
+        create,
+        scoped_events,
+        observed_horizon_seconds,
+        &early_rule_rows,
+    )?;
     Ok(Phase107bTokenAnalysis {
         observed_horizon_seconds,
+        asof_alpha_rows,
         risk_timeline_rows,
         pre_entry_rows,
         post_event_rows,
@@ -44165,6 +44822,120 @@ fn phase107f_read_csv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>>
     Ok(rows)
 }
 
+fn phase107f_read_csv_header(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split(',')
+                .map(|header| header.trim().to_owned())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn phase107h_validate_asof_alpha_artifacts(
+    output_dir: &Path,
+    manifest: Option<&serde_json::Value>,
+) -> Result<(bool, u64, Vec<String>)> {
+    let mut blockers = Vec::<String>::new();
+    let asof_dir = output_dir.join("asof_alpha_features");
+    let advertised = manifest
+        .and_then(|value| value.get("asof_alpha_feature_manifest_path"))
+        .and_then(|value| value.as_str())
+        .is_some()
+        || asof_dir.exists();
+    if !advertised {
+        return Ok((false, 0, blockers));
+    }
+    let manifest_path = asof_dir.join("asof_alpha_feature_manifest.json");
+    let Some(asof_manifest) = phase107f_read_json_value(&manifest_path)? else {
+        blockers.push("asof_alpha_feature_manifest_missing".to_owned());
+        return Ok((false, 0, blockers));
+    };
+    let completeness_path = asof_dir.join("asof_alpha_feature_completeness.json");
+    if !completeness_path.exists() {
+        blockers.push("asof_alpha_feature_completeness_missing".to_owned());
+    }
+    if phase107f_json_bool(&asof_manifest, "holder_rpc_used")
+        || phase107f_json_bool(&asof_manifest, "rpc_mint_supply_canonical")
+        || phase107f_json_bool(&asof_manifest, "formal_backtesting_allowed")
+        || phase107f_json_bool(&asof_manifest, "threshold_tuning_allowed")
+        || phase107f_json_bool(&asof_manifest, "live_trading_enabled")
+    {
+        blockers.push("asof_alpha_safety_flag_enabled".to_owned());
+    }
+    let forbidden = [
+        "final_outcome",
+        "rejection_reason",
+        "candidate_checkpoint_seen",
+        "replay_eligible",
+        "off_vps_candidate_replay_allowed",
+        "ready_for_off_vps_candidate_replay",
+        "r2_verified",
+        "artifact_consistency_ok",
+    ];
+    let mut total_rows = 0u64;
+    let tables = asof_manifest
+        .get("feature_tables")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if tables.is_empty() {
+        blockers.push("asof_alpha_feature_tables_empty".to_owned());
+    }
+    for table in tables {
+        let Some(relative) = table.get("path").and_then(|value| value.as_str()) else {
+            blockers.push("asof_alpha_feature_table_path_missing".to_owned());
+            continue;
+        };
+        let table_path = output_dir.join(relative);
+        if !table_path.exists() {
+            blockers.push(format!("asof_alpha_feature_table_missing:{relative}"));
+            continue;
+        }
+        let header = phase107f_read_csv_header(&table_path)?;
+        for field in forbidden {
+            if header.iter().any(|item| item == field) {
+                blockers.push(format!("asof_alpha_forbidden_feature_column:{field}"));
+            }
+        }
+        for required in [
+            "mint",
+            "horizon_seconds",
+            "feature_asof_timestamp",
+            "mint_first_seen_timestamp",
+            "horizon_reached",
+            "data_complete_for_horizon",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+        ] {
+            if !header.iter().any(|item| item == required) {
+                blockers.push(format!("asof_alpha_required_column_missing:{required}"));
+            }
+        }
+        let rows = phase107f_read_csv_rows(&table_path)?;
+        total_rows = total_rows.saturating_add(rows.len() as u64);
+        for row in rows {
+            if phase107f_row_bool(&row, "holder_rpc_used")
+                || phase107f_row_bool(&row, "rpc_mint_supply_canonical")
+                || phase107f_row_bool(&row, "threshold_tuning_allowed")
+                || phase107f_row_bool(&row, "live_trading_enabled")
+            {
+                blockers.push(format!(
+                    "asof_alpha_row_safety_flag_enabled:{}",
+                    phase107f_row_value(&row, "mint")
+                ));
+            }
+        }
+    }
+    Ok((true, total_rows, blockers))
+}
+
 fn phase107f_row_bool(row: &BTreeMap<String, String>, key: &str) -> bool {
     row.get(key)
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
@@ -44283,6 +45054,9 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     let candidate_rows = phase107f_read_csv_rows(&output_dir.join("candidate_summary.csv"))?;
     let rejected_rows = phase107f_read_csv_rows(&output_dir.join("rejected_summary.csv"))?;
     let attempt_rows = phase107f_read_csv_rows(&output_dir.join("attempt_ledger.csv"))?;
+    let (asof_alpha_manifest_exists, asof_alpha_row_count, asof_alpha_blockers) =
+        phase107h_validate_asof_alpha_artifacts(output_dir, manifest.as_ref())?;
+    blockers.extend(asof_alpha_blockers);
 
     let counted = phase107f_json_bool(&countability, "counted_phase107b_result");
     let replay_allowed = phase107f_json_bool(&countability, "off_vps_candidate_replay_allowed");
@@ -44571,6 +45345,8 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "ready_for_off_vps_candidate_replay": ready_for_replay,
         "service_exit_status_exists": service_exit.is_some(),
         "local_retention_summary_exists": retention_summary.is_some(),
+        "asof_alpha_feature_manifest_exists": asof_alpha_manifest_exists,
+        "asof_alpha_feature_row_count": asof_alpha_row_count,
         "local_retained_bytes": retention_summary
             .as_ref()
             .and_then(|value| value.get("local_retained_bytes"))
@@ -46922,6 +47698,9 @@ fn local_relay_apply_r2_primary_retention(
         "local_collector_summary.json",
         "local_collector_exit_status.json",
         "relay_frame_manifest.json",
+        "asof_alpha_features/asof_alpha_feature_manifest.json",
+        "asof_alpha_features/asof_alpha_feature_completeness.json",
+        "asof_alpha_features/asof_alpha_feature_completeness.md",
     ]
     .iter()
     .filter_map(|relative| {
@@ -60994,6 +61773,87 @@ mod tests {
             "{}\n",
         )
         .expect("tombstone");
+    }
+
+    #[test]
+    fn phase107h_asof_alpha_writer_emits_manifest_and_completeness() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rows = vec![json!({
+            "mint": "mint-a",
+            "slice_id": "slice-a",
+            "segment_id": 1,
+            "relay_session_id": "relay-a",
+            "horizon_seconds": 60,
+            "feature_asof_timestamp": "2026-06-16T12:01:00Z",
+            "mint_first_seen_timestamp": "2026-06-16T12:00:00Z",
+            "horizon_reached": true,
+            "data_complete_for_horizon": true,
+            "trade_update_count_asof": 3,
+            "buy_count_delta_asof": 2,
+            "sell_count_delta_asof": 1,
+            "holder_update_count_asof": 2,
+            "unique_holder_accounts_seen_asof": 2,
+            "vault_update_count_asof": 1,
+            "bonding_curve_update_count_asof": 1,
+            "curve_progress_proxy_asof": "0.2",
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "threshold_tuning_allowed": false,
+            "live_trading_enabled": false,
+        })];
+        phase107h_write_asof_alpha_artifacts(temp.path(), &rows).expect("write alpha");
+        assert!(
+            temp.path()
+                .join("asof_alpha_features/asof_alpha_feature_manifest.json")
+                .exists()
+        );
+        let completeness = read_json_file_or_empty(
+            &temp
+                .path()
+                .join("asof_alpha_features/asof_alpha_feature_completeness.json"),
+        );
+        assert_eq!(completeness["groups"]["trade_delta"]["available"], true);
+        assert_eq!(completeness["groups"]["holder_state"]["available"], true);
+        assert_eq!(completeness["groups"]["vault_curve"]["available"], true);
+        let (exists, row_count, blockers) =
+            phase107h_validate_asof_alpha_artifacts(temp.path(), None).expect("validate alpha");
+        assert!(exists);
+        assert!(row_count > 0);
+        assert!(blockers.is_empty(), "{blockers:?}");
+    }
+
+    #[test]
+    fn phase107h_asof_alpha_validator_rejects_forbidden_label_columns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let asof_dir = temp.path().join("asof_alpha_features");
+        fs::create_dir_all(&asof_dir).expect("asof dir");
+        fs::write(
+            asof_dir.join("asof_alpha_features_060s.csv"),
+            "mint,horizon_seconds,final_outcome,holder_rpc_used,rpc_mint_supply_canonical\nmint-a,60,early_rejected_dead,false,false\n",
+        )
+        .expect("table");
+        fs::write(
+            asof_dir.join("asof_alpha_feature_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "feature_tables": [{"path": "asof_alpha_features/asof_alpha_features_060s.csv"}],
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false
+            }))
+            .expect("json"),
+        )
+        .expect("manifest");
+        fs::write(asof_dir.join("asof_alpha_feature_completeness.json"), "{}")
+            .expect("completeness");
+        let (_exists, _row_count, blockers) =
+            phase107h_validate_asof_alpha_artifacts(temp.path(), None).expect("validate alpha");
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| { blocker == "asof_alpha_forbidden_feature_column:final_outcome" })
+        );
     }
 
     #[test]
