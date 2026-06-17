@@ -8922,6 +8922,8 @@ mod tests {
         let mut loaded = loaded_config();
         loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
         loaded.config.geyser.max_reconnect_attempts = Some(3);
+        loaded.config.geyser.reconnect_backoff_ms = vec![1, 1, 1];
+        loaded.config.geyser.max_reconnect_backoff_ms = 1;
         let connector = MockGeyserConnector {
             batches: Arc::new(std::sync::Mutex::new(vec![
                 MockConnectorBatch {
@@ -8949,7 +8951,7 @@ mod tests {
         let summary = run_material_hunter_stream_with_connector(
             &loaded,
             MaterialHunterStreamOptions {
-                duration_seconds: 1,
+                duration_seconds: 2,
                 gap_tolerant_segments: true,
             },
             Arc::new(connector),
@@ -8985,6 +8987,8 @@ mod tests {
         let mut loaded = loaded_config();
         loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
         loaded.config.geyser.max_reconnect_attempts = Some(3);
+        loaded.config.geyser.reconnect_backoff_ms = vec![1, 1, 1];
+        loaded.config.geyser.max_reconnect_backoff_ms = 1;
         let connector = MockGeyserConnector {
             batches: Arc::new(std::sync::Mutex::new(vec![
                 MockConnectorBatch {
@@ -9007,7 +9011,7 @@ mod tests {
         let summary = run_material_hunter_stream_with_connector(
             &loaded,
             MaterialHunterStreamOptions {
-                duration_seconds: 1,
+                duration_seconds: 2,
                 ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
@@ -9033,6 +9037,8 @@ mod tests {
         let mut loaded = loaded_config();
         loaded.config.geyser.endpoint = "http://example.invalid:10000".to_owned();
         loaded.config.geyser.max_reconnect_attempts = Some(2);
+        loaded.config.geyser.reconnect_backoff_ms = vec![1, 1];
+        loaded.config.geyser.max_reconnect_backoff_ms = 1;
         let connector = MockGeyserConnector {
             batches: Arc::new(std::sync::Mutex::new(vec![
                 MockConnectorBatch {
@@ -9046,7 +9052,7 @@ mod tests {
         let summary = run_material_hunter_stream_with_connector(
             &loaded,
             MaterialHunterStreamOptions {
-                duration_seconds: 1,
+                duration_seconds: 2,
                 ..MaterialHunterStreamOptions::default()
             },
             Arc::new(connector),
