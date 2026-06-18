@@ -20,7 +20,7 @@ def main() -> int:
     parser.add_argument("--pipeline-root", type=pathlib.Path, default=PIPELINE_ROOT)
     args = parser.parse_args()
     readiness = read_json(args.pipeline_root / "READINESS_DECISION.json") or read_json(args.architecture_root / "readiness_decision.json")
-    gate = backtest_gate(readiness).to_dict() | {"strategy": args.strategy}
+    gate = backtest_gate(readiness, strategy=args.strategy).to_dict() | {"strategy": args.strategy}
     if not gate["allowed"]:
         print(json.dumps(gate, sort_keys=True))
         return 2

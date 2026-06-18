@@ -28,6 +28,8 @@ def write_report_set(root: pathlib.Path, summary: dict[str, Any]) -> None:
             f"- early_burst_strategy_research_ready: `{str(summary['readiness'].get('early_burst_strategy_research_ready')).lower()}`",
             f"- early_burst_validation_dataset_ready: `{str(summary['readiness'].get('early_burst_validation_dataset_ready')).lower()}`",
             f"- early_burst_validation_rows: `{summary['readiness'].get('early_burst_validation_rows', 0)}`",
+            f"- early_burst_backtesting_ready: `{str(summary['readiness'].get('early_burst_backtesting_ready')).lower()}`",
+            f"- early_burst_backtest_readiness_classification: `{summary['readiness'].get('early_burst_backtest_readiness_classification', '')}`",
             f"- backtesting_ready: `{str(summary['readiness']['backtesting_ready']).lower()}`",
             f"- replay_ready: `{str(summary['readiness']['replay_ready']).lower()}`",
             f"- profitability_claim_allowed: `{str(summary['readiness']['profitability_claim_allowed']).lower()}`",
@@ -38,6 +40,8 @@ def write_report_set(root: pathlib.Path, summary: dict[str, Any]) -> None:
             "",
             "- architecture: `present`",
             f"- blocker: `{summary['gates']['backtest']['blocker']}`",
+            f"- early_burst_backtesting_ready: `{str(summary['readiness'].get('early_burst_backtesting_ready')).lower()}`",
+            f"- early_burst_backtest_readiness_classification: `{summary['readiness'].get('early_burst_backtest_readiness_classification', '')}`",
             "- formal_performance_evaluation_run: `false`",
         ],
         "REPLAY_HARNESS_REPORT.md": [

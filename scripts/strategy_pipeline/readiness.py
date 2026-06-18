@@ -28,6 +28,7 @@ def build_readiness_decision(
     positive_outcome_summary: dict[str, Any] | None = None,
     early_burst_summary: dict[str, Any] | None = None,
     early_burst_validation_summary: dict[str, Any] | None = None,
+    early_burst_backtest_readiness_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_positives = int(architecture_readiness.get("clean_positive_count", 0))
     replay_eligible = int(architecture_readiness.get("replay_eligible_candidate_count", 0))
@@ -36,6 +37,7 @@ def build_readiness_decision(
     positive_summary = positive_outcome_summary or {}
     early_burst = early_burst_summary or {}
     early_burst_validation = early_burst_validation_summary or {}
+    early_burst_backtest = early_burst_backtest_readiness_summary or {}
     positive_or_high = int(positive_summary.get("positive_or_high_count", 0))
     positive_outcome_research_ready = leakage_passed and int(positive_summary.get("total_rows", 0)) > 0
     reason_codes: list[str] = []
@@ -54,6 +56,10 @@ def build_readiness_decision(
     if early_burst_validation.get("classification") == "EARLY_BURST_VALIDATION_DATASET_PASS":
         reason_codes.append("early_burst_validation_dataset_ready")
         reason_codes.append("exit_window_needs_validation")
+    decision = early_burst_backtest.get("decision", {})
+    if decision:
+        if not decision.get("early_burst_backtesting_ready"):
+            reason_codes.extend(decision.get("reason_codes", []))
     if not leakage_passed:
         reason_codes.append("leakage_audit_required")
     if not splits_passed:
@@ -83,6 +89,8 @@ def build_readiness_decision(
         "positive_outcome_research_ready": positive_outcome_research_ready,
         "early_burst_strategy_research_ready": bool(early_burst.get("early_burst_strategy_research_ready")),
         "early_burst_validation_dataset_ready": early_burst_validation.get("classification") == "EARLY_BURST_VALIDATION_DATASET_PASS",
+        "early_burst_backtesting_ready": bool(decision.get("early_burst_backtesting_ready", False)),
+        "formal_backtesting_ready": False,
         "backtesting_ready": backtesting_ready,
         "replay_ready": False,
         "threshold_tuning_ready": False,
@@ -99,6 +107,7 @@ def build_readiness_decision(
         "unique_high_positive_mints": int(early_burst.get("unique_high_positive_mints", 0)),
         "early_burst_validation_rows": int(early_burst_validation.get("rows", 0)),
         "early_burst_observable_exit_window_mints": int(early_burst_validation.get("observable_exit_window_mints", 0)),
+        "early_burst_backtest_readiness_classification": early_burst_backtest.get("classification", ""),
         "data_mart_rows": data_mart.get("mint_rows", 0),
         "reason_codes": reason_codes,
         "blocked_actions": BASE_BLOCKED_ACTIONS,

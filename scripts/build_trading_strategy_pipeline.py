@@ -21,6 +21,7 @@ from strategy_pipeline.execution_model import execution_model
 from strategy_pipeline.experiment_registry import default_experiment
 from strategy_pipeline.feature_store import PipelineFeatureStore
 from strategy_pipeline.early_burst import build_early_burst_research
+from strategy_pipeline.early_burst_backtest_readiness import build_early_burst_backtest_readiness
 from strategy_pipeline.early_burst_validation import build_early_burst_validation_dataset
 from strategy_pipeline.io import read_json, write_json, write_text
 from strategy_pipeline.label_store import PipelineLabelStore
@@ -142,6 +143,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         data_mart_root=DATA_MART_ROOT,
         architecture_root=args.architecture_root,
     )
+    early_burst_backtest_readiness_summary = build_early_burst_backtest_readiness(output_root=output_root)
 
     splits = build_walk_forward_splits(labels.load())
     split_validation = validate_splits(splits)
@@ -171,6 +173,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         positive_outcome_summary=positive_outcome_summary,
         early_burst_summary=early_burst_summary,
         early_burst_validation_summary=early_burst_validation_summary,
+        early_burst_backtest_readiness_summary=early_burst_backtest_readiness_summary,
     )
     registry_validation = write_registries(output_root, preliminary_readiness, data_mart, splits)
     readiness = build_readiness_decision(
@@ -183,6 +186,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         positive_outcome_summary=positive_outcome_summary,
         early_burst_summary=early_burst_summary,
         early_burst_validation_summary=early_burst_validation_summary,
+        early_burst_backtest_readiness_summary=early_burst_backtest_readiness_summary,
     )
 
     gates = {
@@ -202,6 +206,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "positive_outcomes": positive_outcome_summary,
         "early_burst": early_burst_summary,
         "early_burst_validation": early_burst_validation_summary,
+        "early_burst_backtest_readiness": early_burst_backtest_readiness_summary,
         "splits": split_validation,
         "registry": registry_validation,
         "models_configured": True,
