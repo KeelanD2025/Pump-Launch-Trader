@@ -42,6 +42,26 @@ FORBIDDEN_ALPHA_COLUMNS = {
     "ready_for_off_vps_candidate_replay",
     "r2_verified",
     "artifact_consistency_ok",
+    "positive_outcome_label",
+    "positive_outcome_strength_bin",
+    "positive_outcome_basis",
+    "positive_outcome_reason_codes",
+    "outcome_label",
+    "outcome_label_quality",
+    "outcome_basis",
+    "outcome_window_seconds",
+    "outcome_known_at_end_only",
+    "allowed_for_alpha_features",
+    "curve_progress_proxy_end",
+    "curve_progress_proxy_max",
+    "liquidity_delta_forward",
+    "reserve_delta_forward",
+    "volume_delta_forward",
+    "buy_sell_delta_forward",
+    "holder_growth_forward",
+    "holder_concentration_risk_forward",
+    "max_adverse_proxy",
+    "max_favorable_proxy",
 }
 DATA_QUALITY_PREFIX = "data_quality_"
 
@@ -133,4 +153,3 @@ SIGNAL_FIELDS = [
     "blocked_actions",
     "explanation",
 ]
-

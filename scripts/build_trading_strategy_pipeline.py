@@ -27,6 +27,7 @@ from strategy_pipeline.leakage import run_leakage_audit
 from strategy_pipeline.live_trading import live_trading_gate
 from strategy_pipeline.paper_trading import paper_trading_gate
 from strategy_pipeline.profitability_claims import profitability_claim_gate
+from strategy_pipeline.positive_outcomes import build_positive_outcome_labels
 from strategy_pipeline.readiness import build_readiness_decision
 from strategy_pipeline.registry import config_schema, strategy_registry, validate_registry
 from strategy_pipeline.replay import replay_gate
@@ -124,6 +125,11 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     labels = PipelineLabelStore(DATA_MART_ROOT)
     features = PipelineFeatureStore(DATA_MART_ROOT)
     leakage = run_leakage_audit(features, labels)
+    positive_outcome_summary = build_positive_outcome_labels(
+        data_mart_root=DATA_MART_ROOT,
+        architecture_root=args.architecture_root,
+        output_root=output_root,
+    )
 
     splits = build_walk_forward_splits(labels.load())
     split_validation = validate_splits(splits)
@@ -150,6 +156,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         splits_passed=split_validation["passed"],
         registries_passed=True,
         models_configured=True,
+        positive_outcome_summary=positive_outcome_summary,
     )
     registry_validation = write_registries(output_root, preliminary_readiness, data_mart, splits)
     readiness = build_readiness_decision(
@@ -159,6 +166,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         splits_passed=split_validation["passed"],
         registries_passed=registry_validation["passed"],
         models_configured=all(bool(value) for value in models.values()),
+        positive_outcome_summary=positive_outcome_summary,
     )
 
     gates = {
@@ -175,6 +183,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "classification": "TRADING_STRATEGY_PIPELINE_READY_PASS",
         "data_mart": data_mart,
         "leakage": leakage,
+        "positive_outcomes": positive_outcome_summary,
         "splits": split_validation,
         "registry": registry_validation,
         "models_configured": True,
