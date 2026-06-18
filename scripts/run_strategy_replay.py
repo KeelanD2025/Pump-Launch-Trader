@@ -8,21 +8,21 @@ import sys
 
 from strategy.io import read_json
 from strategy.schemas import STRATEGY_ARCHITECTURE_ROOT
+from strategy_pipeline.replay import replay_gate
+from strategy_pipeline.schemas import PIPELINE_ROOT
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--architecture-root", type=pathlib.Path, default=STRATEGY_ARCHITECTURE_ROOT)
+    parser.add_argument("--pipeline-root", type=pathlib.Path, default=PIPELINE_ROOT)
     args = parser.parse_args()
-    readiness = read_json(args.architecture_root / "readiness_decision.json")
-    if not readiness.get("replay_ready"):
-        print(json.dumps({
-            "allowed": False,
-            "blocker": "REPLAY_BLOCKED_BY_READINESS_GATE",
-            "reason_codes": readiness.get("reason_codes", ["readiness_missing"]),
-        }, sort_keys=True))
+    readiness = read_json(args.pipeline_root / "READINESS_DECISION.json") or read_json(args.architecture_root / "readiness_decision.json")
+    gate = replay_gate(readiness).to_dict()
+    if not gate["allowed"]:
+        print(json.dumps(gate, sort_keys=True))
         return 2
-    print(json.dumps({"allowed": True, "note": "not implemented in this phase"}, sort_keys=True))
+    print(json.dumps(gate, sort_keys=True))
     return 0
 
 

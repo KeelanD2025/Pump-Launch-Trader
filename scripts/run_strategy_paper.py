@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import json
+import argparse
+import pathlib
 import sys
+
+from strategy.io import read_json
+from strategy_pipeline.paper_trading import paper_trading_gate
+from strategy_pipeline.schemas import PIPELINE_ROOT
 
 
 def main() -> int:
-    print(json.dumps({"allowed": False, "blocker": "PAPER_TRADING_DISABLED"}, sort_keys=True))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pipeline-root", type=pathlib.Path, default=PIPELINE_ROOT)
+    args = parser.parse_args()
+    gate = paper_trading_gate(read_json(args.pipeline_root / "READINESS_DECISION.json")).to_dict()
+    print(json.dumps(gate, sort_keys=True))
     return 2
 
 

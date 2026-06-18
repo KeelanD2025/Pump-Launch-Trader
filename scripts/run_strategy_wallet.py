@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import sys
 
+from strategy_pipeline.wallet import wallet_gate
+
 
 def main() -> int:
-    print(json.dumps({"allowed": False, "blocker": "WALLET_EXECUTION_DISABLED"}, sort_keys=True))
+    print(json.dumps(wallet_gate().to_dict(), sort_keys=True))
     return 2
 
 
