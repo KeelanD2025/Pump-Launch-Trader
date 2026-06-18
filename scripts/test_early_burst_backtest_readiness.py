@@ -14,6 +14,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from strategy_pipeline.backtest import backtest_gate
 from strategy_pipeline.early_burst_backtest_readiness import (
+    HOLDER_STATE_FIELDS,
+    TRADE_DELTA_FIELDS,
+    VAULT_CURVE_FIELDS,
     build_early_burst_backtest_readiness,
     leakage_audit,
 )
@@ -98,6 +101,15 @@ def feature_row(mint: str, horizon: int, **overrides: str) -> dict[str, str]:
         "sell_count_delta_asof": "0",
         "net_buy_sell_delta_asof": "1",
         "volume_delta_asof": "10",
+        "holder_update_count_asof": "1",
+        "unique_holder_accounts_seen_asof": "1",
+        "top_holder_concentration_asof": "0.5",
+        "new_holder_count_delta_asof": "1",
+        "vault_update_count_asof": "1",
+        "bonding_curve_update_count_asof": "1",
+        "liquidity_delta_asof": "1",
+        "reserve_delta_asof": "1",
+        "curve_progress_proxy_asof": "10",
         "holder_rpc_used": "false",
         "rpc_mint_supply_canonical": "false",
         "threshold_tuning_allowed": "false",
@@ -163,6 +175,33 @@ class EarlyBurstBacktestReadinessTests(unittest.TestCase):
             self.assertFalse(decision["early_burst_backtesting_ready"])
             self.assertIn("sample_size_positive_too_small", decision["reason_codes"])
             self.assertIn("sample_size_high_positive_too_small", decision["reason_codes"])
+            self.assertEqual(decision["sample_checks"]["feature_complete_cohort_completeness"], 1.0)
+
+    def test_legacy_feature_incomplete_rows_are_label_context_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output, validation, readiness = write_fixture(Path(td))
+            # Keep the label row, but remove the stream-authoritative trade/holder/vault
+            # alpha groups from one mint so it cannot enter the formal cohort.
+            for horizon in HORIZONS:
+                path = validation / f"early_burst_validation_features_{horizon:03d}s.csv"
+                rows = []
+                with path.open(newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = reader.fieldnames or []
+                    for row in reader:
+                        if row["mint"] == "mintB":
+                            for field in sorted(TRADE_DELTA_FIELDS | HOLDER_STATE_FIELDS | VAULT_CURVE_FIELDS):
+                                row[field] = ""
+                        rows.append(row)
+                write_csv(path, rows, fields)
+            summary = build_early_burst_backtest_readiness(output_root=output, validation_root=validation, readiness_root=readiness)
+            decision = summary["decision"]
+            self.assertEqual(decision["sample_checks"]["feature_complete_cohort_rows"], 1)
+            self.assertEqual(decision["sample_checks"]["legacy_rows_excluded_from_backtest_features"], 1)
+            with (readiness / "feature_complete_cohort.csv").open(newline="") as handle:
+                cohort_rows = list(csv.DictReader(handle))
+            mint_b_rows = [row for row in cohort_rows if row["mint"] == "mintB"]
+            self.assertTrue(all(row["cohort"] == "legacy_label_context" for row in mint_b_rows))
 
     def test_backtest_harness_blocks_early_burst_until_readiness_passes(self) -> None:
         readiness = {

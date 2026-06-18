@@ -8,6 +8,7 @@ environment or a local env file. Do not commit the env file.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import pathlib
@@ -42,6 +43,48 @@ REQUIRED_FINAL_FILES = (
     "r2_upload_result.json",
     "local_retention_summary.json",
 )
+ASOF_ALPHA_HORIZONS = (5, 10, 30, 60, 120, 300, 900)
+ASOF_REQUIRED_PREFIX_HORIZONS = (5, 10, 30, 60, 120)
+ASOF_TRADE_FIELDS = {
+    "trade_update_count_asof",
+    "transaction_active_mint_count_asof",
+    "pump_trade_active_mint_count_asof",
+    "buy_count_delta_asof",
+    "sell_count_delta_asof",
+    "net_buy_sell_delta_asof",
+    "volume_delta_asof",
+    "unique_trade_accounts_asof",
+}
+ASOF_HOLDER_FIELDS = {
+    "holder_update_count_asof",
+    "unique_holder_accounts_seen_asof",
+    "top_holder_concentration_asof",
+    "dev_or_creator_holding_proxy_asof",
+    "holder_churn_proxy_asof",
+    "holder_collapse_proxy_asof",
+    "new_holder_count_delta_asof",
+    "exiting_holder_count_delta_asof",
+}
+ASOF_VAULT_FIELDS = {
+    "vault_update_count_asof",
+    "bonding_curve_update_count_asof",
+    "liquidity_delta_asof",
+    "reserve_delta_asof",
+    "curve_progress_proxy_asof",
+    "liquidity_exit_proxy_asof",
+    "price_or_curve_move_proxy_asof",
+}
+ASOF_FORBIDDEN_ALPHA_COLUMNS = {
+    "final_outcome",
+    "positive_outcome_label",
+    "rejection_reason",
+    "terminal_inconclusive_reason",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "off_vps_candidate_replay_allowed",
+    "r2_verified",
+    "artifact_consistency_ok",
+}
 
 
 class BatchError(RuntimeError):
@@ -173,6 +216,86 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def asof_field_group_present(row: dict[str, str], fields: set[str]) -> bool:
+    return any(str(row.get(field, "")).strip() not in {"", "MISSING"} for field in fields)
+
+
+def validate_asof_alpha_features(out: pathlib.Path) -> dict[str, Any]:
+    root = out / "asof_alpha_features"
+    blockers: list[str] = []
+    rows_by_horizon: dict[str, int] = {}
+    manifest_path = root / "asof_alpha_feature_manifest.json"
+    completeness_path = root / "asof_alpha_feature_completeness.json"
+    manifest = read_json(manifest_path)
+    completeness = read_json(completeness_path)
+    if not manifest_path.exists():
+        blockers.append("asof_alpha_manifest_missing")
+    if not completeness_path.exists():
+        blockers.append("asof_alpha_completeness_missing")
+    total_rows = 0
+    group_counts = {"trade_delta": 0, "holder_state": 0, "vault_curve": 0}
+    for horizon in ASOF_ALPHA_HORIZONS:
+        path = root / f"asof_alpha_features_{horizon:03d}s.csv"
+        if not path.exists():
+            if horizon in ASOF_REQUIRED_PREFIX_HORIZONS:
+                blockers.append(f"asof_alpha_horizon_file_missing:{horizon}")
+            rows_by_horizon[str(horizon)] = 0
+            continue
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            header = set(reader.fieldnames or [])
+            leaked = sorted(ASOF_FORBIDDEN_ALPHA_COLUMNS & header)
+            if leaked:
+                blockers.append(f"asof_alpha_forbidden_columns:{horizon}:{','.join(leaked)}")
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                if row.get("horizon_seconds") and str(row.get("horizon_seconds")) != str(horizon):
+                    blockers.append(f"asof_alpha_wrong_horizon:{horizon}:{row.get('mint','')}")
+                try:
+                    age_ms = int(float(row.get("age_ms_at_horizon") or 0))
+                except ValueError:
+                    age_ms = -1
+                if age_ms > horizon * 1000:
+                    blockers.append(f"asof_alpha_post_horizon_age:{horizon}:{row.get('mint','')}")
+                if str(row.get("holder_rpc_used", "")).lower() == "true":
+                    blockers.append(f"asof_alpha_holder_rpc_used:{horizon}:{row.get('mint','')}")
+                if str(row.get("rpc_mint_supply_canonical", "")).lower() == "true":
+                    blockers.append(f"asof_alpha_rpc_mint_supply_canonical:{horizon}:{row.get('mint','')}")
+                if asof_field_group_present(row, ASOF_TRADE_FIELDS):
+                    group_counts["trade_delta"] += 1
+                if asof_field_group_present(row, ASOF_HOLDER_FIELDS):
+                    group_counts["holder_state"] += 1
+                if asof_field_group_present(row, ASOF_VAULT_FIELDS):
+                    group_counts["vault_curve"] += 1
+            rows_by_horizon[str(horizon)] = row_count
+            total_rows += row_count
+    if total_rows == 0:
+        blockers.append("asof_alpha_no_rows")
+    for group, count in group_counts.items():
+        if count == 0:
+            blockers.append(f"asof_alpha_group_missing:{group}")
+    for group in ("trade_delta", "holder_state", "vault_curve"):
+        payload = (completeness.get("groups") or {}).get(group) or {}
+        if payload and payload.get("available") is not True:
+            blockers.append(f"asof_alpha_completeness_group_unavailable:{group}")
+        if payload and payload.get("holder_rpc_used") is True:
+            blockers.append(f"asof_alpha_completeness_holder_rpc:{group}")
+        if payload and payload.get("rpc_mint_supply_canonical") is True:
+            blockers.append(f"asof_alpha_completeness_canonical_supply:{group}")
+    return {
+        "ok": not blockers,
+        "blockers": sorted(set(blockers)),
+        "rows_by_horizon": rows_by_horizon,
+        "total_rows": total_rows,
+        "group_counts": group_counts,
+        "manifest_present": manifest_path.exists(),
+        "completeness_present": completeness_path.exists(),
+        "manifest_schema_version": manifest.get("schema_version"),
+        "completeness_schema_version": completeness.get("schema_version"),
+    }
+
+
 def parse_tcp_url(url: str) -> tuple[str, int]:
     parsed = urlparse(url)
     if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
@@ -201,6 +324,8 @@ def classify_blockers(blockers: list[str], result: dict[str, Any] | None = None)
         return "RELAY_LOCAL_DATASET_BLOCK_SPOOL"
     if "artifact_consistency" in blocker_set:
         return "RELAY_LOCAL_DATASET_BLOCK_ARTIFACT_CONSISTENCY"
+    if "asof_alpha_feature_validation" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES"
     if "vps_forbidden_artifacts" in blocker_set:
         return "RELAY_LOCAL_DATASET_BLOCK_VPS_FORBIDDEN_ARTIFACTS"
     if "not_counted" in blocker_set and result.get("provider_blocker_class"):
@@ -480,6 +605,7 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
             validator_json = json.loads(validator_proc.stdout)
         except json.JSONDecodeError:
             validator_json = {"parse_error": validator_proc.stdout[:2000]}
+    asof_alpha = validate_asof_alpha_features(out)
     uploaded_count = len(r2.get("uploaded_files") or [])
     failed_count = len(r2.get("failed_files") or [])
     result = {
@@ -540,6 +666,11 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         "retention_deleted_bytes": retention.get("deleted_bulk_bytes") or 0,
         "artifact_consistency_ok": validator_proc.returncode == 0 and not validator_json.get("blockers"),
         "artifact_consistency_blockers": validator_json.get("blockers") or [],
+        "asof_alpha_feature_ok": asof_alpha.get("ok") is True,
+        "asof_alpha_feature_blockers": asof_alpha.get("blockers") or [],
+        "asof_alpha_feature_rows_by_horizon": asof_alpha.get("rows_by_horizon") or {},
+        "asof_alpha_feature_total_rows": asof_alpha.get("total_rows") or 0,
+        "asof_alpha_feature_group_counts": asof_alpha.get("group_counts") or {},
     }
     blockers: list[str] = []
     for key in (
@@ -557,6 +688,8 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         blockers.append("retention_not_ok")
     if validator_proc.returncode != 0 or validator_json.get("blockers"):
         blockers.append("artifact_consistency")
+    if asof_alpha.get("ok") is not True:
+        blockers.append("asof_alpha_feature_validation")
     if countability.get("counted_phase107b_result") is not True:
         blockers.append("not_counted")
     if result["candidate_checkpoint_count"] > 0 or (

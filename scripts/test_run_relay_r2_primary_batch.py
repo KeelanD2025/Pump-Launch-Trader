@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import csv
+import json
 import pathlib
 import tempfile
 import types
@@ -38,6 +40,57 @@ def dummy_args(**overrides: object) -> types.SimpleNamespace:
     }
     base.update(overrides)
     return types.SimpleNamespace(**base)
+
+
+def write_asof_alpha_fixture(root: pathlib.Path, *, missing_trade: bool = False) -> None:
+    asof_root = root / "asof_alpha_features"
+    asof_root.mkdir(parents=True, exist_ok=True)
+    (asof_root / "asof_alpha_feature_manifest.json").write_text('{"schema_version":"test"}')
+    (asof_root / "asof_alpha_feature_completeness.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "test",
+                "groups": {
+                    "trade_delta": {"available": not missing_trade, "holder_rpc_used": False, "rpc_mint_supply_canonical": False},
+                    "holder_state": {"available": True, "holder_rpc_used": False, "rpc_mint_supply_canonical": False},
+                    "vault_curve": {"available": True, "holder_rpc_used": False, "rpc_mint_supply_canonical": False},
+                },
+            }
+        )
+    )
+    fields = [
+        "mint",
+        "horizon_seconds",
+        "age_ms_at_horizon",
+        "trade_update_count_asof",
+        "buy_count_delta_asof",
+        "holder_update_count_asof",
+        "unique_holder_accounts_seen_asof",
+        "vault_update_count_asof",
+        "bonding_curve_update_count_asof",
+        "curve_progress_proxy_asof",
+        "holder_rpc_used",
+        "rpc_mint_supply_canonical",
+    ]
+    for horizon in relay_supervisor.ASOF_ALPHA_HORIZONS:
+        row = {
+            "mint": "mintA",
+            "horizon_seconds": str(horizon),
+            "age_ms_at_horizon": str(horizon * 1000),
+            "trade_update_count_asof": "" if missing_trade else "1",
+            "buy_count_delta_asof": "" if missing_trade else "1",
+            "holder_update_count_asof": "1",
+            "unique_holder_accounts_seen_asof": "1",
+            "vault_update_count_asof": "1",
+            "bonding_curve_update_count_asof": "1",
+            "curve_progress_proxy_asof": "1",
+            "holder_rpc_used": "false",
+            "rpc_mint_supply_canonical": "false",
+        }
+        with (asof_root / f"asof_alpha_features_{horizon:03d}s.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow(row)
 
 
 class RelaySupervisorTests(unittest.TestCase):
@@ -177,6 +230,27 @@ class RelaySupervisorTests(unittest.TestCase):
             relay_supervisor.classify_blockers(["r2_timeout"], {}),
             "RELAY_LOCAL_DATASET_BLOCK_R2",
         )
+
+    def test_asof_alpha_validation_accepts_complete_feature_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_asof_alpha_fixture(root)
+            result = relay_supervisor.validate_asof_alpha_features(root)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["total_rows"], 7)
+            self.assertGreater(result["group_counts"]["trade_delta"], 0)
+
+    def test_asof_alpha_validation_blocks_missing_feature_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_asof_alpha_fixture(root, missing_trade=True)
+            result = relay_supervisor.validate_asof_alpha_features(root)
+            self.assertFalse(result["ok"])
+            self.assertIn("asof_alpha_group_missing:trade_delta", result["blockers"])
+            self.assertEqual(
+                relay_supervisor.classify_blockers(["asof_alpha_feature_validation"], {}),
+                "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES",
+            )
 
     def test_cleanup_aborted_deletes_only_unverified_incomplete_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
