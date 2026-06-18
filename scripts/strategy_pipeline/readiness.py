@@ -27,6 +27,7 @@ def build_readiness_decision(
     models_configured: bool,
     positive_outcome_summary: dict[str, Any] | None = None,
     early_burst_summary: dict[str, Any] | None = None,
+    early_burst_validation_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_positives = int(architecture_readiness.get("clean_positive_count", 0))
     replay_eligible = int(architecture_readiness.get("replay_eligible_candidate_count", 0))
@@ -34,6 +35,7 @@ def build_readiness_decision(
     buy_arch_ready = bool(architecture_readiness.get("buy_strategy_architecture_ready")) and registries_passed
     positive_summary = positive_outcome_summary or {}
     early_burst = early_burst_summary or {}
+    early_burst_validation = early_burst_validation_summary or {}
     positive_or_high = int(positive_summary.get("positive_or_high_count", 0))
     positive_outcome_research_ready = leakage_passed and int(positive_summary.get("total_rows", 0)) > 0
     reason_codes: list[str] = []
@@ -49,6 +51,9 @@ def build_readiness_decision(
         reason_codes.append("candidate_replay_labels_missing")
         reason_codes.append("candidate_gate_mismatch_needs_review")
         reason_codes.append("early_burst_research_only")
+    if early_burst_validation.get("classification") == "EARLY_BURST_VALIDATION_DATASET_PASS":
+        reason_codes.append("early_burst_validation_dataset_ready")
+        reason_codes.append("exit_window_needs_validation")
     if not leakage_passed:
         reason_codes.append("leakage_audit_required")
     if not splits_passed:
@@ -58,6 +63,8 @@ def build_readiness_decision(
     if not models_configured:
         reason_codes.append("cost_slippage_latency_models_required")
     reason_codes.extend(["threshold_tuning_disabled", "operator_approval_missing"])
+    if "formal_backtest_not_allowed" not in reason_codes:
+        reason_codes.append("formal_backtest_not_allowed")
     backtesting_ready = (
         strategy_ready
         and buy_arch_ready
@@ -75,6 +82,7 @@ def build_readiness_decision(
         "trading_strategy_pipeline_ready": strategy_ready and buy_arch_ready and leakage_passed and splits_passed and registries_passed and models_configured,
         "positive_outcome_research_ready": positive_outcome_research_ready,
         "early_burst_strategy_research_ready": bool(early_burst.get("early_burst_strategy_research_ready")),
+        "early_burst_validation_dataset_ready": early_burst_validation.get("classification") == "EARLY_BURST_VALIDATION_DATASET_PASS",
         "backtesting_ready": backtesting_ready,
         "replay_ready": False,
         "threshold_tuning_ready": False,
@@ -89,6 +97,8 @@ def build_readiness_decision(
         "positive_or_high_outcome_count": positive_or_high,
         "unique_positive_high_mints": int(early_burst.get("unique_positive_high_mints", 0)),
         "unique_high_positive_mints": int(early_burst.get("unique_high_positive_mints", 0)),
+        "early_burst_validation_rows": int(early_burst_validation.get("rows", 0)),
+        "early_burst_observable_exit_window_mints": int(early_burst_validation.get("observable_exit_window_mints", 0)),
         "data_mart_rows": data_mart.get("mint_rows", 0),
         "reason_codes": reason_codes,
         "blocked_actions": BASE_BLOCKED_ACTIONS,

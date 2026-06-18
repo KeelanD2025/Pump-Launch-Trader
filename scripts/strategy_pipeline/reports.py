@@ -26,6 +26,8 @@ def write_report_set(root: pathlib.Path, summary: dict[str, Any]) -> None:
             f"- positive_outcomes: `{summary['readiness'].get('positive_outcome_count', 0)}`",
             f"- high_positive_outcomes: `{summary['readiness'].get('high_positive_outcome_count', 0)}`",
             f"- early_burst_strategy_research_ready: `{str(summary['readiness'].get('early_burst_strategy_research_ready')).lower()}`",
+            f"- early_burst_validation_dataset_ready: `{str(summary['readiness'].get('early_burst_validation_dataset_ready')).lower()}`",
+            f"- early_burst_validation_rows: `{summary['readiness'].get('early_burst_validation_rows', 0)}`",
             f"- backtesting_ready: `{str(summary['readiness']['backtesting_ready']).lower()}`",
             f"- replay_ready: `{str(summary['readiness']['replay_ready']).lower()}`",
             f"- profitability_claim_allowed: `{str(summary['readiness']['profitability_claim_allowed']).lower()}`",
