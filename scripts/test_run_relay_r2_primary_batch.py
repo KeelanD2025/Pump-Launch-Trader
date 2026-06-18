@@ -209,6 +209,19 @@ class RelaySupervisorTests(unittest.TestCase):
             "RELAY_LOCAL_DATASET_BLOCK_VPS_FORBIDDEN_ARTIFACTS",
         )
 
+    def test_candidate_checkpoint_triggers_review_before_replay(self) -> None:
+        self.assertEqual(
+            relay_supervisor.classify_slice(
+                {
+                    "candidate_checkpoint_count": 1,
+                    "replay_eligible_candidate_count": 0,
+                    "off_vps_candidate_replay_allowed": False,
+                    "upstream_provider_blocker_count": 0,
+                }
+            ),
+            "RELAY_COLLECTION_PASS_REVIEW_CANDIDATE",
+        )
+
     def test_latest_run_id_mutation_blocks(self) -> None:
         self.assertEqual(
             relay_supervisor.classify_blockers(["latest_run_id_changed"], {}),

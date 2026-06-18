@@ -371,6 +371,145 @@ class StrategyReadinessTests(unittest.TestCase):
         self.assertFalse(payload["passed"])
         self.assertTrue(any(blocker.startswith("post_horizon_asof_alpha_timestamp") for blocker in payload["blockers"]))
 
+    def test_candidate_eligibility_v2_uses_asof_alpha_rows_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            label = {
+                "mint": "mint-alpha",
+                "slice_id": "slice-alpha",
+                "segment_id": "1",
+                "relay_session_id": "relay",
+                "candidate_checkpoint_seen": False,
+                "replay_eligible": False,
+                "censored_label": False,
+            }
+            alpha = {
+                "mint": "mint-alpha",
+                "slice_id": "slice-alpha",
+                "segment_id": "1",
+                "relay_session_id": "relay",
+                "horizon_seconds": "60",
+                "horizon_reached": "true",
+                "data_complete_for_horizon": "true",
+                "trade_update_count_asof": "5",
+                "buy_count_delta_asof": "4",
+                "sell_count_delta_asof": "1",
+                "net_buy_sell_delta_asof": "3",
+                "holder_update_count_asof": "3",
+                "unique_holder_accounts_seen_asof": "3",
+                "new_holder_count_delta_asof": "3",
+                "exiting_holder_count_delta_asof": "0",
+                "vault_update_count_asof": "2",
+                "bonding_curve_update_count_asof": "1",
+                "curve_progress_proxy_asof": "0.4",
+            }
+            _, _, rows = sr.score_alpha_strategy_gates_v1_v2(Path(td), [label], [alpha])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["trade_delta_bin"], "HIGH")
+        self.assertIn("candidate_checkpoint_absent", rows[0]["reason_codes"])
+        self.assertEqual(rows[0]["trade_action"], "none")
+
+    def test_candidate_eligibility_v2_rejects_future_leaking_columns(self) -> None:
+        alpha = {
+            "mint": "mint-leak",
+            "slice_id": "slice",
+            "segment_id": "1",
+            "horizon_seconds": "60",
+            "horizon_reached": "true",
+            "data_complete_for_horizon": "true",
+            "final_outcome": "early_rejected_dead",
+        }
+        reasons = sr.v2_alpha_reason_codes(alpha, {})
+        self.assertIn("forbidden_future_leakage_column", reasons)
+        self.assertEqual(sr.v2_decision({}, reasons), "audit_only")
+
+    def test_candidate_eligibility_v2_does_not_make_checkpoint_replay_eligible(self) -> None:
+        label = {"candidate_checkpoint_seen": True, "replay_eligible": False}
+        alpha = {
+            "horizon_seconds": "60",
+            "horizon_reached": "true",
+            "data_complete_for_horizon": "true",
+            "trade_update_count_asof": "4",
+            "buy_count_delta_asof": "3",
+            "sell_count_delta_asof": "0",
+            "net_buy_sell_delta_asof": "3",
+            "holder_update_count_asof": "3",
+            "unique_holder_accounts_seen_asof": "3",
+            "new_holder_count_delta_asof": "3",
+            "exiting_holder_count_delta_asof": "0",
+            "vault_update_count_asof": "2",
+            "bonding_curve_update_count_asof": "2",
+            "curve_progress_proxy_asof": "0.6",
+        }
+        reasons = sr.v2_alpha_reason_codes(alpha, label)
+        self.assertIn("replay_not_countability_allowed", reasons)
+        self.assertNotEqual(sr.v2_decision(label, reasons), "eligible")
+
+    def test_early_avoid_v1_emits_no_trade_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            alpha = {
+                "mint": "mint",
+                "slice_id": "slice",
+                "segment_id": "1",
+                "horizon_seconds": "60",
+                "horizon_reached": "true",
+                "data_complete_for_horizon": "true",
+                "trade_update_count_asof": "1",
+                "buy_count_delta_asof": "0",
+                "sell_count_delta_asof": "1",
+            }
+            early_rows, _, _ = sr.score_alpha_strategy_gates_v1_v2(Path(td), [], [alpha])
+        self.assertEqual(early_rows[0]["decision"], "avoid")
+        self.assertEqual(early_rows[0]["trade_action"], "none")
+
+    def test_continue_tracking_v1_treats_terminal_inconclusive_as_censored(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            label = {
+                "mint": "mint",
+                "slice_id": "slice",
+                "segment_id": "1",
+                "final_outcome": "terminal_inconclusive",
+                "censored_label": True,
+            }
+            alpha = {
+                "mint": "mint",
+                "slice_id": "slice",
+                "segment_id": "1",
+                "horizon_seconds": "60",
+                "horizon_reached": "true",
+                "terminal_inconclusive_before_horizon": "true",
+            }
+            _, continue_rows, _ = sr.score_alpha_strategy_gates_v1_v2(Path(td), [label], [alpha])
+        self.assertEqual(continue_rows[0]["decision"], "censored")
+        self.assertIn("data_quality_or_terminal_censored", continue_rows[0]["reason_codes"])
+
+    def test_candidate_review_pack_generation_stops_before_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            label = {
+                "mint": "mint-candidate",
+                "slice_id": "slice",
+                "segment_id": "1",
+                "relay_session_id": "relay",
+                "candidate_checkpoint_seen": True,
+                "replay_eligible": False,
+            }
+            path = sr.write_candidate_review_pack_if_needed(
+                Path(td),
+                [label],
+                [],
+                [],
+                {
+                    "replay_ready": False,
+                    "backtesting_ready": False,
+                    "threshold_tuning_ready": False,
+                    "live_trading_ready": False,
+                },
+            )
+            decision = sr.read_json(Path(path) / "candidate_review_decision.json")
+        self.assertTrue(path)
+        self.assertFalse(decision["replay_was_run"])
+        self.assertFalse(decision["backtesting_was_run"])
+        self.assertFalse(decision["trading_was_enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -559,7 +559,7 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         blockers.append("artifact_consistency")
     if countability.get("counted_phase107b_result") is not True:
         blockers.append("not_counted")
-    if (
+    if result["candidate_checkpoint_count"] > 0 or (
         result["replay_eligible_candidate_count"] > 0
         and result["off_vps_candidate_replay_allowed"] is True
     ):
@@ -663,6 +663,8 @@ def can_recover_missing_remote_rc(
 
 def classify_slice(result: dict[str, Any]) -> str:
     if (
+        result.get("candidate_checkpoint_count", 0) > 0
+        or
         result.get("replay_eligible_candidate_count", 0) > 0
         and result.get("off_vps_candidate_replay_allowed") is True
     ):

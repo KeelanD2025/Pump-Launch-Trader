@@ -251,6 +251,46 @@ CANDIDATE_ELIGIBILITY_V1_FIELDS = [
     "trade_action",
 ]
 
+CANDIDATE_ELIGIBILITY_V2_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "horizon_seconds",
+    "decision",
+    "score",
+    "trade_delta_bin",
+    "buy_followthrough_bin",
+    "sell_pressure_bin",
+    "holder_growth_bin",
+    "holder_risk_bin",
+    "vault_curve_progress_bin",
+    "liquidity_risk_bin",
+    "reason_codes",
+    "top_reason_code",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "trade_action",
+]
+
+CANDIDATE_POSITIVE_DISCOVERY_FIELDS = [
+    "mint",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "horizons_reached",
+    "early_avoid_v1_decision",
+    "continue_tracking_v1_decision",
+    "candidate_eligibility_v2_decision",
+    "top_reason_codes",
+    "final_outcome",
+    "censored_label",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "why_failed_or_passed_candidate_discovery",
+    "next_data_needed",
+]
+
 CONTINUE_TO_CANDIDATE_GAP_FIELDS = [
     "mint",
     "slice_id",
@@ -1357,6 +1397,501 @@ def score_candidate_eligibility_v1(
     return rows
 
 
+def alpha_rows_at_horizon(alpha_rows: list[dict[str, Any]], horizon: int = 60) -> list[dict[str, Any]]:
+    return [row for row in alpha_rows if int_or_zero(row.get("horizon_seconds")) == horizon]
+
+
+def numeric(value: Any) -> float | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def alpha_quality_blocked(row: dict[str, Any]) -> bool:
+    return any(
+        boolish(row.get(field))
+        for field in (
+            "provider_gap_exposed",
+            "relay_gap_exposed",
+            "sequence_gap_exposed",
+            "hash_mismatch_exposed",
+            "receiver_backpressure_exposed",
+        )
+    )
+
+
+def alpha_group_missing(row: dict[str, Any], group: str) -> bool:
+    return not alpha_group_available(row, group)
+
+
+def bin_trade_delta(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "trade_delta"):
+        return "MISSING"
+    trades = int_or_zero(row.get("trade_update_count_asof"))
+    buys = int_or_zero(row.get("buy_count_delta_asof"))
+    sells = int_or_zero(row.get("sell_count_delta_asof"))
+    net = int_or_zero(row.get("net_buy_sell_delta_asof"))
+    if trades <= 0 or buys <= 0:
+        return "LOW"
+    if buys > sells and net > 0 and trades >= 3:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def bin_buy_followthrough(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "trade_delta"):
+        return "MISSING"
+    buys = int_or_zero(row.get("buy_count_delta_asof"))
+    net = int_or_zero(row.get("net_buy_sell_delta_asof"))
+    if buys <= 0:
+        return "LOW"
+    if net > 0 and buys >= 2:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def bin_sell_pressure(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "trade_delta"):
+        return "MISSING"
+    buys = int_or_zero(row.get("buy_count_delta_asof"))
+    sells = int_or_zero(row.get("sell_count_delta_asof"))
+    net = int_or_zero(row.get("net_buy_sell_delta_asof"))
+    if sells > buys or net < 0:
+        return "HIGH"
+    if sells == 0:
+        return "LOW"
+    return "MEDIUM"
+
+
+def bin_holder_growth(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "holder_state"):
+        return "MISSING"
+    holders = int_or_zero(row.get("unique_holder_accounts_seen_asof"))
+    new_holders = int_or_zero(row.get("new_holder_count_delta_asof"))
+    exiting = int_or_zero(row.get("exiting_holder_count_delta_asof"))
+    if holders <= 1 or new_holders <= exiting:
+        return "LOW"
+    if holders >= 3 and new_holders > exiting:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def bin_holder_risk(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "holder_state"):
+        return "MISSING"
+    concentration = numeric(row.get("top_holder_concentration_asof"))
+    collapse = numeric(row.get("holder_collapse_proxy_asof"))
+    creator_proxy = numeric(row.get("dev_or_creator_holding_proxy_asof"))
+    exiting = int_or_zero(row.get("exiting_holder_count_delta_asof"))
+    new_holders = int_or_zero(row.get("new_holder_count_delta_asof"))
+    if (concentration is not None and concentration >= 0.75) or (collapse is not None and collapse > 0) or (creator_proxy is not None and creator_proxy > 0) or exiting > new_holders:
+        return "HIGH"
+    if concentration is not None and concentration >= 0.5:
+        return "MEDIUM"
+    return "LOW"
+
+
+def bin_vault_curve_progress(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "vault_curve"):
+        return "MISSING"
+    updates = int_or_zero(row.get("vault_update_count_asof")) + int_or_zero(row.get("bonding_curve_update_count_asof"))
+    curve = numeric(row.get("curve_progress_proxy_asof"))
+    if updates <= 0 or curve is None or curve <= 0:
+        return "LOW"
+    if curve >= 0.5 or updates >= 3:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def bin_liquidity_risk(row: dict[str, Any]) -> str:
+    if alpha_group_missing(row, "vault_curve"):
+        return "MISSING"
+    exit_proxy = numeric(row.get("liquidity_exit_proxy_asof"))
+    liquidity_delta = numeric(row.get("liquidity_delta_asof"))
+    if (exit_proxy is not None and exit_proxy > 0) or (liquidity_delta is not None and liquidity_delta < 0):
+        return "HIGH"
+    return "LOW"
+
+
+def v2_alpha_reason_codes(alpha: dict[str, Any], label: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    forbidden_alpha_columns = {
+        "final_outcome",
+        "final_outcome_reason",
+        "rejection_reason",
+        "terminal_inconclusive_reason",
+        "candidate_checkpoint_seen",
+        "replay_eligible",
+        "r2_verified",
+        "artifact_consistency_ok",
+    }
+    if any(str(alpha.get(field) or "").strip() for field in forbidden_alpha_columns):
+        reasons.append("forbidden_future_leakage_column")
+    if boolish(alpha.get("provider_gap_exposed")) or boolish(label.get("provider_gap_exposed")):
+        reasons.append("provider_gap_exposed")
+    if boolish(alpha.get("relay_gap_exposed")) or boolish(label.get("relay_gap_exposed")):
+        reasons.append("relay_gap_exposed")
+    if boolish(alpha.get("sequence_gap_exposed")):
+        reasons.append("relay_gap_exposed")
+    if boolish(alpha.get("hash_mismatch_exposed")):
+        reasons.append("hash_mismatch_exposed")
+    if boolish(alpha.get("receiver_backpressure_exposed")):
+        reasons.append("receiver_backpressure_exposed")
+    if not boolish(alpha.get("horizon_reached")):
+        reasons.append("missing_horizon")
+    if boolish(alpha.get("terminal_inconclusive_before_horizon")) or str(label.get("final_outcome") or "") == "terminal_inconclusive":
+        reasons.append("terminal_inconclusive")
+    if boolish(alpha.get("rejected_before_horizon")):
+        reasons.append("rejected_before_horizon")
+    if boolish(alpha.get("degraded_audit_only_before_horizon")) or boolish(label.get("degraded_active_mint")):
+        reasons.append("high_throughput_degraded_audit_only")
+    elif boolish(alpha.get("high_throughput_before_horizon")):
+        reasons.append("high_throughput_clean_observation")
+
+    if alpha_group_missing(alpha, "trade_delta"):
+        reasons.append("missing_asof_trade_delta")
+    else:
+        if bin_trade_delta(alpha) == "LOW":
+            reasons.append("insufficient_trade_delta_strength")
+        if bin_buy_followthrough(alpha) == "LOW":
+            reasons.append("insufficient_buy_followthrough")
+        if bin_sell_pressure(alpha) == "HIGH":
+            reasons.append("adverse_sell_pressure")
+
+    if alpha_group_missing(alpha, "holder_state"):
+        reasons.append("missing_asof_holder_state")
+    else:
+        if bin_holder_risk(alpha) == "HIGH":
+            reasons.append("holder_concentration_risk")
+            if numeric(alpha.get("holder_collapse_proxy_asof")) and numeric(alpha.get("holder_collapse_proxy_asof")) > 0:
+                reasons.append("holder_collapse_risk")
+            if numeric(alpha.get("dev_or_creator_holding_proxy_asof")) and numeric(alpha.get("dev_or_creator_holding_proxy_asof")) > 0:
+                reasons.append("dev_or_creator_holding_risk")
+        if bin_holder_growth(alpha) == "LOW":
+            reasons.append("weak_holder_growth")
+
+    if alpha_group_missing(alpha, "vault_curve"):
+        reasons.append("missing_asof_vault_curve")
+    else:
+        if bin_vault_curve_progress(alpha) == "LOW":
+            reasons.append("weak_vault_curve_progress")
+            reasons.append("insufficient_curve_progress")
+        if bin_liquidity_risk(alpha) == "HIGH":
+            reasons.append("liquidity_exit_risk")
+
+    if not boolish(label.get("candidate_checkpoint_seen")):
+        reasons.append("candidate_checkpoint_absent")
+    if not boolish(label.get("replay_eligible")):
+        reasons.append("replay_not_countability_allowed")
+    return list(dict.fromkeys(reasons))
+
+
+def v2_decision(label: dict[str, Any], reasons: list[str]) -> str:
+    if "forbidden_future_leakage_column" in reasons:
+        return "audit_only"
+    if any(reason in reasons for reason in ("provider_gap_exposed", "relay_gap_exposed", "hash_mismatch_exposed", "receiver_backpressure_exposed", "terminal_inconclusive")):
+        return "censored"
+    if "high_throughput_degraded_audit_only" in reasons:
+        return "audit_only"
+    if any(reason.startswith("missing_asof_") or reason == "missing_horizon" for reason in reasons):
+        return "insufficient_data"
+    if boolish(label.get("candidate_checkpoint_seen")) and boolish(label.get("replay_eligible")):
+        blocking = {
+            "rejected_before_horizon",
+            "insufficient_trade_delta_strength",
+            "insufficient_buy_followthrough",
+            "adverse_sell_pressure",
+            "holder_concentration_risk",
+            "holder_collapse_risk",
+            "dev_or_creator_holding_risk",
+            "weak_holder_growth",
+            "weak_vault_curve_progress",
+            "liquidity_exit_risk",
+            "insufficient_curve_progress",
+        }
+        if not any(reason in blocking for reason in reasons):
+            return "eligible"
+    return "not_eligible"
+
+
+def v2_score_bin(decision: str, reasons: list[str]) -> str:
+    if decision == "censored":
+        return "CENSORED"
+    if decision == "audit_only" or any(reason.endswith("_risk") for reason in reasons):
+        return "UNSAFE"
+    if decision == "insufficient_data":
+        return "MISSING"
+    if decision == "eligible":
+        return "HIGH"
+    if "candidate_checkpoint_absent" in reasons or "replay_not_countability_allowed" in reasons:
+        return "LOW"
+    return "MEDIUM"
+
+
+def score_alpha_strategy_gates_v1_v2(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    labels_by_key = {label_key(row): row for row in labels}
+    scoring_rows = alpha_rows_at_horizon(alpha_rows, 60)
+    early_rows: list[dict[str, Any]] = []
+    continue_rows: list[dict[str, Any]] = []
+    v2_rows: list[dict[str, Any]] = []
+    for alpha in scoring_rows:
+        label = labels_by_key.get(asof_key(alpha), {})
+        reasons = v2_alpha_reason_codes(alpha, label)
+        decision = v2_decision(label, reasons)
+        quality_blocked = alpha_quality_blocked(alpha)
+        trade_bin = bin_trade_delta(alpha)
+        buy_bin = bin_buy_followthrough(alpha)
+        sell_bin = bin_sell_pressure(alpha)
+        holder_growth_bin = bin_holder_growth(alpha)
+        holder_risk_bin = bin_holder_risk(alpha)
+        vault_bin = bin_vault_curve_progress(alpha)
+        liquidity_bin = bin_liquidity_risk(alpha)
+
+        if quality_blocked:
+            early_decision = "audit_only"
+            early_reasons = ["data_quality_exclusion"]
+        elif boolish(alpha.get("terminal_inconclusive_before_horizon")):
+            early_decision = "audit_only"
+            early_reasons = ["terminal_inconclusive_censored"]
+        elif not boolish(alpha.get("horizon_reached")):
+            early_decision = "insufficient_data"
+            early_reasons = ["missing_horizon"]
+        elif boolish(alpha.get("rejected_before_horizon")) or buy_bin == "LOW" or sell_bin == "HIGH":
+            early_decision = "avoid"
+            early_reasons = [reason for reason in ("rejected_before_horizon", "insufficient_buy_followthrough", "adverse_sell_pressure") if reason in reasons]
+        else:
+            early_decision = "continue_tracking"
+            early_reasons = ["asof_alpha_no_early_avoid_blocker"]
+
+        if quality_blocked or boolish(alpha.get("terminal_inconclusive_before_horizon")):
+            continue_decision = "censored"
+            continue_reasons = ["data_quality_or_terminal_censored"]
+        elif boolish(alpha.get("degraded_audit_only_before_horizon")):
+            continue_decision = "audit_only"
+            continue_reasons = ["high_throughput_degraded_audit_only"]
+        elif not boolish(alpha.get("horizon_reached")):
+            continue_decision = "stop_tracking"
+            continue_reasons = ["missing_horizon"]
+        elif boolish(alpha.get("rejected_before_horizon")):
+            continue_decision = "stop_tracking"
+            continue_reasons = ["rejected_before_horizon"]
+        elif buy_bin in {"MEDIUM", "HIGH"} and holder_risk_bin != "HIGH" and liquidity_bin != "HIGH":
+            continue_decision = "continue_tracking"
+            continue_reasons = ["asof_alpha_continue_observation"]
+        else:
+            continue_decision = "stop_tracking"
+            continue_reasons = [reason for reason in reasons if reason not in {"candidate_checkpoint_absent", "replay_not_countability_allowed"}] or ["weak_alpha_profile"]
+
+        common = {
+            "mint": alpha.get("mint"),
+            "slice_id": alpha.get("slice_id"),
+            "segment_id": alpha.get("segment_id"),
+            "horizon_seconds": alpha.get("horizon_seconds"),
+            "trade_action": "none",
+        }
+        early_rows.append(
+            {
+                **common,
+                "decision": early_decision,
+                "score": "HIGH" if early_decision == "avoid" else "MISSING" if early_decision == "insufficient_data" else "LOW",
+                "reason_codes": "|".join(dict.fromkeys(early_reasons)),
+                "explanation": "EarlyAvoidFilter v1 uses as-of alpha diagnostics only; no trade action or threshold tuning.",
+            }
+        )
+        continue_rows.append(
+            {
+                **common,
+                "decision": continue_decision,
+                "score": "MEDIUM" if continue_decision == "continue_tracking" else "CENSORED" if continue_decision == "censored" else "LOW",
+                "reason_codes": "|".join(dict.fromkeys(continue_reasons)),
+                "explanation": "ContinueTrackingGate v1 uses as-of alpha diagnostics only; terminal inconclusive remains censored.",
+            }
+        )
+        v2_rows.append(
+            {
+                "mint": alpha.get("mint"),
+                "slice_id": alpha.get("slice_id"),
+                "segment_id": alpha.get("segment_id"),
+                "relay_session_id": alpha.get("relay_session_id"),
+                "horizon_seconds": alpha.get("horizon_seconds"),
+                "decision": decision,
+                "score": v2_score_bin(decision, reasons),
+                "trade_delta_bin": trade_bin,
+                "buy_followthrough_bin": buy_bin,
+                "sell_pressure_bin": sell_bin,
+                "holder_growth_bin": holder_growth_bin,
+                "holder_risk_bin": holder_risk_bin,
+                "vault_curve_progress_bin": vault_bin,
+                "liquidity_risk_bin": liquidity_bin,
+                "reason_codes": "|".join(reasons),
+                "top_reason_code": first_failed_candidate_gate(reasons) or (reasons[0] if reasons else ""),
+                "candidate_checkpoint_seen": boolish(label.get("candidate_checkpoint_seen")),
+                "replay_eligible": boolish(label.get("replay_eligible")),
+                "trade_action": "none",
+            }
+        )
+    write_csv(output_dir / "early_avoid_filter_v1_scores.csv", early_rows, EARLY_AVOID_SCORE_FIELDS)
+    write_csv(output_dir / "continue_tracking_gate_v1_scores.csv", continue_rows, CONTINUE_TRACKING_SCORE_FIELDS)
+    write_csv(output_dir / "candidate_eligibility_v2_scores.csv", v2_rows, CANDIDATE_ELIGIBILITY_V2_FIELDS)
+    write_score_report(
+        output_dir / "early_avoid_filter_v1_report.md",
+        "EarlyAvoidFilter v1",
+        early_rows,
+        "Research-only v1 using as-of alpha feature bins. No buy entries, no threshold optimization, no replay/backtesting.",
+    )
+    write_score_report(
+        output_dir / "continue_tracking_gate_v1_report.md",
+        "ContinueTrackingGate v1",
+        continue_rows,
+        "Research-only v1 using as-of alpha feature bins. Terminal inconclusive remains censored.",
+    )
+    write_score_report(
+        output_dir / "candidate_eligibility_v2_report.md",
+        "CandidateEligibilityGate v2",
+        v2_rows,
+        "Diagnostic-only v2 using as-of trade/holder/vault alpha groups. Candidate checkpoints are not replay-eligible unless countability allows replay.",
+    )
+    return early_rows, continue_rows, v2_rows
+
+
+def candidate_positive_discovery_report(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]],
+    early_v1: list[dict[str, Any]],
+    continue_v1: list[dict[str, Any]],
+    v2_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    labels_by_key = {label_key(row): row for row in labels}
+    alpha_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in alpha_rows:
+        alpha_by_key[asof_key(row)].append(row)
+    early_by_key = {label_key(row): row for row in early_v1}
+    continue_by_key = {label_key(row): row for row in continue_v1}
+    v2_by_key = {label_key(row): row for row in v2_rows}
+    rows: list[dict[str, Any]] = []
+    for key, horizons in sorted(alpha_by_key.items()):
+        label = labels_by_key.get(key, {})
+        reached = sorted(int_or_zero(row.get("horizon_seconds")) for row in horizons if boolish(row.get("horizon_reached")))
+        v2 = v2_by_key.get(key, {})
+        reasons = [part for part in str(v2.get("reason_codes") or "").split("|") if part]
+        decision = str(v2.get("decision") or "insufficient_data")
+        if decision == "eligible":
+            why = "candidate_discovery_passed_research_only"
+            next_data = "operator_review_before_replay_or_backtesting"
+        elif boolish(label.get("censored_label")):
+            why = "censored_or_incomplete_observation"
+            next_data = "clean_uninterrupted_survivor_observation"
+        elif any(reason.startswith("missing_asof") or reason == "missing_horizon" for reason in reasons):
+            why = "insufficient_horizon_or_missing_alpha_features"
+            next_data = "more as-of-alpha-complete slices at required horizons"
+        elif "candidate_checkpoint_absent" in reasons:
+            why = "no_candidate_checkpoint_observed"
+            next_data = "fresh survivor-extension collection under same caps"
+        else:
+            why = "failed_behavior_or_conservative_gate"
+            next_data = "more clean survivor examples; do not loosen gates without evidence"
+        rows.append(
+            {
+                "mint": key[0],
+                "slice_id": key[1],
+                "segment_id": key[2],
+                "relay_session_id": horizons[0].get("relay_session_id", "") if horizons else "",
+                "horizons_reached": "|".join(str(item) for item in reached),
+                "early_avoid_v1_decision": early_by_key.get(key, {}).get("decision", ""),
+                "continue_tracking_v1_decision": continue_by_key.get(key, {}).get("decision", ""),
+                "candidate_eligibility_v2_decision": decision,
+                "top_reason_codes": "|".join(reasons[:5]),
+                "final_outcome": label.get("final_outcome", ""),
+                "censored_label": boolish(label.get("censored_label")),
+                "candidate_checkpoint_seen": boolish(label.get("candidate_checkpoint_seen")),
+                "replay_eligible": boolish(label.get("replay_eligible")),
+                "why_failed_or_passed_candidate_discovery": why,
+                "next_data_needed": next_data,
+            }
+        )
+    write_csv(output_dir / "candidate_positive_discovery.csv", rows, CANDIDATE_POSITIVE_DISCOVERY_FIELDS)
+    decisions = Counter(row["candidate_eligibility_v2_decision"] for row in rows)
+    reasons = Counter()
+    for row in rows:
+        for reason in str(row.get("top_reason_codes") or "").split("|"):
+            if reason:
+                reasons[reason] += 1
+    lines = [
+        "# Candidate Positive Discovery Report",
+        "",
+        f"As-of-alpha-complete mint rows: {len(rows)}",
+        "",
+        "## CandidateEligibilityGate v2 Decisions",
+        *[f"- {key}: {count}" for key, count in sorted(decisions.items())],
+        "",
+        "## Top Reason Codes",
+        *[f"- {key}: {count}" for key, count in reasons.most_common(25)],
+        "",
+        "No replay, formal backtesting, threshold tuning, live trading, wallet execution, holder RPC, or canonical RPC mint supply was used.",
+    ]
+    (output_dir / "candidate_positive_discovery_report.md").write_text("\n".join(lines) + "\n")
+    return rows
+
+
+def write_candidate_review_pack_if_needed(
+    output_dir: pathlib.Path,
+    labels: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]],
+    v2_rows: list[dict[str, Any]],
+    readiness: dict[str, Any],
+) -> str:
+    candidates = [
+        row
+        for row in labels
+        if boolish(row.get("candidate_checkpoint_seen")) or boolish(row.get("replay_eligible"))
+    ]
+    if not candidates:
+        return ""
+    stamp = utc_stamp()
+    pack_dir = output_dir / f"candidate_review_pack_{stamp}"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    candidate_keys = {label_key(row) for row in candidates}
+    alpha_subset = [row for row in alpha_rows if asof_key(row) in candidate_keys]
+    v2_subset = [row for row in v2_rows if label_key(row) in candidate_keys]
+    write_csv(pack_dir / "candidate_mints.csv", candidates, MINT_FIELDS)
+    write_csv(pack_dir / "candidate_asof_alpha_features.csv", alpha_subset, ASOF_ALPHA_FIELDS)
+    write_csv(pack_dir / "candidate_eligibility_v2_scores.csv", v2_subset, CANDIDATE_ELIGIBILITY_V2_FIELDS)
+    write_json(
+        pack_dir / "candidate_review_decision.json",
+        {
+            "schema_version": "phase107h.candidate_review_pack.v1",
+            "candidate_count": len(candidates),
+            "replay_eligible_count": sum(1 for row in candidates if boolish(row.get("replay_eligible"))),
+            "replay_ready": bool(readiness.get("replay_ready")),
+            "backtesting_ready": bool(readiness.get("backtesting_ready")),
+            "threshold_tuning_ready": bool(readiness.get("threshold_tuning_ready")),
+            "live_trading_ready": bool(readiness.get("live_trading_ready")),
+            "operator_review_required": True,
+            "replay_was_run": False,
+            "backtesting_was_run": False,
+            "trading_was_enabled": False,
+        },
+    )
+    lines = [
+        "# Candidate Review Pack",
+        "",
+        f"Candidate rows: {len(candidates)}",
+        f"Replay-eligible rows: {sum(1 for row in candidates if boolish(row.get('replay_eligible')))}",
+        "",
+        "Replay, formal backtesting, threshold tuning, live trading, wallet execution, holder RPC, and canonical RPC mint supply remain blocked unless separate gates and operator approval allow them.",
+    ]
+    (pack_dir / "README.md").write_text("\n".join(lines) + "\n")
+    return str(pack_dir)
+
+
 def classify_continue_gap(label: dict[str, Any], reasons: list[str]) -> str:
     if any(reason in reasons for reason in ("provider_gap_exposed", "relay_gap_exposed", "relay_sequence_gap", "hash_mismatch_exposed", "receiver_backpressure_exposed")):
         return "DATA_QUALITY_EXCLUDED"
@@ -1759,18 +2294,21 @@ def write_strategy_modules(output_dir: pathlib.Path) -> dict[str, Any]:
             "status": "research_mode",
             "tradeable": False,
             "outputs": ["score", "reason_codes", "explanation"],
+            "latest_version": "v1_asof_alpha_diagnostic",
             "thresholds_tuned": False,
         },
         "ContinueTrackingGate": {
             "status": "research_mode",
             "tradeable": False,
             "outputs": ["continue_tracking", "stop_tracking", "audit_only", "reason_codes"],
+            "latest_version": "v1_asof_alpha_diagnostic",
             "thresholds_tuned": False,
         },
         "CandidateEligibilityGate": {
             "status": "research_mode",
             "tradeable": False,
             "outputs": ["candidate_eligible", "not_eligible", "censored", "reason_codes"],
+            "latest_version": "v2_asof_alpha_diagnostic",
             "thresholds_tuned": False,
         },
         "BuySetupDraft": BuySetupDraft().describe(),
@@ -1838,10 +2376,27 @@ def write_reports(
     early_scores: list[dict[str, Any]],
     continue_scores: list[dict[str, Any]],
     eligibility_scores: list[dict[str, Any]],
+    alpha_rows: list[dict[str, Any]] | None = None,
+    alpha_completeness: dict[str, Any] | None = None,
+    early_v1_scores: list[dict[str, Any]] | None = None,
+    continue_v1_scores: list[dict[str, Any]] | None = None,
+    v2_scores: list[dict[str, Any]] | None = None,
+    positive_discovery_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     label_counts = Counter(row["label_quality"] for row in labels)
     final_counts = Counter(row["final_outcome"] for row in labels)
     included = [row for row in inventory if boolish(row.get("included"))]
+    alpha_rows = alpha_rows or []
+    alpha_completeness = alpha_completeness or {}
+    early_v1_scores = early_v1_scores or []
+    continue_v1_scores = continue_v1_scores or []
+    v2_scores = v2_scores or []
+    positive_discovery_rows = positive_discovery_rows or []
+    alpha_slice_ids = {str(row.get("slice_id") or "") for row in alpha_rows if row.get("slice_id")}
+    alpha_complete_slices = len(alpha_slice_ids)
+    legacy_label_only_slices = max(0, len(included) - alpha_complete_slices)
+    alpha_rows_by_horizon = Counter(int_or_zero(row.get("horizon_seconds")) for row in alpha_rows)
+    alpha_groups = (alpha_completeness.get("groups") or {})
     clean_neg = readiness["clean_negative_count"]
     clean_pos = readiness["clean_positive_count"]
     censored = sum(1 for row in labels if boolish(row.get("censored_label")))
@@ -1872,10 +2427,19 @@ def write_reports(
         f"- Censored: {censored}",
         f"- Candidate checkpoints: {candidate_count}",
         f"- Replay eligible: {replay_count}",
+        f"- Legacy label-only / feature-incomplete slices: {legacy_label_only_slices}",
+        f"- As-of-alpha-complete slices: {alpha_complete_slices}",
+        f"- As-of alpha rows: {len(alpha_rows)}",
+        f"- Trade delta coverage rows: {alpha_groups.get('trade_delta', {}).get('rows', 0)}",
+        f"- Holder state coverage rows: {alpha_groups.get('holder_state', {}).get('rows', 0)}",
+        f"- Vault/curve coverage rows: {alpha_groups.get('vault_curve', {}).get('rows', 0)}",
         f"- Leakage audit passed: {str(leakage.get('passed')).lower()}",
         f"- Strategy research ready: {str(readiness['strategy_research_ready']).lower()}",
         f"- Buy strategy build ready: {str(readiness['buy_strategy_build_ready']).lower()}",
         f"- Backtesting ready: {str(readiness['backtesting_ready']).lower()}",
+        "",
+        "## As-Of Alpha Rows By Horizon",
+        *[f"- {horizon}s: {count}" for horizon, count in sorted(alpha_rows_by_horizon.items()) if horizon],
         "",
         "Trading, replay, formal backtesting, threshold tuning, wallet execution, holder RPC, and canonical RPC mint supply remain disabled/blocked.",
     ]
@@ -1888,10 +2452,14 @@ def write_reports(
                 "",
                 "Research modules exist for early avoid filtering, continue-tracking, candidate eligibility, disabled buy setup drafts, and disabled risk/exit drafts.",
                 "",
+                "CandidateEligibilityGate v2, EarlyAvoidFilter v1, and ContinueTrackingGate v1 use as-of alpha feature groups diagnostically only. They emit descriptive bins and reason codes, not trade entries.",
+                "",
                 "No buy entries are produced. No thresholds are tuned. No backtests or replay were run.",
                 "",
                 f"Build ready: {str(readiness['buy_strategy_build_ready']).lower()}",
                 f"Reason codes: {', '.join(readiness['reason_codes']) or 'none'}",
+                f"CandidateEligibilityGate v2 rows: {len(v2_scores)}",
+                f"Candidate positive discovery rows: {len(positive_discovery_rows)}",
             ]
         )
         + "\n"
@@ -1917,7 +2485,7 @@ def write_reports(
             [
                 "# Next Data Needed",
                 "",
-                "- Retain explicit per-mint fixed-horizon as-of feature snapshots for trade/transaction/holder/vault deltas.",
+                "- Continue collecting as-of-alpha-complete survivor/candidate examples under the same caps.",
                 "- Collect clean survivor/candidate examples without raising launch caps.",
                 "- Keep terminal inconclusive and provider-gap rows censored.",
                 "- Do not run replay/backtesting/tuning/trading until readiness gates pass and operator approval is explicit.",
@@ -1946,11 +2514,11 @@ def write_reports(
                 "",
                 "## As-Of Features Available",
                 "",
-                "Available now: launch timing features, observation coverage by horizon, and data-quality/high-throughput/degraded flags. These are safe but limited.",
+                f"Available now: launch timing, observation coverage, data-quality/high-throughput/degraded flags, and compact as-of alpha groups. As-of-alpha-complete slices: {alpha_complete_slices}. Trade delta rows: {alpha_groups.get('trade_delta', {}).get('rows', 0)}. Holder state rows: {alpha_groups.get('holder_state', {}).get('rows', 0)}. Vault/curve rows: {alpha_groups.get('vault_curve', {}).get('rows', 0)}.",
                 "",
-                "## Features Still Missing",
+                "## Legacy Feature-Incomplete Slices",
                 "",
-                "Missing for real alpha research: per-mint fixed-horizon transaction/trade deltas, buy/sell/volume deltas, holder/account/token-state snapshots, and bonding curve/vault/liquidity snapshots retained as explicit as-of shards.",
+                f"Legacy label-only / feature-incomplete slices: {legacy_label_only_slices}. They remain useful for labels and avoid-filter context, but candidate-positive discovery should prefer as-of-alpha-complete slices.",
                 "",
                 "## Censored Labels",
                 "",
@@ -1963,6 +2531,10 @@ def write_reports(
                 "## Before Replay/Backtesting",
                 "",
                 "Need clean positives/replay-eligible candidates from countability-approved clean segments, explicit retained as-of feature snapshots, leakage audit still passing, and operator approval. Until then replay/backtesting/tuning/trading remain blocked.",
+                "",
+                "## Candidate Positive Discovery",
+                "",
+                f"CandidateEligibilityGate v2 rows: {len(v2_scores)}. Candidate positive discovery rows: {len(positive_discovery_rows)}. Candidate checkpoints: {candidate_count}. Replay eligible: {replay_count}.",
             ]
         )
         + "\n"
@@ -2109,6 +2681,19 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     leakage = leakage_audit(output_dir, asof_rows, labels, splits, alpha_rows)
     early_scores, continue_scores, eligibility_scores = score_strategy_gates(output_dir, asof_rows)
     v1_scores = score_candidate_eligibility_v1(output_dir, labels, asof_rows)
+    early_v1_scores, continue_v1_scores, v2_scores = score_alpha_strategy_gates_v1_v2(
+        output_dir,
+        labels,
+        alpha_rows,
+    )
+    positive_discovery_rows = candidate_positive_discovery_report(
+        output_dir,
+        labels,
+        alpha_rows,
+        early_v1_scores,
+        continue_v1_scores,
+        v2_scores,
+    )
     gap_rows = continue_to_candidate_gap_analysis(
         output_dir,
         labels,
@@ -2131,6 +2716,13 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
     )
     modules = write_strategy_modules(output_dir)
     readiness = readiness_decision(labels, leakage, modules, asof_rows)
+    candidate_review_pack_path = write_candidate_review_pack_if_needed(
+        output_dir,
+        labels,
+        alpha_rows,
+        v2_scores,
+        readiness,
+    )
 
     write_csv(output_dir / "dataset_inventory.csv", inventory, DATASET_FIELDS)
     write_json(output_dir / "dataset_inventory.json", {"schema_version": "phase107h.dataset_inventory.v1", "slices": inventory})
@@ -2146,6 +2738,12 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         early_scores,
         continue_scores,
         eligibility_scores,
+        alpha_rows,
+        alpha_completeness,
+        early_v1_scores,
+        continue_v1_scores,
+        v2_scores,
+        positive_discovery_rows,
     )
     write_json(output_dir / "backtesting_readiness_decision.json", readiness)
     (output_dir / "backtesting_readiness_decision.md").write_text(
@@ -2165,12 +2763,24 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
         )
         + "\n"
     )
+    if candidate_review_pack_path:
+        classification = "CANDIDATE_REVIEW_TRIGGERED"
+    elif (
+        readiness["buy_strategy_build_ready"]
+        and alpha_rows
+        and v2_scores
+        and positive_discovery_rows
+        and leakage.get("passed")
+    ):
+        classification = "CANDIDATE_POSITIVE_DISCOVERY_PASS"
+    elif readiness["buy_strategy_build_ready"] and early_scores and continue_scores and eligibility_scores and v1_scores and gap_rows is not None and survivor_diagnostics is not None:
+        classification = "CANDIDATE_DISCOVERY_READY_PASS"
+    else:
+        classification = "STRATEGY_RESEARCH_READY_PASS"
     summary = {
         "schema_version": "phase107h.strategy_readiness_summary.v1",
         "generated_at": utc_stamp(),
-        "classification": "CANDIDATE_DISCOVERY_READY_PASS"
-        if readiness["buy_strategy_build_ready"] and early_scores and continue_scores and eligibility_scores and v1_scores and gap_rows is not None and survivor_diagnostics is not None
-        else "STRATEGY_RESEARCH_READY_PASS",
+        "classification": classification,
         "included_slices": len(included),
         "total_mints": len(labels),
         "clean_negative_count": readiness["clean_negative_count"],
@@ -2188,6 +2798,9 @@ def run_build(args: argparse.Namespace) -> dict[str, Any]:
             survivor_extension_runs(inventory)
         ),
         "candidate_eligibility_v1_rows": len(v1_scores),
+        "candidate_eligibility_v2_rows": len(v2_scores),
+        "candidate_positive_discovery_rows": len(positive_discovery_rows),
+        "candidate_review_pack_path": candidate_review_pack_path,
         "continue_to_candidate_gap_rows": len(gap_rows),
         "survivor_extension_diagnostic_rows": len(survivor_diagnostics),
         "asof_trade_delta_features_available": bool(completeness["groups"]["trade_delta"]["available"]),
