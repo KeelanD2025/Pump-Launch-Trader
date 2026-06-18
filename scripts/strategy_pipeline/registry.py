@@ -8,6 +8,7 @@ def strategy_registry() -> dict[str, Any]:
         ("early_avoid_v1", "research_only"),
         ("continue_tracking_v1", "research_only"),
         ("candidate_eligibility_v2", "research_only"),
+        ("early_burst_setup_v0", "research_only_disabled"),
         ("buy_setup_draft_v0", "research_only_disabled"),
         ("risk_exit_draft_v0", "research_only_disabled"),
     ]

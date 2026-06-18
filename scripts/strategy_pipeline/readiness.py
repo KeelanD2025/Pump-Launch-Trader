@@ -26,12 +26,14 @@ def build_readiness_decision(
     registries_passed: bool,
     models_configured: bool,
     positive_outcome_summary: dict[str, Any] | None = None,
+    early_burst_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_positives = int(architecture_readiness.get("clean_positive_count", 0))
     replay_eligible = int(architecture_readiness.get("replay_eligible_candidate_count", 0))
     strategy_ready = bool(architecture_readiness.get("strategy_research_ready")) and leakage_passed
     buy_arch_ready = bool(architecture_readiness.get("buy_strategy_architecture_ready")) and registries_passed
     positive_summary = positive_outcome_summary or {}
+    early_burst = early_burst_summary or {}
     positive_or_high = int(positive_summary.get("positive_or_high_count", 0))
     positive_outcome_research_ready = leakage_passed and int(positive_summary.get("total_rows", 0)) > 0
     reason_codes: list[str] = []
@@ -40,8 +42,13 @@ def build_readiness_decision(
     if replay_eligible <= 0:
         reason_codes.append("no_replay_eligible_candidates")
     if positive_or_high > 0 and replay_eligible <= 0:
+        reason_codes.append("positive_outcomes_exist")
+        if int(positive_summary.get("high_positive_count", 0)) > 0:
+            reason_codes.append("high_positive_outcomes_exist")
         reason_codes.append("positive_outcomes_exist_but_replay_not_allowed")
         reason_codes.append("candidate_replay_labels_missing")
+        reason_codes.append("candidate_gate_mismatch_needs_review")
+        reason_codes.append("early_burst_research_only")
     if not leakage_passed:
         reason_codes.append("leakage_audit_required")
     if not splits_passed:
@@ -67,6 +74,7 @@ def build_readiness_decision(
         "buy_strategy_architecture_ready": buy_arch_ready,
         "trading_strategy_pipeline_ready": strategy_ready and buy_arch_ready and leakage_passed and splits_passed and registries_passed and models_configured,
         "positive_outcome_research_ready": positive_outcome_research_ready,
+        "early_burst_strategy_research_ready": bool(early_burst.get("early_burst_strategy_research_ready")),
         "backtesting_ready": backtesting_ready,
         "replay_ready": False,
         "threshold_tuning_ready": False,
@@ -79,6 +87,8 @@ def build_readiness_decision(
         "positive_outcome_count": int(positive_summary.get("positive_count", 0)),
         "high_positive_outcome_count": int(positive_summary.get("high_positive_count", 0)),
         "positive_or_high_outcome_count": positive_or_high,
+        "unique_positive_high_mints": int(early_burst.get("unique_positive_high_mints", 0)),
+        "unique_high_positive_mints": int(early_burst.get("unique_high_positive_mints", 0)),
         "data_mart_rows": data_mart.get("mint_rows", 0),
         "reason_codes": reason_codes,
         "blocked_actions": BASE_BLOCKED_ACTIONS,

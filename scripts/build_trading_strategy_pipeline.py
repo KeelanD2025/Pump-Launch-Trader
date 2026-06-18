@@ -20,6 +20,7 @@ from strategy_pipeline.data_mart import build_data_mart
 from strategy_pipeline.execution_model import execution_model
 from strategy_pipeline.experiment_registry import default_experiment
 from strategy_pipeline.feature_store import PipelineFeatureStore
+from strategy_pipeline.early_burst import build_early_burst_research
 from strategy_pipeline.io import read_json, write_json, write_text
 from strategy_pipeline.label_store import PipelineLabelStore
 from strategy_pipeline.latency_model import default_latency_model
@@ -130,6 +131,11 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         architecture_root=args.architecture_root,
         output_root=output_root,
     )
+    early_burst_summary = build_early_burst_research(
+        output_root=output_root,
+        data_mart_root=DATA_MART_ROOT,
+        architecture_root=args.architecture_root,
+    )
 
     splits = build_walk_forward_splits(labels.load())
     split_validation = validate_splits(splits)
@@ -157,6 +163,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         registries_passed=True,
         models_configured=True,
         positive_outcome_summary=positive_outcome_summary,
+        early_burst_summary=early_burst_summary,
     )
     registry_validation = write_registries(output_root, preliminary_readiness, data_mart, splits)
     readiness = build_readiness_decision(
@@ -167,6 +174,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         registries_passed=registry_validation["passed"],
         models_configured=all(bool(value) for value in models.values()),
         positive_outcome_summary=positive_outcome_summary,
+        early_burst_summary=early_burst_summary,
     )
 
     gates = {
@@ -184,6 +192,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "data_mart": data_mart,
         "leakage": leakage,
         "positive_outcomes": positive_outcome_summary,
+        "early_burst": early_burst_summary,
         "splits": split_validation,
         "registry": registry_validation,
         "models_configured": True,
