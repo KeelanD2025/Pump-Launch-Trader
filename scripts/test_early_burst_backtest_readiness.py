@@ -267,6 +267,20 @@ class EarlyBurstBacktestReadinessTests(unittest.TestCase):
             self.assertNotIn("private", names)
             self.assertIn("gpt_early_burst_backtest_readiness_prompt.md", names)
 
+    def test_data_needed_plan_and_collection_decision_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output, validation, readiness = write_fixture(Path(td))
+            summary = build_early_burst_backtest_readiness(output_root=output, validation_root=validation, readiness_root=readiness)
+            self.assertTrue((readiness / "EARLY_BURST_DATA_NEEDED_PLAN.md").exists())
+            self.assertIn("early_burst_data_needed_plan_path", summary)
+            decision = read_json(output / "COLLECTION_JUSTIFICATION_DECISION.json")
+            self.assertFalse(decision["collection_allowed"])
+            self.assertEqual(decision["reason"], "generic_collection_blocked")
+            self.assertEqual(decision["next_action"], "finish_existing_inflight_slice_if_any_then_stop")
+            self.assertTrue(decision["launch_caps_remain_blocked"])
+            self.assertFalse(decision["replay_allowed"])
+            self.assertFalse(decision["formal_backtesting_allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

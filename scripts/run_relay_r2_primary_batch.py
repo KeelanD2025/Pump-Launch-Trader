@@ -25,6 +25,12 @@ from urllib.parse import urlparse
 REPO = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPO / "research_output" / "local_stream_collector"
 DEFAULT_LOG_ROOT = pathlib.Path(tempfile.gettempdir()) / "pump_relay_r2_primary_batch"
+DEFAULT_COLLECTION_JUSTIFICATION_PATH = (
+    REPO
+    / "research_output"
+    / "trading_strategy_pipeline"
+    / "COLLECTION_JUSTIFICATION_DECISION.json"
+)
 FORBIDDEN_VPS_ARTIFACT_NAMES = (
     "attempt_ledger.csv",
     "candidate_summary.csv",
@@ -84,6 +90,12 @@ ASOF_FORBIDDEN_ALPHA_COLUMNS = {
     "off_vps_candidate_replay_allowed",
     "r2_verified",
     "artifact_consistency_ok",
+}
+ALLOWED_COLLECTION_JUSTIFICATION_REASONS = {
+    "proof_after_source_patch",
+    "targeted_early_burst_sample_collection",
+    "candidate_review_trigger_recovery",
+    "interrupted_run_recovery",
 }
 
 
@@ -214,6 +226,78 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         return {}
     with path.open() as handle:
         return json.load(handle)
+
+
+def validate_collection_justification(args: argparse.Namespace) -> dict[str, Any]:
+    """Fail closed unless a written collection justification allows this run."""
+    path = args.collection_justification_path
+    if not path.exists():
+        raise BatchError(f"collection justification file missing: {path}")
+    decision = read_json(path)
+    if decision.get("collection_allowed") is not True:
+        raise BatchError(
+            "collection justification denied: "
+            f"{decision.get('reason', 'generic_collection_blocked')}"
+        )
+    reason = str(decision.get("reason", ""))
+    if reason not in ALLOWED_COLLECTION_JUSTIFICATION_REASONS:
+        raise BatchError(f"collection justification reason not allowed: {reason}")
+    if not args.justification_id:
+        raise BatchError("--justification-id is required when collection justification is enforced")
+    if str(decision.get("justification_id", "")) != args.justification_id:
+        raise BatchError("collection justification id mismatch")
+    target = str(decision.get("target_gate") or decision.get("target") or "")
+    if not args.target_gate:
+        raise BatchError("--target-gate is required when collection justification is enforced")
+    if target != args.target_gate:
+        raise BatchError(f"collection target gate mismatch: decision={target!r} requested={args.target_gate!r}")
+    max_allowed = int(decision.get("maximum_allowed_slices") or 0)
+    if args.max_slices is not None:
+        max_allowed = min(max_allowed, int(args.max_slices)) if max_allowed else int(args.max_slices)
+    if max_allowed < 1:
+        raise BatchError("collection justification maximum_allowed_slices missing or invalid")
+    requested = int(args.max_total_slices or args.slices)
+    if requested > max_allowed:
+        raise BatchError(f"requested slices exceed justified maximum: requested={requested} max={max_allowed}")
+    required_fields = {
+        "objective",
+        "exact_blocker_being_targeted",
+        "current_sample_counts",
+        "required_sample_counts",
+        "expected_number_of_slices",
+        "maximum_allowed_slices",
+        "stop_conditions",
+        "proof_batch_mode",
+    }
+    missing = sorted(field for field in required_fields if field not in decision)
+    if missing:
+        raise BatchError(f"collection justification missing required fields: {','.join(missing)}")
+    expected_slices = int(decision.get("expected_number_of_slices") or 0)
+    if expected_slices > max_allowed:
+        raise BatchError("collection justification expected slices exceed maximum allowed slices")
+    if decision.get("launch_caps_remain_blocked") is not True:
+        raise BatchError("collection justification must confirm launch caps remain blocked")
+    if decision.get("launch_caps_changed") is True:
+        raise BatchError("collection justification indicates launch caps changed")
+    if decision.get("max_attempted_launches") is not None and int(decision["max_attempted_launches"]) != args.max_attempted_launches:
+        raise BatchError("requested max_attempted_launches does not match justification")
+    if decision.get("target_candidates") is not None and int(decision["target_candidates"]) != args.target_candidates:
+        raise BatchError("requested target_candidates does not match justification")
+    forbidden_enabled = [
+        "replay_allowed",
+        "formal_backtesting_allowed",
+        "threshold_tuning_allowed",
+        "paper_trading_enabled",
+        "live_trading_enabled",
+        "wallet_execution_enabled",
+        "old_vps_material_hunter_allowed",
+        "holder_rpc_enabled",
+        "rpc_mint_supply_canonical",
+    ]
+    enabled = [field for field in forbidden_enabled if decision.get(field) is True]
+    if enabled:
+        raise BatchError(f"collection justification enables forbidden modes: {','.join(enabled)}")
+    return decision
 
 
 def asof_field_group_present(row: dict[str, str], fields: set[str]) -> bool:
@@ -1183,6 +1267,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--cleanup-min-age-minutes", type=int, default=60)
     parser.add_argument(
+        "--require-collection-justification",
+        action="store_true",
+        default=True,
+        help="Require a fail-closed collection justification decision before proof/batch runs.",
+    )
+    parser.add_argument(
+        "--collection-justification-path",
+        type=pathlib.Path,
+        default=DEFAULT_COLLECTION_JUSTIFICATION_PATH,
+    )
+    parser.add_argument("--justification-id", default="")
+    parser.add_argument("--max-slices", type=int, default=None)
+    parser.add_argument("--target-gate", default="")
+    parser.add_argument(
         "--survivor-extension-mode",
         action="store_true",
         help=(
@@ -1233,6 +1331,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.batch_log_dir = (DEFAULT_LOG_ROOT / utc_stamp()).resolve()
     else:
         args.batch_log_dir = args.batch_log_dir.resolve()
+    args.collection_justification_path = args.collection_justification_path.resolve()
     return args
 
 
@@ -1257,6 +1356,25 @@ def main(argv: list[str]) -> int:
 
     args.batch_log_dir.mkdir(parents=True, exist_ok=True)
     print(f"batch_log_dir={args.batch_log_dir}", flush=True)
+    if args.require_collection_justification:
+        justification = validate_collection_justification(args)
+        (args.batch_log_dir / "collection_justification_decision.json").write_text(
+            json.dumps(justification, indent=2, sort_keys=True)
+        )
+        print(
+            "COLLECTION_JUSTIFICATION",
+            json.dumps(
+                {
+                    "collection_allowed": justification.get("collection_allowed"),
+                    "justification_id": justification.get("justification_id"),
+                    "reason": justification.get("reason"),
+                    "target_gate": justification.get("target_gate") or justification.get("target"),
+                    "maximum_allowed_slices": justification.get("maximum_allowed_slices"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     if not args.skip_preflight:
         preflight = local_preflight(args, env)
         (args.batch_log_dir / "local_preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True))
@@ -1325,4 +1443,8 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BatchError as exc:
+        print("BATCH_ERROR", json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
+        raise SystemExit(2)

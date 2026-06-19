@@ -179,6 +179,133 @@ class RelaySupervisorTests(unittest.TestCase):
         self.assertEqual(args.max_attempted_launches, 15)
         self.assertEqual(args.target_candidates, 2)
 
+    def test_collection_justification_required_by_default_for_live_runs(self) -> None:
+        with mock.patch.dict(
+            relay_supervisor.os.environ,
+            {
+                "PUMP_RELAY_VPS_SSH_TARGET": "ubuntu@example.invalid",
+                "EXPECTED_MATERIAL_LATEST_RUN_ID": "material-candidate-hunter-stable",
+            },
+            clear=True,
+        ):
+            args = relay_supervisor.parse_args(["batch"])
+        self.assertTrue(args.require_collection_justification)
+
+    def test_collection_justification_blocks_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = dummy_args(
+                collection_justification_path=pathlib.Path(tmp) / "missing.json",
+                justification_id="J-1",
+                target_gate="EARLY_BURST_BACKTEST_READINESS",
+                slices=1,
+                max_total_slices=1,
+                max_slices=1,
+            )
+            with self.assertRaises(relay_supervisor.BatchError):
+                relay_supervisor.validate_collection_justification(args)
+
+    def test_collection_justification_blocks_denied_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "decision.json"
+            path.write_text('{"collection_allowed": false, "reason": "generic_collection_blocked"}')
+            args = dummy_args(
+                collection_justification_path=path,
+                justification_id="J-1",
+                target_gate="EARLY_BURST_BACKTEST_READINESS",
+                slices=1,
+                max_total_slices=1,
+                max_slices=1,
+            )
+            with self.assertRaises(relay_supervisor.BatchError):
+                relay_supervisor.validate_collection_justification(args)
+
+    def test_collection_justification_accepts_targeted_reason_and_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "decision.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "collection_allowed": True,
+                        "reason": "targeted_early_burst_sample_collection",
+                        "justification_id": "EB-001",
+                        "target_gate": "EARLY_BURST_BACKTEST_READINESS",
+                        "objective": "Collect feature-complete early-burst samples.",
+                        "exact_blocker_being_targeted": "sample_size_positive_too_small",
+                        "current_sample_counts": {"positive_high_unique_mints": 96},
+                        "required_sample_counts": {"positive_high_unique_mints": 100},
+                        "expected_number_of_slices": 1,
+                        "maximum_allowed_slices": 2,
+                        "stop_conditions": ["stop_on_candidate_review"],
+                        "proof_batch_mode": "batch",
+                        "launch_caps_remain_blocked": True,
+                        "launch_caps_changed": False,
+                        "max_attempted_launches": 15,
+                        "target_candidates": 2,
+                        "replay_allowed": False,
+                        "formal_backtesting_allowed": False,
+                        "threshold_tuning_allowed": False,
+                        "paper_trading_enabled": False,
+                        "live_trading_enabled": False,
+                        "wallet_execution_enabled": False,
+                        "old_vps_material_hunter_allowed": False,
+                        "holder_rpc_enabled": False,
+                        "rpc_mint_supply_canonical": False,
+                    }
+                )
+            )
+            args = dummy_args(
+                collection_justification_path=path,
+                justification_id="EB-001",
+                target_gate="EARLY_BURST_BACKTEST_READINESS",
+                slices=1,
+                max_total_slices=1,
+                max_slices=2,
+                max_attempted_launches=15,
+                target_candidates=2,
+            )
+            decision = relay_supervisor.validate_collection_justification(args)
+            self.assertTrue(decision["collection_allowed"])
+
+    def test_collection_justification_blocks_excess_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "decision.json"
+            payload = {
+                "collection_allowed": True,
+                "reason": "proof_after_source_patch",
+                "justification_id": "PATCH-001",
+                "target_gate": "RELAY_LOCAL_DATASET",
+                "objective": "One proof after source patch.",
+                "exact_blocker_being_targeted": "source_patch_validation",
+                "current_sample_counts": {},
+                "required_sample_counts": {},
+                "expected_number_of_slices": 1,
+                "maximum_allowed_slices": 1,
+                "stop_conditions": ["stop_on_any_blocker"],
+                "proof_batch_mode": "proof",
+                "launch_caps_remain_blocked": True,
+                "launch_caps_changed": False,
+                "replay_allowed": False,
+                "formal_backtesting_allowed": False,
+                "threshold_tuning_allowed": False,
+                "paper_trading_enabled": False,
+                "live_trading_enabled": False,
+                "wallet_execution_enabled": False,
+                "old_vps_material_hunter_allowed": False,
+                "holder_rpc_enabled": False,
+                "rpc_mint_supply_canonical": False,
+            }
+            path.write_text(json.dumps(payload))
+            args = dummy_args(
+                collection_justification_path=path,
+                justification_id="PATCH-001",
+                target_gate="RELAY_LOCAL_DATASET",
+                slices=2,
+                max_total_slices=2,
+                max_slices=2,
+            )
+            with self.assertRaises(relay_supervisor.BatchError):
+                relay_supervisor.validate_collection_justification(args)
+
     def test_remote_receiver_verifier_parses_listener_status(self) -> None:
         stdout = '{"ok":true,"host":"127.0.0.1","port":19097,"listener":"LISTEN 0 128 127.0.0.1:19097"}\n'
         with mock.patch.object(

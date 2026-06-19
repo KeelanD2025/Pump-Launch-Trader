@@ -721,6 +721,107 @@ def next_data_needed(readiness_root: pathlib.Path, decision: dict[str, Any]) -> 
     )
 
 
+def early_burst_data_needed_plan(readiness_root: pathlib.Path, decision: dict[str, Any]) -> None:
+    checks = decision["sample_checks"]
+    need_positive = max(0, checks["min_positive_high_unique_mints"] - checks["positive_high_unique_mints"])
+    need_high = max(0, checks["min_high_positive_unique_mints"] - checks["high_positive_unique_mints"])
+    need_negatives = max(0, checks["min_ordinary_clean_dead_unique_mints"] - checks["ordinary_clean_dead_unique_mints"])
+    blockers = set(decision.get("reason_codes", []))
+    sample_blocked = any(reason.startswith("sample_size_") for reason in blockers)
+    feature_blocked = "feature_completeness_below_minimum" in blockers
+    gate_blocked = "operator_approval_missing" in blockers or "formal_backtest_not_allowed" in blockers
+    more_collection_needed = sample_blocked and (need_positive > 0 or need_high > 0 or need_negatives > 0)
+    can_answer_next_question = checks["positive_high_unique_mints"] > 0 and checks["high_positive_unique_mints"] > 0
+    missing_fields = []
+    if feature_blocked:
+        missing_fields.append("feature_complete_asof_alpha_rows")
+    if need_positive > 0:
+        missing_fields.append("additional_positive_or_high_positive_feature_complete_examples")
+    if need_high > 0:
+        missing_fields.append("additional_high_positive_feature_complete_examples")
+    if need_negatives > 0:
+        missing_fields.append("additional_ordinary_clean_dead_feature_complete_examples")
+    if not missing_fields:
+        missing_fields.append("operator_approval_for_formal_backtest_gate")
+    write_text(
+        readiness_root / "EARLY_BURST_DATA_NEEDED_PLAN.md",
+        "# Early-Burst Data Needed Plan\n\n"
+        "This plan is generated from existing counted artifacts only. It does not authorize generic collection, replay, formal backtesting, threshold tuning, paper trading, live trading, wallet execution, or cap increases.\n\n"
+        "## Current Status\n"
+        f"- more_collection_needed: `{str(more_collection_needed).lower()}`\n"
+        f"- blocker_type_sample_size: `{str(sample_blocked).lower()}`\n"
+        f"- blocker_type_feature_completeness: `{str(feature_blocked).lower()}`\n"
+        f"- blocker_type_operator_or_formal_gate: `{str(gate_blocked).lower()}`\n"
+        f"- feature_complete_positive_high_unique_mints: `{checks['positive_high_unique_mints']}` / `{checks['min_positive_high_unique_mints']}`\n"
+        f"- feature_complete_high_positive_unique_mints: `{checks['high_positive_unique_mints']}` / `{checks['min_high_positive_unique_mints']}`\n"
+        f"- feature_complete_ordinary_clean_dead_unique_mints: `{checks['ordinary_clean_dead_unique_mints']}` / `{checks['min_ordinary_clean_dead_unique_mints']}`\n"
+        f"- feature_complete_cohort_rows: `{checks['feature_complete_cohort_rows']}`\n"
+        f"- feature_complete_cohort_completeness: `{checks['feature_complete_cohort_completeness']}`\n"
+        f"- global_feature_completeness: `{checks['global_feature_completeness']}`\n"
+        f"- legacy_rows_excluded_from_backtest_features: `{checks['legacy_rows_excluded_from_backtest_features']}`\n\n"
+        "## Direct Answers\n"
+        f"- Is more collection needed? `{str(more_collection_needed).lower()}`. Only targeted early-burst sample collection is justifiable if the sample-size blockers remain; generic collection is blocked.\n"
+        f"- Additional positive/high-positive examples required: `{need_positive}`.\n"
+        f"- Additional high-positive examples required: `{need_high}`.\n"
+        f"- Additional ordinary clean-dead examples required: `{need_negatives}`.\n"
+        f"- Current blocker: `{'sample_size' if sample_blocked else 'operator_or_formal_gate' if gate_blocked else 'none'}`.\n"
+        f"- Can existing feature-complete positives answer the next strategy question? `{str(can_answer_next_question).lower()}` for descriptive research, but not for formal backtesting until sample-size and operator gates pass.\n"
+        f"- Fields/data still missing: `{', '.join(missing_fields)}`.\n\n"
+        "## What A Targeted Batch Would Measure\n"
+        "- More feature-complete early-burst validation examples with trade_delta, holder_state, and vault_curve as-of alpha groups present.\n"
+        "- Whether positive/high-positive and high-positive rarity persists under the same launch caps.\n"
+        "- Whether exit-window/adverse-movement risk remains stable as the feature-complete cohort grows.\n"
+        "- Whether any candidate/replay review trigger appears; if it does, collection must stop and no replay should run.\n\n"
+        "## Why Generic Collection Is Blocked\n"
+        "- The relevant gap is not generic data throughput; it is feature-complete early-burst sample sufficiency.\n"
+        "- Legacy label-only rows are useful for descriptive context but excluded from formal feature-based readiness.\n"
+        "- Running unspecific slices risks filling disk/R2 and operator time without directly targeting the remaining gate.\n"
+        "- Replay, formal backtesting, threshold tuning, paper/live trading, wallet execution, and launch-cap increases remain blocked.\n",
+    )
+
+
+def collection_justification_decision(output_root: pathlib.Path) -> dict[str, Any]:
+    decision = {
+        "schema_version": "phase107j.collection_justification_decision.v1",
+        "collection_allowed": False,
+        "reason": "generic_collection_blocked",
+        "next_action": "finish_existing_inflight_slice_if_any_then_stop",
+        "target": "analyze_existing_early_burst_validation_dataset",
+        "target_gate": "EARLY_BURST_BACKTEST_READINESS",
+        "allowed_reasons": [
+            "proof_after_source_patch",
+            "targeted_early_burst_sample_collection",
+            "candidate_review_trigger_recovery",
+            "interrupted_run_recovery",
+        ],
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "paper_trading_enabled": False,
+        "live_trading_enabled": False,
+        "wallet_execution_enabled": False,
+        "old_vps_material_hunter_allowed": False,
+        "holder_rpc_enabled": False,
+        "rpc_mint_supply_canonical": False,
+        "launch_caps_remain_blocked": True,
+        "launch_caps_changed": False,
+    }
+    write_json(output_root / "COLLECTION_JUSTIFICATION_DECISION.json", decision)
+    write_text(
+        output_root / "COLLECTION_JUSTIFICATION_DECISION.md",
+        "# Collection Justification Decision\n\n"
+        "- collection_allowed: `false`\n"
+        "- reason: `generic_collection_blocked`\n"
+        "- next_action: `finish_existing_inflight_slice_if_any_then_stop`\n"
+        "- target: `analyze_existing_early_burst_validation_dataset`\n"
+        "- replay/backtesting/tuning/paper/live/wallet execution: `blocked`\n"
+        "- launch_caps_remain_blocked: `true`\n"
+        "- old VPS material-hunter service: `blocked`\n"
+        "- generic collection is blocked until a written, targeted justification is created.\n",
+    )
+    return decision
+
+
 def targeted_collection_plan(readiness_root: pathlib.Path, decision: dict[str, Any]) -> None:
     checks = decision["sample_checks"]
     need_positive = max(0, checks["min_positive_high_unique_mints"] - checks["positive_high_unique_mints"])
@@ -813,6 +914,7 @@ def write_pack(output_root: pathlib.Path, readiness_root: pathlib.Path) -> pathl
         readiness_root / "EARLY_BURST_EXECUTION_ASSUMPTIONS.md",
         readiness_root / "EARLY_BURST_BACKTEST_READINESS_DECISION.md",
         readiness_root / "feature_complete_cohort_report.md",
+        readiness_root / "EARLY_BURST_DATA_NEEDED_PLAN.md",
         readiness_root / "TARGETED_EARLY_BURST_COLLECTION_PLAN.md",
         output_root / "early_burst_validation_dataset" / "EARLY_BURST_EXIT_WINDOW_ANALYSIS.md",
         output_root / "early_burst_validation_dataset" / "EARLY_BURST_VS_DEAD_COMPARISON.md",
@@ -863,7 +965,9 @@ def build_early_burst_backtest_readiness(
         output_root=output_root,
     )
     next_data_needed(readiness_root, decision)
+    early_burst_data_needed_plan(readiness_root, decision)
     targeted_collection_plan(readiness_root, decision)
+    collection_justification_decision(output_root)
     pack = write_pack(output_root, readiness_root)
     update_readiness(output_root, decision)
     summary = {
@@ -873,6 +977,8 @@ def build_early_burst_backtest_readiness(
         "feature_complete_cohort_report_path": str(readiness_root / "feature_complete_cohort_report.md"),
         "feature_complete_cohort_csv_path": str(readiness_root / "feature_complete_cohort.csv"),
         "targeted_collection_plan_path": str(readiness_root / "TARGETED_EARLY_BURST_COLLECTION_PLAN.md"),
+        "early_burst_data_needed_plan_path": str(readiness_root / "EARLY_BURST_DATA_NEEDED_PLAN.md"),
+        "collection_justification_decision_path": str(output_root / "COLLECTION_JUSTIFICATION_DECISION.json"),
         "hypothesis_registry_path": str(readiness_root / "early_burst_hypotheses.json"),
         "leakage_audit_path": str(readiness_root / "early_burst_leakage_audit.json"),
         "split_manifest_path": str(readiness_root / "early_burst_splits.json"),
