@@ -171,6 +171,34 @@ class RelaySupervisorTests(unittest.TestCase):
             self.assertEqual(args.listen_url, "tcp://127.0.0.1:19113")
             self.assertEqual(args.receiver_url, "tcp://127.0.0.1:19112")
 
+    def test_merged_env_loads_referenced_r2_env_without_committing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            r2_env = root / "r2.env"
+            r2_env.write_text(
+                "\n".join(
+                    [
+                        "R2_ACCESS_KEY_ID=test-access",
+                        "R2_SECRET_ACCESS_KEY=test-secret",
+                        "R2_DATASET_BUCKET=test-bucket",
+                    ]
+                )
+            )
+            relay_env = root / "relay_control.env"
+            relay_env.write_text(
+                "\n".join(
+                    [
+                        f"PUMP_RELAY_R2_ENV_FILE={r2_env}",
+                        "PUMP_RELAY_VPS_SSH_TARGET=ubuntu@example.invalid",
+                    ]
+                )
+            )
+            with mock.patch.dict(relay_supervisor.os.environ, {}, clear=True):
+                env = relay_supervisor.merged_env(relay_env)
+            self.assertEqual(env["R2_ACCESS_KEY_ID"], "test-access")
+            self.assertEqual(env["R2_DATASET_BUCKET"], "test-bucket")
+            self.assertEqual(env["PUMP_RELAY_VPS_SSH_TARGET"], "ubuntu@example.invalid")
+
     def test_survivor_extension_mode_defaults_disabled(self) -> None:
         with mock.patch.dict(
             relay_supervisor.os.environ,

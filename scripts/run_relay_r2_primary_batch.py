@@ -130,6 +130,13 @@ def merged_env(env_file: pathlib.Path | None) -> dict[str, str]:
     env: dict[str, str] = {}
     if env_file is not None:
         env.update(load_env_file(env_file))
+    r2_env = env.get("PUMP_RELAY_R2_ENV_FILE")
+    if r2_env:
+        r2_env_path = pathlib.Path(r2_env).expanduser()
+        if r2_env_path.exists():
+            r2_defaults = load_env_file(r2_env_path)
+            r2_defaults.update(env)
+            env = r2_defaults
     # Explicit shell exports should take precedence over local env-file defaults.
     env.update(os.environ.copy())
     return env
