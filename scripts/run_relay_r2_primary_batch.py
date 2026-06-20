@@ -682,6 +682,7 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
     run_countability = read_json(out / "run_countability_decision.json")
     r2 = read_json(out / "r2_upload_result.json")
     retention = read_json(out / "local_retention_summary.json")
+    all_launch = read_json(out / "all_launch_intake_summary.json")
     validator_proc = run_capture(
         [
             "target/release/cli",
@@ -736,6 +737,28 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         else countability.get("provider_data_loss_seen"),
         "partial_outputs_audit_only": countability.get("partial_outputs_audit_only"),
         "attempted_launches": summary.get("attempted_launches") or hunter.get("attempted_launches") or 0,
+        "all_launches_seen": all_launch.get("all_launches_seen") or hunter.get("all_launches_seen") or 0,
+        "all_launches_indexed": all_launch.get("all_launches_indexed")
+        or hunter.get("all_launches_indexed")
+        or 0,
+        "rich_tracked_launches": all_launch.get("rich_tracked_launches")
+        or hunter.get("rich_tracked_launches")
+        or 0,
+        "cheap_only_launches": all_launch.get("cheap_only_launches")
+        or hunter.get("cheap_only_launches")
+        or 0,
+        "skipped_due_budget": all_launch.get("skipped_due_budget")
+        or hunter.get("skipped_due_budget")
+        or 0,
+        "fast_dead_dropped": all_launch.get("fast_dead_dropped")
+        or hunter.get("fast_dead_dropped")
+        or 0,
+        "missed_good_token_count": all_launch.get("missed_good_token_count")
+        or hunter.get("missed_good_token_count")
+        or 0,
+        "tracking_slots_released": all_launch.get("tracking_slots_released")
+        or hunter.get("tracking_slots_released")
+        or 0,
         "unique_attempted_mints": summary.get("unique_attempted_mints")
         or countability.get("unique_attempted_mint_count")
         or 0,
@@ -1190,6 +1213,14 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "blocked_slices": 0,
         "total_frames": total("frames_received"),
+        "total_all_launches_seen": total("all_launches_seen"),
+        "total_all_launches_indexed": total("all_launches_indexed"),
+        "total_rich_tracked_launches": total("rich_tracked_launches"),
+        "total_cheap_only_launches": total("cheap_only_launches"),
+        "total_skipped_due_budget": total("skipped_due_budget"),
+        "total_fast_dead_dropped": total("fast_dead_dropped"),
+        "total_missed_good_token_count": total("missed_good_token_count"),
+        "total_tracking_slots_released": total("tracking_slots_released"),
         "total_attempted_launches": total("attempted_launches"),
         "total_unique_attempted_mints": total("unique_attempted_mints"),
         "total_rejected_dead": total("rejected_dead_count"),

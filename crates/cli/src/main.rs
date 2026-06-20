@@ -41276,6 +41276,10 @@ async fn material_candidate_hunter_command_with_connector(
     let mut candidate_rows = Vec::<serde_json::Value>::new();
     let mut unavailable_rows = Vec::<serde_json::Value>::new();
     let mut asof_alpha_rows = Vec::<serde_json::Value>::new();
+    let mut all_launch_rows = Vec::<serde_json::Value>::new();
+    let mut all_launch_seen_mints = BTreeSet::<String>::new();
+    let mut cheap_launch_events = BTreeMap::<String, NormalizedEvent>::new();
+    let mut rich_slot_rows = Vec::<serde_json::Value>::new();
     let mut candidates_300 = 0u64;
     let mut candidates_900 = 0u64;
     let mut candidates_1800 = 0u64;
@@ -41284,6 +41288,8 @@ async fn material_candidate_hunter_command_with_connector(
     let mut provider_confirmed_bundle_count = 0u64;
     let mut active_mints = BTreeMap::<String, Phase107fActiveMint>::new();
     let mut finalized_mints = BTreeSet::<String>::new();
+    let subscription_fingerprint = material_hunter_subscription_fingerprint(loaded)
+        .unwrap_or_else(|error| format!("fingerprint_error:{error}"));
     let health_dir = output_dir.join("health");
     fs::create_dir_all(&health_dir)?;
     phase107b_write_incremental_checkpoint(
@@ -41293,6 +41299,14 @@ async fn material_candidate_hunter_command_with_connector(
         &rejected_rows,
         &candidate_rows,
         &unavailable_rows,
+    )?;
+    phase107i_write_all_launch_tracking_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &rich_slot_rows,
+        max_attempted_launches,
+        max_concurrent_tracked_mints,
     )?;
     phase107f_write_health(
         &health_dir,
@@ -41419,15 +41433,59 @@ async fn material_candidate_hunter_command_with_connector(
             )?;
 
             let mut stream_state_hint = MaterialHunterStreamStateHint::default();
-            if is_successful_launch_create(&event)
-                && attempt_rows.len() < max_attempted_launches.max(1)
-                && !event_mint_string(&event)
-                    .map(|mint| finalized_mints.contains(&mint) || active_mints.contains_key(&mint))
-                    .unwrap_or(false)
-            {
-                if active_mints.len() < max_concurrent_tracked_mints {
-                    let mint = event_mint_string(&event)
-                        .ok_or_else(|| anyhow!("create event missing mint"))?;
+            if is_successful_launch_create(&event) {
+                let Some(mint) = phase107i_record_visible_launch(
+                    &mut all_launch_rows,
+                    &mut all_launch_seen_mints,
+                    &run_id,
+                    stream_source,
+                    &subscription_fingerprint,
+                    current_segment_id,
+                    &event,
+                ) else {
+                    return Ok(MaterialHunterStreamAction::Continue);
+                };
+                let already_finalized = finalized_mints.contains(&mint);
+                let already_active = active_mints.contains_key(&mint);
+                if already_finalized {
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "skipped_due_to_existing_tombstone",
+                        false,
+                        true,
+                        false,
+                    );
+                } else if already_active {
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "already_rich_tracking",
+                        false,
+                        false,
+                        false,
+                    );
+                } else if attempt_rows.len() >= max_attempted_launches.max(1) {
+                    cheap_launch_events.insert(mint.clone(), event.clone());
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "max_rich_attempt_budget_reached",
+                        true,
+                        false,
+                        false,
+                    );
+                } else if active_mints.len() >= max_concurrent_tracked_mints {
+                    cheap_launch_events.insert(mint.clone(), event.clone());
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "rich_budget_full",
+                        true,
+                        false,
+                        false,
+                    );
+                } else {
                     let attempt_index = attempt_rows.len() + 1;
                     stream_state_hint.active_mints.push(mint.clone());
                     active_mints.insert(
@@ -41439,27 +41497,30 @@ async fn material_candidate_hunter_command_with_connector(
                             current_segment_id,
                         ),
                     );
-                    attempt_rows.push(json!({
-                        "segment_id": current_segment_id,
-                        "attempt_index": attempt_index,
-                        "mint": mint,
-                        "run_id": run_id,
-                        "launch_timestamp": event_received_ts(&event),
-                        "tracked_until_seconds": 0,
-                        "final_state": "tracking_early",
-                        "rejection_or_promotion_reason": "live_attempt_discovered",
-                        "early_warning_families": "",
-                        "rug_like_outcome_by_300s": false,
-                        "survived_300s": false,
-                        "survived_900s": false,
-                        "survived_1800s": false,
-                        "holder_rpc_used": false,
-                        "rpc_mint_supply_canonical": false,
-                        "r2_verified": false,
-                        "local_artifact_size_bytes": phase107b_dir_size_bytes(&output_dir).unwrap_or(0),
-                        "promoted_to_candidate_dataset": false,
-                        "tombstone_written": false,
-                    }));
+                    attempt_rows.push(phase107i_attempt_row(
+                        &run_id,
+                        current_segment_id,
+                        attempt_index,
+                        &mint,
+                        &event,
+                        &output_dir,
+                        "live_attempt_discovered",
+                    ));
+                    rich_slot_rows.push(phase107i_rich_slot_row(
+                        &run_id,
+                        current_segment_id,
+                        attempt_index,
+                        &mint,
+                        &event,
+                        "live_attempt_discovered",
+                    ));
+                    phase107i_mark_rich_tracking_admitted(
+                        &mut all_launch_rows,
+                        &mint,
+                        event_received_ts(&event),
+                        "live_launch_rich_slot_available",
+                    );
+                    cheap_launch_events.remove(&mint);
                     phase107b_write_incremental_checkpoint(
                         &output_dir,
                         &run_id,
@@ -41468,6 +41529,79 @@ async fn material_candidate_hunter_command_with_connector(
                         &candidate_rows,
                         &unavailable_rows,
                     )?;
+                    phase107i_write_all_launch_tracking_artifacts(
+                        &output_dir,
+                        &run_id,
+                        &all_launch_rows,
+                        &rich_slot_rows,
+                        max_attempted_launches,
+                        max_concurrent_tracked_mints,
+                    )?;
+                }
+            } else if let Some(mint) = event_mint_string(&event) {
+                if cheap_launch_events.contains_key(&mint)
+                    && !finalized_mints.contains(&mint)
+                    && !active_mints.contains_key(&mint)
+                    && attempt_rows.len() < max_attempted_launches.max(1)
+                    && active_mints.len() < max_concurrent_tracked_mints
+                {
+                    if let Some(promotion_reason) = phase107i_promotion_reason_for_event(&event) {
+                        if let Some(create) = cheap_launch_events.remove(&mint) {
+                            let attempt_index = attempt_rows.len() + 1;
+                            stream_state_hint.active_mints.push(mint.clone());
+                            active_mints.insert(
+                                mint.clone(),
+                                Phase107fActiveMint::new(
+                                    mint.clone(),
+                                    create.clone(),
+                                    attempt_index,
+                                    current_segment_id,
+                                ),
+                            );
+                            if let Some(active) = active_mints.get_mut(&mint) {
+                                active.push_if_related(&event);
+                            }
+                            attempt_rows.push(phase107i_attempt_row(
+                                &run_id,
+                                current_segment_id,
+                                attempt_index,
+                                &mint,
+                                &create,
+                                &output_dir,
+                                promotion_reason,
+                            ));
+                            rich_slot_rows.push(phase107i_rich_slot_row(
+                                &run_id,
+                                current_segment_id,
+                                attempt_index,
+                                &mint,
+                                &create,
+                                promotion_reason,
+                            ));
+                            phase107i_mark_rich_tracking_admitted(
+                                &mut all_launch_rows,
+                                &mint,
+                                event_received_ts(&event),
+                                promotion_reason,
+                            );
+                            phase107b_write_incremental_checkpoint(
+                                &output_dir,
+                                &run_id,
+                                &attempt_rows,
+                                &rejected_rows,
+                                &candidate_rows,
+                                &unavailable_rows,
+                            )?;
+                            phase107i_write_all_launch_tracking_artifacts(
+                                &output_dir,
+                                &run_id,
+                                &all_launch_rows,
+                                &rich_slot_rows,
+                                max_attempted_launches,
+                                max_concurrent_tracked_mints,
+                            )?;
+                        }
+                    }
                 }
             }
 
@@ -41605,6 +41739,14 @@ async fn material_candidate_hunter_command_with_connector(
                             &analysis,
                         )?;
                     }
+                    if wrote_candidate_checkpoint {
+                        if let Some(row) = phase107i_find_row_mut(&mut all_launch_rows, mint) {
+                            phase107i_update_row(
+                                row,
+                                &[("candidate_checkpoint_seen", json!(true))],
+                            );
+                        }
+                    }
                 }
                 for reason in &analysis.unavailable_reasons {
                     unavailable_rows.push(json!({
@@ -41638,6 +41780,21 @@ async fn material_candidate_hunter_command_with_connector(
                     }
                 }
                 if should_finalize {
+                    phase107i_mark_final_outcome(
+                        &mut all_launch_rows,
+                        mint,
+                        &decision.final_state,
+                        &decision.reason,
+                        !decision.promoted,
+                    );
+                    phase107i_release_rich_slot(
+                        &mut rich_slot_rows,
+                        mint,
+                        active.create.meta.received_at_wall_time,
+                        event.meta.received_at_wall_time,
+                        &decision.reason,
+                        !decision.promoted,
+                    );
                     active.finalized = true;
                     stream_state_hint.inactive_mints.push(mint.clone());
                     finalized_now.push(mint.clone());
@@ -41654,6 +41811,14 @@ async fn material_candidate_hunter_command_with_connector(
                 &rejected_rows,
                 &candidate_rows,
                 &unavailable_rows,
+            )?;
+            phase107i_write_all_launch_tracking_artifacts(
+                &output_dir,
+                &run_id,
+                &all_launch_rows,
+                &rich_slot_rows,
+                max_attempted_launches,
+                max_concurrent_tracked_mints,
             )?;
             if upload_r2 {
                 let due = last_r2_checkpoint_for_events
@@ -41896,6 +42061,21 @@ async fn material_candidate_hunter_command_with_connector(
                 "threshold_tuning_allowed": false,
             }));
             candidate_rows.retain(|row| row["mint"].as_str() != Some(active.mint.as_str()));
+            phase107i_mark_final_outcome(
+                &mut all_launch_rows,
+                &active.mint,
+                &decision.final_state,
+                &decision.reason,
+                true,
+            );
+            phase107i_release_rich_slot(
+                &mut rich_slot_rows,
+                &active.mint,
+                active.create.meta.received_at_wall_time,
+                OffsetDateTime::now_utc(),
+                &decision.reason,
+                true,
+            );
             if let Some(row) = attempt_rows
                 .iter_mut()
                 .find(|row| row["attempt_index"].as_u64() == Some(active.attempt_index as u64))
@@ -41931,6 +42111,14 @@ async fn material_candidate_hunter_command_with_connector(
             &rejected_rows,
             &candidate_rows,
             &unavailable_rows,
+        )?;
+        phase107i_write_all_launch_tracking_artifacts(
+            &output_dir,
+            &run_id,
+            &all_launch_rows,
+            &rich_slot_rows,
+            max_attempted_launches,
+            max_concurrent_tracked_mints,
         )?;
         if provider_blocked_run {
             for row in &mut candidate_rows {
@@ -42186,9 +42374,19 @@ async fn material_candidate_hunter_command_with_connector(
         &["mint", "run_id", "unavailable_reason"],
         &unavailable_rows,
     )?;
+    phase107i_write_all_launch_tracking_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &rich_slot_rows,
+        max_attempted_launches,
+        max_concurrent_tracked_mints,
+    )?;
     phase107h_write_asof_alpha_artifacts(&output_dir, &asof_alpha_rows)?;
 
     let attempted_launches = attempt_rows.len() as u64;
+    let all_launch_summary =
+        read_json_file_or_empty(&output_dir.join("all_launch_intake_summary.json"));
     let (candidate_checkpoint_count, _replay_eligible_candidate_count) =
         phase107b_candidate_counts(&candidate_rows);
     let segment_count = segment_records.len() as u64;
@@ -42235,6 +42433,15 @@ async fn material_candidate_hunter_command_with_connector(
         "schema_version": "phase107b.hunter_summary.v1",
         "run_id": run_id,
         "attempted_launches": attempted_launches,
+        "all_launches_seen": all_launch_summary["all_launches_seen"].as_u64().unwrap_or(0),
+        "all_launches_indexed": all_launch_summary["all_launches_indexed"].as_u64().unwrap_or(0),
+        "rich_tracked_launches": all_launch_summary["rich_tracked_launches"].as_u64().unwrap_or(attempted_launches),
+        "cheap_only_launches": all_launch_summary["cheap_only_launches"].as_u64().unwrap_or(0),
+        "skipped_due_budget": all_launch_summary["skipped_due_budget"].as_u64().unwrap_or(0),
+        "fast_dead_dropped": all_launch_summary["fast_dead_dropped"].as_u64().unwrap_or(0),
+        "missed_good_token_count": all_launch_summary["missed_good_token_count"].as_u64().unwrap_or(0),
+        "tracking_slots_released": all_launch_summary["tracking_slots_released"].as_u64().unwrap_or(0),
+        "rich_slot_turnover_rate": all_launch_summary["rich_slot_turnover_rate"].clone(),
         "rejected_dead_count": rejected_dead,
         "rejected_inconclusive_count": rejected_inconclusive,
         "rejected_before_60s_count": rejected_rows.iter().filter(|row| row["stop_tracking_at_seconds"].as_u64().unwrap_or(0) <= 60).count(),
@@ -42298,6 +42505,14 @@ async fn material_candidate_hunter_command_with_connector(
         "binary_commit": option_env!("GITHUB_SHA").unwrap_or("unknown"),
         "housekeeping_passed_before_hunter": true,
         "attempted_launches": attempted_launches,
+        "all_launches_seen": all_launch_summary["all_launches_seen"].as_u64().unwrap_or(0),
+        "all_launches_indexed": all_launch_summary["all_launches_indexed"].as_u64().unwrap_or(0),
+        "rich_tracked_launches": all_launch_summary["rich_tracked_launches"].as_u64().unwrap_or(attempted_launches),
+        "cheap_only_launches": all_launch_summary["cheap_only_launches"].as_u64().unwrap_or(0),
+        "skipped_due_budget": all_launch_summary["skipped_due_budget"].as_u64().unwrap_or(0),
+        "fast_dead_dropped": all_launch_summary["fast_dead_dropped"].as_u64().unwrap_or(0),
+        "missed_good_token_count": all_launch_summary["missed_good_token_count"].as_u64().unwrap_or(0),
+        "tracking_slots_released": all_launch_summary["tracking_slots_released"].as_u64().unwrap_or(0),
         "rejected_dead_count": rejected_dead,
         "rejected_inconclusive_count": rejected_inconclusive,
         "candidates_300s_count": candidates_300,
@@ -42641,6 +42856,77 @@ struct Phase107bDecision {
     provider_confirmed_bundle: bool,
 }
 
+const PHASE107I_ALL_LAUNCH_INTAKE_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "mint",
+    "launch_seen_at",
+    "slot",
+    "signature_if_available",
+    "creator_or_authority_if_stream_authoritative",
+    "source_kind",
+    "subscription_fingerprint",
+    "launch_detected_by",
+    "cheap_intake_status",
+    "rich_tracking_status",
+    "rich_tracking_admitted",
+    "rich_tracking_admission_time",
+    "rich_tracking_rejection_reason",
+    "skipped_due_to_budget",
+    "skipped_due_to_existing_tombstone",
+    "skipped_due_to_data_quality",
+    "fast_dead_reason",
+    "tombstone_written",
+    "promoted_to_rich_tracking",
+    "promotion_reason",
+    "promotion_time",
+    "final_outcome_if_known",
+    "terminal_inconclusive",
+    "positive_outcome_label_if_later_known",
+    "high_positive_if_later_known",
+    "replay_eligible",
+    "candidate_checkpoint_seen",
+    "audit_only",
+];
+
+const PHASE107I_RICH_TRACKING_SLOT_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "mint",
+    "attempt_index",
+    "rich_tracking_started_at",
+    "rich_tracking_ended_at",
+    "rich_tracking_duration_ms",
+    "rich_tracking_exit_reason",
+    "tracking_slot_released",
+    "admission_reason",
+    "released_by_tombstone",
+    "holder_rpc_used",
+    "rpc_mint_supply_canonical",
+    "replay_eligible",
+    "threshold_tuning_allowed",
+    "live_trading_enabled",
+];
+
+const PHASE107I_MISSED_GOOD_TOKEN_AUDIT_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "mint",
+    "rich_tracking_admitted",
+    "rich_tracking_rejection_reason",
+    "skipped_due_to_budget",
+    "positive_outcome_label_if_later_known",
+    "high_positive_if_later_known",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "missed_good_token_classification",
+    "audit_reason",
+];
+
 const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 7] = [5, 10, 30, 60, 120, 300, 900];
 
 const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
@@ -42702,6 +42988,490 @@ const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
     "threshold_tuning_allowed",
     "live_trading_enabled",
 ];
+
+fn phase107i_token_creator_or_authority(event: &NormalizedEvent) -> String {
+    match &event.payload {
+        EventPayload::TokenCreated(payload) => payload.creator_wallet.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn phase107i_find_row_mut<'a>(
+    rows: &'a mut [serde_json::Value],
+    mint: &str,
+) -> Option<&'a mut serde_json::Value> {
+    rows.iter_mut()
+        .find(|row| row["mint"].as_str() == Some(mint))
+}
+
+fn phase107i_update_row(row: &mut serde_json::Value, updates: &[(&str, serde_json::Value)]) {
+    if let Some(map) = row.as_object_mut() {
+        for (key, value) in updates {
+            map.insert((*key).to_owned(), value.clone());
+        }
+    }
+}
+
+fn phase107i_record_visible_launch(
+    rows: &mut Vec<serde_json::Value>,
+    seen_mints: &mut BTreeSet<String>,
+    run_id: &str,
+    stream_source: &str,
+    subscription_fingerprint: &str,
+    current_segment_id: usize,
+    event: &NormalizedEvent,
+) -> Option<String> {
+    let mint = event_mint_string(event)?;
+    if !seen_mints.insert(mint.clone()) {
+        return Some(mint);
+    }
+    rows.push(json!({
+        "run_id": run_id,
+        "slice_id": run_id,
+        "segment_id": current_segment_id,
+        "relay_session_id": "",
+        "mint": mint,
+        "launch_seen_at": event_received_ts(event),
+        "slot": event.meta.slot,
+        "signature_if_available": event_signature_string(event).unwrap_or_default(),
+        "creator_or_authority_if_stream_authoritative": phase107i_token_creator_or_authority(event),
+        "source_kind": stream_source,
+        "subscription_fingerprint": subscription_fingerprint,
+        "launch_detected_by": "pump_token_created",
+        "cheap_intake_status": "indexed",
+        "rich_tracking_status": "cheap_only",
+        "rich_tracking_admitted": false,
+        "rich_tracking_admission_time": "",
+        "rich_tracking_rejection_reason": "",
+        "skipped_due_to_budget": false,
+        "skipped_due_to_existing_tombstone": false,
+        "skipped_due_to_data_quality": false,
+        "fast_dead_reason": "",
+        "tombstone_written": false,
+        "promoted_to_rich_tracking": false,
+        "promotion_reason": "",
+        "promotion_time": "",
+        "final_outcome_if_known": "",
+        "terminal_inconclusive": false,
+        "positive_outcome_label_if_later_known": false,
+        "high_positive_if_later_known": false,
+        "replay_eligible": false,
+        "candidate_checkpoint_seen": false,
+        "audit_only": true,
+    }));
+    Some(mint)
+}
+
+fn phase107i_mark_rich_tracking_admitted(
+    rows: &mut [serde_json::Value],
+    mint: &str,
+    admission_time: String,
+    promotion_reason: &str,
+) {
+    if let Some(row) = phase107i_find_row_mut(rows, mint) {
+        phase107i_update_row(
+            row,
+            &[
+                ("rich_tracking_status", json!("rich_active")),
+                ("rich_tracking_admitted", json!(true)),
+                (
+                    "rich_tracking_admission_time",
+                    json!(admission_time.clone()),
+                ),
+                ("rich_tracking_rejection_reason", json!("")),
+                ("skipped_due_to_budget", json!(false)),
+                ("skipped_due_to_existing_tombstone", json!(false)),
+                ("skipped_due_to_data_quality", json!(false)),
+                ("promoted_to_rich_tracking", json!(true)),
+                ("promotion_reason", json!(promotion_reason)),
+                ("promotion_time", json!(admission_time)),
+            ],
+        );
+    }
+}
+
+fn phase107i_mark_rich_tracking_rejected(
+    rows: &mut [serde_json::Value],
+    mint: &str,
+    reason: &str,
+    skipped_due_to_budget: bool,
+    skipped_due_to_existing_tombstone: bool,
+    skipped_due_to_data_quality: bool,
+) {
+    if let Some(row) = phase107i_find_row_mut(rows, mint) {
+        phase107i_update_row(
+            row,
+            &[
+                ("rich_tracking_status", json!("cheap_only")),
+                ("rich_tracking_rejection_reason", json!(reason)),
+                ("skipped_due_to_budget", json!(skipped_due_to_budget)),
+                (
+                    "skipped_due_to_existing_tombstone",
+                    json!(skipped_due_to_existing_tombstone),
+                ),
+                (
+                    "skipped_due_to_data_quality",
+                    json!(skipped_due_to_data_quality),
+                ),
+            ],
+        );
+    }
+}
+
+fn phase107i_mark_final_outcome(
+    rows: &mut [serde_json::Value],
+    mint: &str,
+    final_state: &str,
+    reason: &str,
+    tombstone_written: bool,
+) {
+    if let Some(row) = phase107i_find_row_mut(rows, mint) {
+        let fast_dead_reason = if final_state.starts_with("early_rejected") {
+            reason
+        } else {
+            ""
+        };
+        phase107i_update_row(
+            row,
+            &[
+                ("rich_tracking_status", json!("rich_released")),
+                ("fast_dead_reason", json!(fast_dead_reason)),
+                ("tombstone_written", json!(tombstone_written)),
+                ("final_outcome_if_known", json!(final_state)),
+                (
+                    "terminal_inconclusive",
+                    json!(final_state == "terminal_inconclusive"),
+                ),
+                ("replay_eligible", json!(false)),
+            ],
+        );
+    }
+}
+
+fn phase107i_promotion_reason_for_event(event: &NormalizedEvent) -> Option<&'static str> {
+    match &event.payload {
+        EventPayload::PumpBuy(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("early_buy_sell_followthrough")
+        }
+        EventPayload::PumpSell(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("early_buy_sell_followthrough")
+        }
+        EventPayload::BondingCurveUpdate(_) => Some("early_curve_progress"),
+        EventPayload::HolderBalanceUpdate(_) => Some("early_holder_growth"),
+        EventPayload::ObservedTransaction(_) => Some("early_volume_followthrough"),
+        _ => None,
+    }
+}
+
+fn phase107i_attempt_row(
+    run_id: &str,
+    current_segment_id: usize,
+    attempt_index: usize,
+    mint: &str,
+    create: &NormalizedEvent,
+    output_dir: &Path,
+    discovery_reason: &str,
+) -> serde_json::Value {
+    json!({
+        "segment_id": current_segment_id,
+        "attempt_index": attempt_index,
+        "mint": mint,
+        "run_id": run_id,
+        "launch_timestamp": event_received_ts(create),
+        "tracked_until_seconds": 0,
+        "final_state": "tracking_early",
+        "rejection_or_promotion_reason": discovery_reason,
+        "early_warning_families": "",
+        "rug_like_outcome_by_300s": false,
+        "survived_300s": false,
+        "survived_900s": false,
+        "survived_1800s": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "r2_verified": false,
+        "local_artifact_size_bytes": phase107b_dir_size_bytes(output_dir).unwrap_or(0),
+        "promoted_to_candidate_dataset": false,
+        "tombstone_written": false,
+    })
+}
+
+fn phase107i_rich_slot_row(
+    run_id: &str,
+    current_segment_id: usize,
+    attempt_index: usize,
+    mint: &str,
+    create: &NormalizedEvent,
+    admission_reason: &str,
+) -> serde_json::Value {
+    json!({
+        "run_id": run_id,
+        "slice_id": run_id,
+        "segment_id": current_segment_id,
+        "mint": mint,
+        "attempt_index": attempt_index,
+        "rich_tracking_started_at": event_received_ts(create),
+        "rich_tracking_ended_at": "",
+        "rich_tracking_duration_ms": "",
+        "rich_tracking_exit_reason": "",
+        "tracking_slot_released": false,
+        "admission_reason": admission_reason,
+        "released_by_tombstone": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "replay_eligible": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+    })
+}
+
+fn phase107i_release_rich_slot(
+    rows: &mut [serde_json::Value],
+    mint: &str,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    exit_reason: &str,
+    released_by_tombstone: bool,
+) {
+    if let Some(row) = phase107i_find_row_mut(rows, mint) {
+        phase107i_update_row(
+            row,
+            &[
+                ("rich_tracking_ended_at", json!(ended_at)),
+                (
+                    "rich_tracking_duration_ms",
+                    json!((ended_at - started_at).whole_milliseconds().max(0)),
+                ),
+                ("rich_tracking_exit_reason", json!(exit_reason)),
+                ("tracking_slot_released", json!(true)),
+                ("released_by_tombstone", json!(released_by_tombstone)),
+                ("replay_eligible", json!(false)),
+            ],
+        );
+    }
+}
+
+fn phase107i_missed_good_token_rows(
+    all_launch_rows: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    all_launch_rows
+        .iter()
+        .filter(|row| !row["rich_tracking_admitted"].as_bool().unwrap_or(false))
+        .map(|row| {
+            let skipped_due_to_budget = row["skipped_due_to_budget"].as_bool().unwrap_or(false);
+            let positive = row["positive_outcome_label_if_later_known"]
+                .as_bool()
+                .unwrap_or(false);
+            let high_positive = row["high_positive_if_later_known"]
+                .as_bool()
+                .unwrap_or(false);
+            let final_state = row["final_outcome_if_known"].as_str().unwrap_or("");
+            let classification = if skipped_due_to_budget && (positive || high_positive) {
+                "missed_due_to_budget"
+            } else if row["skipped_due_to_data_quality"].as_bool().unwrap_or(false) {
+                "missed_due_to_data_quality"
+            } else if final_state.starts_with("early_rejected") {
+                "not_missed_correctly_rejected"
+            } else if row["rich_tracking_rejection_reason"].as_str()
+                == Some("skipped_due_to_existing_tombstone")
+            {
+                "missed_due_to_fast_dead_filter"
+            } else if skipped_due_to_budget {
+                "missed_due_to_unknown_lack_of_followup"
+            } else {
+                "missed_due_to_no_positive_behavior"
+            };
+            json!({
+                "run_id": row["run_id"].clone(),
+                "slice_id": row["slice_id"].clone(),
+                "segment_id": row["segment_id"].clone(),
+                "mint": row["mint"].clone(),
+                "rich_tracking_admitted": row["rich_tracking_admitted"].clone(),
+                "rich_tracking_rejection_reason": row["rich_tracking_rejection_reason"].clone(),
+                "skipped_due_to_budget": row["skipped_due_to_budget"].clone(),
+                "positive_outcome_label_if_later_known": row["positive_outcome_label_if_later_known"].clone(),
+                "high_positive_if_later_known": row["high_positive_if_later_known"].clone(),
+                "candidate_checkpoint_seen": row["candidate_checkpoint_seen"].clone(),
+                "replay_eligible": false,
+                "missed_good_token_classification": classification,
+                "audit_reason": "compact_all_launch_intake_no_replay_or_backtest",
+            })
+        })
+        .collect()
+}
+
+fn phase107i_bool_count(rows: &[serde_json::Value], key: &str) -> u64 {
+    rows.iter()
+        .filter(|row| row[key].as_bool().unwrap_or(false))
+        .count() as u64
+}
+
+fn phase107i_write_all_launch_tracking_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+    rich_slot_rows: &[serde_json::Value],
+    max_attempted_launches: usize,
+    max_concurrent_tracked_mints: usize,
+) -> Result<()> {
+    write_json_rows_csv(
+        &output_dir.join("all_launch_intake_ledger.csv"),
+        PHASE107I_ALL_LAUNCH_INTAKE_FIELDS,
+        all_launch_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("rich_tracking_slot_ledger.csv"),
+        PHASE107I_RICH_TRACKING_SLOT_FIELDS,
+        rich_slot_rows,
+    )?;
+    let missed_rows = phase107i_missed_good_token_rows(all_launch_rows);
+    write_json_rows_csv(
+        &output_dir.join("missed_good_token_audit.csv"),
+        PHASE107I_MISSED_GOOD_TOKEN_AUDIT_FIELDS,
+        &missed_rows,
+    )?;
+
+    let all_launches_seen = all_launch_rows.len() as u64;
+    let rich_tracked_launches = phase107i_bool_count(all_launch_rows, "rich_tracking_admitted");
+    let cheap_only_launches = all_launches_seen.saturating_sub(rich_tracked_launches);
+    let skipped_due_budget = phase107i_bool_count(all_launch_rows, "skipped_due_to_budget");
+    let rich_budget_full_count = all_launch_rows
+        .iter()
+        .filter(|row| row["rich_tracking_rejection_reason"].as_str() == Some("rich_budget_full"))
+        .count() as u64;
+    let fast_dead_dropped = all_launch_rows
+        .iter()
+        .filter(|row| {
+            row["tombstone_written"].as_bool().unwrap_or(false)
+                || row["fast_dead_reason"]
+                    .as_str()
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false)
+        })
+        .count() as u64;
+    let tracking_slots_released = phase107i_bool_count(rich_slot_rows, "tracking_slot_released");
+    let rich_duration_total = rich_slot_rows
+        .iter()
+        .filter_map(|row| row["rich_tracking_duration_ms"].as_u64())
+        .sum::<u64>();
+    let average_rich_tracking_duration_ms = if tracking_slots_released > 0 {
+        rich_duration_total / tracking_slots_released
+    } else {
+        0
+    };
+    let missed_good_token_count = missed_rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row["missed_good_token_classification"].as_str(),
+                Some("missed_due_to_budget")
+            )
+        })
+        .count() as u64;
+    let summary = json!({
+        "schema_version": "phase107i.all_launch_intake_summary.v1",
+        "run_id": run_id,
+        "tracking_tiers": {
+            "tier_0": "relay_stream_intake",
+            "tier_1": "cheap_launch_intake",
+            "tier_2": "candidate_or_early_burst_watch",
+            "tier_3": "rich_active_tracking"
+        },
+        "max_rich_active_mints": max_concurrent_tracked_mints,
+        "max_rich_attempted_launches": max_attempted_launches,
+        "max_attempted_launches_applies_to": "tier_3_rich_tracking_not_tier_1_visibility",
+        "all_launches_seen": all_launches_seen,
+        "all_launches_indexed": all_launches_seen,
+        "rich_tracked_launches": rich_tracked_launches,
+        "cheap_only_launches": cheap_only_launches,
+        "skipped_due_budget": skipped_due_budget,
+        "rich_budget_full_count": rich_budget_full_count,
+        "fast_dead_dropped": fast_dead_dropped,
+        "promoted_to_rich_tracking": phase107i_bool_count(all_launch_rows, "promoted_to_rich_tracking"),
+        "tracking_slots_released": tracking_slots_released,
+        "average_rich_tracking_duration_ms": average_rich_tracking_duration_ms,
+        "rich_slot_turnover_rate": if rich_tracked_launches > 0 {
+            serde_json::Value::String(format!("{:.6}", tracking_slots_released as f64 / rich_tracked_launches as f64))
+        } else {
+            serde_json::Value::String("0".to_owned())
+        },
+        "missed_good_token_count": missed_good_token_count,
+        "candidate_checkpoint_seen_count": phase107i_bool_count(all_launch_rows, "candidate_checkpoint_seen"),
+        "replay_eligible_count": phase107i_bool_count(all_launch_rows, "replay_eligible"),
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("all_launch_intake_summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    let summary_md = format!(
+        "# All-Launch Intake Summary\n\n- run_id: `{run_id}`\n- all_launches_seen: `{}`\n- all_launches_indexed: `{}`\n- rich_tracked_launches: `{}`\n- cheap_only_launches: `{}`\n- skipped_due_budget: `{}`\n- rich_budget_full_count: `{}`\n- fast_dead_dropped: `{}`\n- tracking_slots_released: `{}`\n- missed_good_token_count: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n",
+        summary["all_launches_seen"],
+        summary["all_launches_indexed"],
+        summary["rich_tracked_launches"],
+        summary["cheap_only_launches"],
+        summary["skipped_due_budget"],
+        summary["rich_budget_full_count"],
+        summary["fast_dead_dropped"],
+        summary["tracking_slots_released"],
+        summary["missed_good_token_count"],
+    );
+    fs::write(output_dir.join("all_launch_intake_summary.md"), summary_md)?;
+
+    let rich_summary = json!({
+        "schema_version": "phase107i.rich_tracking_slot_summary.v1",
+        "run_id": run_id,
+        "max_rich_active_mints": max_concurrent_tracked_mints,
+        "rich_tracking_slots_opened": rich_slot_rows.len(),
+        "tracking_slots_released": tracking_slots_released,
+        "average_rich_tracking_duration_ms": average_rich_tracking_duration_ms,
+        "dead_token_drop_latency_ms_avg": average_rich_tracking_duration_ms,
+        "replay_eligible_count": 0,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("rich_tracking_slot_summary.json"),
+        serde_json::to_vec_pretty(&rich_summary)?,
+    )?;
+    let rich_md = format!(
+        "# Rich Tracking Slot Summary\n\n- run_id: `{run_id}`\n- rich_tracking_slots_opened: `{}`\n- tracking_slots_released: `{}`\n- average_rich_tracking_duration_ms: `{}`\n- dead_token_drop_latency_ms_avg: `{}`\n- holder_rpc_used: `false`\n- rpc_mint_supply_canonical: `false`\n",
+        rich_summary["rich_tracking_slots_opened"],
+        rich_summary["tracking_slots_released"],
+        rich_summary["average_rich_tracking_duration_ms"],
+        rich_summary["dead_token_drop_latency_ms_avg"],
+    );
+    fs::write(output_dir.join("rich_tracking_slot_summary.md"), rich_md)?;
+
+    let missed_summary = json!({
+        "schema_version": "phase107i.missed_good_token_audit.v1",
+        "run_id": run_id,
+        "rows": missed_rows.len(),
+        "missed_good_token_count": missed_good_token_count,
+        "classifications": missed_rows.iter().filter_map(|row| row["missed_good_token_classification"].as_str()).fold(BTreeMap::<String, u64>::new(), |mut counts, class| {
+            *counts.entry(class.to_owned()).or_default() += 1;
+            counts
+        }),
+        "replay_eligible_count": 0,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    let missed_md = format!(
+        "# Missed Good Token Audit\n\n- run_id: `{run_id}`\n- cheap_only_rows_audited: `{}`\n- missed_good_token_count: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n\nThis audit is diagnostic only. It does not create replay eligibility or candidate eligibility.\n",
+        missed_summary["rows"], missed_summary["missed_good_token_count"],
+    );
+    fs::write(output_dir.join("MISSED_GOOD_TOKEN_AUDIT.md"), missed_md)?;
+    Ok(())
+}
 
 fn phase107h_decimal_ratio(numerator: Decimal, denominator: Decimal) -> Option<Decimal> {
     if denominator == Decimal::ZERO {
@@ -44708,6 +45478,11 @@ fn phase107b_required_final_artifacts_exist(output_dir: &Path) -> bool {
         "rejected_summary.csv",
         "candidate_summary.csv",
         "unavailable_reason_summary.csv",
+        "all_launch_intake_ledger.csv",
+        "all_launch_intake_summary.json",
+        "rich_tracking_slot_ledger.csv",
+        "rich_tracking_slot_summary.json",
+        "missed_good_token_audit.csv",
         "manifest.json",
         "r2_upload_result.json",
     ]
@@ -45073,6 +45848,16 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     let candidate_rows = phase107f_read_csv_rows(&output_dir.join("candidate_summary.csv"))?;
     let rejected_rows = phase107f_read_csv_rows(&output_dir.join("rejected_summary.csv"))?;
     let attempt_rows = phase107f_read_csv_rows(&output_dir.join("attempt_ledger.csv"))?;
+    let all_launch_rows =
+        phase107f_read_csv_rows(&output_dir.join("all_launch_intake_ledger.csv"))?;
+    let rich_slot_rows =
+        phase107f_read_csv_rows(&output_dir.join("rich_tracking_slot_ledger.csv"))?;
+    let all_launch_summary =
+        phase107f_read_json_value(&output_dir.join("all_launch_intake_summary.json"))?;
+    let rich_slot_summary =
+        phase107f_read_json_value(&output_dir.join("rich_tracking_slot_summary.json"))?;
+    let missed_good_audit_rows =
+        phase107f_read_csv_rows(&output_dir.join("missed_good_token_audit.csv"))?;
     let (asof_alpha_manifest_exists, asof_alpha_row_count, asof_alpha_blockers) =
         phase107h_validate_asof_alpha_artifacts(output_dir, manifest.as_ref())?;
     blockers.extend(asof_alpha_blockers);
@@ -45128,6 +45913,68 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         && (countability_path.exists() || hunter_summary.is_some() || interrupted_summary.is_some())
     {
         blockers.push("service_exit_status_missing_for_finished_slice".to_owned());
+    }
+    let all_launch_ledger_exists = output_dir.join("all_launch_intake_ledger.csv").exists();
+    let all_launch_required = counted || !attempt_rows.is_empty() || hunter_summary.is_some();
+    if all_launch_required && !all_launch_ledger_exists {
+        blockers.push("all_launch_intake_ledger_missing".to_owned());
+    }
+    if all_launch_required && all_launch_summary.is_none() {
+        blockers.push("all_launch_intake_summary_missing".to_owned());
+    }
+    if all_launch_required && rich_slot_summary.is_none() {
+        blockers.push("rich_tracking_slot_summary_missing".to_owned());
+    }
+    if !attempt_rows.is_empty() && rich_slot_rows.len() != attempt_rows.len() {
+        blockers.push("rich_tracking_slot_ledger_attempt_count_mismatch".to_owned());
+    }
+    let all_launch_mints = all_launch_rows
+        .iter()
+        .filter_map(|row| row.get("mint").filter(|mint| !mint.is_empty()).cloned())
+        .collect::<BTreeSet<_>>();
+    for row in &attempt_rows {
+        let mint = phase107f_row_value(row, "mint");
+        if !mint.is_empty() && !all_launch_mints.contains(mint) {
+            blockers.push(format!("attempt_missing_all_launch_intake_row:{mint}"));
+        }
+    }
+    for row in &all_launch_rows {
+        if phase107f_row_bool(row, "replay_eligible") {
+            blockers.push(format!(
+                "all_launch_intake_replay_eligible:{}",
+                phase107f_row_value(row, "mint")
+            ));
+        }
+        if !phase107f_row_bool(row, "audit_only") {
+            blockers.push(format!(
+                "all_launch_intake_not_audit_only:{}",
+                phase107f_row_value(row, "mint")
+            ));
+        }
+    }
+    if let Some(summary) = &all_launch_summary {
+        if phase107f_json_bool(summary, "formal_backtesting_allowed")
+            || phase107f_json_bool(summary, "threshold_tuning_allowed")
+            || phase107f_json_bool(summary, "live_trading_enabled")
+            || phase107f_json_bool(summary, "holder_rpc_used")
+            || phase107f_json_bool(summary, "rpc_mint_supply_canonical")
+        {
+            blockers.push("all_launch_intake_summary_safety_flag_enabled".to_owned());
+        }
+        if phase107f_json_u64(summary, "rich_tracked_launches") != attempt_rows.len() as u64 {
+            blockers.push("all_launch_rich_tracked_attempt_count_mismatch".to_owned());
+        }
+        if phase107f_json_u64(summary, "all_launches_indexed") < attempt_rows.len() as u64 {
+            blockers.push("all_launch_indexed_less_than_rich_attempts".to_owned());
+        }
+    }
+    for row in &missed_good_audit_rows {
+        if phase107f_row_bool(row, "replay_eligible") {
+            blockers.push(format!(
+                "missed_good_token_audit_replay_eligible:{}",
+                phase107f_row_value(row, "mint")
+            ));
+        }
     }
     if counted && provider_data_loss_seen {
         blockers.push("counted_provider_data_loss_seen".to_owned());
@@ -45356,6 +46203,27 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "partial_outputs_audit_only": partial_audit_only,
         "candidate_checkpoint_count": checkpoint_count,
         "replay_eligible_candidate_count": replay_eligible_count,
+        "all_launch_intake_ledger_exists": output_dir.join("all_launch_intake_ledger.csv").exists(),
+        "all_launches_indexed": all_launch_summary
+            .as_ref()
+            .and_then(|value| value.get("all_launches_indexed"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(all_launch_rows.len() as u64),
+        "rich_tracked_launches": all_launch_summary
+            .as_ref()
+            .and_then(|value| value.get("rich_tracked_launches"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(rich_slot_rows.len() as u64),
+        "cheap_only_launches": all_launch_summary
+            .as_ref()
+            .and_then(|value| value.get("cheap_only_launches"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "missed_good_token_count": all_launch_summary
+            .as_ref()
+            .and_then(|value| value.get("missed_good_token_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
         "unique_attempted_mint_count": attempt_rows.iter().filter_map(|row| row.get("mint")).filter(|mint| !mint.is_empty()).collect::<BTreeSet<_>>().len(),
         "unique_final_outcome_mint_count": final_outcomes_by_mint.len(),
         "contradictory_final_outcome_mints": contradictory_final_outcome_mints,
@@ -47708,6 +48576,14 @@ fn local_relay_apply_r2_primary_retention(
         "attempt_ledger.csv",
         "candidate_summary.csv",
         "rejected_summary.csv",
+        "all_launch_intake_ledger.csv",
+        "all_launch_intake_summary.json",
+        "all_launch_intake_summary.md",
+        "rich_tracking_slot_ledger.csv",
+        "rich_tracking_slot_summary.json",
+        "rich_tracking_slot_summary.md",
+        "missed_good_token_audit.csv",
+        "MISSED_GOOD_TOKEN_AUDIT.md",
         "countability_decision.json",
         "run_countability_decision.json",
         "manifest.json",
@@ -61612,6 +62488,186 @@ mod tests {
         assert_eq!(report["relay_only_material_artifacts_expected"], false);
     }
 
+    fn phase107i_test_launch(mint: &str, slot: u64) -> NormalizedEvent {
+        let mut event = phase90_token_created_event(None, None);
+        event.meta.slot = slot;
+        event.meta.signature = Some(format!("sig-{mint}"));
+        if let EventPayload::TokenCreated(payload) = &mut event.payload {
+            payload.mint = common::PubkeyValue(mint.to_owned());
+        }
+        event
+    }
+
+    #[test]
+    fn phase107i_all_visible_launches_produce_intake_rows_under_rich_cap() {
+        let mut rows = Vec::new();
+        let mut seen = BTreeSet::new();
+        let launch_a = phase107i_test_launch("mint-a", 1);
+        let launch_b = phase107i_test_launch("mint-b", 2);
+        phase107i_record_visible_launch(
+            &mut rows,
+            &mut seen,
+            "run",
+            "local_relay",
+            "fingerprint",
+            1,
+            &launch_a,
+        );
+        phase107i_record_visible_launch(
+            &mut rows,
+            &mut seen,
+            "run",
+            "local_relay",
+            "fingerprint",
+            1,
+            &launch_b,
+        );
+        phase107i_mark_rich_tracking_admitted(
+            &mut rows,
+            "mint-a",
+            event_received_ts(&launch_a),
+            "live_launch_rich_slot_available",
+        );
+        phase107i_mark_rich_tracking_rejected(
+            &mut rows,
+            "mint-b",
+            "max_rich_attempt_budget_reached",
+            true,
+            false,
+            false,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(phase107i_bool_count(&rows, "rich_tracking_admitted"), 1);
+        assert_eq!(phase107i_bool_count(&rows, "skipped_due_to_budget"), 1);
+    }
+
+    #[test]
+    fn phase107i_artifacts_report_budget_skips_and_slot_turnover() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch_a = phase107i_test_launch("mint-a", 1);
+        let mut rows = vec![json!({
+            "run_id": "run",
+            "slice_id": "run",
+            "segment_id": 1,
+            "relay_session_id": "",
+            "mint": "mint-a",
+            "launch_seen_at": event_received_ts(&launch_a),
+            "slot": 1,
+            "signature_if_available": "sig",
+            "creator_or_authority_if_stream_authoritative": "creator",
+            "source_kind": "local_relay",
+            "subscription_fingerprint": "fingerprint",
+            "launch_detected_by": "pump_token_created",
+            "cheap_intake_status": "indexed",
+            "rich_tracking_status": "rich_released",
+            "rich_tracking_admitted": true,
+            "rich_tracking_admission_time": event_received_ts(&launch_a),
+            "rich_tracking_rejection_reason": "",
+            "skipped_due_to_budget": false,
+            "skipped_due_to_existing_tombstone": false,
+            "skipped_due_to_data_quality": false,
+            "fast_dead_reason": "volume_evaporated",
+            "tombstone_written": true,
+            "promoted_to_rich_tracking": true,
+            "promotion_reason": "live_launch_rich_slot_available",
+            "promotion_time": event_received_ts(&launch_a),
+            "final_outcome_if_known": "early_rejected_dead",
+            "terminal_inconclusive": false,
+            "positive_outcome_label_if_later_known": false,
+            "high_positive_if_later_known": false,
+            "replay_eligible": false,
+            "candidate_checkpoint_seen": false,
+            "audit_only": true,
+        })];
+        rows.push(json!({
+            "run_id": "run",
+            "slice_id": "run",
+            "segment_id": 1,
+            "relay_session_id": "",
+            "mint": "mint-b",
+            "launch_seen_at": "2026-06-16T12:00:00Z",
+            "slot": 2,
+            "signature_if_available": "sig-b",
+            "creator_or_authority_if_stream_authoritative": "creator",
+            "source_kind": "local_relay",
+            "subscription_fingerprint": "fingerprint",
+            "launch_detected_by": "pump_token_created",
+            "cheap_intake_status": "indexed",
+            "rich_tracking_status": "cheap_only",
+            "rich_tracking_admitted": false,
+            "rich_tracking_admission_time": "",
+            "rich_tracking_rejection_reason": "rich_budget_full",
+            "skipped_due_to_budget": true,
+            "skipped_due_to_existing_tombstone": false,
+            "skipped_due_to_data_quality": false,
+            "fast_dead_reason": "",
+            "tombstone_written": false,
+            "promoted_to_rich_tracking": false,
+            "promotion_reason": "",
+            "promotion_time": "",
+            "final_outcome_if_known": "",
+            "terminal_inconclusive": false,
+            "positive_outcome_label_if_later_known": false,
+            "high_positive_if_later_known": false,
+            "replay_eligible": false,
+            "candidate_checkpoint_seen": false,
+            "audit_only": true,
+        }));
+        let slot_rows = vec![json!({
+            "run_id": "run",
+            "slice_id": "run",
+            "segment_id": 1,
+            "mint": "mint-a",
+            "attempt_index": 1,
+            "rich_tracking_started_at": "2026-06-16T12:00:00Z",
+            "rich_tracking_ended_at": "2026-06-16T12:00:15Z",
+            "rich_tracking_duration_ms": 15000,
+            "rich_tracking_exit_reason": "volume_evaporated",
+            "tracking_slot_released": true,
+            "admission_reason": "live_attempt_discovered",
+            "released_by_tombstone": true,
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "replay_eligible": false,
+            "threshold_tuning_allowed": false,
+            "live_trading_enabled": false,
+        })];
+        phase107i_write_all_launch_tracking_artifacts(temp.path(), "run", &rows, &slot_rows, 1, 1)
+            .expect("write tracking");
+        let summary = read_json_file_or_empty(&temp.path().join("all_launch_intake_summary.json"));
+        assert_eq!(summary["all_launches_indexed"], 2);
+        assert_eq!(summary["rich_tracked_launches"], 1);
+        assert_eq!(summary["cheap_only_launches"], 1);
+        assert_eq!(summary["rich_budget_full_count"], 1);
+        assert_eq!(summary["tracking_slots_released"], 1);
+    }
+
+    #[test]
+    fn phase107i_missed_good_token_audit_surfaces_budget_positive() {
+        let rows = vec![json!({
+            "run_id": "run",
+            "slice_id": "run",
+            "segment_id": 1,
+            "mint": "mint-positive",
+            "rich_tracking_admitted": false,
+            "rich_tracking_rejection_reason": "rich_budget_full",
+            "skipped_due_to_budget": true,
+            "skipped_due_to_data_quality": false,
+            "positive_outcome_label_if_later_known": true,
+            "high_positive_if_later_known": true,
+            "candidate_checkpoint_seen": false,
+            "replay_eligible": false,
+            "final_outcome_if_known": "",
+        })];
+        let missed = phase107i_missed_good_token_rows(&rows);
+        assert_eq!(missed.len(), 1);
+        assert_eq!(
+            missed[0]["missed_good_token_classification"],
+            "missed_due_to_budget"
+        );
+        assert_eq!(missed[0]["replay_eligible"], false);
+    }
+
     #[test]
     fn phase107g_r2_primary_spool_deletes_only_verified_bulk_chunks() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -61745,6 +62801,59 @@ mod tests {
             "attempt_index,mint,run_id,final_state\n1,mint-a,run,early_rejected_dead\n",
         )
         .expect("attempt ledger");
+        fs::write(
+            root.join("all_launch_intake_ledger.csv"),
+            "run_id,slice_id,segment_id,relay_session_id,mint,launch_seen_at,slot,signature_if_available,creator_or_authority_if_stream_authoritative,source_kind,subscription_fingerprint,launch_detected_by,cheap_intake_status,rich_tracking_status,rich_tracking_admitted,rich_tracking_admission_time,rich_tracking_rejection_reason,skipped_due_to_budget,skipped_due_to_existing_tombstone,skipped_due_to_data_quality,fast_dead_reason,tombstone_written,promoted_to_rich_tracking,promotion_reason,promotion_time,final_outcome_if_known,terminal_inconclusive,positive_outcome_label_if_later_known,high_positive_if_later_known,replay_eligible,candidate_checkpoint_seen,audit_only\nrun,run,1,,mint-a,2026-06-16T12:00:00Z,1,sig,creator,relay,pfp,pump_token_created,indexed,rich_released,true,2026-06-16T12:00:00Z,,false,false,false,dead,true,true,live_launch_rich_slot_available,2026-06-16T12:00:00Z,early_rejected_dead,false,false,false,false,false,true\n",
+        )
+        .expect("all launch");
+        fs::write(
+            root.join("all_launch_intake_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "phase107i.all_launch_intake_summary.v1",
+                "all_launches_seen": 1,
+                "all_launches_indexed": 1,
+                "rich_tracked_launches": 1,
+                "cheap_only_launches": 0,
+                "missed_good_token_count": 0,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("all launch summary");
+        fs::write(root.join("all_launch_intake_summary.md"), "# All Launch\n")
+            .expect("all launch md");
+        fs::write(
+            root.join("rich_tracking_slot_ledger.csv"),
+            "run_id,slice_id,segment_id,mint,attempt_index,rich_tracking_started_at,rich_tracking_ended_at,rich_tracking_duration_ms,rich_tracking_exit_reason,tracking_slot_released,admission_reason,released_by_tombstone,holder_rpc_used,rpc_mint_supply_canonical,replay_eligible,threshold_tuning_allowed,live_trading_enabled\nrun,run,1,mint-a,1,2026-06-16T12:00:00Z,2026-06-16T12:00:15Z,15000,dead,true,live_attempt_discovered,true,false,false,false,false,false\n",
+        )
+        .expect("rich slot");
+        fs::write(
+            root.join("rich_tracking_slot_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "phase107i.rich_tracking_slot_summary.v1",
+                "rich_tracking_slots_opened": 1,
+                "tracking_slots_released": 1,
+                "replay_eligible_count": 0,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("rich slot summary");
+        fs::write(root.join("rich_tracking_slot_summary.md"), "# Rich Slots\n")
+            .expect("rich slot md");
+        fs::write(
+            root.join("missed_good_token_audit.csv"),
+            "run_id,slice_id,segment_id,mint,rich_tracking_admitted,rich_tracking_rejection_reason,skipped_due_to_budget,positive_outcome_label_if_later_known,high_positive_if_later_known,candidate_checkpoint_seen,replay_eligible,missed_good_token_classification,audit_reason\n",
+        )
+        .expect("missed audit");
+        fs::write(root.join("MISSED_GOOD_TOKEN_AUDIT.md"), "# Missed\n").expect("missed md");
         fs::write(
             root.join("candidate_summary.csv"),
             "mint,final_state,candidate_checkpoint,replay_eligible\n",
@@ -62124,6 +63233,11 @@ mod tests {
             "rejected_summary.csv",
             "candidate_summary.csv",
             "unavailable_reason_summary.csv",
+            "all_launch_intake_ledger.csv",
+            "all_launch_intake_summary.json",
+            "rich_tracking_slot_ledger.csv",
+            "rich_tracking_slot_summary.json",
+            "missed_good_token_audit.csv",
             "manifest.json",
             "r2_upload_result.json",
         ] {
@@ -62379,6 +63493,56 @@ mod tests {
             "mint,final_state,candidate_checkpoint,replay_eligible\nmint-a,survived_300s_candidate_checkpoint,true,false\n",
         )
         .expect("candidates");
+        fs::write(
+            temp.path().join("attempt_ledger.csv"),
+            "attempt_index,mint,run_id,final_state\n1,mint-a,run,tracking_early\n",
+        )
+        .expect("attempts");
+        fs::write(
+            temp.path().join("all_launch_intake_ledger.csv"),
+            "run_id,slice_id,segment_id,relay_session_id,mint,launch_seen_at,slot,signature_if_available,creator_or_authority_if_stream_authoritative,source_kind,subscription_fingerprint,launch_detected_by,cheap_intake_status,rich_tracking_status,rich_tracking_admitted,rich_tracking_admission_time,rich_tracking_rejection_reason,skipped_due_to_budget,skipped_due_to_existing_tombstone,skipped_due_to_data_quality,fast_dead_reason,tombstone_written,promoted_to_rich_tracking,promotion_reason,promotion_time,final_outcome_if_known,terminal_inconclusive,positive_outcome_label_if_later_known,high_positive_if_later_known,replay_eligible,candidate_checkpoint_seen,audit_only\nrun,run,1,,mint-a,2026-06-16T12:00:00Z,1,sig,creator,relay,pfp,pump_token_created,indexed,rich_active,true,2026-06-16T12:00:00Z,,false,false,false,,false,true,live_launch_rich_slot_available,2026-06-16T12:00:00Z,,false,false,false,false,true,true\n",
+        )
+        .expect("all launch");
+        fs::write(
+            temp.path().join("all_launch_intake_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "all_launches_indexed": 1,
+                "rich_tracked_launches": 1,
+                "cheap_only_launches": 0,
+                "missed_good_token_count": 0,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("all launch summary");
+        fs::write(
+            temp.path().join("rich_tracking_slot_ledger.csv"),
+            "run_id,slice_id,segment_id,mint,attempt_index,rich_tracking_started_at,rich_tracking_ended_at,rich_tracking_duration_ms,rich_tracking_exit_reason,tracking_slot_released,admission_reason,released_by_tombstone,holder_rpc_used,rpc_mint_supply_canonical,replay_eligible,threshold_tuning_allowed,live_trading_enabled\nrun,run,1,mint-a,1,2026-06-16T12:00:00Z,,,,false,live_attempt_discovered,false,false,false,false,false,false\n",
+        )
+        .expect("rich slot");
+        fs::write(
+            temp.path().join("rich_tracking_slot_summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "rich_tracking_slots_opened": 1,
+                "tracking_slots_released": 0,
+                "replay_eligible_count": 0,
+                "threshold_tuning_allowed": false,
+                "live_trading_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("rich slot summary");
+        fs::write(
+            temp.path().join("missed_good_token_audit.csv"),
+            "run_id,slice_id,segment_id,mint,rich_tracking_admitted,rich_tracking_rejection_reason,skipped_due_to_budget,positive_outcome_label_if_later_known,high_positive_if_later_known,candidate_checkpoint_seen,replay_eligible,missed_good_token_classification,audit_reason\n",
+        )
+        .expect("missed audit");
         let report =
             validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
         assert_eq!(report["ok"], true);

@@ -53,6 +53,14 @@ DATASET_FIELDS = [
     "provider_blocker_count",
     "upstream_reconnect_count",
     "frames_received",
+    "all_launches_seen",
+    "all_launches_indexed",
+    "rich_tracked_launches",
+    "cheap_only_launches",
+    "skipped_due_budget",
+    "fast_dead_dropped",
+    "missed_good_token_count",
+    "tracking_slots_released",
     "attempted_launches",
     "unique_attempted_mints",
     "attempt_ledger_rows",
@@ -632,9 +640,13 @@ def inspect_run(run_dir: pathlib.Path, exporter: Any, batch_map: dict[str, str])
     r2 = read_json(run_dir / "r2_upload_result.json")
     retention = read_json(run_dir / "local_retention_summary.json")
     hunter = read_json(run_dir / "hunter_summary.json")
+    all_launch = read_json(run_dir / "all_launch_intake_summary.json")
     attempt_rows = read_csv(run_dir / "attempt_ledger.csv")
     rejected_rows = read_csv(run_dir / "rejected_summary.csv")
     candidate_rows = read_csv(run_dir / "candidate_summary.csv")
+    all_launch_rows = read_csv(run_dir / "all_launch_intake_ledger.csv")
+    rich_slot_rows = read_csv(run_dir / "rich_tracking_slot_ledger.csv")
+    missed_good_rows = read_csv(run_dir / "missed_good_token_audit.csv")
     segment_rows = read_csv(run_dir / "run_segment_summary.csv")
     segment_attempt_total = sum(int_or_zero(row.get("attempted_launches")) for row in segment_rows)
     segment_rejected_total = sum(int_or_zero(row.get("rejected_count")) for row in segment_rows)
@@ -692,6 +704,14 @@ def inspect_run(run_dir: pathlib.Path, exporter: Any, batch_map: dict[str, str])
         "r2_verified": r2_ok,
         "artifact_consistency_ok": artifact_ok,
         "frames_received": int_or_zero(proof.get("frames_received") or local.get("frames_received")),
+        "all_launches_seen": int_or_zero(all_launch.get("all_launches_seen")),
+        "all_launches_indexed": int_or_zero(all_launch.get("all_launches_indexed") or len(all_launch_rows)),
+        "rich_tracked_launches": int_or_zero(all_launch.get("rich_tracked_launches") or len(rich_slot_rows)),
+        "cheap_only_launches": int_or_zero(all_launch.get("cheap_only_launches")),
+        "skipped_due_budget": int_or_zero(all_launch.get("skipped_due_budget")),
+        "fast_dead_dropped": int_or_zero(all_launch.get("fast_dead_dropped")),
+        "missed_good_token_count": int_or_zero(all_launch.get("missed_good_token_count") or len([row for row in missed_good_rows if row.get("missed_good_token_classification") == "missed_due_to_budget"])),
+        "tracking_slots_released": int_or_zero(all_launch.get("tracking_slots_released")),
         "r2_uploaded": len(keys),
         "retention_deleted_bytes": int_or_zero(retention.get("deleted_bulk_bytes")),
         "local_retained_bytes": int_or_zero(retention.get("local_retained_bytes")),
@@ -2618,6 +2638,12 @@ def write_inventory_summary(output_dir: pathlib.Path, inventory: list[dict[str, 
         f"- Included slices: {len(included)}",
         f"- Excluded slices: {len(excluded)}",
         f"- Attempts in included slices: {sum(int_or_zero(row.get('attempt_ledger_rows')) for row in included)}",
+        f"- All launches indexed in included slices: {sum(int_or_zero(row.get('all_launches_indexed')) for row in included)}",
+        f"- Rich-tracked launches in included slices: {sum(int_or_zero(row.get('rich_tracked_launches')) for row in included)}",
+        f"- Cheap-only launches in included slices: {sum(int_or_zero(row.get('cheap_only_launches')) for row in included)}",
+        f"- Skipped due rich budget in included slices: {sum(int_or_zero(row.get('skipped_due_budget')) for row in included)}",
+        f"- Missed good-token audit count in included slices: {sum(int_or_zero(row.get('missed_good_token_count')) for row in included)}",
+        f"- Rich tracking slots released in included slices: {sum(int_or_zero(row.get('tracking_slots_released')) for row in included)}",
         f"- R2 verified included slices: {sum(1 for row in included if boolish(row.get('r2_verified')))}",
         f"- Artifact-consistent included slices: {sum(1 for row in included if boolish(row.get('artifact_consistency_ok')))}",
     ]

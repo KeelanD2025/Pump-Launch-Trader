@@ -1,0 +1,31 @@
+{
+  "schema_version": "phase107i.launch_admission_audit.v1",
+  "visible_launch_definition": "successful TokenCreated stream event detected by is_successful_launch_create",
+  "attempted_launch_definition": "Tier 3 rich-tracked mint written to attempt_ledger.csv",
+  "prior_max_attempted_launches_behavior": "enforced before attempt_ledger admission; capped launches could be absent from compact artifacts",
+  "new_max_attempted_launches_behavior": "applies to Tier 3 rich tracking only; Tier 1 all-launch intake is recorded first",
+  "all_launch_intake_artifacts": [
+    "all_launch_intake_ledger.csv",
+    "all_launch_intake_summary.json",
+    "all_launch_intake_summary.md"
+  ],
+  "rich_tracking_artifacts": [
+    "rich_tracking_slot_ledger.csv",
+    "rich_tracking_slot_summary.json",
+    "rich_tracking_slot_summary.md"
+  ],
+  "missed_good_token_artifacts": [
+    "missed_good_token_audit.csv",
+    "MISSED_GOOD_TOKEN_AUDIT.md"
+  ],
+  "capped_or_skipped_launches_recorded": true,
+  "skipped_launch_positive_audit_available": true,
+  "holder_rpc_used": false,
+  "rpc_mint_supply_canonical": false,
+  "replay_allowed": false,
+  "formal_backtesting_allowed": false,
+  "threshold_tuning_allowed": false,
+  "live_trading_enabled": false,
+  "vps_relay_mode_changed": false,
+  "artifact_consistency_requires_all_launch_ledger_for_counted_or_attempted_slices": true
+}
