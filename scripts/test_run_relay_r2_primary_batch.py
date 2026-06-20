@@ -144,6 +144,33 @@ class RelaySupervisorTests(unittest.TestCase):
             self.assertEqual(args.expected_latest_run_id, "material-candidate-hunter-stable")
             self.assertEqual(args.config_override, "config/local.relay.toml")
 
+    def test_parse_args_reads_relay_control_env_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "relay_control.env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "PUMP_RELAY_VPS_SSH_TARGET=ubuntu@example.invalid",
+                        "PUMP_RELAY_VPS_SSH_KEY=/tmp/relay-key",
+                        "PUMP_RELAY_REMOTE_APP_DIR=/srv/pump-launch-quant",
+                        "PUMP_RELAY_REMOTE_CONFIG=config/relay.local.toml",
+                        "PUMP_RELAY_REMOTE_HEALTH_ROOT=/run/user/1000/relay",
+                        "PUMP_RELAY_LOCAL_LISTEN_URL=tcp://127.0.0.1:19111",
+                        "PUMP_RELAY_REVERSE_TUNNEL_REMOTE=tcp://127.0.0.1:19112",
+                        "PUMP_RELAY_REVERSE_TUNNEL_LOCAL=tcp://127.0.0.1:19113",
+                    ]
+                )
+            )
+            with mock.patch.dict(relay_supervisor.os.environ, {}, clear=True):
+                args = relay_supervisor.parse_args(["proof", "--env-file", str(env_file)])
+            self.assertEqual(args.vps_ssh_target, "ubuntu@example.invalid")
+            self.assertEqual(str(args.ssh_key), "/tmp/relay-key")
+            self.assertEqual(args.vps_repo_dir, "/srv/pump-launch-quant")
+            self.assertEqual(args.vps_config_override, "config/relay.local.toml")
+            self.assertEqual(args.vps_health_root, "/run/user/1000/relay")
+            self.assertEqual(args.listen_url, "tcp://127.0.0.1:19113")
+            self.assertEqual(args.receiver_url, "tcp://127.0.0.1:19112")
+
     def test_survivor_extension_mode_defaults_disabled(self) -> None:
         with mock.patch.dict(
             relay_supervisor.os.environ,

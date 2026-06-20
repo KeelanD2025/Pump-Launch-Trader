@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 REPO = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPO / "research_output" / "local_stream_collector"
 DEFAULT_LOG_ROOT = pathlib.Path(tempfile.gettempdir()) / "pump_relay_r2_primary_batch"
+DEFAULT_RELAY_CONTROL_ENV = REPO / ".codex_runtime_env" / "relay_control.env"
 DEFAULT_COLLECTION_JUSTIFICATION_PATH = (
     REPO
     / "research_output"
@@ -1290,6 +1291,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     args.command = command
+    if args.env_file is None and DEFAULT_RELAY_CONTROL_ENV.exists():
+        args.env_file = DEFAULT_RELAY_CONTROL_ENV
     env_file_defaults: dict[str, str] = {}
     if args.env_file is not None:
         try:
@@ -1298,12 +1301,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error(str(exc))
     if not args.vps_ssh_target:
         args.vps_ssh_target = env_file_defaults.get("PUMP_RELAY_VPS_SSH_TARGET", "")
-    if args.ssh_key is None and env_file_defaults.get("PUMP_RELAY_SSH_KEY"):
-        args.ssh_key = pathlib.Path(env_file_defaults["PUMP_RELAY_SSH_KEY"])
+    ssh_key_default = env_file_defaults.get("PUMP_RELAY_VPS_SSH_KEY") or env_file_defaults.get("PUMP_RELAY_SSH_KEY")
+    if args.ssh_key is None and ssh_key_default:
+        args.ssh_key = pathlib.Path(ssh_key_default)
     if not args.expected_latest_run_id:
         args.expected_latest_run_id = env_file_defaults.get("EXPECTED_MATERIAL_LATEST_RUN_ID", "")
-    if args.vps_health_root == "/run/user/1000" and env_file_defaults.get("PUMP_RELAY_VPS_HEALTH_ROOT"):
-        args.vps_health_root = env_file_defaults["PUMP_RELAY_VPS_HEALTH_ROOT"]
+    remote_health_root = env_file_defaults.get("PUMP_RELAY_REMOTE_HEALTH_ROOT") or env_file_defaults.get(
+        "PUMP_RELAY_VPS_HEALTH_ROOT"
+    )
+    if args.vps_health_root == "/run/user/1000" and remote_health_root:
+        args.vps_health_root = remote_health_root
+    if args.vps_repo_dir == "/home/ubuntu/pump-launch-quant" and env_file_defaults.get("PUMP_RELAY_REMOTE_APP_DIR"):
+        args.vps_repo_dir = env_file_defaults["PUMP_RELAY_REMOTE_APP_DIR"]
+    if args.vps_config_override == "config/local.toml" and env_file_defaults.get("PUMP_RELAY_REMOTE_CONFIG"):
+        args.vps_config_override = env_file_defaults["PUMP_RELAY_REMOTE_CONFIG"]
+    if args.listen_url == "tcp://127.0.0.1:19097":
+        args.listen_url = (
+            env_file_defaults.get("PUMP_RELAY_REVERSE_TUNNEL_LOCAL")
+            or env_file_defaults.get("PUMP_RELAY_LOCAL_LISTEN_URL")
+            or args.listen_url
+        )
+    if args.receiver_url == "tcp://127.0.0.1:19097":
+        args.receiver_url = env_file_defaults.get("PUMP_RELAY_REVERSE_TUNNEL_REMOTE") or args.receiver_url
     if args.config_override == "config/local.example.toml" and env_file_defaults.get("CONFIG_OVERRIDE"):
         args.config_override = env_file_defaults["CONFIG_OVERRIDE"]
     if command == "proof":
