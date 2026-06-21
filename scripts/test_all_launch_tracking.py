@@ -35,10 +35,17 @@ class AllLaunchTrackingTests(unittest.TestCase):
             "rich_tracking_slot_ledger.csv",
             "rich_tracking_slot_summary.json",
             "missed_good_token_audit.csv",
+            "all_launch_followup_manifest.json",
+            "all_launch_followup_summary.md",
+            "promotion_queue_ledger.csv",
+            "promotion_queue_summary.json",
+            "missed_good_token_audit_v2.csv",
         ):
             self.assertIn(required, source)
         self.assertIn("max_attempted_launches_applies_to", source)
         self.assertIn("tier_3_rich_tracking_not_tier_1_visibility", source)
+        self.assertIn("max_attempted_launches_semantics", source)
+        self.assertIn("visible launch intake and cheap follow-up are separate", source)
 
     def test_supervisor_rollup_surfaces_all_launch_counts(self) -> None:
         source = SUPERVISOR.read_text()
@@ -48,6 +55,10 @@ class AllLaunchTrackingTests(unittest.TestCase):
             "cheap_only_launches",
             "skipped_due_budget",
             "missed_good_token_count",
+            "cheap_followup_rows",
+            "promotion_recommended_count",
+            "promotion_admitted_count",
+            "promotion_blocked_budget_count",
         ):
             self.assertIn(field, source)
 
@@ -59,8 +70,25 @@ class AllLaunchTrackingTests(unittest.TestCase):
             "cheap_only_launches",
             "skipped_due_budget",
             "tracking_slots_released",
+            "cheap_followup_rows",
+            "promotion_recommended_count",
+            "promotion_admitted_count",
+            "promotion_blocked_budget_count",
         ):
             self.assertIn(field, source)
+
+    def test_cli_preserves_followup_safety_invariants(self) -> None:
+        source = CLI_MAIN.read_text()
+        for invariant in (
+            "all_launch_followup_replay_eligible",
+            "all_launch_followup_row_safety_flag_enabled",
+            "missed_good_token_audit_v2_replay_eligible",
+            "holder_rpc_used",
+            "rpc_mint_supply_canonical",
+            "threshold_tuning_allowed",
+            "live_trading_enabled",
+        ):
+            self.assertIn(invariant, source)
 
 
 if __name__ == "__main__":

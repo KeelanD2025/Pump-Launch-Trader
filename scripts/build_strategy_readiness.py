@@ -61,6 +61,10 @@ DATASET_FIELDS = [
     "fast_dead_dropped",
     "missed_good_token_count",
     "tracking_slots_released",
+    "cheap_followup_rows",
+    "promotion_recommended_count",
+    "promotion_admitted_count",
+    "promotion_blocked_budget_count",
     "attempted_launches",
     "unique_attempted_mints",
     "attempt_ledger_rows",
@@ -647,6 +651,8 @@ def inspect_run(run_dir: pathlib.Path, exporter: Any, batch_map: dict[str, str])
     all_launch_rows = read_csv(run_dir / "all_launch_intake_ledger.csv")
     rich_slot_rows = read_csv(run_dir / "rich_tracking_slot_ledger.csv")
     missed_good_rows = read_csv(run_dir / "missed_good_token_audit.csv")
+    followup_manifest = read_json(run_dir / "all_launch_followup_manifest.json")
+    promotion_summary = read_json(run_dir / "promotion_queue_summary.json")
     segment_rows = read_csv(run_dir / "run_segment_summary.csv")
     segment_attempt_total = sum(int_or_zero(row.get("attempted_launches")) for row in segment_rows)
     segment_rejected_total = sum(int_or_zero(row.get("rejected_count")) for row in segment_rows)
@@ -712,6 +718,10 @@ def inspect_run(run_dir: pathlib.Path, exporter: Any, batch_map: dict[str, str])
         "fast_dead_dropped": int_or_zero(all_launch.get("fast_dead_dropped")),
         "missed_good_token_count": int_or_zero(all_launch.get("missed_good_token_count") or len([row for row in missed_good_rows if row.get("missed_good_token_classification") == "missed_due_to_budget"])),
         "tracking_slots_released": int_or_zero(all_launch.get("tracking_slots_released")),
+        "cheap_followup_rows": int_or_zero(followup_manifest.get("total_rows")),
+        "promotion_recommended_count": int_or_zero(promotion_summary.get("promotion_recommended_count")),
+        "promotion_admitted_count": int_or_zero(promotion_summary.get("promotion_admitted_count")),
+        "promotion_blocked_budget_count": int_or_zero(promotion_summary.get("promotion_blocked_budget_count")),
         "r2_uploaded": len(keys),
         "retention_deleted_bytes": int_or_zero(retention.get("deleted_bulk_bytes")),
         "local_retained_bytes": int_or_zero(retention.get("local_retained_bytes")),
@@ -2644,6 +2654,10 @@ def write_inventory_summary(output_dir: pathlib.Path, inventory: list[dict[str, 
         f"- Skipped due rich budget in included slices: {sum(int_or_zero(row.get('skipped_due_budget')) for row in included)}",
         f"- Missed good-token audit count in included slices: {sum(int_or_zero(row.get('missed_good_token_count')) for row in included)}",
         f"- Rich tracking slots released in included slices: {sum(int_or_zero(row.get('tracking_slots_released')) for row in included)}",
+        f"- Cheap follow-up rows in included slices: {sum(int_or_zero(row.get('cheap_followup_rows')) for row in included)}",
+        f"- Promotion recommendations in included slices: {sum(int_or_zero(row.get('promotion_recommended_count')) for row in included)}",
+        f"- Promotion admissions in included slices: {sum(int_or_zero(row.get('promotion_admitted_count')) for row in included)}",
+        f"- Promotion blocked by budget in included slices: {sum(int_or_zero(row.get('promotion_blocked_budget_count')) for row in included)}",
         f"- R2 verified included slices: {sum(1 for row in included if boolish(row.get('r2_verified')))}",
         f"- Artifact-consistent included slices: {sum(1 for row in included if boolish(row.get('artifact_consistency_ok')))}",
     ]

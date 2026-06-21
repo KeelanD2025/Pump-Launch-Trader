@@ -41279,7 +41279,15 @@ async fn material_candidate_hunter_command_with_connector(
     let mut all_launch_rows = Vec::<serde_json::Value>::new();
     let mut all_launch_seen_mints = BTreeSet::<String>::new();
     let mut cheap_launch_events = BTreeMap::<String, NormalizedEvent>::new();
+    let mut cheap_followup_events = BTreeMap::<String, Vec<NormalizedEvent>>::new();
+    let mut cheap_followup_tracked_mints = BTreeSet::<String>::new();
+    let mut cheap_followup_rows = Vec::<serde_json::Value>::new();
+    let mut cheap_followup_emitted = BTreeSet::<String>::new();
+    let mut promotion_queue_rows = Vec::<serde_json::Value>::new();
     let mut rich_slot_rows = Vec::<serde_json::Value>::new();
+    let mut rich_promotion_admitted_at = Vec::<OffsetDateTime>::new();
+    let tracking_budgets =
+        phase107k_tracking_budgets(max_attempted_launches, max_concurrent_tracked_mints);
     let mut candidates_300 = 0u64;
     let mut candidates_900 = 0u64;
     let mut candidates_1800 = 0u64;
@@ -41307,6 +41315,14 @@ async fn material_candidate_hunter_command_with_connector(
         &rich_slot_rows,
         max_attempted_launches,
         max_concurrent_tracked_mints,
+    )?;
+    phase107k_write_followup_and_promotion_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_rows,
+        &promotion_queue_rows,
+        tracking_budgets,
     )?;
     phase107f_write_health(
         &health_dir,
@@ -41445,6 +41461,30 @@ async fn material_candidate_hunter_command_with_connector(
                 ) else {
                     return Ok(MaterialHunterStreamAction::Continue);
                 };
+                if cheap_followup_tracked_mints.contains(&mint)
+                    || cheap_followup_tracked_mints.len()
+                        < tracking_budgets.max_cheap_followup_mints_per_slice
+                {
+                    cheap_followup_tracked_mints.insert(mint.clone());
+                    cheap_followup_events
+                        .entry(mint.clone())
+                        .or_default()
+                        .push(event.clone());
+                    phase107k_emit_followup_rows_for_mint(
+                        loaded,
+                        &run_id,
+                        current_segment_id,
+                        &mint,
+                        cheap_followup_events
+                            .get(&mint)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        &all_launch_rows,
+                        &mut cheap_followup_rows,
+                        &mut cheap_followup_emitted,
+                        false,
+                    )?;
+                }
                 let already_finalized = finalized_mints.contains(&mint);
                 let already_active = active_mints.contains_key(&mint);
                 if already_finalized {
@@ -41465,12 +41505,26 @@ async fn material_candidate_hunter_command_with_connector(
                         false,
                         false,
                     );
-                } else if attempt_rows.len() >= max_attempted_launches.max(1) {
+                } else if attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice {
                     cheap_launch_events.insert(mint.clone(), event.clone());
                     phase107i_mark_rich_tracking_rejected(
                         &mut all_launch_rows,
                         &mint,
-                        "max_rich_attempt_budget_reached",
+                        "max_rich_promotions_reached",
+                        true,
+                        false,
+                        false,
+                    );
+                } else if phase107k_recent_rich_promotions(
+                    &rich_promotion_admitted_at,
+                    event.meta.received_at_wall_time,
+                ) >= tracking_budgets.max_rich_promotions_per_minute
+                {
+                    cheap_launch_events.insert(mint.clone(), event.clone());
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "max_rich_promotions_per_minute_reached",
                         true,
                         false,
                         false,
@@ -41520,6 +41574,7 @@ async fn material_candidate_hunter_command_with_connector(
                         event_received_ts(&event),
                         "live_launch_rich_slot_available",
                     );
+                    rich_promotion_admitted_at.push(event.meta.received_at_wall_time);
                     cheap_launch_events.remove(&mint);
                     phase107b_write_incremental_checkpoint(
                         &output_dir,
@@ -41537,16 +41592,91 @@ async fn material_candidate_hunter_command_with_connector(
                         max_attempted_launches,
                         max_concurrent_tracked_mints,
                     )?;
+                    phase107k_write_followup_and_promotion_artifacts(
+                        &output_dir,
+                        &run_id,
+                        &all_launch_rows,
+                        &cheap_followup_rows,
+                        &promotion_queue_rows,
+                        tracking_budgets,
+                    )?;
                 }
             } else if let Some(mint) = event_mint_string(&event) {
+                if let Some(events) = cheap_followup_events.get_mut(&mint) {
+                    events.push(event.clone());
+                }
+                if cheap_followup_events.contains_key(&mint) {
+                    phase107k_emit_followup_rows_for_mint(
+                        loaded,
+                        &run_id,
+                        current_segment_id,
+                        &mint,
+                        cheap_followup_events
+                            .get(&mint)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        &all_launch_rows,
+                        &mut cheap_followup_rows,
+                        &mut cheap_followup_emitted,
+                        false,
+                    )?;
+                }
                 if cheap_launch_events.contains_key(&mint)
                     && !finalized_mints.contains(&mint)
                     && !active_mints.contains_key(&mint)
-                    && attempt_rows.len() < max_attempted_launches.max(1)
-                    && active_mints.len() < max_concurrent_tracked_mints
                 {
                     if let Some(promotion_reason) = phase107i_promotion_reason_for_event(&event) {
-                        if let Some(create) = cheap_launch_events.remove(&mint) {
+                        let launch_row = phase107k_all_launch_row(&all_launch_rows, &mint)
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let promotion_horizon = cheap_followup_rows
+                            .iter()
+                            .rev()
+                            .find(|row| {
+                                row["mint"].as_str() == Some(mint.as_str())
+                                    && phase107k_row_truthy(row, "promotion_recommended")
+                            })
+                            .and_then(|row| row["horizon_seconds"].as_u64())
+                            .unwrap_or(0);
+                        let promotion_blocker =
+                            if attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
+                            {
+                                "max_rich_promotions_reached"
+                            } else if phase107k_recent_rich_promotions(
+                                &rich_promotion_admitted_at,
+                                event.meta.received_at_wall_time,
+                            ) >= tracking_budgets.max_rich_promotions_per_minute
+                            {
+                                "max_rich_promotions_per_minute_reached"
+                            } else if active_mints.len() >= max_concurrent_tracked_mints {
+                                "rich_budget_full"
+                            } else {
+                                ""
+                            };
+                        if !promotion_blocker.is_empty() {
+                            phase107k_record_promotion_queue(
+                                &mut promotion_queue_rows,
+                                &run_id,
+                                current_segment_id,
+                                &mint,
+                                &launch_row,
+                                promotion_horizon,
+                                promotion_reason,
+                                "blocked",
+                                promotion_blocker,
+                                active_mints.len(),
+                                attempt_rows.len(),
+                                tracking_budgets,
+                            );
+                            phase107i_mark_rich_tracking_rejected(
+                                &mut all_launch_rows,
+                                &mint,
+                                promotion_blocker,
+                                true,
+                                false,
+                                false,
+                            );
+                        } else if let Some(create) = cheap_launch_events.remove(&mint) {
                             let attempt_index = attempt_rows.len() + 1;
                             stream_state_hint.active_mints.push(mint.clone());
                             active_mints.insert(
@@ -41584,6 +41714,21 @@ async fn material_candidate_hunter_command_with_connector(
                                 event_received_ts(&event),
                                 promotion_reason,
                             );
+                            rich_promotion_admitted_at.push(event.meta.received_at_wall_time);
+                            phase107k_record_promotion_queue(
+                                &mut promotion_queue_rows,
+                                &run_id,
+                                current_segment_id,
+                                &mint,
+                                &launch_row,
+                                promotion_horizon,
+                                promotion_reason,
+                                "admitted_to_rich_tracking",
+                                "",
+                                active_mints.len(),
+                                attempt_rows.len(),
+                                tracking_budgets,
+                            );
                             phase107b_write_incremental_checkpoint(
                                 &output_dir,
                                 &run_id,
@@ -41599,6 +41744,14 @@ async fn material_candidate_hunter_command_with_connector(
                                 &rich_slot_rows,
                                 max_attempted_launches,
                                 max_concurrent_tracked_mints,
+                            )?;
+                            phase107k_write_followup_and_promotion_artifacts(
+                                &output_dir,
+                                &run_id,
+                                &all_launch_rows,
+                                &cheap_followup_rows,
+                                &promotion_queue_rows,
+                                tracking_budgets,
                             )?;
                         }
                     }
@@ -41820,6 +41973,14 @@ async fn material_candidate_hunter_command_with_connector(
                 max_attempted_launches,
                 max_concurrent_tracked_mints,
             )?;
+            phase107k_write_followup_and_promotion_artifacts(
+                &output_dir,
+                &run_id,
+                &all_launch_rows,
+                &cheap_followup_rows,
+                &promotion_queue_rows,
+                tracking_budgets,
+            )?;
             if upload_r2 {
                 let due = last_r2_checkpoint_for_events
                     .lock()
@@ -41851,7 +42012,8 @@ async fn material_candidate_hunter_command_with_connector(
                 candidates_300
             } as usize;
             if candidate_total >= target_material_candidates
-                || (attempt_rows.len() >= max_attempted_launches.max(1) && active_mints.is_empty())
+                || (attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
+                    && active_mints.is_empty())
             {
                 return Ok(MaterialHunterStreamAction::Stop);
             }
@@ -42120,6 +42282,14 @@ async fn material_candidate_hunter_command_with_connector(
             max_attempted_launches,
             max_concurrent_tracked_mints,
         )?;
+        phase107k_write_followup_and_promotion_artifacts(
+            &output_dir,
+            &run_id,
+            &all_launch_rows,
+            &cheap_followup_rows,
+            &promotion_queue_rows,
+            tracking_budgets,
+        )?;
         if provider_blocked_run {
             for row in &mut candidate_rows {
                 if phase107f_row_segment_id(row) == current_segment_id {
@@ -42236,7 +42406,7 @@ async fn material_candidate_hunter_command_with_connector(
         let reconnect_allowed = provider_blocked_run
             && !interrupted.load(Ordering::SeqCst)
             && run_started_at.elapsed().as_secs() < duration_seconds
-            && attempt_rows.len() < max_attempted_launches.max(1)
+            && attempt_rows.len() < tracking_budgets.max_rich_promotions_per_slice
             && target_candidate_total < target_material_candidates
             && stream_summary.provider_blocker_class.as_deref() != Some("stream_runtime_error")
             && stream_summary.provider_blocker_class.as_deref()
@@ -42382,11 +42552,31 @@ async fn material_candidate_hunter_command_with_connector(
         max_attempted_launches,
         max_concurrent_tracked_mints,
     )?;
+    phase107k_backfill_followup_rows(
+        loaded,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_events,
+        &mut cheap_followup_rows,
+        &mut cheap_followup_emitted,
+    )?;
+    phase107k_write_followup_and_promotion_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_rows,
+        &promotion_queue_rows,
+        tracking_budgets,
+    )?;
     phase107h_write_asof_alpha_artifacts(&output_dir, &asof_alpha_rows)?;
 
     let attempted_launches = attempt_rows.len() as u64;
     let all_launch_summary =
         read_json_file_or_empty(&output_dir.join("all_launch_intake_summary.json"));
+    let followup_manifest =
+        read_json_file_or_empty(&output_dir.join("all_launch_followup_manifest.json"));
+    let promotion_summary =
+        read_json_file_or_empty(&output_dir.join("promotion_queue_summary.json"));
     let (candidate_checkpoint_count, _replay_eligible_candidate_count) =
         phase107b_candidate_counts(&candidate_rows);
     let segment_count = segment_records.len() as u64;
@@ -42442,6 +42632,12 @@ async fn material_candidate_hunter_command_with_connector(
         "missed_good_token_count": all_launch_summary["missed_good_token_count"].as_u64().unwrap_or(0),
         "tracking_slots_released": all_launch_summary["tracking_slots_released"].as_u64().unwrap_or(0),
         "rich_slot_turnover_rate": all_launch_summary["rich_slot_turnover_rate"].clone(),
+        "cheap_followup_rows": followup_manifest["total_rows"].as_u64().unwrap_or(0),
+        "cheap_followup_horizon_coverage": followup_manifest["followup_tables"].clone(),
+        "promotion_recommended_count": promotion_summary["promotion_recommended_count"].as_u64().unwrap_or(0),
+        "promotion_admitted_count": promotion_summary["promotion_admitted_count"].as_u64().unwrap_or(0),
+        "promotion_blocked_budget_count": promotion_summary["promotion_blocked_budget_count"].as_u64().unwrap_or(0),
+        "tracking_budgets": phase107k_budget_summary(tracking_budgets),
         "rejected_dead_count": rejected_dead,
         "rejected_inconclusive_count": rejected_inconclusive,
         "rejected_before_60s_count": rejected_rows.iter().filter(|row| row["stop_tracking_at_seconds"].as_u64().unwrap_or(0) <= 60).count(),
@@ -42460,6 +42656,11 @@ async fn material_candidate_hunter_command_with_connector(
         "affected_mints_at_gaps": affected_mints_at_gaps,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "cheap_followup_rows": followup_manifest["total_rows"].as_u64().unwrap_or(0),
+        "promotion_recommended_count": promotion_summary["promotion_recommended_count"].as_u64().unwrap_or(0),
+        "promotion_admitted_count": promotion_summary["promotion_admitted_count"].as_u64().unwrap_or(0),
+        "promotion_blocked_budget_count": promotion_summary["promotion_blocked_budget_count"].as_u64().unwrap_or(0),
+        "tracking_budgets": phase107k_budget_summary(tracking_budgets),
         "asof_alpha_feature_rows": asof_alpha_rows.len(),
         "asof_alpha_feature_manifest_exists": output_dir.join("asof_alpha_features").join("asof_alpha_feature_manifest.json").exists(),
         "target_material_candidates": target_material_candidates,
@@ -42927,6 +43128,86 @@ const PHASE107I_MISSED_GOOD_TOKEN_AUDIT_FIELDS: &[&str] = &[
     "audit_reason",
 ];
 
+const PHASE107K_ALL_LAUNCH_FOLLOWUP_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "mint",
+    "launch_seen_at",
+    "horizon_seconds",
+    "horizon_reached",
+    "cheap_followup_status",
+    "data_quality_exclusion",
+    "trade_update_count",
+    "buy_sell_delta_proxy",
+    "volume_followthrough_proxy",
+    "holder_growth_proxy",
+    "holder_concentration_risk_proxy",
+    "dev_or_creator_holding_risk_proxy",
+    "vault_curve_progress_proxy",
+    "liquidity_exit_proxy",
+    "high_throughput_flag",
+    "degraded_audit_only",
+    "tombstoned_before_horizon",
+    "fast_dead_reason",
+    "promotion_recommended",
+    "promotion_reason_codes",
+    "rich_tracking_admitted",
+    "rich_tracking_rejection_reason",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "holder_rpc_used",
+    "rpc_mint_supply_canonical",
+    "threshold_tuning_allowed",
+    "live_trading_enabled",
+];
+
+const PHASE107K_PROMOTION_QUEUE_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "mint",
+    "launch_seen_at",
+    "horizon_seconds",
+    "promotion_seen_at",
+    "promotion_recommended",
+    "promotion_reason_codes",
+    "promotion_status",
+    "promotion_blocker",
+    "rich_tracking_admitted",
+    "rich_tracking_rejection_reason",
+    "active_rich_mints_at_decision",
+    "max_rich_active_mints",
+    "rich_admissions_so_far",
+    "max_rich_promotions_per_slice",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "audit_only",
+];
+
+const PHASE107K_MISSED_GOOD_TOKEN_AUDIT_V2_FIELDS: &[&str] = &[
+    "run_id",
+    "slice_id",
+    "segment_id",
+    "mint",
+    "rich_tracking_admitted",
+    "rich_tracking_rejection_reason",
+    "skipped_due_to_budget",
+    "followup_row_count",
+    "horizons_reached",
+    "promotion_recommended",
+    "promotion_admitted",
+    "promotion_blocked_budget",
+    "positive_outcome_label_if_later_known",
+    "high_positive_if_later_known",
+    "candidate_checkpoint_seen",
+    "replay_eligible",
+    "missed_good_token_classification_v2",
+    "audit_reason",
+];
+
 const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 7] = [5, 10, 30, 60, 120, 300, 900];
 
 const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
@@ -43305,6 +43586,588 @@ fn phase107i_bool_count(rows: &[serde_json::Value], key: &str) -> u64 {
         .count() as u64
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Phase107kTrackingBudgets {
+    max_visible_launch_intake_per_slice: usize,
+    max_cheap_followup_mints_per_slice: usize,
+    max_watch_mints_per_slice: usize,
+    max_rich_active_mints: usize,
+    max_rich_promotions_per_slice: usize,
+    max_rich_promotions_per_minute: usize,
+}
+
+fn phase107k_tracking_budgets(
+    max_attempted_launches: usize,
+    max_concurrent_tracked_mints: usize,
+) -> Phase107kTrackingBudgets {
+    let max_rich_active_mints = max_concurrent_tracked_mints.max(1);
+    let base_rich_budget = max_attempted_launches.max(1);
+    Phase107kTrackingBudgets {
+        max_visible_launch_intake_per_slice: usize::MAX,
+        max_cheap_followup_mints_per_slice: base_rich_budget.saturating_mul(200).max(2_000),
+        max_watch_mints_per_slice: base_rich_budget.saturating_mul(20).max(200),
+        max_rich_active_mints,
+        max_rich_promotions_per_slice: base_rich_budget
+            .saturating_mul(max_rich_active_mints)
+            .max(base_rich_budget),
+        max_rich_promotions_per_minute: max_rich_active_mints.saturating_mul(6).max(6),
+    }
+}
+
+fn phase107k_budget_summary(budgets: Phase107kTrackingBudgets) -> serde_json::Value {
+    json!({
+        "max_visible_launch_intake_per_slice": if budgets.max_visible_launch_intake_per_slice == usize::MAX {
+            serde_json::Value::String("unbounded_stream_visible_launches".to_owned())
+        } else {
+            json!(budgets.max_visible_launch_intake_per_slice)
+        },
+        "max_cheap_followup_mints_per_slice": budgets.max_cheap_followup_mints_per_slice,
+        "max_watch_mints_per_slice": budgets.max_watch_mints_per_slice,
+        "max_rich_active_mints": budgets.max_rich_active_mints,
+        "max_rich_promotions_per_slice": budgets.max_rich_promotions_per_slice,
+        "max_rich_promotions_per_minute": budgets.max_rich_promotions_per_minute,
+        "max_attempted_launches_semantics": "legacy input retained as base rich promotion budget; visible launch intake and cheap follow-up are separate",
+    })
+}
+
+fn phase107k_recent_rich_promotions(admitted_at: &[OffsetDateTime], now: OffsetDateTime) -> usize {
+    admitted_at
+        .iter()
+        .filter(|admitted| {
+            let age = now - **admitted;
+            age.whole_seconds() >= 0 && age.whole_seconds() < 60
+        })
+        .count()
+}
+
+fn phase107k_json_u64(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().map(|item| item.max(0) as u64))
+        .or_else(|| value.as_str().and_then(|item| item.parse::<u64>().ok()))
+        .unwrap_or(0)
+}
+
+fn phase107k_json_i64(value: &serde_json::Value) -> i64 {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|item| item as i64))
+        .or_else(|| value.as_str().and_then(|item| item.parse::<i64>().ok()))
+        .unwrap_or(0)
+}
+
+fn phase107k_json_truthy(value: &serde_json::Value) -> bool {
+    value.as_bool().unwrap_or_else(|| {
+        value
+            .as_str()
+            .map(|item| item.eq_ignore_ascii_case("true") || item == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn phase107k_row_truthy(row: &serde_json::Value, key: &str) -> bool {
+    phase107k_json_truthy(row.get(key).unwrap_or(&serde_json::Value::Null))
+}
+
+fn phase107k_row_string(row: &serde_json::Value, key: &str) -> String {
+    row.get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn phase107k_followup_key(mint: &str, horizon: u64) -> String {
+    format!("{mint}|{horizon}")
+}
+
+fn phase107k_all_launch_row<'a>(
+    rows: &'a [serde_json::Value],
+    mint: &str,
+) -> Option<&'a serde_json::Value> {
+    rows.iter().find(|row| row["mint"].as_str() == Some(mint))
+}
+
+fn phase107k_followup_reason_codes(asof: &serde_json::Value) -> Vec<String> {
+    let mut reasons = BTreeSet::<String>::new();
+    if !phase107k_row_truthy(asof, "horizon_reached") {
+        reasons.insert("insufficient_followup".to_owned());
+    }
+    if phase107k_row_truthy(asof, "data_quality_exclusion") {
+        reasons.insert("data_quality_excluded".to_owned());
+    }
+    if phase107k_row_truthy(asof, "high_throughput_before_horizon") {
+        reasons.insert("clean_high_throughput_watch".to_owned());
+    }
+    if phase107k_json_u64(&asof["trade_update_count_asof"]) > 0 {
+        reasons.insert("early_volume_followthrough".to_owned());
+    }
+    if phase107k_json_i64(&asof["net_buy_sell_delta_asof"]) > 0 {
+        reasons.insert("early_buy_sell_followthrough".to_owned());
+        reasons.insert("low_adverse_sell_pressure".to_owned());
+    }
+    if phase107k_json_u64(&asof["new_holder_count_delta_asof"]) > 0
+        || phase107k_json_u64(&asof["holder_update_count_asof"]) > 0
+    {
+        reasons.insert("early_holder_growth".to_owned());
+    }
+    if phase107k_json_u64(&asof["bonding_curve_update_count_asof"]) > 0
+        || !asof["curve_progress_proxy_asof"].is_null()
+    {
+        reasons.insert("early_curve_progress".to_owned());
+    }
+    reasons.into_iter().collect()
+}
+
+fn phase107k_followup_row_from_asof(
+    run_id: &str,
+    segment_id: usize,
+    mint: &str,
+    launch: &serde_json::Value,
+    asof: &serde_json::Value,
+) -> serde_json::Value {
+    let reasons = phase107k_followup_reason_codes(asof);
+    let promotion_recommended = phase107k_row_truthy(asof, "horizon_reached")
+        && !phase107k_row_truthy(asof, "data_quality_exclusion")
+        && reasons.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "early_curve_progress"
+                    | "early_buy_sell_followthrough"
+                    | "early_volume_followthrough"
+                    | "early_holder_growth"
+                    | "low_adverse_sell_pressure"
+                    | "clean_high_throughput_watch"
+            )
+        });
+    json!({
+        "run_id": run_id,
+        "slice_id": run_id,
+        "segment_id": segment_id,
+        "relay_session_id": launch["relay_session_id"].clone(),
+        "mint": mint,
+        "launch_seen_at": launch["launch_seen_at"].clone(),
+        "horizon_seconds": asof["horizon_seconds"].clone(),
+        "horizon_reached": asof["horizon_reached"].clone(),
+        "cheap_followup_status": if phase107k_row_truthy(asof, "horizon_reached") { "snapshot_recorded" } else { "horizon_not_reached" },
+        "data_quality_exclusion": asof["data_quality_exclusion"].clone(),
+        "trade_update_count": asof["trade_update_count_asof"].clone(),
+        "buy_sell_delta_proxy": asof["net_buy_sell_delta_asof"].clone(),
+        "volume_followthrough_proxy": asof["volume_delta_asof"].clone(),
+        "holder_growth_proxy": asof["new_holder_count_delta_asof"].clone(),
+        "holder_concentration_risk_proxy": asof["top_holder_concentration_asof"].clone(),
+        "dev_or_creator_holding_risk_proxy": asof["dev_or_creator_holding_proxy_asof"].clone(),
+        "vault_curve_progress_proxy": asof["curve_progress_proxy_asof"].clone(),
+        "liquidity_exit_proxy": asof["liquidity_exit_proxy_asof"].clone(),
+        "high_throughput_flag": asof["high_throughput_before_horizon"].clone(),
+        "degraded_audit_only": asof["degraded_audit_only_before_horizon"].clone(),
+        "tombstoned_before_horizon": launch["tombstone_written"].clone(),
+        "fast_dead_reason": launch["fast_dead_reason"].clone(),
+        "promotion_recommended": promotion_recommended,
+        "promotion_reason_codes": reasons.join("|"),
+        "rich_tracking_admitted": launch["rich_tracking_admitted"].clone(),
+        "rich_tracking_rejection_reason": launch["rich_tracking_rejection_reason"].clone(),
+        "candidate_checkpoint_seen": false,
+        "replay_eligible": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+    })
+}
+
+fn phase107k_emit_followup_rows_for_mint(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    current_segment_id: usize,
+    mint: &str,
+    events: &[NormalizedEvent],
+    all_launch_rows: &[serde_json::Value],
+    followup_rows: &mut Vec<serde_json::Value>,
+    emitted: &mut BTreeSet<String>,
+    include_unreached: bool,
+) -> Result<()> {
+    let Some(create) = events.first() else {
+        return Ok(());
+    };
+    let Some(launch) = phase107k_all_launch_row(all_launch_rows, mint) else {
+        return Ok(());
+    };
+    let observed_horizon_seconds = events
+        .iter()
+        .map(|event| {
+            (event.meta.received_at_wall_time - create.meta.received_at_wall_time)
+                .whole_seconds()
+                .max(0) as u64
+        })
+        .max()
+        .unwrap_or(0);
+    let asof_rows = phase107h_build_asof_alpha_rows(
+        loaded,
+        run_id,
+        mint,
+        create,
+        events,
+        observed_horizon_seconds,
+        &[],
+    )?;
+    for asof in asof_rows {
+        let horizon = asof["horizon_seconds"].as_u64().unwrap_or(0);
+        if horizon == 0 {
+            continue;
+        }
+        let reached = phase107k_row_truthy(&asof, "horizon_reached");
+        if !include_unreached && !reached {
+            continue;
+        }
+        let key = phase107k_followup_key(mint, horizon);
+        if emitted.insert(key) {
+            followup_rows.push(phase107k_followup_row_from_asof(
+                run_id,
+                current_segment_id,
+                mint,
+                launch,
+                &asof,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn phase107k_backfill_followup_rows(
+    loaded: &LoadedConfig,
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+    followup_events: &BTreeMap<String, Vec<NormalizedEvent>>,
+    followup_rows: &mut Vec<serde_json::Value>,
+    emitted: &mut BTreeSet<String>,
+) -> Result<()> {
+    for row in all_launch_rows {
+        let Some(mint) = row["mint"].as_str() else {
+            continue;
+        };
+        let Some(events) = followup_events.get(mint) else {
+            continue;
+        };
+        let segment_id = row["segment_id"].as_u64().unwrap_or(1) as usize;
+        phase107k_emit_followup_rows_for_mint(
+            loaded,
+            run_id,
+            segment_id,
+            mint,
+            events,
+            all_launch_rows,
+            followup_rows,
+            emitted,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn phase107k_record_promotion_queue(
+    promotion_queue_rows: &mut Vec<serde_json::Value>,
+    run_id: &str,
+    current_segment_id: usize,
+    mint: &str,
+    launch: &serde_json::Value,
+    horizon: u64,
+    reason_codes: &str,
+    promotion_status: &str,
+    promotion_blocker: &str,
+    active_rich_mints_at_decision: usize,
+    rich_admissions_so_far: usize,
+    budgets: Phase107kTrackingBudgets,
+) {
+    let already_recorded = promotion_queue_rows.iter().any(|row| {
+        row["mint"].as_str() == Some(mint)
+            && row["horizon_seconds"].as_u64() == Some(horizon)
+            && row["promotion_status"].as_str() == Some(promotion_status)
+    });
+    if already_recorded {
+        return;
+    }
+    promotion_queue_rows.push(json!({
+        "run_id": run_id,
+        "slice_id": run_id,
+        "segment_id": current_segment_id,
+        "relay_session_id": launch["relay_session_id"].clone(),
+        "mint": mint,
+        "launch_seen_at": launch["launch_seen_at"].clone(),
+        "horizon_seconds": horizon,
+        "promotion_seen_at": OffsetDateTime::now_utc(),
+        "promotion_recommended": true,
+        "promotion_reason_codes": reason_codes,
+        "promotion_status": promotion_status,
+        "promotion_blocker": promotion_blocker,
+        "rich_tracking_admitted": promotion_status == "admitted_to_rich_tracking",
+        "rich_tracking_rejection_reason": promotion_blocker,
+        "active_rich_mints_at_decision": active_rich_mints_at_decision,
+        "max_rich_active_mints": budgets.max_rich_active_mints,
+        "rich_admissions_so_far": rich_admissions_so_far,
+        "max_rich_promotions_per_slice": budgets.max_rich_promotions_per_slice,
+        "candidate_checkpoint_seen": false,
+        "replay_eligible": false,
+        "audit_only": true,
+    }));
+}
+
+fn phase107k_followup_counts_by_mint(
+    followup_rows: &[serde_json::Value],
+) -> BTreeMap<String, (u64, BTreeSet<u64>, bool)> {
+    let mut counts = BTreeMap::<String, (u64, BTreeSet<u64>, bool)>::new();
+    for row in followup_rows {
+        let Some(mint) = row["mint"].as_str() else {
+            continue;
+        };
+        let entry = counts.entry(mint.to_owned()).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        if phase107k_row_truthy(row, "horizon_reached") {
+            entry.1.insert(row["horizon_seconds"].as_u64().unwrap_or(0));
+        }
+        if phase107k_row_truthy(row, "promotion_recommended") {
+            entry.2 = true;
+        }
+    }
+    counts
+}
+
+fn phase107k_missed_good_token_rows_v2(
+    all_launch_rows: &[serde_json::Value],
+    followup_rows: &[serde_json::Value],
+    promotion_queue_rows: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let followup_counts = phase107k_followup_counts_by_mint(followup_rows);
+    all_launch_rows
+        .iter()
+        .filter(|row| !row["rich_tracking_admitted"].as_bool().unwrap_or(false))
+        .map(|row| {
+            let mint = row["mint"].as_str().unwrap_or_default();
+            let (followup_count, horizons, promotion_recommended_by_followup) =
+                followup_counts.get(mint).cloned().unwrap_or_default();
+            let promotion_rows = promotion_queue_rows
+                .iter()
+                .filter(|promotion| promotion["mint"].as_str() == Some(mint))
+                .collect::<Vec<_>>();
+            let promotion_admitted = promotion_rows
+                .iter()
+                .any(|promotion| promotion["promotion_status"].as_str() == Some("admitted_to_rich_tracking"));
+            let promotion_blocked_budget = promotion_rows.iter().any(|promotion| {
+                matches!(
+                    promotion["promotion_blocker"].as_str(),
+                    Some(
+                        "rich_budget_full"
+                            | "max_rich_promotions_reached"
+                            | "max_rich_promotions_per_minute_reached"
+                    )
+                )
+            });
+            let positive = phase107k_row_truthy(row, "positive_outcome_label_if_later_known");
+            let high_positive = phase107k_row_truthy(row, "high_positive_if_later_known");
+            let skipped_due_to_budget = phase107k_row_truthy(row, "skipped_due_to_budget");
+            let final_state = phase107k_row_string(row, "final_outcome_if_known");
+            let classification = if phase107k_row_truthy(row, "skipped_due_to_data_quality") {
+                "missed_due_to_data_quality"
+            } else if final_state.starts_with("early_rejected") {
+                "not_missed_correctly_rejected"
+            } else if followup_count == 0 {
+                "missed_due_to_missing_followup"
+            } else if promotion_blocked_budget {
+                "missed_due_to_promotion_budget"
+            } else if skipped_due_to_budget && (positive || high_positive) {
+                "missed_due_to_rich_budget"
+            } else if positive || high_positive || promotion_recommended_by_followup {
+                "needs_manual_review"
+            } else if skipped_due_to_budget {
+                "missed_due_to_rich_budget"
+            } else {
+                "not_missed_correctly_rejected"
+            };
+            json!({
+                "run_id": row["run_id"].clone(),
+                "slice_id": row["slice_id"].clone(),
+                "segment_id": row["segment_id"].clone(),
+                "mint": row["mint"].clone(),
+                "rich_tracking_admitted": row["rich_tracking_admitted"].clone(),
+                "rich_tracking_rejection_reason": row["rich_tracking_rejection_reason"].clone(),
+                "skipped_due_to_budget": row["skipped_due_to_budget"].clone(),
+                "followup_row_count": followup_count,
+                "horizons_reached": horizons.into_iter().map(|horizon| horizon.to_string()).collect::<Vec<_>>().join("|"),
+                "promotion_recommended": promotion_recommended_by_followup,
+                "promotion_admitted": promotion_admitted,
+                "promotion_blocked_budget": promotion_blocked_budget,
+                "positive_outcome_label_if_later_known": row["positive_outcome_label_if_later_known"].clone(),
+                "high_positive_if_later_known": row["high_positive_if_later_known"].clone(),
+                "candidate_checkpoint_seen": row["candidate_checkpoint_seen"].clone(),
+                "replay_eligible": false,
+                "missed_good_token_classification_v2": classification,
+                "audit_reason": "cheap_followup_dynamic_promotion_audit_no_replay_or_backtest",
+            })
+        })
+        .collect()
+}
+
+fn phase107k_write_followup_and_promotion_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+    followup_rows: &[serde_json::Value],
+    promotion_queue_rows: &[serde_json::Value],
+    budgets: Phase107kTrackingBudgets,
+) -> Result<()> {
+    let followup_dir = output_dir.join("all_launch_followup");
+    fs::create_dir_all(&followup_dir)?;
+    let mut manifest_tables = Vec::new();
+    let mut total_followup_rows = 0usize;
+    let mut reached_by_horizon = BTreeMap::<String, u64>::new();
+    for horizon in PHASE107H_ASOF_ALPHA_HORIZONS {
+        let rows = followup_rows
+            .iter()
+            .filter(|row| row["horizon_seconds"].as_u64() == Some(horizon))
+            .cloned()
+            .collect::<Vec<_>>();
+        total_followup_rows = total_followup_rows.saturating_add(rows.len());
+        let filename = format!("all_launch_followup_{horizon:03}s.csv");
+        write_json_rows_csv(
+            &followup_dir.join(&filename),
+            PHASE107K_ALL_LAUNCH_FOLLOWUP_FIELDS,
+            &rows,
+        )?;
+        let reached = rows
+            .iter()
+            .filter(|row| phase107k_row_truthy(row, "horizon_reached"))
+            .count() as u64;
+        reached_by_horizon.insert(horizon.to_string(), reached);
+        manifest_tables.push(json!({
+            "horizon_seconds": horizon,
+            "path": format!("all_launch_followup/{filename}"),
+            "rows": rows.len(),
+            "horizon_reached_rows": reached,
+        }));
+    }
+    let promotion_recommended_count = followup_rows
+        .iter()
+        .filter(|row| phase107k_row_truthy(row, "promotion_recommended"))
+        .count() as u64;
+    let promotion_admitted_count = promotion_queue_rows
+        .iter()
+        .filter(|row| row["promotion_status"].as_str() == Some("admitted_to_rich_tracking"))
+        .count() as u64;
+    let promotion_blocked_budget_count = promotion_queue_rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row["promotion_blocker"].as_str(),
+                Some(
+                    "rich_budget_full"
+                        | "max_rich_promotions_reached"
+                        | "max_rich_promotions_per_minute_reached"
+                )
+            )
+        })
+        .count() as u64;
+    let followup_manifest = json!({
+        "schema_version": "phase107k.all_launch_followup_manifest.v1",
+        "run_id": run_id,
+        "horizons_seconds": PHASE107H_ASOF_ALPHA_HORIZONS,
+        "followup_tables": manifest_tables,
+        "total_rows": total_followup_rows,
+        "all_launches_indexed": all_launch_rows.len(),
+        "promotion_recommended_count": promotion_recommended_count,
+        "promotion_admitted_count": promotion_admitted_count,
+        "promotion_blocked_budget_count": promotion_blocked_budget_count,
+        "budgets": phase107k_budget_summary(budgets),
+        "no_future_data_policy": "snapshots are emitted only from stream events observed at or before the fixed horizon",
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("all_launch_followup_manifest.json"),
+        serde_json::to_vec_pretty(&followup_manifest)?,
+    )?;
+    let followup_md = format!(
+        "# All-Launch Follow-Up Summary\n\n- run_id: `{run_id}`\n- all_launches_indexed: `{}`\n- cheap_followup_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- holder_rpc_used: `false`\n- rpc_mint_supply_canonical: `false`\n- replay/backtesting/tuning/trading: `disabled`\n",
+        all_launch_rows.len(),
+        total_followup_rows,
+        promotion_recommended_count,
+        promotion_admitted_count,
+        promotion_blocked_budget_count,
+    );
+    fs::write(
+        output_dir.join("all_launch_followup_summary.md"),
+        followup_md,
+    )?;
+
+    write_json_rows_csv(
+        &output_dir.join("promotion_queue_ledger.csv"),
+        PHASE107K_PROMOTION_QUEUE_FIELDS,
+        promotion_queue_rows,
+    )?;
+    let promotion_summary = json!({
+        "schema_version": "phase107k.promotion_queue_summary.v1",
+        "run_id": run_id,
+        "promotion_recommended_count": promotion_recommended_count,
+        "promotion_queue_rows": promotion_queue_rows.len(),
+        "promotion_admitted_count": promotion_admitted_count,
+        "promotion_blocked_budget_count": promotion_blocked_budget_count,
+        "budgets": phase107k_budget_summary(budgets),
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "live_trading_enabled": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("promotion_queue_summary.json"),
+        serde_json::to_vec_pretty(&promotion_summary)?,
+    )?;
+    let promotion_md = format!(
+        "# Promotion Queue Summary\n\n- run_id: `{run_id}`\n- promotion_queue_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- max_rich_active_mints: `{}`\n- max_rich_promotions_per_slice: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n",
+        promotion_queue_rows.len(),
+        promotion_recommended_count,
+        promotion_admitted_count,
+        promotion_blocked_budget_count,
+        budgets.max_rich_active_mints,
+        budgets.max_rich_promotions_per_slice,
+    );
+    fs::write(output_dir.join("promotion_queue_summary.md"), promotion_md)?;
+
+    let missed_v2_rows =
+        phase107k_missed_good_token_rows_v2(all_launch_rows, followup_rows, promotion_queue_rows);
+    write_json_rows_csv(
+        &output_dir.join("missed_good_token_audit_v2.csv"),
+        PHASE107K_MISSED_GOOD_TOKEN_AUDIT_V2_FIELDS,
+        &missed_v2_rows,
+    )?;
+    let missed_classes = missed_v2_rows
+        .iter()
+        .filter_map(|row| row["missed_good_token_classification_v2"].as_str())
+        .fold(BTreeMap::<String, u64>::new(), |mut counts, class| {
+            *counts.entry(class.to_owned()).or_default() += 1;
+            counts
+        });
+    let missed_v2_md = format!(
+        "# Missed Good Token Audit V2\n\n- run_id: `{run_id}`\n- rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n\nClasses: `{}`\n",
+        missed_v2_rows.len(),
+        promotion_recommended_count,
+        promotion_blocked_budget_count,
+        missed_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    fs::write(
+        output_dir.join("missed_good_token_audit_v2.md"),
+        missed_v2_md,
+    )?;
+    Ok(())
+}
+
 fn phase107i_write_all_launch_tracking_artifacts(
     output_dir: &Path,
     run_id: &str,
@@ -43331,6 +44194,8 @@ fn phase107i_write_all_launch_tracking_artifacts(
     )?;
 
     let all_launches_seen = all_launch_rows.len() as u64;
+    let tracking_budgets =
+        phase107k_tracking_budgets(max_attempted_launches, max_concurrent_tracked_mints);
     let rich_tracked_launches = phase107i_bool_count(all_launch_rows, "rich_tracking_admitted");
     let cheap_only_launches = all_launches_seen.saturating_sub(rich_tracked_launches);
     let skipped_due_budget = phase107i_bool_count(all_launch_rows, "skipped_due_to_budget");
@@ -43379,6 +44244,7 @@ fn phase107i_write_all_launch_tracking_artifacts(
         "max_rich_active_mints": max_concurrent_tracked_mints,
         "max_rich_attempted_launches": max_attempted_launches,
         "max_attempted_launches_applies_to": "tier_3_rich_tracking_not_tier_1_visibility",
+        "split_tracking_budgets": phase107k_budget_summary(tracking_budgets),
         "all_launches_seen": all_launches_seen,
         "all_launches_indexed": all_launches_seen,
         "rich_tracked_launches": rich_tracked_launches,
@@ -45483,6 +46349,11 @@ fn phase107b_required_final_artifacts_exist(output_dir: &Path) -> bool {
         "rich_tracking_slot_ledger.csv",
         "rich_tracking_slot_summary.json",
         "missed_good_token_audit.csv",
+        "all_launch_followup_manifest.json",
+        "all_launch_followup_summary.md",
+        "promotion_queue_ledger.csv",
+        "promotion_queue_summary.json",
+        "missed_good_token_audit_v2.csv",
         "manifest.json",
         "r2_upload_result.json",
     ]
@@ -45858,6 +46729,14 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         phase107f_read_json_value(&output_dir.join("rich_tracking_slot_summary.json"))?;
     let missed_good_audit_rows =
         phase107f_read_csv_rows(&output_dir.join("missed_good_token_audit.csv"))?;
+    let followup_manifest =
+        phase107f_read_json_value(&output_dir.join("all_launch_followup_manifest.json"))?;
+    let promotion_summary =
+        phase107f_read_json_value(&output_dir.join("promotion_queue_summary.json"))?;
+    let promotion_queue_rows =
+        phase107f_read_csv_rows(&output_dir.join("promotion_queue_ledger.csv"))?;
+    let missed_good_audit_v2_rows =
+        phase107f_read_csv_rows(&output_dir.join("missed_good_token_audit_v2.csv"))?;
     let (asof_alpha_manifest_exists, asof_alpha_row_count, asof_alpha_blockers) =
         phase107h_validate_asof_alpha_artifacts(output_dir, manifest.as_ref())?;
     blockers.extend(asof_alpha_blockers);
@@ -45925,6 +46804,18 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     if all_launch_required && rich_slot_summary.is_none() {
         blockers.push("rich_tracking_slot_summary_missing".to_owned());
     }
+    if all_launch_required && followup_manifest.is_none() {
+        blockers.push("all_launch_followup_manifest_missing".to_owned());
+    }
+    if all_launch_required && promotion_summary.is_none() {
+        blockers.push("promotion_queue_summary_missing".to_owned());
+    }
+    if all_launch_required && !output_dir.join("promotion_queue_ledger.csv").exists() {
+        blockers.push("promotion_queue_ledger_missing".to_owned());
+    }
+    if all_launch_required && !output_dir.join("missed_good_token_audit_v2.csv").exists() {
+        blockers.push("missed_good_token_audit_v2_missing".to_owned());
+    }
     if !attempt_rows.is_empty() && rich_slot_rows.len() != attempt_rows.len() {
         blockers.push("rich_tracking_slot_ledger_attempt_count_mismatch".to_owned());
     }
@@ -45968,10 +46859,84 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             blockers.push("all_launch_indexed_less_than_rich_attempts".to_owned());
         }
     }
+    if let Some(manifest) = &followup_manifest {
+        if phase107f_json_bool(manifest, "formal_backtesting_allowed")
+            || phase107f_json_bool(manifest, "threshold_tuning_allowed")
+            || phase107f_json_bool(manifest, "live_trading_enabled")
+            || phase107f_json_bool(manifest, "holder_rpc_used")
+            || phase107f_json_bool(manifest, "rpc_mint_supply_canonical")
+        {
+            blockers.push("all_launch_followup_manifest_safety_flag_enabled".to_owned());
+        }
+        let total_rows = phase107f_json_u64(manifest, "total_rows");
+        if all_launch_required && !all_launch_rows.is_empty() && total_rows == 0 {
+            blockers.push("all_launch_followup_rows_missing".to_owned());
+        }
+        let tables = manifest
+            .get("followup_tables")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if all_launch_required && tables.is_empty() {
+            blockers.push("all_launch_followup_tables_empty".to_owned());
+        }
+        for table in tables {
+            let Some(relative) = table.get("path").and_then(|value| value.as_str()) else {
+                blockers.push("all_launch_followup_table_path_missing".to_owned());
+                continue;
+            };
+            let path = output_dir.join(relative);
+            if !path.exists() {
+                blockers.push(format!("all_launch_followup_table_missing:{relative}"));
+                continue;
+            }
+            let rows = phase107f_read_csv_rows(&path)?;
+            for row in rows {
+                if phase107f_row_bool(&row, "replay_eligible") {
+                    blockers.push(format!(
+                        "all_launch_followup_replay_eligible:{}",
+                        phase107f_row_value(&row, "mint")
+                    ));
+                }
+                if phase107f_row_bool(&row, "holder_rpc_used")
+                    || phase107f_row_bool(&row, "rpc_mint_supply_canonical")
+                    || phase107f_row_bool(&row, "threshold_tuning_allowed")
+                    || phase107f_row_bool(&row, "live_trading_enabled")
+                {
+                    blockers.push(format!(
+                        "all_launch_followup_row_safety_flag_enabled:{}",
+                        phase107f_row_value(&row, "mint")
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(summary) = &promotion_summary {
+        if phase107f_json_bool(summary, "formal_backtesting_allowed")
+            || phase107f_json_bool(summary, "threshold_tuning_allowed")
+            || phase107f_json_bool(summary, "live_trading_enabled")
+            || phase107f_json_bool(summary, "holder_rpc_used")
+            || phase107f_json_bool(summary, "rpc_mint_supply_canonical")
+        {
+            blockers.push("promotion_queue_summary_safety_flag_enabled".to_owned());
+        }
+        if phase107f_json_u64(summary, "promotion_queue_rows") != promotion_queue_rows.len() as u64
+        {
+            blockers.push("promotion_queue_summary_row_count_mismatch".to_owned());
+        }
+    }
     for row in &missed_good_audit_rows {
         if phase107f_row_bool(row, "replay_eligible") {
             blockers.push(format!(
                 "missed_good_token_audit_replay_eligible:{}",
+                phase107f_row_value(row, "mint")
+            ));
+        }
+    }
+    for row in &missed_good_audit_v2_rows {
+        if phase107f_row_bool(row, "replay_eligible") {
+            blockers.push(format!(
+                "missed_good_token_audit_v2_replay_eligible:{}",
                 phase107f_row_value(row, "mint")
             ));
         }
@@ -46222,6 +47187,26 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "missed_good_token_count": all_launch_summary
             .as_ref()
             .and_then(|value| value.get("missed_good_token_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "cheap_followup_rows": followup_manifest
+            .as_ref()
+            .and_then(|value| value.get("total_rows"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "promotion_recommended_count": promotion_summary
+            .as_ref()
+            .and_then(|value| value.get("promotion_recommended_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "promotion_admitted_count": promotion_summary
+            .as_ref()
+            .and_then(|value| value.get("promotion_admitted_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "promotion_blocked_budget_count": promotion_summary
+            .as_ref()
+            .and_then(|value| value.get("promotion_blocked_budget_count"))
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
         "unique_attempted_mint_count": attempt_rows.iter().filter_map(|row| row.get("mint")).filter(|mint| !mint.is_empty()).collect::<BTreeSet<_>>().len(),
@@ -48584,6 +49569,13 @@ fn local_relay_apply_r2_primary_retention(
         "rich_tracking_slot_summary.md",
         "missed_good_token_audit.csv",
         "MISSED_GOOD_TOKEN_AUDIT.md",
+        "all_launch_followup_manifest.json",
+        "all_launch_followup_summary.md",
+        "promotion_queue_ledger.csv",
+        "promotion_queue_summary.json",
+        "promotion_queue_summary.md",
+        "missed_good_token_audit_v2.csv",
+        "missed_good_token_audit_v2.md",
         "countability_decision.json",
         "run_countability_decision.json",
         "manifest.json",
@@ -62498,6 +63490,110 @@ mod tests {
         event
     }
 
+    fn phase107i_test_all_launch_row(
+        mint: &str,
+        rich_tracking_admitted: bool,
+        rejection_reason: &str,
+        skipped_due_to_budget: bool,
+    ) -> serde_json::Value {
+        json!({
+            "run_id": "run",
+            "slice_id": "run",
+            "segment_id": 1,
+            "relay_session_id": "relay-a",
+            "mint": mint,
+            "launch_seen_at": "2026-06-16T12:00:00Z",
+            "slot": 1,
+            "signature_if_available": "sig",
+            "creator_or_authority_if_stream_authoritative": "creator",
+            "source_kind": "local_relay",
+            "subscription_fingerprint": "fingerprint",
+            "launch_detected_by": "pump_token_created",
+            "cheap_intake_status": "indexed",
+            "rich_tracking_status": if rich_tracking_admitted { "rich_active" } else { "cheap_only" },
+            "rich_tracking_admitted": rich_tracking_admitted,
+            "rich_tracking_admission_time": if rich_tracking_admitted { "2026-06-16T12:00:05Z" } else { "" },
+            "rich_tracking_rejection_reason": rejection_reason,
+            "skipped_due_to_budget": skipped_due_to_budget,
+            "skipped_due_to_existing_tombstone": false,
+            "skipped_due_to_data_quality": false,
+            "fast_dead_reason": "",
+            "tombstone_written": false,
+            "promoted_to_rich_tracking": rich_tracking_admitted,
+            "promotion_reason": if rich_tracking_admitted { "early_buy_sell_followthrough" } else { "" },
+            "promotion_time": if rich_tracking_admitted { "2026-06-16T12:00:05Z" } else { "" },
+            "final_outcome_if_known": "",
+            "terminal_inconclusive": false,
+            "positive_outcome_label_if_later_known": false,
+            "high_positive_if_later_known": false,
+            "replay_eligible": false,
+            "candidate_checkpoint_seen": false,
+            "audit_only": true,
+        })
+    }
+
+    fn phase107k_test_asof_row(horizon: u64, reached: bool) -> serde_json::Value {
+        json!({
+            "mint": "mint-cheap",
+            "slice_id": "run",
+            "segment_id": 1,
+            "relay_session_id": "relay-a",
+            "horizon_seconds": horizon,
+            "feature_asof_timestamp": "2026-06-16T12:00:05Z",
+            "mint_first_seen_timestamp": "2026-06-16T12:00:00Z",
+            "age_ms_at_horizon": horizon.saturating_mul(1000),
+            "horizon_reached": reached,
+            "data_complete_for_horizon": reached,
+            "data_quality_exclusion": false,
+            "provider_gap_exposed": false,
+            "relay_gap_exposed": false,
+            "sequence_gap_exposed": false,
+            "hash_mismatch_exposed": false,
+            "receiver_backpressure_exposed": false,
+            "terminal_inconclusive_before_horizon": false,
+            "rejected_before_horizon": false,
+            "degraded_audit_only_before_horizon": false,
+            "high_throughput_before_horizon": false,
+            "trade_update_count_asof": 2,
+            "transaction_active_mint_count_asof": 1,
+            "pump_trade_active_mint_count_asof": 1,
+            "buy_count_delta_asof": 2,
+            "sell_count_delta_asof": 0,
+            "net_buy_sell_delta_asof": 2,
+            "volume_delta_asof": 2,
+            "unique_trade_accounts_asof": 2,
+            "last_trade_age_ms_asof": 100,
+            "trade_burst_score_asof": "MEDIUM",
+            "trade_direction_imbalance_asof": "BUY_LEANING",
+            "holder_update_count_asof": 1,
+            "unique_holder_accounts_seen_asof": 1,
+            "top_holder_concentration_asof": "",
+            "dev_or_creator_holding_proxy_asof": "",
+            "holder_churn_proxy_asof": "",
+            "holder_collapse_proxy_asof": "",
+            "new_holder_count_delta_asof": 1,
+            "exiting_holder_count_delta_asof": 0,
+            "vault_update_count_asof": 1,
+            "bonding_curve_update_count_asof": 1,
+            "liquidity_delta_asof": "",
+            "reserve_delta_asof": "",
+            "curve_progress_proxy_asof": "0.2",
+            "liquidity_exit_proxy_asof": "",
+            "price_or_curve_move_proxy_asof": "",
+            "early_avoid_decision_asof": "continue_tracking",
+            "continue_tracking_decision_asof": "continue_tracking",
+            "candidate_gate_status_asof": "insufficient_data",
+            "candidate_first_failed_gate_asof": "candidate_checkpoint_absent",
+            "candidate_failed_gate_reason_codes_asof": "candidate_checkpoint_absent",
+            "survivor_extension_active_asof": false,
+            "survival_horizon_reached_asof": reached,
+            "holder_rpc_used": false,
+            "rpc_mint_supply_canonical": false,
+            "threshold_tuning_allowed": false,
+            "live_trading_enabled": false,
+        })
+    }
+
     #[test]
     fn phase107i_all_visible_launches_produce_intake_rows_under_rich_cap() {
         let mut rows = Vec::new();
@@ -62666,6 +63762,209 @@ mod tests {
             "missed_due_to_budget"
         );
         assert_eq!(missed[0]["replay_eligible"], false);
+    }
+
+    #[test]
+    fn phase107k_tracking_budgets_split_visible_intake_from_rich_promotions() {
+        let budgets = phase107k_tracking_budgets(15, 3);
+        assert_eq!(budgets.max_rich_active_mints, 3);
+        assert!(budgets.max_visible_launch_intake_per_slice > 1_000_000);
+        assert!(budgets.max_cheap_followup_mints_per_slice >= 2_000);
+        assert!(budgets.max_rich_promotions_per_slice > 15);
+        assert_eq!(
+            phase107k_budget_summary(budgets)["max_attempted_launches_semantics"],
+            "legacy input retained as base rich promotion budget; visible launch intake and cheap follow-up are separate"
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            phase107k_recent_rich_promotions(&[now - time::Duration::seconds(30)], now),
+            1
+        );
+        assert_eq!(
+            phase107k_recent_rich_promotions(&[now - time::Duration::seconds(61)], now),
+            0
+        );
+    }
+
+    #[test]
+    fn phase107k_cheap_only_launch_gets_followup_and_promotion_recommendation() {
+        let launch = phase107i_test_all_launch_row("mint-cheap", false, "rich_budget_full", true);
+        let asof = phase107k_test_asof_row(5, true);
+        let row = phase107k_followup_row_from_asof("run", 1, "mint-cheap", &launch, &asof);
+        assert_eq!(row["horizon_seconds"], 5);
+        assert_eq!(row["horizon_reached"], true);
+        assert_eq!(row["cheap_followup_status"], "snapshot_recorded");
+        assert_eq!(row["promotion_recommended"], true);
+        assert!(
+            row["promotion_reason_codes"]
+                .as_str()
+                .unwrap()
+                .contains("early_buy_sell_followthrough")
+        );
+        assert_eq!(row["candidate_checkpoint_seen"], false);
+        assert_eq!(row["replay_eligible"], false);
+        assert_eq!(row["holder_rpc_used"], false);
+        assert_eq!(row["rpc_mint_supply_canonical"], false);
+    }
+
+    #[test]
+    fn phase107k_promotion_queue_records_budget_block_without_replay() {
+        let launch = phase107i_test_all_launch_row("mint-cheap", false, "rich_budget_full", true);
+        let budgets = phase107k_tracking_budgets(15, 3);
+        let mut rows = Vec::new();
+        phase107k_record_promotion_queue(
+            &mut rows,
+            "run",
+            1,
+            "mint-cheap",
+            &launch,
+            5,
+            "early_buy_sell_followthrough",
+            "blocked",
+            "rich_budget_full",
+            3,
+            15,
+            budgets,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["promotion_recommended"], true);
+        assert_eq!(rows[0]["promotion_status"], "blocked");
+        assert_eq!(rows[0]["promotion_blocker"], "rich_budget_full");
+        assert_eq!(rows[0]["rich_tracking_admitted"], false);
+        assert_eq!(rows[0]["replay_eligible"], false);
+        assert_eq!(rows[0]["audit_only"], true);
+    }
+
+    #[test]
+    fn phase107k_missed_good_token_v2_distinguishes_followup_and_budget_causes() {
+        let rows = vec![
+            phase107i_test_all_launch_row("mint-missing", false, "rich_budget_full", true),
+            phase107i_test_all_launch_row("mint-promo-blocked", false, "rich_budget_full", true),
+            phase107i_test_all_launch_row("mint-positive", false, "rich_budget_full", true),
+        ];
+        let mut followup = Vec::new();
+        followup.push(phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-promo-blocked",
+            &rows[1],
+            &phase107k_test_asof_row(5, true),
+        ));
+        followup.push(phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-positive",
+            &rows[2],
+            &phase107k_test_asof_row(5, true),
+        ));
+        let budgets = phase107k_tracking_budgets(15, 3);
+        let mut promotion_rows = Vec::new();
+        phase107k_record_promotion_queue(
+            &mut promotion_rows,
+            "run",
+            1,
+            "mint-promo-blocked",
+            &rows[1],
+            5,
+            "early_buy_sell_followthrough",
+            "blocked",
+            "rich_budget_full",
+            3,
+            15,
+            budgets,
+        );
+        let mut rows = rows;
+        phase107i_update_row(
+            &mut rows[2],
+            &[
+                ("positive_outcome_label_if_later_known", json!(true)),
+                ("high_positive_if_later_known", json!(true)),
+            ],
+        );
+        let missed = phase107k_missed_good_token_rows_v2(&rows, &followup, &promotion_rows);
+        let by_mint = missed
+            .iter()
+            .map(|row| {
+                (
+                    row["mint"].as_str().unwrap().to_owned(),
+                    row["missed_good_token_classification_v2"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_mint.get("mint-missing").map(String::as_str),
+            Some("missed_due_to_missing_followup")
+        );
+        assert_eq!(
+            by_mint.get("mint-promo-blocked").map(String::as_str),
+            Some("missed_due_to_promotion_budget")
+        );
+        assert_eq!(
+            by_mint.get("mint-positive").map(String::as_str),
+            Some("missed_due_to_rich_budget")
+        );
+        assert!(missed.iter().all(|row| row["replay_eligible"] == false));
+    }
+
+    #[test]
+    fn phase107k_artifact_writer_emits_required_followup_and_promotion_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = phase107i_test_all_launch_row("mint-cheap", false, "rich_budget_full", true);
+        let followup = vec![phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-cheap",
+            &launch,
+            &phase107k_test_asof_row(5, true),
+        )];
+        let budgets = phase107k_tracking_budgets(15, 3);
+        let mut promotion_rows = Vec::new();
+        phase107k_record_promotion_queue(
+            &mut promotion_rows,
+            "run",
+            1,
+            "mint-cheap",
+            &launch,
+            5,
+            "early_buy_sell_followthrough",
+            "blocked",
+            "rich_budget_full",
+            3,
+            15,
+            budgets,
+        );
+        phase107k_write_followup_and_promotion_artifacts(
+            temp.path(),
+            "run",
+            &[launch],
+            &followup,
+            &promotion_rows,
+            budgets,
+        )
+        .expect("write phase107k artifacts");
+        for required in [
+            "all_launch_followup_manifest.json",
+            "all_launch_followup_summary.md",
+            "promotion_queue_ledger.csv",
+            "promotion_queue_summary.json",
+            "promotion_queue_summary.md",
+            "missed_good_token_audit_v2.csv",
+            "missed_good_token_audit_v2.md",
+            "all_launch_followup/all_launch_followup_005s.csv",
+        ] {
+            assert!(temp.path().join(required).exists(), "missing {required}");
+        }
+        let manifest =
+            read_json_file_or_empty(&temp.path().join("all_launch_followup_manifest.json"));
+        assert_eq!(manifest["total_rows"], 1);
+        assert_eq!(manifest["promotion_recommended_count"], 1);
+        let promotion_summary =
+            read_json_file_or_empty(&temp.path().join("promotion_queue_summary.json"));
+        assert_eq!(promotion_summary["promotion_queue_rows"], 1);
+        assert_eq!(promotion_summary["promotion_blocked_budget_count"], 1);
     }
 
     #[test]
@@ -62854,6 +64153,23 @@ mod tests {
         )
         .expect("missed audit");
         fs::write(root.join("MISSED_GOOD_TOKEN_AUDIT.md"), "# Missed\n").expect("missed md");
+        let all_launch_rows = vec![phase107i_test_all_launch_row("mint-a", true, "", false)];
+        let followup_rows = vec![phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-a",
+            &all_launch_rows[0],
+            &phase107k_test_asof_row(5, true),
+        )];
+        phase107k_write_followup_and_promotion_artifacts(
+            root,
+            "run",
+            &all_launch_rows,
+            &followup_rows,
+            &[],
+            phase107k_tracking_budgets(1, 1),
+        )
+        .expect("phase107k artifacts");
         fs::write(
             root.join("candidate_summary.csv"),
             "mint,final_state,candidate_checkpoint,replay_eligible\n",
@@ -63238,6 +64554,11 @@ mod tests {
             "rich_tracking_slot_ledger.csv",
             "rich_tracking_slot_summary.json",
             "missed_good_token_audit.csv",
+            "all_launch_followup_manifest.json",
+            "all_launch_followup_summary.md",
+            "promotion_queue_ledger.csv",
+            "promotion_queue_summary.json",
+            "missed_good_token_audit_v2.csv",
             "manifest.json",
             "r2_upload_result.json",
         ] {
@@ -63543,6 +64864,23 @@ mod tests {
             "run_id,slice_id,segment_id,mint,rich_tracking_admitted,rich_tracking_rejection_reason,skipped_due_to_budget,positive_outcome_label_if_later_known,high_positive_if_later_known,candidate_checkpoint_seen,replay_eligible,missed_good_token_classification,audit_reason\n",
         )
         .expect("missed audit");
+        let all_launch_rows = vec![phase107i_test_all_launch_row("mint-a", true, "", false)];
+        let followup_rows = vec![phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-a",
+            &all_launch_rows[0],
+            &phase107k_test_asof_row(5, true),
+        )];
+        phase107k_write_followup_and_promotion_artifacts(
+            temp.path(),
+            "run",
+            &all_launch_rows,
+            &followup_rows,
+            &[],
+            phase107k_tracking_budgets(1, 1),
+        )
+        .expect("phase107k artifacts");
         let report =
             validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
         assert_eq!(report["ok"], true);

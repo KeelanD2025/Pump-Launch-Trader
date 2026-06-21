@@ -683,6 +683,8 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
     r2 = read_json(out / "r2_upload_result.json")
     retention = read_json(out / "local_retention_summary.json")
     all_launch = read_json(out / "all_launch_intake_summary.json")
+    followup = read_json(out / "all_launch_followup_manifest.json")
+    promotion = read_json(out / "promotion_queue_summary.json")
     validator_proc = run_capture(
         [
             "target/release/cli",
@@ -758,6 +760,16 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         or 0,
         "tracking_slots_released": all_launch.get("tracking_slots_released")
         or hunter.get("tracking_slots_released")
+        or 0,
+        "cheap_followup_rows": followup.get("total_rows") or hunter.get("cheap_followup_rows") or 0,
+        "promotion_recommended_count": promotion.get("promotion_recommended_count")
+        or hunter.get("promotion_recommended_count")
+        or 0,
+        "promotion_admitted_count": promotion.get("promotion_admitted_count")
+        or hunter.get("promotion_admitted_count")
+        or 0,
+        "promotion_blocked_budget_count": promotion.get("promotion_blocked_budget_count")
+        or hunter.get("promotion_blocked_budget_count")
         or 0,
         "unique_attempted_mints": summary.get("unique_attempted_mints")
         or countability.get("unique_attempted_mint_count")
@@ -1221,6 +1233,10 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_fast_dead_dropped": total("fast_dead_dropped"),
         "total_missed_good_token_count": total("missed_good_token_count"),
         "total_tracking_slots_released": total("tracking_slots_released"),
+        "total_cheap_followup_rows": total("cheap_followup_rows"),
+        "total_promotion_recommended_count": total("promotion_recommended_count"),
+        "total_promotion_admitted_count": total("promotion_admitted_count"),
+        "total_promotion_blocked_budget_count": total("promotion_blocked_budget_count"),
         "total_attempted_launches": total("attempted_launches"),
         "total_unique_attempted_mints": total("unique_attempted_mints"),
         "total_rejected_dead": total("rejected_dead_count"),
