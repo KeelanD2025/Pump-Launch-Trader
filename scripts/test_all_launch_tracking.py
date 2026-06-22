@@ -40,6 +40,8 @@ class AllLaunchTrackingTests(unittest.TestCase):
             "promotion_queue_ledger.csv",
             "promotion_queue_summary.json",
             "missed_good_token_audit_v2.csv",
+            "promotion_priority_v1_shadow_decision",
+            "promotion_priority_v1_shadow_only",
         ):
             self.assertIn(required, source)
         self.assertIn("max_attempted_launches_applies_to", source)
@@ -87,6 +89,9 @@ class AllLaunchTrackingTests(unittest.TestCase):
             "rpc_mint_supply_canonical",
             "threshold_tuning_allowed",
             "live_trading_enabled",
+            "promotion_priority_v1_shadow_only",
+            "promotion_priority_v1_would_promote",
+            "promotion_priority_v1_would_reject",
         ):
             self.assertIn(invariant, source)
 

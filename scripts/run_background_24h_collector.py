@@ -71,6 +71,9 @@ SLICE_FIELDS = [
     "terminal_inconclusive_count",
     "candidate_checkpoint_count",
     "replay_eligible_candidate_count",
+    "early_burst_review_candidate_count",
+    "early_burst_review_unique_mint_count",
+    "early_burst_review_replay_eligible_candidate_count",
     "positive_outcome_rows",
     "high_positive_outcome_rows",
     "high_positive_unique_total",
@@ -483,6 +486,9 @@ def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
         "additional_high_positive_needed": max(0, TARGET_HIGH_POSITIVE_MINTS - high_positive),
         "candidate_checkpoint_count": candidate,
         "replay_eligible_candidate_count": replay,
+        "early_burst_review_candidate_count": sum(
+            safe_int(r.get("early_burst_review_candidate_count")) for r in rows
+        ),
         "blocker_rows": len(blockers),
         "total_all_launches_indexed": sum(safe_int(r.get("all_launches_indexed")) for r in rows),
         "total_cheap_followup_rows": sum(safe_int(r.get("cheap_followup_rows")) for r in rows),
@@ -554,6 +560,11 @@ def mirror_slice(batch_index: int, batch_log_dir: pathlib.Path, report_summary: 
         "terminal_inconclusive_count": row.get("terminal_inconclusive_count", ""),
         "candidate_checkpoint_count": row.get("candidate_checkpoint_count", ""),
         "replay_eligible_candidate_count": row.get("replay_eligible_candidate_count", ""),
+        "early_burst_review_candidate_count": row.get("early_burst_review_candidate_count", ""),
+        "early_burst_review_unique_mint_count": row.get("early_burst_review_unique_mint_count", ""),
+        "early_burst_review_replay_eligible_candidate_count": row.get(
+            "early_burst_review_replay_eligible_candidate_count", ""
+        ),
         "positive_outcome_rows": report_summary.get("positive_outcome_rows", ""),
         "high_positive_outcome_rows": report_summary.get("high_positive_outcome_rows", ""),
         "high_positive_unique_total": high_positive,
@@ -598,6 +609,7 @@ def write_batch_summary(batch_index: int) -> None:
         f"- rich_tracked_launches: `{sum(safe_int(r.get('rich_tracked_launches')) for r in rows)}`\n"
         f"- candidate_checkpoints: `{sum(safe_int(r.get('candidate_checkpoint_count')) for r in rows)}`\n"
         f"- replay_eligible_candidates: `{sum(safe_int(r.get('replay_eligible_candidate_count')) for r in rows)}`\n"
+        f"- early_burst_review_candidates: `{sum(safe_int(r.get('early_burst_review_candidate_count')) for r in rows)}`\n"
         f"- high_positive_unique_total: `{current_high_positive_count()}`\n"
         f"- blockers: `{sum(1 for r in rows if r.get('blocker_if_any'))}`\n"
         "\nReplay/backtesting/tuning/paper/live/wallet remain blocked. Launch caps remain blocked.\n",
@@ -623,6 +635,7 @@ def write_final_report(classification: str, blocker: str = "") -> None:
         f"- target_high_positive_count: `{TARGET_HIGH_POSITIVE_MINTS}`\n"
         f"- candidate_checkpoints: `{sum(safe_int(r.get('candidate_checkpoint_count')) for r in rows)}`\n"
         f"- replay_eligible_candidates: `{sum(safe_int(r.get('replay_eligible_candidate_count')) for r in rows)}`\n"
+        f"- early_burst_review_candidates: `{sum(safe_int(r.get('early_burst_review_candidate_count')) for r in rows)}`\n"
         f"- blockers_encountered: `{sum(1 for r in rows if r.get('blocker_if_any'))}`\n"
         f"- more_collection_justified: `{str(high_positive < TARGET_HIGH_POSITIVE_MINTS and not blocker).lower()}`\n"
         f"- backtesting_remains_blocked: `true`\n"
@@ -699,6 +712,11 @@ def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_inde
         str(MAX_SLICES_PER_BATCH),
         "--target-gate",
         TARGET_GATE,
+        "--early-burst-in-out-v1-review-artifacts-enabled",
+        "--early-burst-in-out-v1-review-artifacts-mode",
+        "emit_review_only",
+        "--promotion-policy",
+        "v1_controlled",
     ]
     env = merged_env(control_env)
     append_event({"event": "slice_start", "batch_index": batch_index, "slice_global_index": slice_global_index})

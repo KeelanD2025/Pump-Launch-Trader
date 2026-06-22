@@ -234,6 +234,33 @@ class RelaySupervisorTests(unittest.TestCase):
         self.assertEqual(args.max_attempted_launches, 15)
         self.assertEqual(args.target_candidates, 2)
 
+    def test_early_burst_review_flags_parse_fail_closed(self) -> None:
+        with mock.patch.dict(
+            relay_supervisor.os.environ,
+            {
+                "PUMP_RELAY_VPS_SSH_TARGET": "ubuntu@example.invalid",
+                "EXPECTED_MATERIAL_LATEST_RUN_ID": "material-candidate-hunter-stable",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(SystemExit):
+                relay_supervisor.parse_args(
+                    ["proof", "--early-burst-in-out-v1-review-artifacts-enabled"]
+                )
+            args = relay_supervisor.parse_args(
+                [
+                    "proof",
+                    "--early-burst-in-out-v1-review-artifacts-enabled",
+                    "--early-burst-in-out-v1-review-artifacts-mode",
+                    "emit_review_only",
+                    "--promotion-policy",
+                    "v1_controlled",
+                ]
+            )
+        self.assertTrue(args.early_burst_in_out_v1_review_artifacts_enabled)
+        self.assertEqual(args.early_burst_in_out_v1_review_artifacts_mode, "emit_review_only")
+        self.assertEqual(args.promotion_policy, "v1_controlled")
+
     def test_collection_justification_required_by_default_for_live_runs(self) -> None:
         with mock.patch.dict(
             relay_supervisor.os.environ,

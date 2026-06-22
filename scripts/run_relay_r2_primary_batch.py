@@ -784,6 +784,18 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         "replay_eligible_candidate_count": countability.get("replay_eligible_candidate_count")
         or run_countability.get("replay_eligible_candidate_count")
         or 0,
+        "early_burst_review_candidate_count": summary.get("early_burst_review_candidate_count")
+        or hunter.get("early_burst_review_candidate_count")
+        or countability.get("early_burst_review_candidate_count")
+        or 0,
+        "early_burst_review_unique_mint_count": summary.get("early_burst_review_unique_mint_count")
+        or 0,
+        "early_burst_review_replay_eligible_candidate_count": summary.get(
+            "early_burst_review_replay_eligible_candidate_count"
+        )
+        or hunter.get("early_burst_review_replay_eligible_candidate_count")
+        or countability.get("early_burst_review_replay_eligible_candidate_count")
+        or 0,
         "counted_phase107b_result": countability.get("counted_phase107b_result"),
         "off_vps_candidate_replay_allowed": countability.get("off_vps_candidate_replay_allowed"),
         "ready_for_off_vps_candidate_replay": countability.get("ready_for_off_vps_candidate_replay"),
@@ -1084,6 +1096,17 @@ def run_slice(
         "--verify-r2",
         "--json",
     ]
+    if args.early_burst_in_out_v1_review_artifacts_enabled:
+        local_cmd.append("--early-burst-in-out-v1-review-artifacts-enabled")
+    if args.early_burst_in_out_v1_review_artifacts_mode != "disabled":
+        local_cmd.extend(
+            [
+                "--early-burst-in-out-v1-review-artifacts-mode",
+                args.early_burst_in_out_v1_review_artifacts_mode,
+            ]
+        )
+    if args.promotion_policy != "current":
+        local_cmd.extend(["--promotion-policy", args.promotion_policy])
     local_log = (log_dir / "local.log").open("w")
     local_err = (log_dir / "local.err").open("w")
     local_proc = subprocess.Popen(
@@ -1243,6 +1266,10 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_terminal_inconclusive": total("terminal_inconclusive_count"),
         "candidate_checkpoints": total("candidate_checkpoint_count"),
         "replay_eligible_candidates": total("replay_eligible_candidate_count"),
+        "early_burst_review_candidates": total("early_burst_review_candidate_count"),
+        "early_burst_review_replay_eligible_candidates": total(
+            "early_burst_review_replay_eligible_candidate_count"
+        ),
         "provider_blockers": total("upstream_provider_blocker_count"),
         "reconnects": total("upstream_reconnect_count"),
         "sequence_gaps": total("sequence_gap_count"),
@@ -1343,8 +1370,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "without raising caps or enabling replay/backtesting/tuning/trading."
         ),
     )
+    parser.add_argument("--early-burst-in-out-v1-review-artifacts-enabled", action="store_true")
+    parser.add_argument(
+        "--early-burst-in-out-v1-review-artifacts-mode",
+        choices=("disabled", "shadow", "emit_review_only"),
+        default="disabled",
+    )
+    parser.add_argument(
+        "--promotion-policy",
+        choices=("current", "v1_shadow", "v1_controlled"),
+        default="current",
+    )
     args = parser.parse_args(argv)
     args.command = command
+    if (
+        args.early_burst_in_out_v1_review_artifacts_enabled
+        and args.early_burst_in_out_v1_review_artifacts_mode == "disabled"
+    ):
+        parser.error(
+            "--early-burst-in-out-v1-review-artifacts-enabled requires "
+            "--early-burst-in-out-v1-review-artifacts-mode shadow or emit_review_only"
+        )
     if args.env_file is None and DEFAULT_RELAY_CONTROL_ENV.exists():
         args.env_file = DEFAULT_RELAY_CONTROL_ENV
     env_file_defaults: dict[str, str] = {}

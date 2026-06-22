@@ -487,6 +487,12 @@ enum Command {
         upload_r2: bool,
         #[arg(long)]
         verify_r2: bool,
+        #[arg(long, default_value_t = false)]
+        early_burst_in_out_v1_review_artifacts_enabled: bool,
+        #[arg(long, default_value = "disabled")]
+        early_burst_in_out_v1_review_artifacts_mode: String,
+        #[arg(long, default_value = "current")]
+        promotion_policy: String,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -4623,6 +4629,9 @@ async fn main() -> Result<()> {
             no_rpc,
             upload_r2,
             verify_r2,
+            early_burst_in_out_v1_review_artifacts_enabled,
+            early_burst_in_out_v1_review_artifacts_mode,
+            promotion_policy,
             dry_run,
             json,
         } => {
@@ -4641,6 +4650,9 @@ async fn main() -> Result<()> {
                 no_rpc,
                 upload_r2,
                 verify_r2,
+                early_burst_in_out_v1_review_artifacts_enabled,
+                &early_burst_in_out_v1_review_artifacts_mode,
+                &promotion_policy,
                 dry_run,
                 json,
             )
@@ -41199,6 +41211,7 @@ async fn material_candidate_hunter_command(
         no_rpc,
         upload_r2,
         verify_r2,
+        Phase107lEarlyBurstReviewConfig::disabled(),
         output_dir,
         run_id,
         Arc::new(RealGeyserConnector),
@@ -41217,6 +41230,7 @@ async fn material_candidate_hunter_command_with_connector(
     no_rpc: bool,
     upload_r2: bool,
     verify_r2: bool,
+    early_burst_review_config: Phase107lEarlyBurstReviewConfig,
     output_dir: &str,
     run_id: Option<String>,
     stream_connector: Arc<dyn GeyserStreamConnector>,
@@ -41539,6 +41553,16 @@ async fn material_candidate_hunter_command_with_connector(
                         false,
                         false,
                     );
+                } else if early_burst_review_config.v1_controlled_promotion() {
+                    cheap_launch_events.insert(mint.clone(), event.clone());
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "v1_controlled_waiting_for_followup",
+                        false,
+                        false,
+                        false,
+                    );
                 } else {
                     let attempt_index = attempt_rows.len() + 1;
                     stream_state_hint.active_mints.push(mint.clone());
@@ -41629,14 +41653,45 @@ async fn material_candidate_hunter_command_with_connector(
                         let launch_row = phase107k_all_launch_row(&all_launch_rows, &mint)
                             .cloned()
                             .unwrap_or_else(|| json!({}));
-                        let promotion_horizon = cheap_followup_rows
+                        let v1_controlled_followup =
+                            if early_burst_review_config.v1_controlled_promotion() {
+                                cheap_followup_rows.iter().rev().find(|row| {
+                                    row["mint"].as_str() == Some(mint.as_str())
+                                        && phase107k_row_truthy(row, "horizon_reached")
+                                        && phase107k_row_truthy(
+                                            row,
+                                            "promotion_priority_v1_would_promote",
+                                        )
+                                })
+                            } else {
+                                None
+                            };
+                        if early_burst_review_config.v1_controlled_promotion()
+                            && v1_controlled_followup.is_none()
+                        {
+                            return Ok(MaterialHunterStreamAction::Continue);
+                        }
+                        let mut promotion_reason_owned = promotion_reason.to_owned();
+                        if let Some(row) = v1_controlled_followup {
+                            let v1_reasons =
+                                phase107k_row_string(row, "promotion_priority_v1_shadow_reason_codes");
+                            if !v1_reasons.is_empty() {
+                                promotion_reason_owned = v1_reasons;
+                            }
+                        }
+                        let promotion_reason = promotion_reason_owned.as_str();
+                        let promotion_horizon = v1_controlled_followup
+                            .and_then(|row| row["horizon_seconds"].as_u64())
+                            .or_else(|| {
+                                cheap_followup_rows
                             .iter()
                             .rev()
                             .find(|row| {
                                 row["mint"].as_str() == Some(mint.as_str())
                                     && phase107k_row_truthy(row, "promotion_recommended")
                             })
-                            .and_then(|row| row["horizon_seconds"].as_u64())
+                                    .and_then(|row| row["horizon_seconds"].as_u64())
+                            })
                             .unwrap_or(0);
                         let promotion_blocker =
                             if attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
@@ -42569,6 +42624,16 @@ async fn material_candidate_hunter_command_with_connector(
         tracking_budgets,
     )?;
     phase107h_write_asof_alpha_artifacts(&output_dir, &asof_alpha_rows)?;
+    let mut early_burst_review_candidate_count = phase107l_write_early_burst_review_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_rows,
+        &early_burst_review_config,
+        false,
+        false,
+        false,
+    )?;
 
     let attempted_launches = attempt_rows.len() as u64;
     let all_launch_summary =
@@ -42656,6 +42721,11 @@ async fn material_candidate_hunter_command_with_connector(
         "affected_mints_at_gaps": affected_mints_at_gaps,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "early_burst_in_out_v1_review_artifacts_enabled": early_burst_review_config.enabled,
+        "early_burst_in_out_v1_review_artifacts_mode": early_burst_review_config.mode,
+        "promotion_policy": early_burst_review_config.promotion_policy,
+        "early_burst_review_candidate_count": early_burst_review_candidate_count,
+        "early_burst_review_replay_eligible_candidate_count": 0,
         "cheap_followup_rows": followup_manifest["total_rows"].as_u64().unwrap_or(0),
         "promotion_recommended_count": promotion_summary["promotion_recommended_count"].as_u64().unwrap_or(0),
         "promotion_admitted_count": promotion_summary["promotion_admitted_count"].as_u64().unwrap_or(0),
@@ -42721,6 +42791,11 @@ async fn material_candidate_hunter_command_with_connector(
         "candidates_1800s_count": candidates_1800,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+        "early_burst_in_out_v1_review_artifacts_enabled": early_burst_review_config.enabled,
+        "early_burst_in_out_v1_review_artifacts_mode": early_burst_review_config.mode,
+        "promotion_policy": early_burst_review_config.promotion_policy,
+        "early_burst_review_candidate_count": early_burst_review_candidate_count,
+        "early_burst_review_replay_eligible_candidate_count": 0,
         "asof_alpha_feature_rows": asof_alpha_rows.len(),
         "asof_alpha_feature_manifest_path": "asof_alpha_features/asof_alpha_feature_manifest.json",
         "segment_count": segment_count,
@@ -42939,6 +43014,9 @@ async fn material_candidate_hunter_command_with_connector(
             "candidate_mints": candidate_rows.iter().filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned)).collect::<Vec<_>>(),
             "candidate_checkpoint_count": candidate_checkpoint_count,
             "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+            "early_burst_review_candidate_count": early_burst_review_candidate_count,
+            "early_burst_review_replay_eligible_candidate_count": 0,
+            "early_burst_review_status": "review_only",
             "degraded_active_mint_count": stream_summary.degraded_active_mint_count,
             "degraded_active_mints": stream_summary.degraded_active_mints.clone(),
             "segment_count": segment_count,
@@ -42966,6 +43044,16 @@ async fn material_candidate_hunter_command_with_connector(
                 candidate_rows.len()
             ),
         )?;
+        early_burst_review_candidate_count = phase107l_write_early_burst_review_artifacts(
+            &output_dir,
+            &run_id,
+            &all_launch_rows,
+            &cheap_followup_rows,
+            &early_burst_review_config,
+            counted_phase107b_result,
+            r2_upload["verified"].as_bool().unwrap_or(false),
+            hard_invariants_passed,
+        )?;
         r2_upload = upload_phase_report_dir_to_r2(
             loaded,
             &output_dir,
@@ -42974,6 +43062,15 @@ async fn material_candidate_hunter_command_with_connector(
             verify_r2,
         )
         .await?;
+        write_quant_json_md(
+            &output_dir,
+            "r2_upload_result",
+            &r2_upload,
+            format!(
+                "# Phase 107B R2 Upload\n\n- run_id: `{run_id}`\n- verified: `{}`\n- early_burst_review_candidate_count: `{early_burst_review_candidate_count}`\n- threshold_tuning_allowed: `false`\n",
+                r2_upload["verified"]
+            ),
+        )?;
     }
     if !upload_r2 && !output_dir.join("countability_decision.json").exists() {
         let replay_allowed = false;
@@ -42993,6 +43090,9 @@ async fn material_candidate_hunter_command_with_connector(
             "partial_outputs_audit_only": true,
             "candidate_checkpoint_count": candidate_checkpoint_count,
             "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
+            "early_burst_review_candidate_count": early_burst_review_candidate_count,
+            "early_burst_review_replay_eligible_candidate_count": 0,
+            "early_burst_review_status": "review_only",
             "segment_count": segment_count,
             "clean_segment_count": clean_segment_count,
             "blocked_segment_count": blocked_segment_count,
@@ -43017,6 +43117,7 @@ async fn material_candidate_hunter_command_with_connector(
         "output_dir": output_dir.display().to_string(),
         "attempted_launches": attempted_launches,
         "material_candidates_found": candidate_rows.len(),
+        "early_burst_review_candidate_count": early_burst_review_candidate_count,
         "r2_upload_verified": r2_upload["verified"],
         "stable_manifest_verified": stable_manifest_upload["verified"],
         "threshold_tuning_allowed": false,
@@ -43153,6 +43254,13 @@ const PHASE107K_ALL_LAUNCH_FOLLOWUP_FIELDS: &[&str] = &[
     "fast_dead_reason",
     "promotion_recommended",
     "promotion_reason_codes",
+    "promotion_priority_v1_shadow_decision",
+    "promotion_priority_v1_shadow_reason_codes",
+    "promotion_priority_v1_shadow_confidence_bin",
+    "promotion_priority_v1_would_promote",
+    "promotion_priority_v1_would_reject",
+    "promotion_priority_v1_would_keep_cheap_followup",
+    "promotion_priority_v1_shadow_only",
     "rich_tracking_admitted",
     "rich_tracking_rejection_reason",
     "candidate_checkpoint_seen",
@@ -43174,6 +43282,13 @@ const PHASE107K_PROMOTION_QUEUE_FIELDS: &[&str] = &[
     "promotion_seen_at",
     "promotion_recommended",
     "promotion_reason_codes",
+    "promotion_priority_v1_shadow_decision",
+    "promotion_priority_v1_shadow_reason_codes",
+    "promotion_priority_v1_shadow_confidence_bin",
+    "promotion_priority_v1_would_promote",
+    "promotion_priority_v1_would_reject",
+    "promotion_priority_v1_would_keep_cheap_followup",
+    "promotion_priority_v1_shadow_only",
     "promotion_status",
     "promotion_blocker",
     "rich_tracking_admitted",
@@ -43200,12 +43315,102 @@ const PHASE107K_MISSED_GOOD_TOKEN_AUDIT_V2_FIELDS: &[&str] = &[
     "promotion_recommended",
     "promotion_admitted",
     "promotion_blocked_budget",
+    "promotion_priority_v1_shadow_decision",
+    "promotion_priority_v1_shadow_reason_codes",
+    "promotion_priority_v1_shadow_confidence_bin",
+    "promotion_priority_v1_would_promote",
+    "promotion_priority_v1_would_reject",
+    "promotion_priority_v1_would_keep_cheap_followup",
+    "promotion_priority_v1_shadow_only",
     "positive_outcome_label_if_later_known",
     "high_positive_if_later_known",
     "candidate_checkpoint_seen",
     "replay_eligible",
     "missed_good_token_classification_v2",
     "audit_reason",
+];
+
+#[derive(Debug, Clone)]
+struct Phase107lEarlyBurstReviewConfig {
+    enabled: bool,
+    mode: String,
+    promotion_policy: String,
+}
+
+impl Phase107lEarlyBurstReviewConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            mode: "disabled".to_owned(),
+            promotion_policy: "current".to_owned(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !matches!(
+            self.mode.as_str(),
+            "disabled" | "shadow" | "emit_review_only"
+        ) {
+            bail!(
+                "unsupported early_burst_in_out_v1_review_artifacts_mode: {}",
+                self.mode
+            );
+        }
+        if !matches!(
+            self.promotion_policy.as_str(),
+            "current" | "v1_shadow" | "v1_controlled"
+        ) {
+            bail!("unsupported promotion_policy: {}", self.promotion_policy);
+        }
+        if self.enabled && self.mode == "disabled" {
+            bail!("early burst V1 review artifacts enabled but mode is disabled");
+        }
+        Ok(())
+    }
+
+    fn emit_review_artifacts(&self) -> bool {
+        self.enabled && self.mode == "emit_review_only"
+    }
+
+    fn v1_controlled_promotion(&self) -> bool {
+        self.promotion_policy == "v1_controlled"
+    }
+}
+
+const PHASE107L_EARLY_BURST_REVIEW_FIELDS: &[&str] = &[
+    "mint",
+    "slice_id",
+    "segment_id",
+    "relay_session_id",
+    "launch_seen_at",
+    "all_launch_indexed",
+    "cheap_followup_horizons_reached",
+    "rich_tracked",
+    "v1_promoted",
+    "v1_would_promote",
+    "promotion_priority_v1_reason_codes",
+    "early_burst_in_out_v1_decision",
+    "early_burst_in_out_v1_reason_codes",
+    "exit_window_guard_v1_decision",
+    "positive_outcome_label_if_later_known",
+    "high_positive_if_later_known",
+    "max_favorable_proxy",
+    "max_adverse_proxy",
+    "exit_window_observed",
+    "adverse_sell_pressure_before_exit",
+    "holder_dev_risk_before_burst",
+    "vault_curve_progress_before_burst",
+    "data_quality_exclusion",
+    "provider_gap_exposed",
+    "relay_gap_exposed",
+    "terminal_inconclusive",
+    "counted_segment",
+    "counted_run",
+    "r2_verified",
+    "artifact_consistency_ok",
+    "review_status",
+    "replay_eligible",
+    "replay_blocker_reason_codes",
 ];
 
 const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 7] = [5, 10, 30, 60, 120, 300, 900];
@@ -43656,6 +43861,15 @@ fn phase107k_json_i64(value: &serde_json::Value) -> i64 {
         .unwrap_or(0)
 }
 
+fn phase107k_json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|item| item as f64))
+        .or_else(|| value.as_u64().map(|item| item as f64))
+        .or_else(|| value.as_str().and_then(|item| item.parse::<f64>().ok()))
+        .filter(|item| item.is_finite())
+}
+
 fn phase107k_json_truthy(value: &serde_json::Value) -> bool {
     value.as_bool().unwrap_or_else(|| {
         value
@@ -43718,6 +43932,260 @@ fn phase107k_followup_reason_codes(asof: &serde_json::Value) -> Vec<String> {
     reasons.into_iter().collect()
 }
 
+fn phase107k_bin(value: Option<f64>, low: f64, high: f64) -> &'static str {
+    match value {
+        None => "MISSING",
+        Some(item) if item >= high => "HIGH",
+        Some(item) if item >= low => "MEDIUM",
+        Some(_) => "LOW",
+    }
+}
+
+fn phase107k_sell_pressure_bin(asof: &serde_json::Value) -> &'static str {
+    let buys = phase107k_json_f64(&asof["buy_count_delta_asof"]).unwrap_or(0.0);
+    let sells = phase107k_json_f64(&asof["sell_count_delta_asof"]);
+    let net = phase107k_json_f64(&asof["net_buy_sell_delta_asof"]);
+    if sells.is_none() && net.is_none() {
+        return "MISSING";
+    }
+    if net.is_some_and(|item| item < 0.0) || sells.is_some_and(|item| item >= buys + 2.0) {
+        "HIGH"
+    } else if sells.unwrap_or(0.0) > 0.0 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
+fn phase107k_shadow_from_parts(
+    horizon_reached: bool,
+    data_quality_exclusion: bool,
+    terminal_inconclusive: bool,
+    liquidity_exit: bool,
+    holder_collapse: bool,
+    high_throughput: bool,
+    trade_bin: &str,
+    buy_bin: &str,
+    sell_bin: &str,
+    volume_bin: &str,
+    holder_bin: &str,
+    dev_bin: &str,
+    curve_bin: &str,
+    dead_launch_avoid: bool,
+) -> serde_json::Value {
+    let mut reasons = BTreeSet::<String>::new();
+    let decision;
+    let confidence;
+    if terminal_inconclusive {
+        decision = "censored";
+        confidence = "CENSORED";
+        reasons.insert("terminal_inconclusive_censored".to_owned());
+    } else if data_quality_exclusion {
+        decision = "audit_only";
+        confidence = "UNSAFE";
+        reasons.insert("data_quality_excluded".to_owned());
+    } else if !horizon_reached {
+        decision = "insufficient_data";
+        confidence = "MISSING";
+        reasons.insert("insufficient_followup".to_owned());
+    } else {
+        let buy_ok = matches!(buy_bin, "HIGH" | "MEDIUM");
+        let sell_ok = matches!(sell_bin, "LOW" | "MEDIUM");
+        let strong_curve = curve_bin == "HIGH";
+        let decent_curve = matches!(curve_bin, "HIGH" | "MEDIUM");
+        let strong_volume = volume_bin == "HIGH";
+        let decent_volume = matches!(volume_bin, "HIGH" | "MEDIUM");
+        let hard_dead = liquidity_exit
+            || holder_collapse
+            || sell_bin == "HIGH"
+            || (dead_launch_avoid
+                && (buy_bin == "LOW"
+                    || volume_bin == "LOW"
+                    || matches!(curve_bin, "LOW" | "MISSING")));
+        let strong_shape = strong_curve
+            && strong_volume
+            && buy_ok
+            && sell_ok
+            && !liquidity_exit
+            && !holder_collapse;
+        let secondary_shape = decent_curve
+            && strong_volume
+            && buy_ok
+            && sell_ok
+            && matches!(trade_bin, "HIGH" | "MEDIUM")
+            && !liquidity_exit
+            && !holder_collapse;
+        if strong_shape || secondary_shape {
+            decision = "promote_to_rich_tracking_research_only";
+            confidence = if strong_shape { "HIGH" } else { "MEDIUM" };
+            reasons.insert("sufficient_horizon_coverage".to_owned());
+            reasons.insert("early_curve_progress".to_owned());
+            reasons.insert("early_volume_followthrough".to_owned());
+            reasons.insert("early_buy_sell_followthrough".to_owned());
+            reasons.insert("low_adverse_sell_pressure".to_owned());
+            reasons.insert("vault_curve_progress".to_owned());
+            if high_throughput {
+                reasons.insert("clean_high_throughput_watch".to_owned());
+            }
+            if !matches!(holder_bin, "HIGH" | "MISSING") && !matches!(dev_bin, "HIGH" | "MISSING") {
+                reasons.insert("absence_of_holder_dev_risk".to_owned());
+            }
+            if holder_bin == "HIGH" {
+                reasons.insert("holder_concentration_risk".to_owned());
+            }
+            if dev_bin == "HIGH" {
+                reasons.insert("dev_or_creator_holding_risk".to_owned());
+            }
+        } else if hard_dead {
+            decision = "reject";
+            confidence = "UNSAFE";
+            reasons.insert("dead_launch_avoider_reject".to_owned());
+            if liquidity_exit {
+                reasons.insert("liquidity_exit_proxy".to_owned());
+            }
+            if sell_bin == "HIGH" {
+                reasons.insert("adverse_sell_pressure".to_owned());
+            }
+            if holder_bin == "HIGH" {
+                reasons.insert("holder_concentration_risk".to_owned());
+            }
+            if dev_bin == "HIGH" {
+                reasons.insert("dev_or_creator_holding_risk".to_owned());
+            }
+            if !buy_ok || !decent_volume {
+                reasons.insert("insufficient_followup".to_owned());
+            }
+        } else {
+            decision = "keep_cheap_followup";
+            confidence = "LOW";
+            reasons.insert("insufficient_followup".to_owned());
+            if dead_launch_avoid {
+                reasons.insert("dead_launch_avoider_reject".to_owned());
+            }
+            if decent_curve {
+                reasons.insert("early_curve_progress".to_owned());
+            }
+            if decent_volume {
+                reasons.insert("early_volume_followthrough".to_owned());
+            }
+            if buy_ok {
+                reasons.insert("early_buy_sell_followthrough".to_owned());
+            }
+        }
+    }
+    json!({
+        "promotion_priority_v1_shadow_decision": decision,
+        "promotion_priority_v1_shadow_reason_codes": reasons.into_iter().collect::<Vec<_>>().join("|"),
+        "promotion_priority_v1_shadow_confidence_bin": confidence,
+        "promotion_priority_v1_would_promote": decision == "promote_to_rich_tracking_research_only",
+        "promotion_priority_v1_would_reject": decision == "reject",
+        "promotion_priority_v1_would_keep_cheap_followup": decision == "keep_cheap_followup",
+        "promotion_priority_v1_shadow_only": true,
+    })
+}
+
+fn phase107k_promotion_priority_v1_shadow_from_asof(asof: &serde_json::Value) -> serde_json::Value {
+    let trade_bin = phase107k_bin(
+        phase107k_json_f64(&asof["trade_burst_score_asof"]),
+        0.1,
+        0.5,
+    );
+    let buy_bin = phase107k_bin(phase107k_json_f64(&asof["buy_count_delta_asof"]), 1.0, 3.0);
+    let sell_bin = phase107k_sell_pressure_bin(asof);
+    let volume_bin = phase107k_bin(
+        phase107k_json_f64(&asof["volume_delta_asof"]),
+        500_000_000.0,
+        5_000_000_000.0,
+    );
+    let holder_bin = phase107k_bin(
+        phase107k_json_f64(&asof["top_holder_concentration_asof"]),
+        0.5,
+        0.8,
+    );
+    let dev_bin = phase107k_bin(
+        phase107k_json_f64(&asof["dev_or_creator_holding_proxy_asof"]),
+        0.02,
+        0.10,
+    );
+    let curve_bin = phase107k_bin(
+        phase107k_json_f64(&asof["curve_progress_proxy_asof"]),
+        20.0,
+        50.0,
+    );
+    let dead_launch_avoid = phase107k_row_truthy(asof, "liquidity_exit_proxy_asof")
+        || phase107k_row_truthy(asof, "holder_collapse_proxy_asof")
+        || sell_bin == "HIGH"
+        || (buy_bin == "LOW" && volume_bin == "LOW");
+    phase107k_shadow_from_parts(
+        phase107k_row_truthy(asof, "horizon_reached"),
+        phase107k_row_truthy(asof, "data_quality_exclusion")
+            || phase107k_row_truthy(asof, "provider_gap_exposed")
+            || phase107k_row_truthy(asof, "relay_gap_exposed")
+            || phase107k_row_truthy(asof, "sequence_gap_exposed")
+            || phase107k_row_truthy(asof, "hash_mismatch_exposed")
+            || phase107k_row_truthy(asof, "receiver_backpressure_exposed"),
+        phase107k_row_truthy(asof, "terminal_inconclusive_before_horizon"),
+        phase107k_row_truthy(asof, "liquidity_exit_proxy_asof"),
+        phase107k_row_truthy(asof, "holder_collapse_proxy_asof"),
+        phase107k_row_truthy(asof, "high_throughput_before_horizon"),
+        trade_bin,
+        buy_bin,
+        sell_bin,
+        volume_bin,
+        holder_bin,
+        dev_bin,
+        curve_bin,
+        dead_launch_avoid,
+    )
+}
+
+fn phase107k_promotion_priority_v1_shadow_from_reason_codes(
+    reason_codes: &str,
+) -> serde_json::Value {
+    let reasons = reason_codes.split('|').collect::<BTreeSet<_>>();
+    let data_quality = reasons.contains("data_quality_excluded");
+    let liquidity_exit = reasons.contains("liquidity_exit_proxy");
+    let adverse_sell = reasons.contains("adverse_sell_pressure");
+    let holder_risk = reasons.contains("holder_concentration_risk");
+    let dev_risk = reasons.contains("dev_or_creator_holding_risk");
+    let curve = if reasons.contains("early_curve_progress") {
+        "MEDIUM"
+    } else {
+        "MISSING"
+    };
+    let volume = if reasons.contains("early_volume_followthrough") {
+        "MEDIUM"
+    } else {
+        "MISSING"
+    };
+    let buy = if reasons.contains("early_buy_sell_followthrough") {
+        "MEDIUM"
+    } else {
+        "MISSING"
+    };
+    let sell = if adverse_sell { "HIGH" } else { "LOW" };
+    phase107k_shadow_from_parts(
+        !reasons.contains("insufficient_followup"),
+        data_quality,
+        false,
+        liquidity_exit,
+        false,
+        reasons.contains("clean_high_throughput_watch"),
+        if reasons.contains("early_volume_followthrough") {
+            "MEDIUM"
+        } else {
+            "MISSING"
+        },
+        buy,
+        sell,
+        volume,
+        if holder_risk { "HIGH" } else { "MISSING" },
+        if dev_risk { "HIGH" } else { "MISSING" },
+        curve,
+        liquidity_exit || adverse_sell,
+    )
+}
+
 fn phase107k_followup_row_from_asof(
     run_id: &str,
     segment_id: usize,
@@ -43726,6 +44194,7 @@ fn phase107k_followup_row_from_asof(
     asof: &serde_json::Value,
 ) -> serde_json::Value {
     let reasons = phase107k_followup_reason_codes(asof);
+    let shadow = phase107k_promotion_priority_v1_shadow_from_asof(asof);
     let promotion_recommended = phase107k_row_truthy(asof, "horizon_reached")
         && !phase107k_row_truthy(asof, "data_quality_exclusion")
         && reasons.iter().any(|reason| {
@@ -43764,6 +44233,13 @@ fn phase107k_followup_row_from_asof(
         "fast_dead_reason": launch["fast_dead_reason"].clone(),
         "promotion_recommended": promotion_recommended,
         "promotion_reason_codes": reasons.join("|"),
+        "promotion_priority_v1_shadow_decision": shadow["promotion_priority_v1_shadow_decision"].clone(),
+        "promotion_priority_v1_shadow_reason_codes": shadow["promotion_priority_v1_shadow_reason_codes"].clone(),
+        "promotion_priority_v1_shadow_confidence_bin": shadow["promotion_priority_v1_shadow_confidence_bin"].clone(),
+        "promotion_priority_v1_would_promote": shadow["promotion_priority_v1_would_promote"].clone(),
+        "promotion_priority_v1_would_reject": shadow["promotion_priority_v1_would_reject"].clone(),
+        "promotion_priority_v1_would_keep_cheap_followup": shadow["promotion_priority_v1_would_keep_cheap_followup"].clone(),
+        "promotion_priority_v1_shadow_only": true,
         "rich_tracking_admitted": launch["rich_tracking_admitted"].clone(),
         "rich_tracking_rejection_reason": launch["rich_tracking_rejection_reason"].clone(),
         "candidate_checkpoint_seen": false,
@@ -43886,6 +44362,7 @@ fn phase107k_record_promotion_queue(
     if already_recorded {
         return;
     }
+    let shadow = phase107k_promotion_priority_v1_shadow_from_reason_codes(reason_codes);
     promotion_queue_rows.push(json!({
         "run_id": run_id,
         "slice_id": run_id,
@@ -43897,6 +44374,13 @@ fn phase107k_record_promotion_queue(
         "promotion_seen_at": OffsetDateTime::now_utc(),
         "promotion_recommended": true,
         "promotion_reason_codes": reason_codes,
+        "promotion_priority_v1_shadow_decision": shadow["promotion_priority_v1_shadow_decision"].clone(),
+        "promotion_priority_v1_shadow_reason_codes": shadow["promotion_priority_v1_shadow_reason_codes"].clone(),
+        "promotion_priority_v1_shadow_confidence_bin": shadow["promotion_priority_v1_shadow_confidence_bin"].clone(),
+        "promotion_priority_v1_would_promote": shadow["promotion_priority_v1_would_promote"].clone(),
+        "promotion_priority_v1_would_reject": shadow["promotion_priority_v1_would_reject"].clone(),
+        "promotion_priority_v1_would_keep_cheap_followup": shadow["promotion_priority_v1_would_keep_cheap_followup"].clone(),
+        "promotion_priority_v1_shadow_only": true,
         "promotion_status": promotion_status,
         "promotion_blocker": promotion_blocker,
         "rich_tracking_admitted": promotion_status == "admitted_to_rich_tracking",
@@ -43961,6 +44445,12 @@ fn phase107k_missed_good_token_rows_v2(
                     )
                 )
             });
+            let shadow_source = promotion_rows.first().copied().or_else(|| {
+                followup_rows.iter().find(|followup| followup["mint"].as_str() == Some(mint))
+            });
+            let shadow = shadow_source.cloned().unwrap_or_else(|| {
+                phase107k_promotion_priority_v1_shadow_from_reason_codes("insufficient_followup")
+            });
             let positive = phase107k_row_truthy(row, "positive_outcome_label_if_later_known");
             let high_positive = phase107k_row_truthy(row, "high_positive_if_later_known");
             let skipped_due_to_budget = phase107k_row_truthy(row, "skipped_due_to_budget");
@@ -43995,6 +44485,13 @@ fn phase107k_missed_good_token_rows_v2(
                 "promotion_recommended": promotion_recommended_by_followup,
                 "promotion_admitted": promotion_admitted,
                 "promotion_blocked_budget": promotion_blocked_budget,
+                "promotion_priority_v1_shadow_decision": shadow["promotion_priority_v1_shadow_decision"].clone(),
+                "promotion_priority_v1_shadow_reason_codes": shadow["promotion_priority_v1_shadow_reason_codes"].clone(),
+                "promotion_priority_v1_shadow_confidence_bin": shadow["promotion_priority_v1_shadow_confidence_bin"].clone(),
+                "promotion_priority_v1_would_promote": shadow["promotion_priority_v1_would_promote"].clone(),
+                "promotion_priority_v1_would_reject": shadow["promotion_priority_v1_would_reject"].clone(),
+                "promotion_priority_v1_would_keep_cheap_followup": shadow["promotion_priority_v1_would_keep_cheap_followup"].clone(),
+                "promotion_priority_v1_shadow_only": true,
                 "positive_outcome_label_if_later_known": row["positive_outcome_label_if_later_known"].clone(),
                 "high_positive_if_later_known": row["high_positive_if_later_known"].clone(),
                 "candidate_checkpoint_seen": row["candidate_checkpoint_seen"].clone(),
@@ -44004,6 +44501,250 @@ fn phase107k_missed_good_token_rows_v2(
             })
         })
         .collect()
+}
+
+fn phase107l_horizons_reached_for_mint(
+    followup_rows: &[serde_json::Value],
+    mint: &str,
+) -> BTreeSet<u64> {
+    followup_rows
+        .iter()
+        .filter(|row| {
+            row["mint"].as_str() == Some(mint) && phase107k_row_truthy(row, "horizon_reached")
+        })
+        .filter_map(|row| row["horizon_seconds"].as_u64())
+        .collect()
+}
+
+fn phase107l_latest_review_followup<'a>(
+    followup_rows: &'a [serde_json::Value],
+    mint: &str,
+) -> Option<&'a serde_json::Value> {
+    followup_rows.iter().rev().find(|row| {
+        row["mint"].as_str() == Some(mint)
+            && phase107k_row_truthy(row, "horizon_reached")
+            && phase107k_row_truthy(row, "promotion_priority_v1_would_promote")
+    })
+}
+
+fn phase107l_review_evidence_present(reason_codes: &str) -> bool {
+    reason_codes.split('|').any(|reason| {
+        matches!(
+            reason,
+            "early_curve_progress" | "early_buy_sell_followthrough" | "early_volume_followthrough"
+        )
+    })
+}
+
+fn phase107l_risk_before_burst(followup: &serde_json::Value, key: &str) -> serde_json::Value {
+    followup
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::String(String::new()))
+}
+
+fn phase107l_early_burst_review_rows(
+    all_launch_rows: &[serde_json::Value],
+    followup_rows: &[serde_json::Value],
+    counted_run: bool,
+    r2_verified: bool,
+    artifact_consistency_ok: bool,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for launch in all_launch_rows {
+        let Some(mint) = launch["mint"].as_str() else {
+            continue;
+        };
+        let Some(followup) = phase107l_latest_review_followup(followup_rows, mint) else {
+            continue;
+        };
+        let promotion_reasons =
+            phase107k_row_string(followup, "promotion_priority_v1_shadow_reason_codes");
+        let followup_reasons = phase107k_row_string(followup, "promotion_reason_codes");
+        let combined_reasons = if promotion_reasons.is_empty() {
+            followup_reasons.clone()
+        } else if followup_reasons.is_empty() {
+            promotion_reasons.clone()
+        } else {
+            format!("{promotion_reasons}|{followup_reasons}")
+        };
+        let horizons = phase107l_horizons_reached_for_mint(followup_rows, mint);
+        let all_launch_indexed = launch["cheap_intake_status"].as_str() == Some("indexed");
+        let cheap_followup_exists = !horizons.is_empty();
+        let dead_hard_reject = phase107k_row_truthy(followup, "promotion_priority_v1_would_reject")
+            || phase107k_row_truthy(launch, "tombstone_written")
+            || !phase107k_row_string(launch, "fast_dead_reason").is_empty();
+        let evidence_present = phase107l_review_evidence_present(&combined_reasons);
+        let data_quality_exclusion = phase107k_row_truthy(followup, "data_quality_exclusion")
+            || phase107k_row_truthy(launch, "skipped_due_to_data_quality");
+        let terminal_inconclusive = phase107k_row_truthy(launch, "terminal_inconclusive");
+        let degraded_audit_only = phase107k_row_truthy(followup, "degraded_audit_only");
+        let exit_window_observed = cheap_followup_exists;
+        let review_candidate = all_launch_indexed
+            && cheap_followup_exists
+            && phase107k_row_truthy(followup, "promotion_priority_v1_would_promote")
+            && !dead_hard_reject
+            && evidence_present
+            && exit_window_observed
+            && !data_quality_exclusion
+            && !terminal_inconclusive
+            && !degraded_audit_only;
+        if !review_candidate {
+            continue;
+        }
+        let mut review_reasons = BTreeSet::<String>::new();
+        review_reasons.insert("v1_promoted_or_would_promote".to_owned());
+        for reason in combined_reasons.split('|') {
+            if matches!(
+                reason,
+                "early_curve_progress"
+                    | "early_buy_sell_followthrough"
+                    | "early_volume_followthrough"
+            ) {
+                review_reasons.insert(reason.to_owned());
+            }
+        }
+        review_reasons.insert("exit_window_observable".to_owned());
+        review_reasons.insert("research_only_not_signal".to_owned());
+        review_reasons.insert("replay_not_allowed".to_owned());
+        rows.push(json!({
+            "mint": mint,
+            "slice_id": launch["slice_id"].clone(),
+            "segment_id": launch["segment_id"].clone(),
+            "relay_session_id": launch["relay_session_id"].clone(),
+            "launch_seen_at": launch["launch_seen_at"].clone(),
+            "all_launch_indexed": all_launch_indexed,
+            "cheap_followup_horizons_reached": horizons.into_iter().map(|horizon| horizon.to_string()).collect::<Vec<_>>().join("|"),
+            "rich_tracked": launch["rich_tracking_admitted"].clone(),
+            "v1_promoted": phase107k_row_truthy(followup, "promotion_priority_v1_would_promote") && launch["rich_tracking_admitted"].as_bool().unwrap_or(false),
+            "v1_would_promote": followup["promotion_priority_v1_would_promote"].clone(),
+            "promotion_priority_v1_reason_codes": promotion_reasons,
+            "early_burst_in_out_v1_decision": "early_burst_candidate_review",
+            "early_burst_in_out_v1_reason_codes": review_reasons.into_iter().collect::<Vec<_>>().join("|"),
+            "exit_window_guard_v1_decision": "observable_for_review",
+            "positive_outcome_label_if_later_known": launch["positive_outcome_label_if_later_known"].clone(),
+            "high_positive_if_later_known": launch["high_positive_if_later_known"].clone(),
+            "max_favorable_proxy": "",
+            "max_adverse_proxy": "",
+            "exit_window_observed": exit_window_observed,
+            "adverse_sell_pressure_before_exit": phase107l_risk_before_burst(followup, "buy_sell_delta_proxy"),
+            "holder_dev_risk_before_burst": phase107l_risk_before_burst(followup, "dev_or_creator_holding_risk_proxy"),
+            "vault_curve_progress_before_burst": phase107l_risk_before_burst(followup, "vault_curve_progress_proxy"),
+            "data_quality_exclusion": data_quality_exclusion,
+            "provider_gap_exposed": false,
+            "relay_gap_exposed": false,
+            "terminal_inconclusive": terminal_inconclusive,
+            "counted_segment": !data_quality_exclusion && !terminal_inconclusive,
+            "counted_run": counted_run,
+            "r2_verified": r2_verified,
+            "artifact_consistency_ok": artifact_consistency_ok,
+            "review_status": "review_only",
+            "replay_eligible": false,
+            "replay_blocker_reason_codes": "review_only_not_countability_candidate|replay_not_allowed",
+        }));
+    }
+    rows
+}
+
+fn phase107l_write_early_burst_review_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+    followup_rows: &[serde_json::Value],
+    config: &Phase107lEarlyBurstReviewConfig,
+    counted_run: bool,
+    r2_verified: bool,
+    artifact_consistency_ok: bool,
+) -> Result<usize> {
+    if !config.emit_review_artifacts() {
+        return Ok(0);
+    }
+    let rows = phase107l_early_burst_review_rows(
+        all_launch_rows,
+        followup_rows,
+        counted_run,
+        r2_verified,
+        artifact_consistency_ok,
+    );
+    write_json_rows_csv(
+        &output_dir.join("early_burst_review_candidate_summary.csv"),
+        PHASE107L_EARLY_BURST_REVIEW_FIELDS,
+        &rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("early_burst_review_candidate_summary_partial.csv"),
+        PHASE107L_EARLY_BURST_REVIEW_FIELDS,
+        &rows,
+    )?;
+    let mut detail = String::new();
+    for row in &rows {
+        detail.push_str(&serde_json::to_string(row)?);
+        detail.push('\n');
+    }
+    fs::write(
+        output_dir.join("early_burst_review_candidate_detail.jsonl"),
+        detail,
+    )?;
+    let unique_mints = rows
+        .iter()
+        .filter_map(|row| row["mint"].as_str().map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let countability = json!({
+        "schema_version": "phase107l.early_burst_review_candidate_countability.v1",
+        "run_id": run_id,
+        "review_candidate_count": rows.len(),
+        "unique_review_candidate_mints": unique_mints.len(),
+        "candidate_checkpoint_count": 0,
+        "replay_eligible_candidate_count": 0,
+        "counted_run": counted_run,
+        "r2_verified": r2_verified,
+        "artifact_consistency_ok": artifact_consistency_ok,
+        "review_status": "review_only",
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "paper_trading_enabled": false,
+        "live_trading_enabled": false,
+        "wallet_execution_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("early_burst_review_candidate_countability.json"),
+        serde_json::to_vec_pretty(&countability)?,
+    )?;
+    let manifest = json!({
+        "schema_version": "phase107l.early_burst_review_candidate_manifest.v1",
+        "run_id": run_id,
+        "enabled": config.enabled,
+        "mode": config.mode,
+        "promotion_policy": config.promotion_policy,
+        "files": [
+            "early_burst_review_candidate_summary.csv",
+            "early_burst_review_candidate_summary_partial.csv",
+            "early_burst_review_candidate_detail.jsonl",
+            "early_burst_review_candidate_countability.json",
+            "early_burst_review_candidate_review_pack_manifest.json"
+        ],
+        "review_candidate_count": rows.len(),
+        "unique_review_candidate_mints": unique_mints.len(),
+        "review_status": "review_only",
+        "replay_allowed": false,
+        "formal_backtesting_allowed": false,
+        "threshold_tuning_allowed": false,
+        "paper_trading_enabled": false,
+        "live_trading_enabled": false,
+        "wallet_execution_enabled": false,
+        "holder_rpc_used": false,
+        "rpc_mint_supply_canonical": false,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("early_burst_review_candidate_review_pack_manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(rows.len())
 }
 
 fn phase107k_write_followup_and_promotion_artifacts(
@@ -44048,6 +44789,14 @@ fn phase107k_write_followup_and_promotion_artifacts(
         .iter()
         .filter(|row| phase107k_row_truthy(row, "promotion_recommended"))
         .count() as u64;
+    let promotion_priority_v1_shadow_promote_count = followup_rows
+        .iter()
+        .filter(|row| phase107k_row_truthy(row, "promotion_priority_v1_would_promote"))
+        .count() as u64;
+    let promotion_priority_v1_shadow_reject_count = followup_rows
+        .iter()
+        .filter(|row| phase107k_row_truthy(row, "promotion_priority_v1_would_reject"))
+        .count() as u64;
     let promotion_admitted_count = promotion_queue_rows
         .iter()
         .filter(|row| row["promotion_status"].as_str() == Some("admitted_to_rich_tracking"))
@@ -44073,6 +44822,10 @@ fn phase107k_write_followup_and_promotion_artifacts(
         "total_rows": total_followup_rows,
         "all_launches_indexed": all_launch_rows.len(),
         "promotion_recommended_count": promotion_recommended_count,
+        "promotion_priority_v1_shadow_enabled": true,
+        "promotion_priority_v1_shadow_promote_count": promotion_priority_v1_shadow_promote_count,
+        "promotion_priority_v1_shadow_reject_count": promotion_priority_v1_shadow_reject_count,
+        "promotion_priority_v1_shadow_policy": "research_only_no_live_promotion_effect",
         "promotion_admitted_count": promotion_admitted_count,
         "promotion_blocked_budget_count": promotion_blocked_budget_count,
         "budgets": phase107k_budget_summary(budgets),
@@ -44089,10 +44842,12 @@ fn phase107k_write_followup_and_promotion_artifacts(
         serde_json::to_vec_pretty(&followup_manifest)?,
     )?;
     let followup_md = format!(
-        "# All-Launch Follow-Up Summary\n\n- run_id: `{run_id}`\n- all_launches_indexed: `{}`\n- cheap_followup_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- holder_rpc_used: `false`\n- rpc_mint_supply_canonical: `false`\n- replay/backtesting/tuning/trading: `disabled`\n",
+        "# All-Launch Follow-Up Summary\n\n- run_id: `{run_id}`\n- all_launches_indexed: `{}`\n- cheap_followup_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_priority_v1_shadow_promote_count: `{}`\n- promotion_priority_v1_shadow_reject_count: `{}`\n- promotion_priority_v1_shadow_policy: `research_only_no_live_promotion_effect`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- holder_rpc_used: `false`\n- rpc_mint_supply_canonical: `false`\n- replay/backtesting/tuning/trading: `disabled`\n",
         all_launch_rows.len(),
         total_followup_rows,
         promotion_recommended_count,
+        promotion_priority_v1_shadow_promote_count,
+        promotion_priority_v1_shadow_reject_count,
         promotion_admitted_count,
         promotion_blocked_budget_count,
     );
@@ -44110,6 +44865,10 @@ fn phase107k_write_followup_and_promotion_artifacts(
         "schema_version": "phase107k.promotion_queue_summary.v1",
         "run_id": run_id,
         "promotion_recommended_count": promotion_recommended_count,
+        "promotion_priority_v1_shadow_enabled": true,
+        "promotion_priority_v1_shadow_promote_count": promotion_priority_v1_shadow_promote_count,
+        "promotion_priority_v1_shadow_reject_count": promotion_priority_v1_shadow_reject_count,
+        "promotion_priority_v1_shadow_policy": "research_only_no_live_promotion_effect",
         "promotion_queue_rows": promotion_queue_rows.len(),
         "promotion_admitted_count": promotion_admitted_count,
         "promotion_blocked_budget_count": promotion_blocked_budget_count,
@@ -44126,9 +44885,11 @@ fn phase107k_write_followup_and_promotion_artifacts(
         serde_json::to_vec_pretty(&promotion_summary)?,
     )?;
     let promotion_md = format!(
-        "# Promotion Queue Summary\n\n- run_id: `{run_id}`\n- promotion_queue_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- max_rich_active_mints: `{}`\n- max_rich_promotions_per_slice: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n",
+        "# Promotion Queue Summary\n\n- run_id: `{run_id}`\n- promotion_queue_rows: `{}`\n- promotion_recommended_count: `{}`\n- promotion_priority_v1_shadow_promote_count: `{}`\n- promotion_priority_v1_shadow_reject_count: `{}`\n- promotion_priority_v1_shadow_policy: `research_only_no_live_promotion_effect`\n- promotion_admitted_count: `{}`\n- promotion_blocked_budget_count: `{}`\n- max_rich_active_mints: `{}`\n- max_rich_promotions_per_slice: `{}`\n- replay/backtesting/tuning/trading: `disabled`\n",
         promotion_queue_rows.len(),
         promotion_recommended_count,
+        promotion_priority_v1_shadow_promote_count,
+        promotion_priority_v1_shadow_reject_count,
         promotion_admitted_count,
         promotion_blocked_budget_count,
         budgets.max_rich_active_mints,
@@ -46338,7 +47099,7 @@ fn phase107b_dir_size_bytes(path: &Path) -> Result<u64> {
 }
 
 fn phase107b_required_final_artifacts_exist(output_dir: &Path) -> bool {
-    [
+    let base_required = [
         "hunter_summary.json",
         "attempt_ledger.csv",
         "rejected_summary.csv",
@@ -46358,7 +47119,26 @@ fn phase107b_required_final_artifacts_exist(output_dir: &Path) -> bool {
         "r2_upload_result.json",
     ]
     .iter()
-    .all(|relative| output_dir.join(relative).exists())
+    .all(|relative| output_dir.join(relative).exists());
+    if !base_required {
+        return false;
+    }
+    if output_dir
+        .join("early_burst_review_candidate_review_pack_manifest.json")
+        .exists()
+    {
+        [
+            "early_burst_review_candidate_summary.csv",
+            "early_burst_review_candidate_summary_partial.csv",
+            "early_burst_review_candidate_detail.jsonl",
+            "early_burst_review_candidate_countability.json",
+            "early_burst_review_candidate_review_pack_manifest.json",
+        ]
+        .iter()
+        .all(|relative| output_dir.join(relative).exists())
+    } else {
+        true
+    }
 }
 
 fn phase107b_csv_data_row_count(path: &Path) -> Result<usize> {
@@ -46740,6 +47520,30 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
     let (asof_alpha_manifest_exists, asof_alpha_row_count, asof_alpha_blockers) =
         phase107h_validate_asof_alpha_artifacts(output_dir, manifest.as_ref())?;
     blockers.extend(asof_alpha_blockers);
+    let early_burst_review_manifest = phase107f_read_json_value(
+        &output_dir.join("early_burst_review_candidate_review_pack_manifest.json"),
+    )?;
+    let early_burst_review_summary_path =
+        output_dir.join("early_burst_review_candidate_summary.csv");
+    let early_burst_review_partial_path =
+        output_dir.join("early_burst_review_candidate_summary_partial.csv");
+    let early_burst_review_detail_path =
+        output_dir.join("early_burst_review_candidate_detail.jsonl");
+    let early_burst_review_countability = phase107f_read_json_value(
+        &output_dir.join("early_burst_review_candidate_countability.json"),
+    )?;
+    let early_burst_review_rows = if early_burst_review_summary_path.exists() {
+        phase107f_read_csv_rows(&early_burst_review_summary_path)?
+    } else {
+        Vec::new()
+    };
+    let mut unique_early_burst_review_mints = BTreeSet::<String>::new();
+    for row in &early_burst_review_rows {
+        let mint = phase107f_row_value(row, "mint");
+        if !mint.is_empty() {
+            unique_early_burst_review_mints.insert(mint.to_owned());
+        }
+    }
 
     let counted = phase107f_json_bool(&countability, "counted_phase107b_result");
     let replay_allowed = phase107f_json_bool(&countability, "off_vps_candidate_replay_allowed");
@@ -46939,6 +47743,125 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
                 "missed_good_token_audit_v2_replay_eligible:{}",
                 phase107f_row_value(row, "mint")
             ));
+        }
+    }
+    if early_burst_review_manifest.is_none()
+        && (early_burst_review_summary_path.exists()
+            || early_burst_review_partial_path.exists()
+            || early_burst_review_detail_path.exists()
+            || early_burst_review_countability.is_some())
+    {
+        blockers.push("early_burst_review_artifacts_without_manifest".to_owned());
+    }
+    if let Some(review_manifest) = &early_burst_review_manifest {
+        for relative in [
+            "early_burst_review_candidate_summary.csv",
+            "early_burst_review_candidate_summary_partial.csv",
+            "early_burst_review_candidate_detail.jsonl",
+            "early_burst_review_candidate_countability.json",
+            "early_burst_review_candidate_review_pack_manifest.json",
+        ] {
+            if !output_dir.join(relative).exists() {
+                blockers.push(format!(
+                    "early_burst_review_required_artifact_missing:{relative}"
+                ));
+            }
+        }
+        if phase107f_json_bool(review_manifest, "replay_allowed")
+            || phase107f_json_bool(review_manifest, "formal_backtesting_allowed")
+            || phase107f_json_bool(review_manifest, "threshold_tuning_allowed")
+            || phase107f_json_bool(review_manifest, "paper_trading_enabled")
+            || phase107f_json_bool(review_manifest, "live_trading_enabled")
+            || phase107f_json_bool(review_manifest, "wallet_execution_enabled")
+            || phase107f_json_bool(review_manifest, "holder_rpc_used")
+            || phase107f_json_bool(review_manifest, "rpc_mint_supply_canonical")
+        {
+            blockers.push("early_burst_review_manifest_safety_flag_enabled".to_owned());
+        }
+        if review_manifest
+            .get("review_status")
+            .and_then(|value| value.as_str())
+            != Some("review_only")
+        {
+            blockers.push("early_burst_review_manifest_not_review_only".to_owned());
+        }
+        let manifest_rows = phase107f_json_u64(review_manifest, "review_candidate_count");
+        if manifest_rows != early_burst_review_rows.len() as u64 {
+            blockers.push("early_burst_review_manifest_row_count_mismatch".to_owned());
+        }
+        if phase107f_json_u64(review_manifest, "unique_review_candidate_mints")
+            != unique_early_burst_review_mints.len() as u64
+        {
+            blockers.push("early_burst_review_manifest_unique_mint_mismatch".to_owned());
+        }
+        if let Some(review_countability) = &early_burst_review_countability {
+            if phase107f_json_bool(review_countability, "replay_allowed")
+                || phase107f_json_bool(review_countability, "formal_backtesting_allowed")
+                || phase107f_json_bool(review_countability, "threshold_tuning_allowed")
+                || phase107f_json_bool(review_countability, "paper_trading_enabled")
+                || phase107f_json_bool(review_countability, "live_trading_enabled")
+                || phase107f_json_bool(review_countability, "wallet_execution_enabled")
+                || phase107f_json_bool(review_countability, "holder_rpc_used")
+                || phase107f_json_bool(review_countability, "rpc_mint_supply_canonical")
+            {
+                blockers.push("early_burst_review_countability_safety_flag_enabled".to_owned());
+            }
+            if phase107f_json_u64(review_countability, "candidate_checkpoint_count") != 0
+                || phase107f_json_u64(review_countability, "replay_eligible_candidate_count") != 0
+            {
+                blockers
+                    .push("early_burst_review_countability_granted_candidate_or_replay".to_owned());
+            }
+            if phase107f_json_u64(review_countability, "review_candidate_count")
+                != early_burst_review_rows.len() as u64
+            {
+                blockers.push("early_burst_review_countability_row_count_mismatch".to_owned());
+            }
+        } else {
+            blockers.push("early_burst_review_countability_missing".to_owned());
+        }
+        if early_burst_review_partial_path.exists() {
+            let partial_rows = phase107f_read_csv_rows(&early_burst_review_partial_path)?;
+            if partial_rows.len() != early_burst_review_rows.len() {
+                blockers.push("early_burst_review_partial_row_count_mismatch".to_owned());
+            }
+        }
+        if early_burst_review_detail_path.exists() {
+            let detail_rows = fs::read_to_string(&early_burst_review_detail_path)
+                .with_context(|| format!("read {}", early_burst_review_detail_path.display()))?
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            if detail_rows != early_burst_review_rows.len() {
+                blockers.push("early_burst_review_detail_row_count_mismatch".to_owned());
+            }
+        }
+        for row in &early_burst_review_rows {
+            let mint = phase107f_row_value(row, "mint");
+            if phase107f_row_value(row, "review_status") != "review_only" {
+                blockers.push(format!("early_burst_review_row_not_review_only:{mint}"));
+            }
+            if phase107f_row_bool(row, "replay_eligible")
+                || phase107f_row_bool(row, "candidate_checkpoint_seen")
+            {
+                blockers.push(format!(
+                    "early_burst_review_row_candidate_or_replay_enabled:{mint}"
+                ));
+            }
+            if phase107f_row_bool(row, "data_quality_exclusion")
+                || phase107f_row_bool(row, "provider_gap_exposed")
+                || phase107f_row_bool(row, "relay_gap_exposed")
+                || phase107f_row_bool(row, "terminal_inconclusive")
+            {
+                blockers.push(format!(
+                    "early_burst_review_row_not_clean_review_window:{mint}"
+                ));
+            }
+            if phase107f_row_value(row, "early_burst_in_out_v1_decision")
+                != "early_burst_candidate_review"
+            {
+                blockers.push(format!("early_burst_review_row_bad_decision:{mint}"));
+            }
         }
     }
     if counted && provider_data_loss_seen {
@@ -47219,6 +48142,9 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
         "local_retention_summary_exists": retention_summary.is_some(),
         "asof_alpha_feature_manifest_exists": asof_alpha_manifest_exists,
         "asof_alpha_feature_row_count": asof_alpha_row_count,
+        "early_burst_review_candidate_manifest_exists": early_burst_review_manifest.is_some(),
+        "early_burst_review_candidate_count": early_burst_review_rows.len(),
+        "unique_early_burst_review_candidate_mints": unique_early_burst_review_mints.len(),
         "local_retained_bytes": retention_summary
             .as_ref()
             .and_then(|value| value.get("local_retained_bytes"))
@@ -49192,6 +50118,9 @@ async fn local_stream_collector_command(
     no_rpc: bool,
     upload_r2: bool,
     verify_r2: bool,
+    early_burst_in_out_v1_review_artifacts_enabled: bool,
+    early_burst_in_out_v1_review_artifacts_mode: &str,
+    promotion_policy: &str,
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
@@ -49216,6 +50145,12 @@ async fn local_stream_collector_command(
                     "local-stream-collector dataset mode requires --upload-r2 for R2-primary proof"
                 );
             }
+            let review_config = Phase107lEarlyBurstReviewConfig {
+                enabled: early_burst_in_out_v1_review_artifacts_enabled,
+                mode: early_burst_in_out_v1_review_artifacts_mode.to_owned(),
+                promotion_policy: promotion_policy.to_owned(),
+            };
+            review_config.validate()?;
             let dataset_loaded = loaded.clone();
             let listen_url = listen_url.to_owned();
             let output_dir = output_dir.to_owned();
@@ -49249,6 +50184,7 @@ async fn local_stream_collector_command(
                             no_rpc,
                             upload_r2,
                             verify_r2,
+                            review_config,
                             &hunter_output,
                             run_id,
                             hunter_connector,
@@ -49367,6 +50303,9 @@ async fn local_stream_collector_command(
         "preflight": report,
         "material_hunter_artifacts_local_only": run_material_hunter,
         "material_hunter_processing_requested": run_material_hunter,
+        "early_burst_in_out_v1_review_artifacts_enabled": early_burst_in_out_v1_review_artifacts_enabled,
+        "early_burst_in_out_v1_review_artifacts_mode": early_burst_in_out_v1_review_artifacts_mode,
+        "promotion_policy": promotion_policy,
         "vps_material_hunter_artifacts_written": false,
         "countability_decision_source_of_truth": "local",
         "off_vps_candidate_replay_allowed": false,
@@ -49588,6 +50527,11 @@ fn local_relay_apply_r2_primary_retention(
         "asof_alpha_features/asof_alpha_feature_manifest.json",
         "asof_alpha_features/asof_alpha_feature_completeness.json",
         "asof_alpha_features/asof_alpha_feature_completeness.md",
+        "early_burst_review_candidate_summary.csv",
+        "early_burst_review_candidate_summary_partial.csv",
+        "early_burst_review_candidate_detail.jsonl",
+        "early_burst_review_candidate_countability.json",
+        "early_burst_review_candidate_review_pack_manifest.json",
     ]
     .iter()
     .filter_map(|relative| {
@@ -49668,6 +50612,11 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
     let r2_upload = read_json_file_or_empty(&output_dir.join("r2_upload_result.json"));
     let retention_summary =
         read_json_file_or_empty(&output_dir.join("local_retention_summary.json"));
+    let early_burst_review_countability =
+        read_json_file_or_empty(&output_dir.join("early_burst_review_candidate_countability.json"));
+    let early_burst_review_manifest = read_json_file_or_empty(
+        &output_dir.join("early_burst_review_candidate_review_pack_manifest.json"),
+    );
     let attempted_launches = hunter_summary["attempted_launches"]
         .as_u64()
         .or_else(|| countability["attempted_launches"].as_u64())
@@ -49767,6 +50716,15 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "rejected_inconclusive_count": hunter_summary["rejected_inconclusive_count"],
         "candidate_checkpoint_count": countability["candidate_checkpoint_count"],
         "replay_eligible_candidate_count": countability["replay_eligible_candidate_count"],
+        "early_burst_review_candidate_count": early_burst_review_countability["review_candidate_count"]
+            .as_u64()
+            .or_else(|| early_burst_review_manifest["review_candidate_count"].as_u64())
+            .unwrap_or(0),
+        "early_burst_review_unique_mint_count": early_burst_review_countability["unique_review_candidate_mints"]
+            .as_u64()
+            .or_else(|| early_burst_review_manifest["unique_review_candidate_mints"].as_u64())
+            .unwrap_or(0),
+        "early_burst_review_replay_eligible_candidate_count": early_burst_review_countability["replay_eligible_candidate_count"].as_u64().unwrap_or(0),
         "counted_phase107b_result": counted_phase107b_result,
         "off_vps_candidate_replay_allowed": countability["off_vps_candidate_replay_allowed"].as_bool().unwrap_or(false),
         "ready_for_off_vps_candidate_replay": countability["ready_for_off_vps_candidate_replay"].as_bool().unwrap_or(false),
@@ -63801,10 +64759,47 @@ mod tests {
                 .unwrap()
                 .contains("early_buy_sell_followthrough")
         );
+        assert_eq!(row["promotion_priority_v1_shadow_only"], true);
+        assert_eq!(
+            row["promotion_priority_v1_shadow_decision"],
+            "keep_cheap_followup"
+        );
+        assert_eq!(row["promotion_priority_v1_would_promote"], false);
+        assert_eq!(row["promotion_priority_v1_would_reject"], false);
         assert_eq!(row["candidate_checkpoint_seen"], false);
         assert_eq!(row["replay_eligible"], false);
         assert_eq!(row["holder_rpc_used"], false);
         assert_eq!(row["rpc_mint_supply_canonical"], false);
+    }
+
+    #[test]
+    fn phase107k_promotion_priority_v1_shadow_promotes_strong_asof_without_side_effects() {
+        let launch = phase107i_test_all_launch_row("mint-strong", false, "rich_budget_full", true);
+        let mut asof = phase107k_test_asof_row(5, true);
+        phase107i_update_row(
+            &mut asof,
+            &[
+                ("trade_burst_score_asof", json!("0.6")),
+                ("buy_count_delta_asof", json!(3)),
+                ("sell_count_delta_asof", json!(0)),
+                ("net_buy_sell_delta_asof", json!(3)),
+                ("volume_delta_asof", json!(6_000_000_000u64)),
+                ("curve_progress_proxy_asof", json!("60")),
+                ("top_holder_concentration_asof", json!("0.55")),
+                ("dev_or_creator_holding_proxy_asof", json!("0.03")),
+            ],
+        );
+        let row = phase107k_followup_row_from_asof("run", 1, "mint-strong", &launch, &asof);
+        assert_eq!(
+            row["promotion_priority_v1_shadow_decision"],
+            "promote_to_rich_tracking_research_only"
+        );
+        assert_eq!(row["promotion_priority_v1_would_promote"], true);
+        assert_eq!(row["promotion_priority_v1_shadow_only"], true);
+        assert_eq!(row["candidate_checkpoint_seen"], false);
+        assert_eq!(row["replay_eligible"], false);
+        assert_eq!(row["threshold_tuning_allowed"], false);
+        assert_eq!(row["live_trading_enabled"], false);
     }
 
     #[test]
@@ -63833,6 +64828,8 @@ mod tests {
         assert_eq!(rows[0]["rich_tracking_admitted"], false);
         assert_eq!(rows[0]["replay_eligible"], false);
         assert_eq!(rows[0]["audit_only"], true);
+        assert_eq!(rows[0]["promotion_priority_v1_shadow_only"], true);
+        assert!(rows[0]["promotion_priority_v1_shadow_decision"].is_string());
     }
 
     #[test]
@@ -63907,6 +64904,11 @@ mod tests {
             Some("missed_due_to_rich_budget")
         );
         assert!(missed.iter().all(|row| row["replay_eligible"] == false));
+        assert!(
+            missed
+                .iter()
+                .all(|row| row["promotion_priority_v1_shadow_only"] == true)
+        );
     }
 
     #[test]
@@ -63965,6 +64967,16 @@ mod tests {
             read_json_file_or_empty(&temp.path().join("promotion_queue_summary.json"));
         assert_eq!(promotion_summary["promotion_queue_rows"], 1);
         assert_eq!(promotion_summary["promotion_blocked_budget_count"], 1);
+        assert_eq!(
+            promotion_summary["promotion_priority_v1_shadow_enabled"],
+            true
+        );
+        let followup_manifest =
+            read_json_file_or_empty(&temp.path().join("all_launch_followup_manifest.json"));
+        assert_eq!(
+            followup_manifest["promotion_priority_v1_shadow_enabled"],
+            true
+        );
     }
 
     #[test]
@@ -64330,6 +65342,132 @@ mod tests {
         assert!(exists);
         assert_eq!(row_count, 1);
         assert!(blockers.is_empty(), "{blockers:?}");
+    }
+
+    #[test]
+    fn phase107l_review_artifacts_are_review_only_and_consistency_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        let all_launch_rows = vec![phase107i_test_all_launch_row(
+            "mint-review",
+            true,
+            "",
+            false,
+        )];
+        let mut asof = phase107k_test_asof_row(5, true);
+        asof["trade_burst_score_asof"] = json!(0.9);
+        asof["buy_count_delta_asof"] = json!(4);
+        asof["volume_delta_asof"] = json!(6_000_000_000u64);
+        asof["curve_progress_proxy_asof"] = json!(60);
+        let followup_rows = vec![phase107k_followup_row_from_asof(
+            "run",
+            1,
+            "mint-review",
+            &all_launch_rows[0],
+            &asof,
+        )];
+        let config = Phase107lEarlyBurstReviewConfig {
+            enabled: true,
+            mode: "emit_review_only".to_owned(),
+            promotion_policy: "v1_controlled".to_owned(),
+        };
+        let count = phase107l_write_early_burst_review_artifacts(
+            temp.path(),
+            "run",
+            &all_launch_rows,
+            &followup_rows,
+            &config,
+            true,
+            true,
+            true,
+        )
+        .expect("review artifacts");
+        assert_eq!(count, 1);
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], true, "{}", report["blockers"]);
+        assert_eq!(report["early_burst_review_candidate_manifest_exists"], true);
+        assert_eq!(report["early_burst_review_candidate_count"], 1);
+        let rows =
+            phase107f_read_csv_rows(&temp.path().join("early_burst_review_candidate_summary.csv"))
+                .expect("review rows");
+        assert_eq!(
+            phase107f_row_value(&rows[0], "review_status"),
+            "review_only"
+        );
+        assert!(!phase107f_row_bool(&rows[0], "replay_eligible"));
+    }
+
+    #[test]
+    fn phase107l_review_artifact_consistency_rejects_replay_leakage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        phase107g_write_minimal_valid_local_dataset_artifacts(temp.path());
+        fs::write(
+            temp.path()
+                .join("early_burst_review_candidate_summary.csv"),
+            "mint,review_status,replay_eligible,early_burst_in_out_v1_decision,data_quality_exclusion,provider_gap_exposed,relay_gap_exposed,terminal_inconclusive\nmint-a,review_only,true,early_burst_candidate_review,false,false,false,false\n",
+        )
+        .expect("summary");
+        fs::write(
+            temp.path()
+                .join("early_burst_review_candidate_summary_partial.csv"),
+            "mint,review_status,replay_eligible,early_burst_in_out_v1_decision,data_quality_exclusion,provider_gap_exposed,relay_gap_exposed,terminal_inconclusive\nmint-a,review_only,true,early_burst_candidate_review,false,false,false,false\n",
+        )
+        .expect("partial");
+        fs::write(
+            temp.path()
+                .join("early_burst_review_candidate_detail.jsonl"),
+            "{\"mint\":\"mint-a\",\"review_status\":\"review_only\",\"replay_eligible\":true}\n",
+        )
+        .expect("detail");
+        fs::write(
+            temp.path()
+                .join("early_burst_review_candidate_countability.json"),
+            serde_json::to_vec_pretty(&json!({
+                "review_candidate_count": 1,
+                "unique_review_candidate_mints": 1,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "review_status": "review_only",
+                "replay_allowed": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "paper_trading_enabled": false,
+                "live_trading_enabled": false,
+                "wallet_execution_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("countability");
+        fs::write(
+            temp.path()
+                .join("early_burst_review_candidate_review_pack_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "review_candidate_count": 1,
+                "unique_review_candidate_mints": 1,
+                "review_status": "review_only",
+                "replay_allowed": false,
+                "formal_backtesting_allowed": false,
+                "threshold_tuning_allowed": false,
+                "paper_trading_enabled": false,
+                "live_trading_enabled": false,
+                "wallet_execution_enabled": false,
+                "holder_rpc_used": false,
+                "rpc_mint_supply_canonical": false
+            }))
+            .expect("json"),
+        )
+        .expect("manifest");
+        let report =
+            validate_material_hunter_artifact_consistency(temp.path()).expect("consistency report");
+        assert_eq!(report["ok"], false);
+        assert!(
+            report["blockers"]
+                .to_string()
+                .contains("early_burst_review_row_candidate_or_replay_enabled:mint-a")
+        );
     }
 
     #[test]

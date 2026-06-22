@@ -125,6 +125,9 @@ class Background24hCollectorTests(unittest.TestCase):
                         "terminal_inconclusive_count": 1,
                         "candidate_checkpoint_count": 0,
                         "replay_eligible_candidate_count": 0,
+                        "early_burst_review_candidate_count": 2,
+                        "early_burst_review_unique_mint_count": 2,
+                        "early_burst_review_replay_eligible_candidate_count": 0,
                         "r2_failed": 0,
                         "artifact_consistency_ok": True,
                         "vps_safety": {"forbidden_recent": 0, "material_candidate_service": "inactive", "material_hunter_service": "inactive"},
@@ -141,6 +144,7 @@ class Background24hCollectorTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["cheap_followup_rows"], "70")
+            self.assertEqual(rows[0]["early_burst_review_candidate_count"], "2")
             self.assertEqual(rows[0]["high_positive_unique_total"], "4")
 
 
