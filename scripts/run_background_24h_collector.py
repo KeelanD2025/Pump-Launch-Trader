@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,6 +48,27 @@ LOCAL_RECEIVER_WINDOW_SECONDS = 1020
 MAX_ATTEMPTED_LAUNCHES = 15
 MAX_CONCURRENT_TRACKED_MINTS = 3
 TARGET_CANDIDATES = 2
+LOCAL_DISK_BLOCK_CLASSIFICATION = "BACKGROUND_24H_COLLECTION_BLOCK_LOCAL_DISK"
+LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION = "BACKGROUND_24H_COLLECTION_BLOCK_LOCAL_DISK_CAPACITY"
+DEFAULT_STORAGE_MODE = os.environ.get("PUMP_BACKGROUND_24H_STORAGE_MODE", "r2-streaming")
+R2_STREAMING_MIN_FREE_MB = int(os.environ.get("PUMP_R2_STREAMING_MIN_FREE_MB", "4096"))
+R2_STREAMING_SPOOL_MB = int(os.environ.get("PUMP_R2_STREAMING_SPOOL_MB", "2048"))
+R2_STREAMING_CHUNK_MB = int(os.environ.get("PUMP_R2_STREAMING_CHUNK_MB", "32"))
+MAX_LOCAL_COLLECTOR_USAGE_MB = int(os.environ.get("PUMP_MAX_LOCAL_COLLECTOR_USAGE_MB", "5000"))
+HARD_MIN_FREE_MB = 10_000
+RECOMMENDED_RESUME_FREE_MB = 15_000
+PREFERRED_24H_FREE_MB = 20_000
+LOW_DISK_OVERRIDE_ENV = "PUMP_ALLOW_24H_RESUME_BELOW_RECOMMENDED_DISK"
+OUTPUT_ROOT_ENV = "PUMP_LOCAL_COLLECTOR_OUTPUT_ROOT"
+SPOOL_ROOT_ENV = "PUMP_R2_PRIMARY_SPOOL_ROOT"
+LOCAL_DISK_BLOCKER_PREFIXES = (
+    "local_output_disk_below_required",
+    "local_spool_disk_below_required",
+    "local_disk_below_r2_primary_gate",
+    "local_disk_below_r2_streaming_gate",
+    "r2_primary_local_disk_preflight_failed",
+    "r2_streaming_local_disk_preflight_failed",
+)
 
 SLICE_FIELDS = [
     "batch_index",
@@ -87,6 +109,20 @@ SLICE_FIELDS = [
     "artifact_consistency_ok",
     "retention_deleted_bytes",
     "local_retained_bytes",
+    "storage_mode",
+    "local_collector_usage_mb",
+    "max_local_collector_usage_mb",
+    "local_spool_bytes_current",
+    "local_spool_bytes_peak",
+    "local_spool_bytes_limit",
+    "local_disk_free_mb",
+    "r2_streaming_uploaded_chunks",
+    "r2_streaming_verified_chunks",
+    "r2_streaming_deleted_local_chunks",
+    "r2_streaming_unverified_chunks",
+    "r2_streaming_retry_count",
+    "r2_streaming_upload_timeout_count",
+    "r2_streaming_backpressure_detected",
     "vps_safety_ok",
     "blocker_if_any",
 ]
@@ -213,6 +249,327 @@ def run_capture(
     return proc
 
 
+def json_from_stdout(stdout: str) -> dict[str, Any]:
+    stripped = stdout.strip()
+    if stripped:
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(stripped[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+    for raw in reversed(stdout.splitlines()):
+        line = raw.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def run_local_r2_primary_preflight(control_env: pathlib.Path) -> dict[str, Any]:
+    env = merged_env(control_env)
+    output_root = configured_output_root(env)
+    spool_root = configured_spool_root(env)
+    storage_mode = env.get("PUMP_BACKGROUND_24H_STORAGE_MODE", DEFAULT_STORAGE_MODE)
+    streaming_mode = storage_mode == "r2-streaming"
+    env.update(
+        {
+            "PUMP_RELAY_CONTROL_ENV_FILE": str(control_env),
+            "LOCAL_COLLECTOR_STORAGE_MODE": storage_mode,
+            "LOCAL_COLLECTOR_PREFLIGHT_MODE": "collection",
+            "LOCAL_COLLECTOR_RETENTION_MODE": "keep-manifests-after-verified-r2",
+            "LOCAL_COLLECTOR_R2_UPLOAD_REQUIRED": "true",
+            "LOCAL_COLLECTOR_VERIFY_R2_HEALTH_LIVE": "true",
+            "UPLOAD_R2": "true",
+        }
+    )
+    if output_root:
+        env["LOCAL_COLLECTOR_OUTPUT_DIR"] = str(output_root)
+    if spool_root:
+        env["LOCAL_COLLECTOR_R2_SPOOL_DIR"] = str(spool_root)
+    cmd = [
+        "./scripts/local_stream_collector_preflight.sh",
+        "--storage-mode",
+        storage_mode,
+        "--mode",
+        "collection",
+        "--verify-r2-health-live",
+    ]
+    if streaming_mode:
+        cmd.extend(["--r2-spool-max-mb", str(R2_STREAMING_SPOOL_MB)])
+        cmd.extend(["--min-free-mb", str(R2_STREAMING_MIN_FREE_MB)])
+    proc = run_capture(
+        cmd,
+        env=env,
+        timeout=600,
+    )
+    payload = json_from_stdout(proc.stdout)
+    payload["configured_output_root"] = str(output_root) if output_root else ""
+    payload["configured_spool_root"] = str(spool_root) if spool_root else ""
+    payload["background_storage_mode"] = storage_mode
+    payload["output_spool_override_validation"] = validate_output_spool_overrides(
+        env,
+        min_free_mb=R2_STREAMING_MIN_FREE_MB if streaming_mode else HARD_MIN_FREE_MB,
+    )
+    payload.setdefault("returncode", proc.returncode)
+    payload.setdefault("stdout_tail", proc.stdout[-1200:])
+    payload.setdefault("stderr_tail", proc.stderr[-1200:])
+    return payload
+
+
+def configured_output_root(env: dict[str, str]) -> pathlib.Path | None:
+    value = env.get(OUTPUT_ROOT_ENV, "").strip()
+    return pathlib.Path(value).expanduser() if value else None
+
+
+def configured_spool_root(env: dict[str, str]) -> pathlib.Path | None:
+    value = env.get(SPOOL_ROOT_ENV, "").strip()
+    return pathlib.Path(value).expanduser() if value else None
+
+
+def path_free_mb(path: pathlib.Path) -> int:
+    target = path if path.exists() else path.parent
+    usage = shutil.disk_usage(target)
+    return usage.free // (1024 * 1024)
+
+
+def is_r2_streaming_storage_mode(storage_mode: str) -> bool:
+    return storage_mode in {"r2-streaming", "r2_streaming"}
+
+
+def storage_recommended_resume_mb(storage_mode: str) -> int:
+    return R2_STREAMING_MIN_FREE_MB if is_r2_streaming_storage_mode(storage_mode) else RECOMMENDED_RESUME_FREE_MB
+
+
+def storage_preferred_24h_mb(storage_mode: str) -> int:
+    if is_r2_streaming_storage_mode(storage_mode):
+        return max(R2_STREAMING_MIN_FREE_MB, R2_STREAMING_SPOOL_MB * 2)
+    return PREFERRED_24H_FREE_MB
+
+
+def validate_storage_override_path(
+    path: pathlib.Path | None,
+    *,
+    label: str,
+    min_free_mb: int,
+) -> dict[str, Any]:
+    if path is None:
+        return {"configured": False, "ok": True}
+    resolved = path.resolve()
+    codex_env = (REPO / ".codex_runtime_env").resolve()
+    blockers: list[str] = []
+    if codex_env in resolved.parents or resolved == codex_env:
+        blockers.append(f"{label}_inside_codex_runtime_env")
+    if not resolved.exists():
+        blockers.append(f"{label}_missing")
+    elif not resolved.is_dir():
+        blockers.append(f"{label}_not_directory")
+    elif not os.access(resolved, os.W_OK):
+        blockers.append(f"{label}_not_writable")
+    free = path_free_mb(resolved)
+    if free < min_free_mb:
+        blockers.append(f"{label}_disk_below_hard_min:{free}<{min_free_mb}")
+    return {
+        "configured": True,
+        "path": str(resolved),
+        "ok": not blockers,
+        "free_mb": free,
+        "blockers": blockers,
+    }
+
+
+def validate_output_spool_overrides(env: dict[str, str], *, min_free_mb: int | None = None) -> dict[str, Any]:
+    storage_mode = env.get("PUMP_BACKGROUND_24H_STORAGE_MODE", DEFAULT_STORAGE_MODE)
+    floor = min_free_mb if min_free_mb is not None else storage_recommended_resume_mb(storage_mode)
+    output = validate_storage_override_path(configured_output_root(env), label="output_root", min_free_mb=floor)
+    spool = validate_storage_override_path(configured_spool_root(env), label="spool_root", min_free_mb=floor)
+    blockers = list(output.get("blockers") or []) + list(spool.get("blockers") or [])
+    return {"ok": not blockers, "output_root": output, "spool_root": spool, "blockers": blockers}
+
+
+def local_disk_blockers(preflight: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    required = safe_int(preflight.get("required_mb"), 10000)
+    free_output = safe_int(preflight.get("free_mb_output"))
+    free_spool = safe_int(preflight.get("free_mb_spool"), free_output)
+    if free_output and free_output < required:
+        blockers.append(f"local_output_disk_below_required:{free_output}<{required}")
+    if free_spool and free_spool < required:
+        blockers.append(f"local_spool_disk_below_required:{free_spool}<{required}")
+    for blocker in preflight.get("blockers") or []:
+        text = str(blocker)
+        if "disk" in text or "spool" in text:
+            blockers.append(text)
+    if preflight.get("returncode") != 0 and not blockers:
+        stdout_tail = str(preflight.get("stdout_tail", ""))
+        stderr_tail = str(preflight.get("stderr_tail", ""))
+        if "disk_below" in stdout_tail or "disk_below" in stderr_tail:
+            blockers.append("r2_primary_local_disk_preflight_failed")
+    override = preflight.get("output_spool_override_validation") or {}
+    blockers.extend(str(item) for item in override.get("blockers") or [])
+    return blockers
+
+
+def is_local_disk_blocker(blocker: str) -> bool:
+    return any(str(blocker).startswith(prefix) or prefix in str(blocker) for prefix in LOCAL_DISK_BLOCKER_PREFIXES)
+
+
+def run_storage_gc(*, apply: bool, min_free_mb: int) -> dict[str, Any]:
+    cmd = [
+        "python3",
+        "scripts/local_r2_first_storage_enforcer.py",
+        "--max-local-stream-mb",
+        str(MAX_LOCAL_COLLECTOR_USAGE_MB),
+        "--include-legacy-unverified-raw-spool",
+    ]
+    if apply:
+        cmd.append("--apply")
+    proc = run_capture(cmd, timeout=900)
+    payload = json_from_stdout(proc.stdout)
+    payload.setdefault("returncode", proc.returncode)
+    payload.setdefault("stdout_tail", proc.stdout[-1200:])
+    payload.setdefault("stderr_tail", proc.stderr[-1200:])
+    payload.setdefault(
+        "report_path",
+        str(
+            STATUS_ROOT
+            / ("local_storage_enforcement_apply.json" if apply else "local_storage_enforcement_dry_run.json")
+        ),
+    )
+    return payload
+
+
+def low_disk_override_enabled(control_env: pathlib.Path) -> bool:
+    env = merged_env(control_env)
+    return boolish(env.get(LOW_DISK_OVERRIDE_ENV))
+
+
+def ensure_local_storage_ready(control_env: pathlib.Path) -> dict[str, Any]:
+    before = run_local_r2_primary_preflight(control_env)
+    blockers = local_disk_blockers(before)
+    required = safe_int(before.get("required_mb"), 10000)
+    free_output = safe_int(before.get("free_mb_output"))
+    storage_mode = str(before.get("storage_mode") or before.get("background_storage_mode") or DEFAULT_STORAGE_MODE)
+    recommended = storage_recommended_resume_mb(storage_mode)
+    preferred = storage_preferred_24h_mb(storage_mode)
+    override = low_disk_override_enabled(control_env)
+    budget_dry_run = run_storage_gc(apply=False, min_free_mb=max(required, recommended))
+    local_usage_mb = safe_int(budget_dry_run.get("local_stream_collector_mb_after"))
+    budget_apply: dict[str, Any] | None = None
+    if local_usage_mb > MAX_LOCAL_COLLECTOR_USAGE_MB:
+        budget_apply = run_storage_gc(apply=True, min_free_mb=max(required, recommended))
+        local_usage_mb = safe_int(budget_apply.get("local_stream_collector_mb_after"), local_usage_mb)
+        if local_usage_mb > MAX_LOCAL_COLLECTOR_USAGE_MB:
+            return {
+                "ok": False,
+                "preflight_before": before,
+                "preflight_after": before,
+                "gc_ran": True,
+                "gc_dry_run": budget_dry_run,
+                "gc_apply": budget_apply,
+                "blockers": blockers
+                + [f"local_stream_collector_usage_above_budget:{local_usage_mb}>{MAX_LOCAL_COLLECTOR_USAGE_MB}"],
+                "hard_min_free_mb": required,
+                "recommended_resume_free_mb": recommended,
+                "preferred_24h_free_mb": preferred,
+                "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+                "local_stream_collector_usage_mb": local_usage_mb,
+                "storage_mode": storage_mode,
+                "low_disk_operator_override": override,
+            }
+    if not blockers and before.get("returncode") == 0 and (free_output >= recommended or override):
+        return {
+            "ok": True,
+            "preflight_before": before,
+            "preflight_after": before,
+            "gc_ran": budget_apply is not None,
+            "gc_dry_run": budget_dry_run,
+            "gc_apply": budget_apply,
+            "blockers": [],
+            "hard_min_free_mb": required,
+            "recommended_resume_free_mb": recommended,
+            "preferred_24h_free_mb": preferred,
+            "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+            "local_stream_collector_usage_mb": local_usage_mb,
+            "storage_mode": storage_mode,
+            "low_disk_operator_override": override,
+        }
+
+    if not blockers and before.get("returncode") != 0:
+        return {
+            "ok": False,
+            "preflight_before": before,
+            "preflight_after": before,
+            "gc_ran": False,
+            "blockers": ["local_r2_primary_preflight_failed_non_disk"],
+            "hard_min_free_mb": required,
+            "recommended_resume_free_mb": recommended,
+            "preferred_24h_free_mb": preferred,
+            "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+            "local_stream_collector_usage_mb": local_usage_mb,
+            "storage_mode": storage_mode,
+            "low_disk_operator_override": override,
+        }
+    if not blockers and free_output < recommended and not override:
+        blockers = [f"local_disk_below_recommended_resume:{free_output}<{recommended}"]
+
+    dry_run = budget_dry_run
+    free_mb = safe_int(before.get("free_mb_output"))
+    target_mb = required if free_mb < required else recommended
+    needed_bytes = max(0, (target_mb - free_mb) * 1024 * 1024)
+    safe_delete_bytes = safe_int(dry_run.get("safe_delete_bytes"), safe_int(dry_run.get("safe_delete_bytes_available")))
+    if dry_run.get("returncode") != 0 or safe_delete_bytes < needed_bytes:
+        return {
+            "ok": False,
+            "preflight_before": before,
+            "preflight_after": before,
+            "gc_ran": True,
+            "gc_dry_run": dry_run,
+            "blockers": blockers + ["insufficient_safe_verified_bulk_artifacts_for_gc"],
+            "hard_min_free_mb": required,
+            "recommended_resume_free_mb": recommended,
+            "preferred_24h_free_mb": preferred,
+            "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+            "local_stream_collector_usage_mb": local_usage_mb,
+            "storage_mode": storage_mode,
+            "low_disk_operator_override": override,
+        }
+
+    apply_result = budget_apply or run_storage_gc(apply=True, min_free_mb=max(required, recommended))
+    after = run_local_r2_primary_preflight(control_env)
+    after_blockers = local_disk_blockers(after)
+    after_free = safe_int(after.get("free_mb_output"))
+    if after.get("returncode") == 0 and after_free < recommended and not override:
+        after_blockers.append(f"local_disk_below_recommended_resume:{after_free}<{recommended}")
+    after_usage_mb = safe_int(apply_result.get("local_stream_collector_mb_after"), local_usage_mb)
+    if after_usage_mb > MAX_LOCAL_COLLECTOR_USAGE_MB:
+        after_blockers.append(f"local_stream_collector_usage_above_budget:{after_usage_mb}>{MAX_LOCAL_COLLECTOR_USAGE_MB}")
+    return {
+        "ok": not after_blockers and after.get("returncode") == 0,
+        "preflight_before": before,
+        "preflight_after": after,
+        "gc_ran": True,
+        "gc_dry_run": dry_run,
+        "gc_apply": apply_result,
+        "blockers": after_blockers,
+        "hard_min_free_mb": required,
+        "recommended_resume_free_mb": recommended,
+        "preferred_24h_free_mb": preferred,
+        "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+        "local_stream_collector_usage_mb": after_usage_mb,
+        "storage_mode": storage_mode,
+        "low_disk_operator_override": override,
+    }
+
+
 def run_reports() -> dict[str, Any]:
     commands = [
         ["python3", "scripts/build_positive_outcome_labels.py"],
@@ -259,6 +616,12 @@ def ensure_review_queue() -> None:
 
 
 def write_live_summary(status: dict[str, Any]) -> None:
+    storage = status.get("last_storage_recovery") or {}
+    preflight = storage.get("preflight_after") or storage.get("preflight_before") or {}
+    storage_mode = str(storage.get("storage_mode") or preflight.get("storage_mode") or DEFAULT_STORAGE_MODE)
+    hard_min = storage.get("hard_min_free_mb", preflight.get("required_mb", ""))
+    recommended = storage.get("recommended_resume_free_mb", storage_recommended_resume_mb(storage_mode))
+    preferred = storage.get("preferred_24h_free_mb", storage_preferred_24h_mb(storage_mode))
     lines = [
         "# Background 24h Targeted Collector",
         "",
@@ -276,6 +639,29 @@ def write_live_summary(status: dict[str, Any]) -> None:
         f"- candidate_checkpoint_count: `{status.get('candidate_checkpoint_count', 0)}`",
         f"- replay_eligible_candidate_count: `{status.get('replay_eligible_candidate_count', 0)}`",
         f"- blocker: `{status.get('blocker', '')}`",
+        f"- storage_mode: `{storage_mode}`",
+        f"- local_free_mb_output: `{preflight.get('free_mb_output', '')}`",
+        f"- local_free_mb_spool: `{preflight.get('free_mb_spool', '')}`",
+        f"- hard_min_free_mb: `{hard_min}`",
+        f"- recommended_resume_free_mb: `{recommended}`",
+        f"- preferred_24h_free_mb: `{preferred}`",
+        f"- local_collector_usage_mb: `{storage.get('local_stream_collector_usage_mb', '')}`",
+        f"- max_local_collector_usage_mb: `{storage.get('max_local_collector_usage_mb', MAX_LOCAL_COLLECTOR_USAGE_MB)}`",
+        f"- local_spool_bytes_current: `{preflight.get('local_spool_bytes_current', '')}`",
+        f"- local_spool_bytes_peak: `{preflight.get('local_spool_bytes_peak', '')}`",
+        f"- local_spool_bytes_limit: `{preflight.get('local_spool_bytes_limit', '')}`",
+        f"- local_disk_free_mb: `{preflight.get('local_disk_free_mb', preflight.get('free_mb_output', ''))}`",
+        f"- r2_streaming_spool_mb: `{R2_STREAMING_SPOOL_MB if is_r2_streaming_storage_mode(storage_mode) else ''}`",
+        f"- r2_streaming_chunk_mb: `{R2_STREAMING_CHUNK_MB if is_r2_streaming_storage_mode(storage_mode) else ''}`",
+        f"- r2_streaming_uploaded_chunks: `{status.get('r2_streaming_uploaded_chunks', '')}`",
+        f"- r2_streaming_verified_chunks: `{status.get('r2_streaming_verified_chunks', '')}`",
+        f"- r2_streaming_deleted_local_chunks: `{status.get('r2_streaming_deleted_local_chunks', '')}`",
+        f"- r2_streaming_unverified_chunks: `{status.get('r2_streaming_unverified_chunks', '')}`",
+        f"- r2_streaming_retry_count: `{status.get('r2_streaming_retry_count', '')}`",
+        f"- r2_streaming_upload_timeout_count: `{status.get('r2_streaming_upload_timeout_count', '')}`",
+        f"- r2_streaming_backpressure_detected: `{status.get('r2_streaming_backpressure_detected', '')}`",
+        f"- configured_output_root: `{preflight.get('configured_output_root', '')}`",
+        f"- configured_spool_root: `{preflight.get('configured_spool_root', '')}`",
         f"- replay/backtesting/tuning/paper/live/wallet: `blocked`",
         f"- launch_caps: `blocked`",
         "",
@@ -290,6 +676,7 @@ def write_live_summary(status: dict[str, Any]) -> None:
 
 
 def write_master_justification(current_high_positive: int) -> dict[str, Any]:
+    storage_mode = DEFAULT_STORAGE_MODE
     payload = {
         "schema_version": "phase107k.background_24h_collection_justification.v1",
         "written_at_utc": utc_stamp(),
@@ -307,7 +694,10 @@ def write_master_justification(current_high_positive: int) -> dict[str, Any]:
         "max_attempted_launches": MAX_ATTEMPTED_LAUNCHES,
         "max_concurrent_tracked_mints": MAX_CONCURRENT_TRACKED_MINTS,
         "target_candidates": TARGET_CANDIDATES,
-        "storage_mode": "r2-primary",
+        "storage_mode": storage_mode,
+        "r2_streaming_spool_mb": R2_STREAMING_SPOOL_MB if is_r2_streaming_storage_mode(storage_mode) else None,
+        "r2_streaming_min_free_mb": R2_STREAMING_MIN_FREE_MB if is_r2_streaming_storage_mode(storage_mode) else None,
+        "r2_streaming_chunk_mb": R2_STREAMING_CHUNK_MB if is_r2_streaming_storage_mode(storage_mode) else None,
         "retention_mode": "keep-manifests-after-verified-r2",
         "generic_collection_allowed": False,
         "launch_caps_remain_blocked": True,
@@ -325,6 +715,9 @@ def write_master_justification(current_high_positive: int) -> dict[str, Any]:
         f"- max_slices_total: `{MAX_TOTAL_SLICES}`\n"
         f"- max_slices_per_batch: `{MAX_SLICES_PER_BATCH}`\n"
         f"- slice_duration_seconds: `{SLICE_DURATION_SECONDS}`\n"
+        f"- storage_mode: `{storage_mode}`\n"
+        f"- r2_streaming_min_free_mb: `{payload.get('r2_streaming_min_free_mb') or ''}`\n"
+        f"- r2_streaming_spool_mb: `{payload.get('r2_streaming_spool_mb') or ''}`\n"
         f"- generic_collection_allowed: `false`\n"
         f"- replay/backtesting/tuning/paper/live/wallet: `blocked`\n"
         f"- launch_caps: `blocked`\n",
@@ -334,6 +727,7 @@ def write_master_justification(current_high_positive: int) -> dict[str, Any]:
 
 
 def write_batch_gate(batch_index: int, expected_slices: int) -> pathlib.Path:
+    storage_mode = DEFAULT_STORAGE_MODE
     gate = {
         "schema_version": "phase107j.collection_justification_decision.v1",
         "written_at_utc": utc_stamp(),
@@ -361,6 +755,10 @@ def write_batch_gate(batch_index: int, expected_slices: int) -> pathlib.Path:
         "proof_batch_mode": "batch",
         "max_attempted_launches": MAX_ATTEMPTED_LAUNCHES,
         "target_candidates": TARGET_CANDIDATES,
+        "storage_mode": storage_mode,
+        "r2_streaming_spool_mb": R2_STREAMING_SPOOL_MB if is_r2_streaming_storage_mode(storage_mode) else None,
+        "r2_streaming_min_free_mb": R2_STREAMING_MIN_FREE_MB if is_r2_streaming_storage_mode(storage_mode) else None,
+        "r2_streaming_chunk_mb": R2_STREAMING_CHUNK_MB if is_r2_streaming_storage_mode(storage_mode) else None,
         "launch_caps_changed": False,
         "launch_caps_remain_blocked": True,
         "replay_allowed": False,
@@ -435,19 +833,27 @@ def local_inflight_processes() -> list[str]:
 def pre_start_checks(control_env: pathlib.Path) -> dict[str, Any]:
     preflight = run_preflight(control_env)
     status = supervisor_status(control_env)
+    storage = ensure_local_storage_ready(control_env)
     deployed = verify_deployed_sha(control_env)
     inflight = local_inflight_processes()
-    local = status.get("local_preflight", {})
+    local = storage.get("preflight_after") or storage.get("preflight_before") or {}
     vps = status.get("vps_safety", {})
+    storage_mode = str(storage.get("storage_mode") or local.get("storage_mode") or DEFAULT_STORAGE_MODE)
+    hard_min = safe_int(storage.get("hard_min_free_mb"), safe_int(local.get("required_mb"), HARD_MIN_FREE_MB))
+    recommended = safe_int(storage.get("recommended_resume_free_mb"), storage_recommended_resume_mb(storage_mode))
     blockers: list[str] = []
     if inflight:
         blockers.append("local_relay_or_supervisor_process_already_running")
     if preflight.get("classification") != "RELAY_CONTROL_CONFIG_PASS":
         blockers.append("relay_control_preflight_failed")
-    if not local.get("ok"):
-        blockers.append("local_r2_primary_preflight_failed")
-    if safe_int(local.get("free_mb_output")) < safe_int(local.get("required_mb"), 10000):
-        blockers.append("local_disk_below_r2_primary_gate")
+    if not storage.get("ok"):
+        blockers.extend(str(item) for item in storage.get("blockers") or ["local_r2_primary_storage_not_ready"])
+    free_output = safe_int(local.get("free_mb_output"))
+    if free_output < hard_min:
+        gate = "local_disk_below_r2_streaming_gate" if is_r2_streaming_storage_mode(storage_mode) else "local_disk_below_r2_primary_gate"
+        blockers.append(f"{gate}:{free_output}<{hard_min}")
+    elif free_output < recommended and not low_disk_override_enabled(control_env):
+        blockers.append(f"local_disk_below_recommended_resume:{free_output}<{recommended}")
     if vps.get("material_candidate_service") != "inactive" or vps.get("material_hunter_service") != "inactive":
         blockers.append("old_vps_material_hunter_active")
     if safe_int(vps.get("relay_running")) != 0:
@@ -460,6 +866,7 @@ def pre_start_checks(control_env: pathlib.Path) -> dict[str, Any]:
         "ok": not blockers,
         "blockers": blockers,
         "relay_control_preflight": preflight,
+        "storage_recovery": storage,
         "supervisor_status": status,
         "deployed_sha_check": deployed,
         "local_inflight_processes": inflight,
@@ -494,6 +901,24 @@ def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
         "total_cheap_followup_rows": sum(safe_int(r.get("cheap_followup_rows")) for r in rows),
         "total_rich_tracked_launches": sum(safe_int(r.get("rich_tracked_launches")) for r in rows),
         "total_retention_deleted_bytes": sum(safe_int(r.get("retention_deleted_bytes")) for r in rows),
+        "max_local_collector_usage_mb": MAX_LOCAL_COLLECTOR_USAGE_MB,
+        "local_collector_usage_mb": max([safe_int(r.get("local_collector_usage_mb")) for r in rows] or [0]),
+        "local_spool_bytes_current": sum(safe_int(r.get("local_spool_bytes_current")) for r in rows),
+        "local_spool_bytes_peak": max([safe_int(r.get("local_spool_bytes_peak")) for r in rows] or [0]),
+        "local_spool_bytes_limit": max([safe_int(r.get("local_spool_bytes_limit")) for r in rows] or [0]),
+        "local_disk_free_mb": min(
+            [safe_int(r.get("local_disk_free_mb")) for r in rows if safe_int(r.get("local_disk_free_mb")) > 0]
+            or [0]
+        ),
+        "r2_streaming_uploaded_chunks": sum(safe_int(r.get("r2_streaming_uploaded_chunks")) for r in rows),
+        "r2_streaming_verified_chunks": sum(safe_int(r.get("r2_streaming_verified_chunks")) for r in rows),
+        "r2_streaming_deleted_local_chunks": sum(safe_int(r.get("r2_streaming_deleted_local_chunks")) for r in rows),
+        "r2_streaming_unverified_chunks": sum(safe_int(r.get("r2_streaming_unverified_chunks")) for r in rows),
+        "r2_streaming_retry_count": sum(safe_int(r.get("r2_streaming_retry_count")) for r in rows),
+        "r2_streaming_upload_timeout_count": sum(safe_int(r.get("r2_streaming_upload_timeout_count")) for r in rows),
+        "r2_streaming_backpressure_detected": any(
+            str(r.get("r2_streaming_backpressure_detected", "")).lower() == "true" for r in rows
+        ),
         "generic_collection_allowed": False,
         "replay_allowed": False,
         "formal_backtesting_allowed": False,
@@ -578,6 +1003,20 @@ def mirror_slice(batch_index: int, batch_log_dir: pathlib.Path, report_summary: 
         "artifact_consistency_ok": row.get("artifact_consistency_ok", ""),
         "retention_deleted_bytes": row.get("retention_deleted_bytes", ""),
         "local_retained_bytes": row.get("local_retained_bytes", ""),
+        "storage_mode": row.get("storage_mode", DEFAULT_STORAGE_MODE),
+        "local_collector_usage_mb": row.get("local_collector_usage_mb", ""),
+        "max_local_collector_usage_mb": row.get("max_local_collector_usage_mb", MAX_LOCAL_COLLECTOR_USAGE_MB),
+        "local_spool_bytes_current": row.get("local_spool_bytes_current", ""),
+        "local_spool_bytes_peak": row.get("local_spool_bytes_peak", ""),
+        "local_spool_bytes_limit": row.get("local_spool_bytes_limit", ""),
+        "local_disk_free_mb": row.get("local_disk_free_mb", ""),
+        "r2_streaming_uploaded_chunks": row.get("r2_streaming_uploaded_chunks", ""),
+        "r2_streaming_verified_chunks": row.get("r2_streaming_verified_chunks", ""),
+        "r2_streaming_deleted_local_chunks": row.get("r2_streaming_deleted_local_chunks", ""),
+        "r2_streaming_unverified_chunks": row.get("r2_streaming_unverified_chunks", ""),
+        "r2_streaming_retry_count": row.get("r2_streaming_retry_count", ""),
+        "r2_streaming_upload_timeout_count": row.get("r2_streaming_upload_timeout_count", ""),
+        "r2_streaming_backpressure_detected": row.get("r2_streaming_backpressure_detected", ""),
         "vps_safety_ok": str(not blocker.startswith("vps") and blocker != "old_vps_material_hunter_active").lower(),
         "blocker_if_any": blocker,
     }
@@ -612,6 +1051,18 @@ def write_batch_summary(batch_index: int) -> None:
         f"- early_burst_review_candidates: `{sum(safe_int(r.get('early_burst_review_candidate_count')) for r in rows)}`\n"
         f"- high_positive_unique_total: `{current_high_positive_count()}`\n"
         f"- blockers: `{sum(1 for r in rows if r.get('blocker_if_any'))}`\n"
+        f"- storage_mode: `{DEFAULT_STORAGE_MODE}`\n"
+        f"- max_local_collector_usage_mb: `{MAX_LOCAL_COLLECTOR_USAGE_MB}`\n"
+        f"- max_local_collector_usage_seen_mb: `{max([safe_int(r.get('local_collector_usage_mb')) for r in rows] or [0])}`\n"
+        f"- local_spool_bytes_peak: `{max([safe_int(r.get('local_spool_bytes_peak')) for r in rows] or [0])}`\n"
+        f"- local_spool_bytes_limit: `{max([safe_int(r.get('local_spool_bytes_limit')) for r in rows] or [0])}`\n"
+        f"- r2_streaming_uploaded_chunks: `{sum(safe_int(r.get('r2_streaming_uploaded_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_verified_chunks: `{sum(safe_int(r.get('r2_streaming_verified_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_deleted_local_chunks: `{sum(safe_int(r.get('r2_streaming_deleted_local_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_unverified_chunks: `{sum(safe_int(r.get('r2_streaming_unverified_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_retry_count: `{sum(safe_int(r.get('r2_streaming_retry_count')) for r in rows)}`\n"
+        f"- r2_streaming_upload_timeout_count: `{sum(safe_int(r.get('r2_streaming_upload_timeout_count')) for r in rows)}`\n"
+        f"- r2_streaming_backpressure_detected: `{str(any(str(r.get('r2_streaming_backpressure_detected', '')).lower() == 'true' for r in rows)).lower()}`\n"
         "\nReplay/backtesting/tuning/paper/live/wallet remain blocked. Launch caps remain blocked.\n",
         encoding="utf-8",
     )
@@ -636,6 +1087,18 @@ def write_final_report(classification: str, blocker: str = "") -> None:
         f"- candidate_checkpoints: `{sum(safe_int(r.get('candidate_checkpoint_count')) for r in rows)}`\n"
         f"- replay_eligible_candidates: `{sum(safe_int(r.get('replay_eligible_candidate_count')) for r in rows)}`\n"
         f"- early_burst_review_candidates: `{sum(safe_int(r.get('early_burst_review_candidate_count')) for r in rows)}`\n"
+        f"- storage_mode: `{DEFAULT_STORAGE_MODE}`\n"
+        f"- max_local_collector_usage_mb: `{MAX_LOCAL_COLLECTOR_USAGE_MB}`\n"
+        f"- max_local_collector_usage_seen_mb: `{max([safe_int(r.get('local_collector_usage_mb')) for r in rows] or [0])}`\n"
+        f"- local_spool_bytes_peak: `{max([safe_int(r.get('local_spool_bytes_peak')) for r in rows] or [0])}`\n"
+        f"- local_spool_bytes_limit: `{max([safe_int(r.get('local_spool_bytes_limit')) for r in rows] or [0])}`\n"
+        f"- r2_streaming_uploaded_chunks: `{sum(safe_int(r.get('r2_streaming_uploaded_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_verified_chunks: `{sum(safe_int(r.get('r2_streaming_verified_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_deleted_local_chunks: `{sum(safe_int(r.get('r2_streaming_deleted_local_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_unverified_chunks: `{sum(safe_int(r.get('r2_streaming_unverified_chunks')) for r in rows)}`\n"
+        f"- r2_streaming_retry_count: `{sum(safe_int(r.get('r2_streaming_retry_count')) for r in rows)}`\n"
+        f"- r2_streaming_upload_timeout_count: `{sum(safe_int(r.get('r2_streaming_upload_timeout_count')) for r in rows)}`\n"
+        f"- r2_streaming_backpressure_detected: `{str(any(str(r.get('r2_streaming_backpressure_detected', '')).lower() == 'true' for r in rows)).lower()}`\n"
         f"- blockers_encountered: `{sum(1 for r in rows if r.get('blocker_if_any'))}`\n"
         f"- more_collection_justified: `{str(high_positive < TARGET_HIGH_POSITIVE_MINTS and not blocker).lower()}`\n"
         f"- backtesting_remains_blocked: `true`\n"
@@ -645,10 +1108,142 @@ def write_final_report(classification: str, blocker: str = "") -> None:
     )
 
 
+def write_resume_decision(payload: dict[str, Any]) -> None:
+    path_json = STATUS_ROOT / "RESUME_DECISION.json"
+    path_md = STATUS_ROOT / "RESUME_DECISION.md"
+    path_json_v2 = STATUS_ROOT / "RESUME_DECISION_V2.json"
+    path_md_v2 = STATUS_ROOT / "RESUME_DECISION_V2.md"
+    write_json(path_json, payload)
+    write_json(path_json_v2, payload)
+    path_md.write_text(
+        "# Background 24h Resume Decision\n\n"
+        f"- written_at_utc: `{payload.get('written_at_utc')}`\n"
+        f"- resume_allowed: `{str(payload.get('resume_allowed')).lower()}`\n"
+        f"- reason: `{payload.get('reason')}`\n"
+        f"- completed_slices_preserved: `{payload.get('completed_slices_preserved')}`\n"
+        f"- next_slice_index: `{payload.get('next_slice_index')}`\n"
+        f"- local_preflight_ok: `{str(payload.get('local_preflight_ok')).lower()}`\n"
+        f"- vps_safety_ok: `{str(payload.get('vps_safety_ok')).lower()}`\n"
+        f"- blockers: `{', '.join(payload.get('blockers') or []) or 'none'}`\n"
+        f"- replay/backtesting/tuning/paper/live/wallet: `blocked`\n"
+        f"- launch_caps: `blocked`\n",
+        encoding="utf-8",
+    )
+    path_md_v2.write_text(path_md.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def previous_stop_was_local_disk_only(status_payload: dict[str, Any]) -> bool:
+    if status_payload.get("classification") in {LOCAL_DISK_BLOCK_CLASSIFICATION, LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION}:
+        return True
+    blocker = str(status_payload.get("blocker", ""))
+    if is_local_disk_blocker(blocker):
+        return True
+    for log_name in ("worker.err", "worker.log"):
+        path = STATUS_ROOT / log_name
+        if path.exists():
+            tail = path.read_text(encoding="utf-8", errors="replace")[-12000:]
+            if any(prefix in tail for prefix in LOCAL_DISK_BLOCKER_PREFIXES):
+                return True
+    return False
+
+
+def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
+    rows = completed_slice_rows()
+    status_payload = read_json(STATUS_PATH)
+    active = pid_running(safe_int(status_payload.get("pid"), 0) or None)
+    row_blockers = [r.get("blocker_if_any", "") for r in rows if r.get("blocker_if_any")]
+    r2_failures = sum(safe_int(r.get("r2_failed_files")) for r in rows)
+    artifact_failures = sum(1 for r in rows if str(r.get("artifact_consistency_ok")).lower() == "false")
+    candidate = sum(safe_int(r.get("candidate_checkpoint_count")) for r in rows)
+    replay = sum(safe_int(r.get("replay_eligible_candidate_count")) for r in rows)
+    storage = ensure_local_storage_ready(control_env)
+    preflight = storage.get("preflight_after") or storage.get("preflight_before") or {}
+    preflight_disk_blockers = local_disk_blockers(preflight)
+    supervisor = supervisor_status(control_env)
+    vps = supervisor.get("vps_safety", {})
+    vps_ok = (
+        safe_int(vps.get("forbidden_recent")) == 0
+        and safe_int(vps.get("relay_running")) == 0
+        and vps.get("material_candidate_service") == "inactive"
+        and vps.get("material_hunter_service") == "inactive"
+    )
+    blockers: list[str] = []
+    if active:
+        blockers.append("collector_process_still_active")
+    if not previous_stop_was_local_disk_only(status_payload):
+        blockers.append("previous_stop_not_proven_local_disk_only")
+    if row_blockers:
+        blockers.append("prior_slice_blockers_present")
+    if r2_failures:
+        blockers.append("prior_r2_failures_present")
+    if artifact_failures:
+        blockers.append("prior_artifact_failures_present")
+    if candidate or replay:
+        blockers.append("candidate_or_replay_trigger_present")
+    free_mb = safe_int(preflight.get("free_mb_output"))
+    override = low_disk_override_enabled(control_env)
+    storage_mode = str(storage.get("storage_mode") or preflight.get("storage_mode") or DEFAULT_STORAGE_MODE)
+    hard_min = safe_int(storage.get("hard_min_free_mb"), safe_int(preflight.get("required_mb"), HARD_MIN_FREE_MB))
+    recommended = safe_int(storage.get("recommended_resume_free_mb"), storage_recommended_resume_mb(storage_mode))
+    preferred = safe_int(storage.get("preferred_24h_free_mb"), storage_preferred_24h_mb(storage_mode))
+    if not storage.get("ok") or preflight.get("returncode") != 0 or preflight_disk_blockers:
+        blockers.append("local_r2_primary_preflight_not_passing_or_capacity_low")
+    if free_mb < hard_min:
+        blockers.append(f"local_disk_below_hard_min:{free_mb}<{hard_min}")
+    elif free_mb < recommended and not override:
+        blockers.append(f"local_disk_below_recommended_resume:{free_mb}<{recommended}")
+    if not vps_ok:
+        blockers.append("vps_safety_not_clean")
+    allowed = not blockers
+    return {
+        "schema_version": "phase107k.background_24h_resume_decision.v2",
+        "written_at_utc": utc_stamp(),
+        "resume_allowed": allowed,
+        "reason": "local_disk_capacity_recovered" if allowed else "local_disk_capacity_block",
+        "next_action": "resume_at_slice_20" if allowed else "free_local_disk_or_configure_larger_output_root",
+        "completed_slices_preserved": len(rows),
+        "next_slice_index": len(rows) + 1,
+        "previous_stop_was_local_disk_only": previous_stop_was_local_disk_only(status_payload),
+        "local_preflight_ok": preflight.get("returncode") == 0 and not preflight_disk_blockers,
+        "local_storage_ready": storage.get("ok") is True,
+        "local_storage_recovery": storage,
+        "local_preflight": preflight,
+        "free_mb_output": free_mb,
+        "storage_mode": storage_mode,
+        "hard_min_free_mb": hard_min,
+        "recommended_resume_free_mb": recommended,
+        "preferred_24h_free_mb": preferred,
+        "low_disk_operator_override": override,
+        "larger_output_root_configured": bool(preflight.get("configured_output_root")),
+        "larger_spool_root_configured": bool(preflight.get("configured_spool_root")),
+        "configured_output_root": preflight.get("configured_output_root", ""),
+        "configured_spool_root": preflight.get("configured_spool_root", ""),
+        "vps_safety_ok": vps_ok,
+        "vps_safety": vps,
+        "r2_failures": r2_failures,
+        "artifact_consistency_failures": artifact_failures,
+        "candidate_checkpoint_count": candidate,
+        "replay_eligible_candidate_count": replay,
+        "blockers": blockers,
+        "collection_allowed_after_resume_decision": allowed,
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "paper_trading_enabled": False,
+        "live_trading_enabled": False,
+        "wallet_execution_enabled": False,
+        "launch_caps_remain_blocked": True,
+    }
+
+
 def stop_classification(status: dict[str, Any], started_at: float) -> tuple[bool, str, str]:
     rows = completed_slice_rows()
     high_positive = current_high_positive_count()
     if status.get("blocker"):
+        if status.get("classification") == LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION:
+            return True, LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION, str(status.get("blocker"))
+        if is_local_disk_blocker(str(status.get("blocker"))) or status.get("classification") == LOCAL_DISK_BLOCK_CLASSIFICATION:
+            return True, LOCAL_DISK_BLOCK_CLASSIFICATION, str(status.get("blocker"))
         return True, "BACKGROUND_24H_COLLECTION_BLOCK_RELAY", str(status.get("blocker"))
     if rows:
         last = rows[-1]
@@ -675,6 +1270,28 @@ def stop_classification(status: dict[str, Any], started_at: float) -> tuple[bool
 
 
 def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_index: int) -> int:
+    storage = ensure_local_storage_ready(control_env)
+    if not storage.get("ok"):
+        blocker = ",".join(str(item) for item in storage.get("blockers", [])) or "local_disk_preflight_failed"
+        classification = (
+            LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION
+            if "recommended" in blocker or "insufficient_safe_verified_bulk_artifacts_for_gc" in blocker
+            else LOCAL_DISK_BLOCK_CLASSIFICATION
+        )
+        status = aggregate_status(read_json(STATUS_PATH))
+        status.update(
+            {
+                "state": "blocked",
+                "classification": classification,
+                "blocker": blocker,
+                "last_storage_recovery": storage,
+                "current_batch_index": batch_index,
+            }
+        )
+        write_json(STATUS_PATH, status)
+        write_live_summary(status)
+        append_event({"event": "local_disk_block", "batch_index": batch_index, "blocker": blocker})
+        return 3
     gate_path = write_batch_gate(batch_index, MAX_SLICES_PER_BATCH)
     batch_log_dir = STATUS_ROOT / f"batch_{batch_index:03d}" / f"slice_{slice_global_index:03d}_{compact_stamp()}"
     cmd = [
@@ -701,6 +1318,8 @@ def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_inde
         str(MAX_CONCURRENT_TRACKED_MINTS),
         "--run-prefix",
         "background-24h-early-burst",
+        "--storage-mode",
+        DEFAULT_STORAGE_MODE,
         "--batch-log-dir",
         str(batch_log_dir),
         "--require-collection-justification",
@@ -718,7 +1337,14 @@ def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_inde
         "--promotion-policy",
         "v1_controlled",
     ]
+    if is_r2_streaming_storage_mode(DEFAULT_STORAGE_MODE):
+        cmd.extend(["--r2-streaming-spool-mb", str(R2_STREAMING_SPOOL_MB)])
+        cmd.extend(["--r2-streaming-min-free-mb", str(R2_STREAMING_MIN_FREE_MB)])
+        cmd.extend(["--r2-streaming-chunk-mb", str(R2_STREAMING_CHUNK_MB)])
     env = merged_env(control_env)
+    output_root = configured_output_root(env)
+    if output_root:
+        cmd.extend(["--output-root", str(output_root)])
     append_event({"event": "slice_start", "batch_index": batch_index, "slice_global_index": slice_global_index})
     proc = subprocess.run(cmd, cwd=REPO, env=env, text=True)
     reports = run_reports()
@@ -780,17 +1406,25 @@ def worker(args: argparse.Namespace) -> int:
         rc = run_one_slice(args.control_env, batch_index, slice_index)
         if rc != 0:
             status = aggregate_status(read_json(STATUS_PATH))
+            classification = (
+                status.get("classification")
+                if status.get("classification") in {LOCAL_DISK_BLOCK_CLASSIFICATION, LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION}
+                else "BACKGROUND_24H_COLLECTION_BLOCK_RELAY"
+            )
+            blocker = status.get("blocker") if classification == LOCAL_DISK_BLOCK_CLASSIFICATION else "supervisor_slice_failed"
+            if classification == LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION:
+                blocker = status.get("blocker")
             status.update(
                 {
                     "state": "blocked",
-                    "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
-                    "blocker": "supervisor_slice_failed",
+                    "classification": classification,
+                    "blocker": blocker,
                     "pid": None,
                 }
             )
             write_json(STATUS_PATH, status)
             write_live_summary(status)
-            write_final_report("BACKGROUND_24H_COLLECTION_BLOCK_RELAY", "supervisor_slice_failed")
+            write_final_report(classification, blocker)
             return rc
         if slice_index % MAX_SLICES_PER_BATCH == 0:
             write_batch_summary(batch_index)
@@ -883,10 +1517,36 @@ def recover(_: argparse.Namespace) -> int:
         payload["state"] = "recovered"
         payload["classification"] = "BACKGROUND_24H_COLLECTION_BLOCK_LOCAL_FINALIZATION"
         payload["blocker"] = "worker_exited_before_terminal_classification"
+    if not payload["process_alive"] and previous_stop_was_local_disk_only(payload):
+        payload["state"] = "blocked"
+        payload["classification"] = LOCAL_DISK_BLOCK_CLASSIFICATION
+        payload["blocker"] = "local_r2_primary_disk_preflight_block"
     write_json(STATUS_PATH, payload)
     write_live_summary(payload)
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def resume(args: argparse.Namespace) -> int:
+    payload = resume_decision(args.control_env)
+    write_resume_decision(payload)
+    status_payload = aggregate_status(read_json(STATUS_PATH))
+    status_payload.update(
+        {
+            "state": "ready_to_resume" if payload.get("resume_allowed") else "blocked",
+            "classification": "BACKGROUND_24H_COLLECTION_RESUME_ALLOWED"
+            if payload.get("resume_allowed")
+            else LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION,
+            "blocker": "" if payload.get("resume_allowed") else ",".join(payload.get("blockers") or []),
+            "last_resume_decision": payload,
+            "last_storage_recovery": payload.get("local_storage_recovery", {}),
+            "pid": None,
+        }
+    )
+    write_json(STATUS_PATH, status_payload)
+    write_live_summary(status_payload)
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("resume_allowed") else 2
 
 
 def summarize(_: argparse.Namespace) -> int:
@@ -901,7 +1561,7 @@ def summarize(_: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["start", "status", "stop", "recover", "summarize", "worker"])
+    parser.add_argument("command", choices=["start", "status", "stop", "recover", "resume", "summarize", "worker"])
     parser.add_argument("--control-env", type=pathlib.Path, default=DEFAULT_CONTROL_ENV)
     return parser.parse_args(argv)
 
@@ -918,6 +1578,8 @@ def main(argv: list[str]) -> int:
         return stop(args)
     if args.command == "recover":
         return recover(args)
+    if args.command == "resume":
+        return resume(args)
     if args.command == "summarize":
         return summarize(args)
     raise CollectorError(f"unknown command {args.command}")

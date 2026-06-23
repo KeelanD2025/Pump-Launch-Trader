@@ -543,11 +543,19 @@ def local_preflight(args: argparse.Namespace, env: dict[str, str]) -> dict[str, 
     cmd = [
         "./scripts/local_stream_collector_preflight.sh",
         "--storage-mode",
-        "r2-primary",
+        args.storage_mode,
         "--mode",
         "collection",
+        "--output-dir",
+        str(args.output_root),
         "--verify-r2-health-live",
     ]
+    spool_root = env.get("PUMP_R2_PRIMARY_SPOOL_ROOT", "").strip()
+    if spool_root:
+        cmd.extend(["--spool-dir", spool_root])
+    if args.storage_mode == "r2-streaming":
+        cmd.extend(["--r2-spool-max-mb", str(args.r2_streaming_spool_mb)])
+        cmd.extend(["--min-free-mb", str(args.r2_streaming_min_free_mb)])
     proc = run_capture(cmd, env=env, check=True)
     return json.loads(proc.stdout)
 
@@ -877,6 +885,41 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         "asof_alpha_feature_rows_by_horizon": asof_alpha.get("rows_by_horizon") or {},
         "asof_alpha_feature_total_rows": asof_alpha.get("total_rows") or 0,
         "asof_alpha_feature_group_counts": asof_alpha.get("group_counts") or {},
+        "storage_mode": summary.get("storage_mode") or collector.get("storage_mode"),
+        "local_collector_usage_mb": summary.get("local_collector_usage_mb")
+        or (int((retention.get("local_retained_bytes") or 0) / (1024 * 1024)) if retention else 0),
+        "max_local_collector_usage_mb": 5000,
+        "local_spool_bytes_current": summary.get("local_spool_bytes_current")
+        or collector.get("local_spool_bytes_current")
+        or 0,
+        "local_spool_bytes_peak": summary.get("local_spool_bytes_peak")
+        or collector.get("local_spool_bytes_peak")
+        or 0,
+        "local_spool_bytes_limit": summary.get("local_spool_bytes_limit")
+        or collector.get("local_spool_bytes_limit")
+        or 0,
+        "local_disk_free_mb": summary.get("local_disk_free_mb") or collector.get("local_disk_free_mb") or 0,
+        "r2_streaming_uploaded_chunks": summary.get("r2_streaming_uploaded_chunks")
+        or collector.get("r2_streaming_uploaded_chunks")
+        or 0,
+        "r2_streaming_verified_chunks": summary.get("r2_streaming_verified_chunks")
+        or collector.get("r2_streaming_verified_chunks")
+        or 0,
+        "r2_streaming_deleted_local_chunks": summary.get("r2_streaming_deleted_local_chunks")
+        or collector.get("r2_streaming_deleted_local_chunks")
+        or 0,
+        "r2_streaming_unverified_chunks": summary.get("r2_streaming_unverified_chunks")
+        or collector.get("r2_streaming_unverified_chunks")
+        or 0,
+        "r2_streaming_retry_count": summary.get("r2_streaming_retry_count")
+        or collector.get("r2_streaming_retry_count")
+        or 0,
+        "r2_streaming_upload_timeout_count": summary.get("r2_streaming_upload_timeout_count")
+        or collector.get("r2_streaming_upload_timeout_count")
+        or 0,
+        "r2_streaming_backpressure_detected": summary.get("r2_streaming_backpressure_detected")
+        if "r2_streaming_backpressure_detected" in summary
+        else collector.get("r2_streaming_backpressure_detected", False),
     }
     blockers: list[str] = []
     for key in (
@@ -1167,6 +1210,10 @@ def run_slice(
         str(args.duration_seconds),
         "--output-dir",
         str(out),
+        "--storage-mode",
+        args.storage_mode,
+        "--r2-streaming-chunk-mb",
+        str(args.r2_streaming_chunk_mb),
         "--run-material-hunter",
         "--run-id",
         run_id,
@@ -1400,6 +1447,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="relay-r2-primary-proof" if command == "proof" else "relay-r2-primary-batch",
     )
     parser.add_argument("--output-root", type=pathlib.Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--storage-mode",
+        choices=["r2-primary", "r2-streaming"],
+        default=os.environ.get("PUMP_RELAY_BATCH_STORAGE_MODE", "r2-streaming"),
+    )
+    parser.add_argument("--r2-streaming-spool-mb", type=int, default=2048)
+    parser.add_argument("--r2-streaming-min-free-mb", type=int, default=4096)
+    parser.add_argument("--r2-streaming-chunk-mb", type=int, default=32)
     parser.add_argument("--batch-log-dir", type=pathlib.Path, default=None)
     parser.add_argument("--env-file", type=pathlib.Path, default=None)
     parser.add_argument("--config", default="config/default.toml")

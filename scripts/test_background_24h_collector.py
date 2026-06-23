@@ -17,6 +17,12 @@ collector = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(collector)
 
+GC_SCRIPT = pathlib.Path(__file__).with_name("local_r2_primary_storage_gc.py")
+GC_SPEC = importlib.util.spec_from_file_location("local_r2_primary_storage_gc", GC_SCRIPT)
+storage_gc = importlib.util.module_from_spec(GC_SPEC)
+assert GC_SPEC.loader is not None
+GC_SPEC.loader.exec_module(storage_gc)
+
 
 class Background24hCollectorTests(unittest.TestCase):
     @contextlib.contextmanager
@@ -32,6 +38,39 @@ class Background24hCollectorTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(collector, "MASTER_JUSTIFICATION_MD", root / "BACKGROUND_24H_COLLECTION_JUSTIFICATION.md"))
             yield
 
+    def write_verified_run(self, root: pathlib.Path, run_id: str = "run-1") -> pathlib.Path:
+        run = root / run_id
+        (run / "relay_frames").mkdir(parents=True)
+        (run / "relay_frames" / "part-000001.ndjson").write_text("frame\n" * 100)
+        (run / "countability_decision.json").write_text("{}\n")
+        (run / "run_countability_decision.json").write_text("{}\n")
+        (run / "attempt_ledger.csv").write_text("mint\n")
+        (run / "r2_upload_result.json").write_text(
+            json.dumps({"verified": True, "failed_files": [], "uploaded_files": ["k"]}) + "\n"
+        )
+        (run / "local_retention_summary.json").write_text(
+            json.dumps({"ok": True, "r2_verified": True}) + "\n"
+        )
+        (run / "artifact_consistency_summary.json").write_text(json.dumps({"ok": True}) + "\n")
+        (run / "service_exit_status.json").write_text(
+            json.dumps({"hunter_exit_status": 0, "service_exit_reason": "local_relay_collector_completed"}) + "\n"
+        )
+        (run / "local_collector_summary.json").write_text(
+            json.dumps(
+                {
+                    "frames_received": 10,
+                    "sequence_gap_count": 0,
+                    "hash_mismatch_count": 0,
+                    "malformed_frame_count": 0,
+                    "downstream_backpressure_count": 0,
+                    "receiver_unavailable_count": 0,
+                }
+            )
+            + "\n"
+        )
+        (run / "local_relay_dataset_proof_summary.json").write_text("{}\n")
+        return run
+
     def test_master_justification_is_targeted_and_forbidden_modes_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -45,6 +84,9 @@ class Background24hCollectorTests(unittest.TestCase):
             saved = json.loads((root / "BACKGROUND_24H_COLLECTION_JUSTIFICATION.json").read_text())
             self.assertEqual(saved["max_slices_per_batch"], 10)
             self.assertEqual(saved["max_slices_total"], 96)
+            self.assertEqual(saved["storage_mode"], "r2-streaming")
+            self.assertEqual(saved["r2_streaming_min_free_mb"], 4096)
+            self.assertEqual(saved["r2_streaming_spool_mb"], 2048)
 
     def test_batch_gate_is_accepted_by_relay_supervisor_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,6 +107,11 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertFalse(gate["old_vps_material_hunter_allowed"])
             self.assertFalse(gate["holder_rpc_enabled"])
             self.assertFalse(gate["rpc_mint_supply_canonical"])
+
+    def test_json_from_stdout_accepts_pretty_printed_json(self) -> None:
+        payload = collector.json_from_stdout('info line\n{\n  "free_mb_output": 10038,\n  "ok": true\n}\n')
+        self.assertEqual(payload["free_mb_output"], 10038)
+        self.assertTrue(payload["ok"])
 
     def test_stop_classification_triggers_on_candidate_or_replay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,6 +193,383 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertEqual(rows[0]["cheap_followup_rows"], "70")
             self.assertEqual(rows[0]["early_burst_review_candidate_count"], "2")
             self.assertEqual(rows[0]["high_positive_unique_total"], "4")
+
+    def test_gc_dry_run_does_not_delete_verified_bulk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "local_stream_collector"
+            report = pathlib.Path(tmp) / "reports"
+            run = self.write_verified_run(root)
+            args = type("Args", (), {"output_root": root, "report_root": report, "min_free_mb": 10000, "apply": False, "skip_validator": True, "include_operator_review_tier": False})()
+            audit = storage_gc.build_audit(args)
+            storage_gc.write_outputs(args, audit, [])
+            self.assertTrue((run / "relay_frames" / "part-000001.ndjson").exists())
+            self.assertGreater(audit["safe_delete_bytes"], 0)
+            self.assertTrue((report / "local_r2_primary_storage_gc_dry_run.json").exists())
+            self.assertTrue((report / "local_r2_primary_storage_gc_v2_dry_run.json").exists())
+            self.assertTrue((report / "LOCAL_STORAGE_CAPACITY_AUDIT_V2.md").exists())
+
+    def test_gc_apply_deletes_only_verified_bulk_and_preserves_compact_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "local_stream_collector"
+            report = pathlib.Path(tmp) / "reports"
+            run = self.write_verified_run(root)
+            args = type("Args", (), {"output_root": root, "report_root": report, "min_free_mb": 10000, "apply": True, "skip_validator": True, "include_operator_review_tier": False})()
+            audit = storage_gc.build_audit(args)
+            deleted = storage_gc.apply_deletions(audit, output_root=root)
+            storage_gc.write_outputs(args, audit, deleted)
+            self.assertFalse((run / "relay_frames").exists())
+            self.assertTrue((run / "countability_decision.json").exists())
+            self.assertTrue((run / "r2_upload_result.json").exists())
+            self.assertTrue((run / "attempt_ledger.csv").exists())
+            self.assertGreater(sum(item["bytes"] for item in deleted), 0)
+            self.assertTrue((report / "local_r2_primary_storage_gc_v2_apply.json").exists())
+            self.assertTrue((report / "LOCAL_R2_PRIMARY_STORAGE_GC_V2_REPORT.md").exists())
+
+    def test_gc_refuses_unverified_r2_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "local_stream_collector"
+            run = self.write_verified_run(root)
+            (run / "r2_upload_result.json").write_text(json.dumps({"verified": False, "failed_files": ["x"]}) + "\n")
+            args = type("Args", (), {"output_root": root, "report_root": pathlib.Path(tmp) / "reports", "min_free_mb": 10000, "apply": False, "skip_validator": True, "include_operator_review_tier": False})()
+            audit = storage_gc.build_audit(args)
+            self.assertEqual(audit["safe_delete_bytes"], 0)
+            self.assertIn("r2_not_verified", audit["unsafe_to_delete_candidates"][0]["unsafe_reasons"])
+
+    def test_gc_refuses_current_inflight_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "local_stream_collector"
+            run = self.write_verified_run(root, "active-run")
+            with mock.patch.object(storage_gc, "pgrep_lines", return_value=[f"123 local-stream-collector {run}"]):
+                args = type("Args", (), {"output_root": root, "report_root": pathlib.Path(tmp) / "reports", "min_free_mb": 10000, "apply": False, "skip_validator": True, "include_operator_review_tier": False})()
+                audit = storage_gc.build_audit(args)
+            self.assertEqual(audit["safe_delete_bytes"], 0)
+            self.assertIn("current_or_inflight_run", audit["unsafe_to_delete_candidates"][0]["unsafe_reasons"])
+
+    def test_below_disk_preflight_triggers_gc_before_local_disk_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    side_effect=[
+                        {"returncode": 2, "free_mb_output": 8909, "free_mb_spool": 8909, "required_mb": 10000},
+                        {"returncode": 0, "free_mb_output": 16000, "free_mb_spool": 16000, "required_mb": 10000},
+                    ],
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    side_effect=[
+                        {"returncode": 0, "safe_delete_bytes": 2 * 1024 * 1024 * 1024},
+                        {"returncode": 0, "deleted_bytes": 2 * 1024 * 1024 * 1024},
+                    ],
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["gc_ran"])
+
+    def test_supervisor_refuses_24h_resume_below_recommended_without_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={
+                        "returncode": 0,
+                        "storage_mode": "r2_primary",
+                        "free_mb_output": 12000,
+                        "free_mb_spool": 12000,
+                        "required_mb": 10000,
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    return_value={"returncode": 0, "safe_delete_bytes": 0},
+                ), mock.patch.object(
+                    collector,
+                    "low_disk_override_enabled",
+                    return_value=False,
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    return_value={"returncode": 0, "safe_delete_bytes_available": 0, "local_stream_collector_mb_after": 4000},
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertFalse(result["ok"])
+            self.assertIn("local_disk_below_recommended_resume:12000<15000", result["blockers"])
+
+    def test_r2_streaming_storage_ready_uses_streaming_floor_not_old_10gb_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={
+                        "returncode": 0,
+                        "storage_mode": "r2_streaming",
+                        "free_mb_output": 5000,
+                        "free_mb_spool": 5000,
+                        "required_mb": 4096,
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "low_disk_override_enabled",
+                    return_value=False,
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["gc_ran"])
+            self.assertEqual(result["hard_min_free_mb"], 4096)
+            self.assertEqual(result["recommended_resume_free_mb"], 4096)
+            self.assertEqual(result["storage_mode"], "r2_streaming")
+
+    def test_low_disk_operator_override_allows_resume_above_hard_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={"returncode": 0, "free_mb_output": 12000, "free_mb_spool": 12000, "required_mb": 10000},
+                ), mock.patch.object(
+                    collector,
+                    "low_disk_override_enabled",
+                    return_value=True,
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    return_value={"returncode": 0, "safe_delete_bytes_available": 0, "local_stream_collector_mb_after": 4000},
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["gc_ran"])
+            self.assertTrue(result["low_disk_operator_override"])
+
+    def test_local_collector_usage_budget_triggers_enforcement_before_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={
+                        "returncode": 0,
+                        "storage_mode": "r2_streaming",
+                        "free_mb_output": 7000,
+                        "free_mb_spool": 7000,
+                        "required_mb": 4096,
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    side_effect=[
+                        {"returncode": 0, "safe_delete_bytes_available": 1024, "local_stream_collector_mb_after": 6000},
+                        {"returncode": 0, "deleted_bytes": 1024, "local_stream_collector_mb_after": 4200},
+                    ],
+                ), mock.patch.object(
+                    collector,
+                    "low_disk_override_enabled",
+                    return_value=False,
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["gc_ran"])
+            self.assertEqual(result["max_local_collector_usage_mb"], 5000)
+            self.assertEqual(result["local_stream_collector_usage_mb"], 4200)
+
+    def test_local_collector_usage_budget_blocks_if_cleanup_cannot_get_under_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={
+                        "returncode": 0,
+                        "storage_mode": "r2_streaming",
+                        "free_mb_output": 7000,
+                        "free_mb_spool": 7000,
+                        "required_mb": 4096,
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "run_storage_gc",
+                    side_effect=[
+                        {"returncode": 0, "safe_delete_bytes_available": 1024, "local_stream_collector_mb_after": 6000},
+                        {"returncode": 0, "deleted_bytes": 1024, "local_stream_collector_mb_after": 5500},
+                    ],
+                ), mock.patch.object(
+                    collector,
+                    "low_disk_override_enabled",
+                    return_value=False,
+                ):
+                    result = collector.ensure_local_storage_ready(pathlib.Path("env"))
+            self.assertFalse(result["ok"])
+            self.assertIn("local_stream_collector_usage_above_budget:5500>5000", result["blockers"])
+
+    def test_if_gc_cannot_fix_disk_supervisor_blocks_as_local_disk_not_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "ensure_local_storage_ready",
+                    return_value={"ok": False, "blockers": ["local_output_disk_below_required:8909<10000"]},
+                ):
+                    rc = collector.run_one_slice(pathlib.Path("env"), 1, 1)
+            self.assertEqual(rc, 3)
+            status = json.loads((root / "status.json").read_text())
+            self.assertEqual(status["classification"], collector.LOCAL_DISK_BLOCK_CLASSIFICATION)
+
+    def test_resume_allowed_after_local_disk_only_block_with_clean_prior_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                (root / "status.json").write_text(
+                    json.dumps({"state": "blocked", "classification": collector.LOCAL_DISK_BLOCK_CLASSIFICATION, "blocker": "local_output_disk_below_required:8909<10000"}) + "\n"
+                )
+                collector.write_csv_rows(
+                    root / "slice_summaries.csv",
+                    [
+                        {
+                            "slice_id": "slice-1",
+                            "classification": "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE",
+                            "r2_failed_files": "0",
+                            "artifact_consistency_ok": "true",
+                            "candidate_checkpoint_count": "0",
+                            "replay_eligible_candidate_count": "0",
+                        }
+                    ],
+                    collector.SLICE_FIELDS,
+                )
+                with mock.patch.object(collector, "run_local_r2_primary_preflight", return_value={"returncode": 0, "free_mb_output": 16000, "free_mb_spool": 16000, "required_mb": 10000}), mock.patch.object(collector, "supervisor_status", return_value={"vps_safety": {"forbidden_recent": 0, "relay_running": 0, "material_candidate_service": "inactive", "material_hunter_service": "inactive"}}):
+                    decision = collector.resume_decision(pathlib.Path("env"))
+            self.assertTrue(decision["resume_allowed"])
+            self.assertEqual(decision["next_slice_index"], 2)
+
+    def test_resume_refused_below_recommended_without_operator_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                (root / "status.json").write_text(
+                    json.dumps({"state": "blocked", "classification": collector.LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION, "blocker": "local_disk_below_recommended_resume:12000<15000"}) + "\n"
+                )
+                collector.write_csv_rows(
+                    root / "slice_summaries.csv",
+                    [
+                        {
+                            "slice_id": "slice-1",
+                            "classification": "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE",
+                            "r2_failed_files": "0",
+                            "artifact_consistency_ok": "true",
+                            "candidate_checkpoint_count": "0",
+                            "replay_eligible_candidate_count": "0",
+                        }
+                    ],
+                    collector.SLICE_FIELDS,
+                )
+                with mock.patch.object(
+                    collector,
+                    "run_local_r2_primary_preflight",
+                    return_value={
+                        "returncode": 0,
+                        "storage_mode": "r2_primary",
+                        "free_mb_output": 12000,
+                        "free_mb_spool": 12000,
+                        "required_mb": 10000,
+                    },
+                ), mock.patch.object(collector, "run_storage_gc", return_value={"returncode": 0, "safe_delete_bytes": 0}), mock.patch.object(collector, "supervisor_status", return_value={"vps_safety": {"forbidden_recent": 0, "relay_running": 0, "material_candidate_service": "inactive", "material_hunter_service": "inactive"}}):
+                    decision = collector.resume_decision(pathlib.Path("env"))
+            self.assertFalse(decision["resume_allowed"])
+            self.assertIn("local_disk_below_recommended_resume:12000<15000", decision["blockers"])
+
+    def test_resume_command_mirrors_capacity_block_into_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                with mock.patch.object(
+                    collector,
+                    "resume_decision",
+                    return_value={
+                        "resume_allowed": False,
+                        "blockers": ["local_disk_below_recommended_resume:12000<15000"],
+                        "local_storage_recovery": {"ok": False},
+                    },
+                ):
+                    rc = collector.resume(type("Args", (), {"control_env": pathlib.Path("env")})())
+            self.assertEqual(rc, 2)
+            status = json.loads((root / "status.json").read_text())
+            self.assertEqual(status["classification"], collector.LOCAL_DISK_CAPACITY_BLOCK_CLASSIFICATION)
+            self.assertIn("local_disk_below_recommended_resume", status["blocker"])
+
+    def test_output_spool_root_override_rejects_codex_runtime_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp)
+            bad = repo / ".codex_runtime_env" / "spool"
+            bad.mkdir(parents=True)
+            with mock.patch.object(collector, "REPO", repo):
+                validation = collector.validate_output_spool_overrides(
+                    {
+                        collector.OUTPUT_ROOT_ENV: str(bad),
+                        collector.SPOOL_ROOT_ENV: str(bad),
+                    }
+                )
+            self.assertFalse(validation["ok"])
+            self.assertIn("output_root_inside_codex_runtime_env", validation["blockers"])
+            self.assertIn("spool_root_inside_codex_runtime_env", validation["blockers"])
+
+    def test_run_one_slice_passes_r2_streaming_storage_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            captured: dict[str, object] = {}
+
+            def fake_run(cmd, **kwargs):  # noqa: ANN001 - test shim.
+                captured["cmd"] = cmd
+                return type("Proc", (), {"returncode": 1})()
+
+            with self.patch_paths(root):
+                with mock.patch.object(collector, "ensure_local_storage_ready", return_value={"ok": True}), mock.patch.object(
+                    collector.subprocess,
+                    "run",
+                    side_effect=fake_run,
+                ), mock.patch.object(collector, "run_reports", return_value={"ok": True}):
+                    rc = collector.run_one_slice(pathlib.Path("env"), 1, 1)
+            self.assertEqual(rc, 1)
+            cmd = captured["cmd"]
+            self.assertIsInstance(cmd, list)
+            self.assertIn("--storage-mode", cmd)
+            self.assertIn("r2-streaming", cmd)
+            self.assertIn("--r2-streaming-spool-mb", cmd)
+            self.assertIn("--r2-streaming-min-free-mb", cmd)
+            self.assertIn("--r2-streaming-chunk-mb", cmd)
+
+    def test_resume_refused_after_r2_artifact_or_candidate_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                (root / "status.json").write_text(
+                    json.dumps({"state": "blocked", "classification": collector.LOCAL_DISK_BLOCK_CLASSIFICATION}) + "\n"
+                )
+                collector.write_csv_rows(
+                    root / "slice_summaries.csv",
+                    [
+                        {
+                            "slice_id": "slice-1",
+                            "classification": "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE",
+                            "r2_failed_files": "1",
+                            "artifact_consistency_ok": "true",
+                            "candidate_checkpoint_count": "0",
+                            "replay_eligible_candidate_count": "0",
+                        }
+                    ],
+                    collector.SLICE_FIELDS,
+                )
+                with mock.patch.object(collector, "run_local_r2_primary_preflight", return_value={"returncode": 0, "free_mb_output": 12000, "free_mb_spool": 12000, "required_mb": 10000}), mock.patch.object(collector, "supervisor_status", return_value={"vps_safety": {"forbidden_recent": 0, "relay_running": 0, "material_candidate_service": "inactive", "material_hunter_service": "inactive"}}):
+                    decision = collector.resume_decision(pathlib.Path("env"))
+            self.assertFalse(decision["resume_allowed"])
+            self.assertIn("prior_r2_failures_present", decision["blockers"])
 
 
 if __name__ == "__main__":

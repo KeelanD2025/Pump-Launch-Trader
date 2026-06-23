@@ -37,6 +37,11 @@ def dummy_args(**overrides: object) -> types.SimpleNamespace:
         "cleanup_min_age_minutes": 0,
         "manage_reverse_tunnel": True,
         "tunnel_timeout_seconds": 60,
+        "storage_mode": "r2-primary",
+        "r2_streaming_spool_mb": 2048,
+        "r2_streaming_min_free_mb": 4096,
+        "r2_streaming_chunk_mb": 32,
+        "output_root": pathlib.Path("research_output/local_stream_collector"),
     }
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -391,6 +396,32 @@ class RelaySupervisorTests(unittest.TestCase):
         ):
             args = relay_supervisor.parse_args(["batch"])
         self.assertTrue(args.require_collection_justification)
+
+    def test_local_preflight_r2_streaming_uses_streaming_disk_gate(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run_capture(cmd, **kwargs):  # noqa: ANN001 - test shim.
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(
+                stdout=json.dumps({"ok": True, "storage_mode": "r2_streaming", "required_mb": 4096}),
+                stderr="",
+                returncode=0,
+            )
+
+        args = dummy_args(storage_mode="r2-streaming", output_root=pathlib.Path("/tmp/out"))
+        with mock.patch.object(relay_supervisor, "run_capture", side_effect=fake_run_capture):
+            payload = relay_supervisor.local_preflight(args, {"PUMP_R2_PRIMARY_SPOOL_ROOT": "/tmp/spool"})
+        self.assertTrue(payload["ok"])
+        cmd = captured["cmd"]
+        self.assertIsInstance(cmd, list)
+        self.assertIn("--storage-mode", cmd)
+        self.assertIn("r2-streaming", cmd)
+        self.assertIn("--output-dir", cmd)
+        self.assertIn("/tmp/out", cmd)
+        self.assertIn("--spool-dir", cmd)
+        self.assertIn("/tmp/spool", cmd)
+        self.assertIn("--r2-spool-max-mb", cmd)
+        self.assertIn("--min-free-mb", cmd)
 
     def test_collection_justification_blocks_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
