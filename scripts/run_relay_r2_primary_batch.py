@@ -399,6 +399,10 @@ def classify_blockers(blockers: list[str], result: dict[str, Any] | None = None)
     result = result or {}
     blocker_set = set(blockers)
     if not blockers:
+        if result.get("zero_attempt_no_signal") is True:
+            if int(result.get("all_launches_seen") or 0) == 0:
+                return "RELAY_LOCAL_DATASET_PASS_EMPTY_NO_ATTEMPTS"
+            return "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL"
         if int(result.get("upstream_provider_blocker_count") or 0) > 0:
             return "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
         return "RELAY_LOCAL_DATASET_PASS"
@@ -429,6 +433,69 @@ def classify_blockers(blockers: list[str], result: dict[str, Any] | None = None)
     if "missing_final_artifacts" in blocker_set:
         return "RELAY_LOCAL_DATASET_BLOCK_STRUCTURAL"
     return "RELAY_LOCAL_DATASET_BLOCK_STRUCTURAL"
+
+
+EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS = {
+    "asof_alpha_no_rows",
+    "asof_alpha_group_missing:trade_delta",
+    "asof_alpha_group_missing:holder_state",
+    "asof_alpha_group_missing:vault_curve",
+    "asof_alpha_completeness_group_unavailable:trade_delta",
+    "asof_alpha_completeness_group_unavailable:holder_state",
+    "asof_alpha_completeness_group_unavailable:vault_curve",
+}
+
+
+def is_clean_zero_attempt_no_signal(
+    result: dict[str, Any],
+    blockers: list[str],
+    asof_alpha: dict[str, Any],
+) -> bool:
+    """True when a slice cleanly saw no rich-tracked material attempts.
+
+    A zero-attempt slice can still have all-launch/cheap-follow-up rows. In that
+    case as-of alpha feature rows are expected to be empty because as-of alpha
+    shards are emitted for rich-tracked material attempts, not every visible
+    launch. Only tolerate the expected empty-feature blockers; schema, leakage,
+    post-horizon, RPC, R2, artifact, transport, and candidate/replay blockers
+    must still fail closed.
+    """
+    if int(result.get("attempted_launches") or 0) != 0:
+        return False
+    if int(result.get("rich_tracked_launches") or 0) != 0:
+        return False
+    if int(result.get("candidate_checkpoint_count") or 0) != 0:
+        return False
+    if int(result.get("replay_eligible_candidate_count") or 0) != 0:
+        return False
+    if result.get("off_vps_candidate_replay_allowed") is True:
+        return False
+    if result.get("artifact_consistency_ok") is not True:
+        return False
+    if int(result.get("r2_failed") or 0) != 0:
+        return False
+    if int(result.get("upstream_provider_blocker_count") or 0) != 0:
+        return False
+    if result.get("provider_blocker_class"):
+        return False
+    if result.get("provider_data_loss_seen") is True:
+        return False
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if int(result.get(key) or 0) != 0:
+            return False
+    tolerated_blockers = {"asof_alpha_feature_validation", "not_counted"}
+    if not set(blockers).issubset(tolerated_blockers):
+        return False
+    asof_blockers = set(asof_alpha.get("blockers") or [])
+    if not asof_blockers:
+        return True
+    return asof_blockers.issubset(EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS)
 
 
 def latest_run_id_remote_command(args: argparse.Namespace) -> str:
@@ -836,6 +903,21 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         and result["off_vps_candidate_replay_allowed"] is True
     ):
         blockers.append("candidate_review_required")
+    if is_clean_zero_attempt_no_signal(result, blockers, asof_alpha):
+        result["zero_attempt_no_signal"] = True
+        result["no_signal_reason"] = (
+            "clean_empty_no_attempts"
+            if int(result.get("all_launches_seen") or 0) == 0
+            else "clean_cheap_only_no_rich_admission"
+        )
+        result["asof_alpha_zero_attempt_expected"] = True
+        result["asof_alpha_feature_expected_empty_reasons"] = sorted(
+            set(asof_alpha.get("blockers") or [])
+        )
+        result["asof_alpha_feature_ok"] = True
+        result["asof_alpha_feature_blockers"] = []
+        blockers = []
+        result["classification"] = classify_blockers(blockers, result)
     return result, blockers
 
 
@@ -934,6 +1016,10 @@ def can_recover_missing_remote_rc(
 
 
 def classify_slice(result: dict[str, Any]) -> str:
+    if result.get("zero_attempt_no_signal") is True:
+        if int(result.get("all_launches_seen") or 0) == 0:
+            return "RELAY_LOCAL_DATASET_PASS_EMPTY_NO_ATTEMPTS"
+        return "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL"
     if (
         result.get("candidate_checkpoint_count", 0) > 0
         or
@@ -1246,6 +1332,7 @@ def rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
         "safe_provider_quarantined_slices": sum(
             1 for item in results if item.get("safe_provider_quarantine_no_count") is True
         ),
+        "no_signal_slices": sum(1 for item in results if item.get("zero_attempt_no_signal") is True),
         "blocked_slices": 0,
         "total_frames": total("frames_received"),
         "total_all_launches_seen": total("all_launches_seen"),
@@ -1503,8 +1590,9 @@ def main(argv: list[str]) -> int:
 
     passed: list[dict[str, Any]] = []
     counted_slices = 0
+    accepted_slices = 0
     attempted_slices = 0
-    while attempted_slices < args.max_total_slices and counted_slices < args.counted_slices_target:
+    while attempted_slices < args.max_total_slices and accepted_slices < args.counted_slices_target:
         idx = args.start_index + attempted_slices
         attempted_slices += 1
         print(f"=== batch_slice={idx} start={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
@@ -1527,6 +1615,9 @@ def main(argv: list[str]) -> int:
         passed.append(result)
         if result.get("counted_phase107b_result") is True:
             counted_slices += 1
+            accepted_slices += 1
+        elif result.get("zero_attempt_no_signal") is True:
+            accepted_slices += 1
         if result["classification"] == "RELAY_COLLECTION_PASS_REVIEW_CANDIDATE":
             stop = {"slice": idx, "reason": "candidate_review_required", "result": result}
             (args.batch_log_dir / "batch_stop.json").write_text(json.dumps(stop, indent=2, sort_keys=True))
@@ -1535,20 +1626,27 @@ def main(argv: list[str]) -> int:
         print(f"=== batch_slice={idx} pass={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
 
     final = rollup(passed)
+    final["accepted_slices"] = accepted_slices
     if args.command == "proof":
-        final["classification"] = (
-            "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
-            if final["provider_gap_continued_slices"] > 0
-            else "RELAY_LOCAL_DATASET_PASS"
-        )
+        if len(passed) == 1 and passed[0].get("zero_attempt_no_signal") is True:
+            final["classification"] = passed[0]["classification"]
+        else:
+            final["classification"] = (
+                "RELAY_PROVIDER_GAP_CONTINUATION_PASS"
+                if final["provider_gap_continued_slices"] > 0
+                else "RELAY_LOCAL_DATASET_PASS"
+            )
+    elif final["no_signal_slices"] > 0 and final["counted_slices"] == 0:
+        final["classification"] = "RELAY_R2_PRIMARY_BATCH_PASS_NO_SIGNAL"
     else:
         final["classification"] = "RELAY_R2_PRIMARY_BATCH_PASS_WITH_GAP_CONTINUATION"
-    if counted_slices < args.counted_slices_target:
-        final["blocked_slices"] = args.counted_slices_target - counted_slices
+    if accepted_slices < args.counted_slices_target:
+        final["blocked_slices"] = args.counted_slices_target - accepted_slices
         final["counted_slices_target"] = args.counted_slices_target
         stop = {
             "reason": "counted_slice_target_not_met",
             "counted_slices": counted_slices,
+            "accepted_slices": accepted_slices,
             "counted_slices_target": args.counted_slices_target,
             "max_total_slices": args.max_total_slices,
             "rollup": final,

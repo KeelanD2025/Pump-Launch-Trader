@@ -93,6 +93,125 @@ def write_asof_alpha_fixture(root: pathlib.Path, *, missing_trade: bool = False)
             writer.writerow(row)
 
 
+def write_empty_asof_alpha_fixture(root: pathlib.Path, *, forbidden_column: bool = False) -> None:
+    asof_root = root / "asof_alpha_features"
+    asof_root.mkdir(parents=True, exist_ok=True)
+    (asof_root / "asof_alpha_feature_manifest.json").write_text('{"schema_version":"test"}')
+    (asof_root / "asof_alpha_feature_completeness.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "test",
+                "groups": {
+                    "trade_delta": {
+                        "available": False,
+                        "holder_rpc_used": False,
+                        "rpc_mint_supply_canonical": False,
+                    },
+                    "holder_state": {
+                        "available": False,
+                        "holder_rpc_used": False,
+                        "rpc_mint_supply_canonical": False,
+                    },
+                    "vault_curve": {
+                        "available": False,
+                        "holder_rpc_used": False,
+                        "rpc_mint_supply_canonical": False,
+                    },
+                },
+            }
+        )
+    )
+    fields = [
+        "mint",
+        "horizon_seconds",
+        "age_ms_at_horizon",
+        "trade_update_count_asof",
+        "holder_update_count_asof",
+        "vault_update_count_asof",
+        "holder_rpc_used",
+        "rpc_mint_supply_canonical",
+    ]
+    if forbidden_column:
+        fields.append("final_outcome")
+    for horizon in relay_supervisor.ASOF_ALPHA_HORIZONS:
+        with (asof_root / f"asof_alpha_features_{horizon:03d}s.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+
+
+def write_zero_attempt_slice_fixture(
+    root: pathlib.Path,
+    *,
+    all_launches_seen: int,
+    asof_forbidden_column: bool = False,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "local_relay_dataset_proof_summary.json").write_text(
+        json.dumps(
+            {
+                "classification": "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES",
+                "relay_session_id": "relay-test",
+                "duration_seconds": 900,
+                "frames_received": 100,
+                "sequence_gap_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "receiver_backpressure_count": 0,
+                "receiver_unavailable_count": 0,
+                "upstream_provider_blocker_count": 0,
+                "upstream_reconnect_count": 0,
+                "attempted_launches": 0,
+                "unique_attempted_mints": 0,
+                "rejected_dead_count": 0,
+            }
+        )
+    )
+    (root / "local_collector_summary.json").write_text("{}")
+    (root / "hunter_summary.json").write_text("{}")
+    (root / "countability_decision.json").write_text(
+        json.dumps(
+            {
+                "counted_phase107b_result": False,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "off_vps_candidate_replay_allowed": False,
+                "ready_for_off_vps_candidate_replay": False,
+                "provider_data_loss_seen": False,
+            }
+        )
+    )
+    (root / "run_countability_decision.json").write_text(
+        json.dumps({"candidate_checkpoint_count": 0, "replay_eligible_candidate_count": 0})
+    )
+    (root / "r2_upload_result.json").write_text(
+        json.dumps({"verified": True, "uploaded_files": ["manifest.json"], "failed_files": []})
+    )
+    (root / "local_retention_summary.json").write_text(json.dumps({"ok": True}))
+    (root / "all_launch_intake_summary.json").write_text(
+        json.dumps(
+            {
+                "all_launches_seen": all_launches_seen,
+                "all_launches_indexed": all_launches_seen,
+                "rich_tracked_launches": 0,
+                "cheap_only_launches": all_launches_seen,
+            }
+        )
+    )
+    (root / "all_launch_followup_manifest.json").write_text(
+        json.dumps({"total_rows": all_launches_seen * 7})
+    )
+    (root / "promotion_queue_summary.json").write_text(
+        json.dumps(
+            {
+                "promotion_recommended_count": all_launches_seen,
+                "promotion_admitted_count": 0,
+                "promotion_blocked_budget_count": 0,
+            }
+        )
+    )
+    write_empty_asof_alpha_fixture(root, forbidden_column=asof_forbidden_column)
+
+
 class RelaySupervisorTests(unittest.TestCase):
     def test_listener_readiness_is_required_before_relay_start(self) -> None:
         proc = types.SimpleNamespace(returncode=1)
@@ -460,6 +579,153 @@ class RelaySupervisorTests(unittest.TestCase):
                 relay_supervisor.classify_blockers(["asof_alpha_feature_validation"], {}),
                 "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES",
             )
+
+    def test_clean_zero_attempt_visible_launches_is_no_signal_not_asof_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=226)
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertEqual(blockers, [])
+            self.assertTrue(result["zero_attempt_no_signal"])
+            self.assertEqual(result["no_signal_reason"], "clean_cheap_only_no_rich_admission")
+            self.assertEqual(result["classification"], "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL")
+            self.assertEqual(result["all_launches_seen"], 226)
+            self.assertEqual(result["all_launches_indexed"], 226)
+            self.assertEqual(result["attempted_launches"], 0)
+            self.assertEqual(result["rich_tracked_launches"], 0)
+            self.assertTrue(result["asof_alpha_feature_ok"])
+            self.assertEqual(result["asof_alpha_feature_blockers"], [])
+
+    def test_clean_zero_attempt_empty_launches_is_empty_no_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=0)
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertEqual(blockers, [])
+            self.assertEqual(result["classification"], "RELAY_LOCAL_DATASET_PASS_EMPTY_NO_ATTEMPTS")
+            self.assertEqual(result["no_signal_reason"], "clean_empty_no_attempts")
+
+    def test_zero_attempt_does_not_hide_asof_schema_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=10, asof_forbidden_column=True)
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertIn("asof_alpha_feature_validation", blockers)
+            self.assertFalse(result.get("zero_attempt_no_signal", False))
+            self.assertEqual(
+                relay_supervisor.classify_blockers(blockers, result),
+                "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES",
+            )
+
+    def test_no_signal_slice_satisfies_one_slice_batch_without_counted_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            gate = root / "collection_gate.json"
+            gate.write_text(
+                json.dumps(
+                    {
+                        "collection_allowed": True,
+                        "reason": "targeted_early_burst_sample_collection",
+                        "justification_id": "test-no-signal",
+                        "target_gate": "EARLY_BURST_BACKTEST_READINESS",
+                        "objective": "test no-signal slice handling",
+                        "exact_blocker_being_targeted": "none",
+                        "current_sample_counts": {},
+                        "required_sample_counts": {},
+                        "expected_number_of_slices": 1,
+                        "maximum_allowed_slices": 1,
+                        "stop_conditions": ["test"],
+                        "proof_batch_mode": "batch",
+                        "launch_caps_remain_blocked": True,
+                        "replay_allowed": False,
+                        "formal_backtesting_allowed": False,
+                        "threshold_tuning_allowed": False,
+                        "paper_trading_enabled": False,
+                        "live_trading_enabled": False,
+                        "wallet_execution_enabled": False,
+                        "old_vps_material_hunter_allowed": False,
+                        "holder_rpc_enabled": False,
+                        "rpc_mint_supply_canonical": False,
+                    }
+                )
+            )
+            no_signal_result = {
+                "classification": "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL",
+                "zero_attempt_no_signal": True,
+                "all_launches_seen": 5,
+                "all_launches_indexed": 5,
+                "attempted_launches": 0,
+                "rich_tracked_launches": 0,
+                "counted_phase107b_result": False,
+                "candidate_checkpoint_count": 0,
+                "replay_eligible_candidate_count": 0,
+                "off_vps_candidate_replay_allowed": False,
+                "artifact_consistency_ok": True,
+                "r2_failed": 0,
+            }
+            with mock.patch.dict(
+                relay_supervisor.os.environ,
+                {"PUMP_RELAY_VPS_SSH_TARGET": "ubuntu@example.invalid"},
+                clear=True,
+            ):
+                with mock.patch.object(
+                    relay_supervisor,
+                    "verify_vps_safety",
+                    return_value={"ok": True},
+                ):
+                    with mock.patch.object(
+                        relay_supervisor,
+                        "run_slice",
+                        return_value=(no_signal_result, []),
+                    ):
+                        rc = relay_supervisor.main(
+                            [
+                                "batch",
+                                "--slices",
+                                "1",
+                                "--counted-slices-target",
+                                "1",
+                                "--max-total-slices",
+                                "1",
+                                "--skip-preflight",
+                                "--batch-log-dir",
+                                str(root / "logs"),
+                                "--output-root",
+                                str(root / "out"),
+                                "--collection-justification-path",
+                                str(gate),
+                                "--justification-id",
+                                "test-no-signal",
+                                "--target-gate",
+                                "EARLY_BURST_BACKTEST_READINESS",
+                                "--max-slices",
+                                "1",
+                            ]
+                        )
+            self.assertEqual(rc, 0)
+            rollup = json.loads((root / "logs" / "batch_rollup.json").read_text())
+            self.assertEqual(rollup["accepted_slices"], 1)
+            self.assertEqual(rollup["counted_slices"], 0)
+            self.assertEqual(rollup["no_signal_slices"], 1)
+            self.assertEqual(rollup["classification"], "RELAY_R2_PRIMARY_BATCH_PASS_NO_SIGNAL")
 
     def test_cleanup_aborted_deletes_only_unverified_incomplete_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
