@@ -1210,10 +1210,82 @@ def previous_stop_was_local_disk_only(status_payload: dict[str, Any]) -> bool:
     return False
 
 
+def local_stream_collector_root() -> pathlib.Path:
+    return REPO / "research_output" / "local_stream_collector"
+
+
+def latest_unmirrored_local_run_dir(rows: list[dict[str, str]]) -> pathlib.Path | None:
+    known_slice_ids = {row.get("slice_id", "") for row in rows}
+    root = local_stream_collector_root()
+    if not root.exists():
+        return None
+    candidates = [
+        path
+        for path in root.glob("background-24h-early-burst-*")
+        if path.is_dir() and not path.name.endswith("-logs") and path.name not in known_slice_ids
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_payload: dict[str, Any]) -> dict[str, Any]:
+    if status_payload.get("classification") != "BACKGROUND_24H_COLLECTION_BLOCK_RELAY":
+        return {"ok": False, "reason": "previous_stop_not_relay_block"}
+    if str(status_payload.get("blocker", "")) != "supervisor_slice_failed":
+        return {"ok": False, "reason": "previous_relay_blocker_not_supervisor_slice_failed"}
+    run_dir = latest_unmirrored_local_run_dir(rows)
+    if run_dir is None:
+        return {"ok": False, "reason": "no_unmirrored_failed_run_dir"}
+
+    proof = read_json(run_dir / "local_relay_dataset_proof_summary.json")
+    collector_exit = read_json(run_dir / "local_collector_exit_status.json")
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    retention = read_json(run_dir / "local_retention_summary.json")
+    r2_streaming = read_json(run_dir / "r2_streaming_upload_manifest.json")
+    service_exit = read_json(run_dir / "service_exit_status.json")
+    blockers: list[str] = []
+    if proof.get("classification") != "RELAY_LOCAL_DATASET_BLOCK_PROVIDER":
+        blockers.append("failed_run_not_provider_block")
+    if proof.get("provider_blocker_class") != "provider_reconnect_exhausted":
+        blockers.append("provider_block_not_reconnect_exhausted")
+    if safe_int(proof.get("attempted_launches")) != 0:
+        blockers.append("provider_block_had_attempted_launches")
+    if safe_int(proof.get("candidate_checkpoint_count")) != 0:
+        blockers.append("provider_block_candidate_checkpoint_present")
+    if safe_int(proof.get("replay_eligible_candidate_count")) != 0:
+        blockers.append("provider_block_replay_candidate_present")
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if safe_int(proof.get(key, collector_exit.get(key))) != 0:
+            blockers.append(f"provider_block_{key}_nonzero")
+    if r2_upload.get("verified") is not True or r2_upload.get("failed_files"):
+        blockers.append("provider_block_r2_not_verified")
+    if retention.get("ok") is not True:
+        blockers.append("provider_block_retention_not_ok")
+    if r2_streaming and safe_int(r2_streaming.get("unverified_chunks")) != 0:
+        blockers.append("provider_block_r2_streaming_unverified_chunks")
+    if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
+        blockers.append("provider_block_service_exit_not_clean")
+    return {
+        "ok": not blockers,
+        "reason": "recovered_provider_reconnect_exhausted_zero_attempt_slice" if not blockers else "provider_block_recovery_failed",
+        "blockers": blockers,
+        "run_dir": str(run_dir),
+        "run_id": run_dir.name,
+    }
+
+
 def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
     rows = completed_slice_rows()
     status_payload = read_json(STATUS_PATH)
     active = pid_running(safe_int(status_payload.get("pid"), 0) or None)
+    provider_recovery = recovered_provider_block_resume_status(rows, status_payload)
     row_blockers = [r.get("blocker_if_any", "") for r in rows if r.get("blocker_if_any")]
     r2_failures = sum(safe_int(r.get("r2_failed_files")) for r in rows)
     artifact_failures = sum(1 for r in rows if str(r.get("artifact_consistency_ok")).lower() == "false")
@@ -1233,8 +1305,8 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
     blockers: list[str] = []
     if active:
         blockers.append("collector_process_still_active")
-    if not previous_stop_was_local_disk_only(status_payload):
-        blockers.append("previous_stop_not_proven_local_disk_only")
+    if not previous_stop_was_local_disk_only(status_payload) and not provider_recovery.get("ok"):
+        blockers.append("previous_stop_not_proven_local_disk_or_recovered_provider_only")
     if row_blockers:
         blockers.append("prior_slice_blockers_present")
     if r2_failures:
@@ -1262,11 +1334,19 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
         "schema_version": "phase107k.background_24h_resume_decision.v2",
         "written_at_utc": utc_stamp(),
         "resume_allowed": allowed,
-        "reason": "local_disk_capacity_recovered" if allowed else "local_disk_capacity_block",
-        "next_action": "resume_at_slice_20" if allowed else "free_local_disk_or_configure_larger_output_root",
+        "reason": (
+            provider_recovery.get("reason")
+            if allowed and provider_recovery.get("ok")
+            else "local_disk_capacity_recovered"
+            if allowed
+            else "local_disk_capacity_block"
+        ),
+        "next_action": "resume_next_slice" if allowed else "free_local_disk_or_configure_larger_output_root",
         "completed_slices_preserved": len(rows),
         "next_slice_index": len(rows) + 1,
         "previous_stop_was_local_disk_only": previous_stop_was_local_disk_only(status_payload),
+        "previous_stop_was_recovered_provider_only": provider_recovery.get("ok") is True,
+        "provider_block_recovery": provider_recovery,
         "local_preflight_ok": preflight.get("returncode") == 0 and not preflight_disk_blockers,
         "local_storage_ready": storage.get("ok") is True,
         "local_storage_recovery": storage,

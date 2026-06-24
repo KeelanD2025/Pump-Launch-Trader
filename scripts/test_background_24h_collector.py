@@ -620,6 +620,155 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertFalse(decision["resume_allowed"])
             self.assertIn("prior_r2_failures_present", decision["blockers"])
 
+    def test_resume_allowed_after_recovered_zero_attempt_provider_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "status"
+            repo = pathlib.Path(tmp) / "repo"
+            run_root = repo / "research_output" / "local_stream_collector"
+            recovered = run_root / "background-24h-early-burst-20260624T105439Z"
+            recovered.mkdir(parents=True)
+            root.mkdir(parents=True)
+            (recovered / "local_relay_dataset_proof_summary.json").write_text(
+                json.dumps(
+                    {
+                        "classification": "RELAY_LOCAL_DATASET_BLOCK_PROVIDER",
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                        "attempted_launches": 0,
+                        "candidate_checkpoint_count": 0,
+                        "replay_eligible_candidate_count": 0,
+                        "sequence_gap_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "receiver_backpressure_count": 0,
+                        "receiver_unavailable_count": 0,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "local_collector_exit_status.json").write_text(json.dumps({}) + "\n")
+            (recovered / "r2_upload_result.json").write_text(json.dumps({"verified": True, "failed_files": []}) + "\n")
+            (recovered / "local_retention_summary.json").write_text(json.dumps({"ok": True}) + "\n")
+            (recovered / "r2_streaming_upload_manifest.json").write_text(json.dumps({"unverified_chunks": 0}) + "\n")
+            (recovered / "service_exit_status.json").write_text(
+                json.dumps({"service_exit_reason": "local_relay_collector_completed"}) + "\n"
+            )
+            with self.patch_paths(root), mock.patch.object(collector, "REPO", repo):
+                (root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
+                            "blocker": "supervisor_slice_failed",
+                            "pid": None,
+                        }
+                    )
+                    + "\n"
+                )
+                collector.write_csv_rows(
+                    root / "slice_summaries.csv",
+                    [
+                        {
+                            "slice_id": "background-24h-early-burst-20260624T103603Z",
+                            "classification": "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE",
+                            "r2_failed_files": "0",
+                            "artifact_consistency_ok": "true",
+                            "candidate_checkpoint_count": "0",
+                            "replay_eligible_candidate_count": "0",
+                        }
+                    ],
+                    collector.SLICE_FIELDS,
+                )
+                with mock.patch.object(
+                    collector,
+                    "ensure_local_storage_ready",
+                    return_value={
+                        "ok": True,
+                        "storage_mode": "r2_streaming",
+                        "preflight_after": {"returncode": 0, "free_mb_output": 6000, "required_mb": 4096},
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "supervisor_status",
+                    return_value={
+                        "vps_safety": {
+                            "forbidden_recent": 0,
+                            "relay_running": 0,
+                            "material_candidate_service": "inactive",
+                            "material_hunter_service": "inactive",
+                        }
+                    },
+                ):
+                    decision = collector.resume_decision(pathlib.Path("env"))
+            self.assertTrue(decision["resume_allowed"])
+            self.assertTrue(decision["previous_stop_was_recovered_provider_only"])
+            self.assertEqual(decision["next_slice_index"], 2)
+
+    def test_resume_refuses_recovered_provider_block_with_unverified_streaming_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "status"
+            repo = pathlib.Path(tmp) / "repo"
+            recovered = repo / "research_output" / "local_stream_collector" / "background-24h-early-burst-20260624T105439Z"
+            recovered.mkdir(parents=True)
+            root.mkdir(parents=True)
+            (recovered / "local_relay_dataset_proof_summary.json").write_text(
+                json.dumps(
+                    {
+                        "classification": "RELAY_LOCAL_DATASET_BLOCK_PROVIDER",
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                        "attempted_launches": 0,
+                        "candidate_checkpoint_count": 0,
+                        "replay_eligible_candidate_count": 0,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "local_collector_exit_status.json").write_text(json.dumps({}) + "\n")
+            (recovered / "r2_upload_result.json").write_text(json.dumps({"verified": True, "failed_files": []}) + "\n")
+            (recovered / "local_retention_summary.json").write_text(json.dumps({"ok": True}) + "\n")
+            (recovered / "r2_streaming_upload_manifest.json").write_text(json.dumps({"unverified_chunks": 1}) + "\n")
+            (recovered / "service_exit_status.json").write_text(
+                json.dumps({"service_exit_reason": "local_relay_collector_completed"}) + "\n"
+            )
+            with self.patch_paths(root), mock.patch.object(collector, "REPO", repo):
+                (root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
+                            "blocker": "supervisor_slice_failed",
+                        }
+                    )
+                    + "\n"
+                )
+                collector.write_csv_rows(root / "slice_summaries.csv", [], collector.SLICE_FIELDS)
+                with mock.patch.object(
+                    collector,
+                    "ensure_local_storage_ready",
+                    return_value={
+                        "ok": True,
+                        "storage_mode": "r2_streaming",
+                        "preflight_after": {"returncode": 0, "free_mb_output": 6000, "required_mb": 4096},
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "supervisor_status",
+                    return_value={
+                        "vps_safety": {
+                            "forbidden_recent": 0,
+                            "relay_running": 0,
+                            "material_candidate_service": "inactive",
+                            "material_hunter_service": "inactive",
+                        }
+                    },
+                ):
+                    decision = collector.resume_decision(pathlib.Path("env"))
+            self.assertFalse(decision["resume_allowed"])
+            self.assertIn("previous_stop_not_proven_local_disk_or_recovered_provider_only", decision["blockers"])
+            self.assertIn(
+                "provider_block_r2_streaming_unverified_chunks",
+                decision["provider_block_recovery"]["blockers"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

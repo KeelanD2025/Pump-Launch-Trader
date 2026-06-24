@@ -11,6 +11,7 @@ This script is intentionally conservative:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import time
@@ -42,6 +43,18 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         return {"parse_error": str(path)}
 
 
+def write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def path_size(path: pathlib.Path) -> int:
     if not path.exists():
         return 0
@@ -53,6 +66,168 @@ def path_size(path: pathlib.Path) -> int:
 def streaming_shards(run_dir: pathlib.Path) -> list[dict[str, Any]]:
     relay = read_json(run_dir / "relay_frame_manifest.json")
     return list(relay.get("streaming_shards") or [])
+
+
+def _mark_verified_entries(
+    entries: list[dict[str, Any]],
+    *,
+    object_key: str,
+    delete_verified_local: bool,
+) -> int:
+    changed = 0
+    for shard in entries:
+        local_path = pathlib.Path(str(shard.get("local_path") or ""))
+        entry_key = str(shard.get("object_key") or object_key)
+        if entry_key != object_key and shard.get("object_key"):
+            continue
+        if shard.get("verified") is True and shard.get("local_deleted") is True:
+            continue
+        if not local_path.exists():
+            continue
+        expected_sha = str(shard.get("sha256") or "")
+        actual_sha = file_sha256(local_path)
+        if expected_sha and expected_sha != actual_sha:
+            raise ValueError(
+                f"refusing to mark verified chunk with sha mismatch: {local_path}"
+            )
+        shard["object_key"] = object_key
+        shard["uploaded"] = True
+        shard["verified"] = True
+        shard["error"] = None
+        if delete_verified_local:
+            local_path.unlink()
+            shard["local_deleted"] = True
+        else:
+            shard["local_deleted"] = False
+        changed += 1
+    return changed
+
+
+def apply_verified_upload(
+    run_dir: pathlib.Path,
+    *,
+    object_key: str,
+    delete_verified_local: bool,
+) -> dict[str, Any]:
+    """Mark retained chunks verified after an independently verified R2 upload.
+
+    This never fabricates verification: callers must pass an object key only
+    after the upload tool has reported uploaded=true and verified=true.
+    """
+    relay_path = run_dir / "relay_frame_manifest.json"
+    relay = read_json(relay_path)
+    relay_entries = list(relay.get("streaming_shards") or [])
+    changed = _mark_verified_entries(
+        relay_entries,
+        object_key=object_key,
+        delete_verified_local=delete_verified_local,
+    )
+    if changed == 0:
+        raise ValueError("no retained local streaming chunks matched the verified object key")
+    relay["streaming_shards"] = relay_entries
+    write_json(relay_path, relay)
+
+    artifact_path = run_dir / "artifact_stream_manifest.json"
+    artifact = read_json(artifact_path)
+    artifact_entries = list(artifact.get("relay_frame_chunks") or [])
+    _mark_verified_entries(
+        artifact_entries,
+        object_key=object_key,
+        delete_verified_local=delete_verified_local,
+    )
+    artifact["relay_frame_chunks"] = artifact_entries
+    write_json(artifact_path, artifact)
+
+    uploaded = sum(1 for entry in relay_entries if entry.get("uploaded") is True)
+    verified = sum(1 for entry in relay_entries if entry.get("verified") is True)
+    deleted = sum(1 for entry in relay_entries if entry.get("local_deleted") is True)
+    unverified = sum(1 for entry in relay_entries if entry.get("verified") is not True)
+    local_spool_bytes = path_size(run_dir / "relay_frames")
+    local_retained_bytes = path_size(run_dir)
+
+    stream_path = run_dir / "r2_streaming_upload_manifest.json"
+    stream = read_json(stream_path)
+    blockers = [
+        blocker
+        for blocker in stream.get("blockers", [])
+        if blocker != "R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD"
+    ]
+    if unverified:
+        blockers.append("R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD")
+    stream.update(
+        {
+            "ok": unverified == 0 and not blockers,
+            "uploaded_chunks": uploaded,
+            "verified_chunks": verified,
+            "deleted_local_chunks": deleted,
+            "unverified_chunks": unverified,
+            "blockers": blockers,
+            "local_spool_bytes_current": local_spool_bytes,
+            "local_retained_bytes": local_retained_bytes,
+            "recovery_applied_at_utc": utc_stamp(),
+            "recovery_verified_object_key": object_key,
+        }
+    )
+    write_json(stream_path, stream)
+
+    spool_path = run_dir / "local_spool_manifest.json"
+    spool = read_json(spool_path)
+    spool.update(
+        {
+            "verified_chunks_deleted_local": deleted,
+            "unverified_chunks_retained_local": unverified,
+            "local_spool_bytes_current": local_spool_bytes,
+            "local_retained_bytes": local_retained_bytes,
+            "recovery_applied_at_utc": utc_stamp(),
+        }
+    )
+    write_json(spool_path, spool)
+
+    retention_path = run_dir / "local_retention_summary.json"
+    retention = read_json(retention_path)
+    retention["skipped_paths"] = [
+        item
+        for item in retention.get("skipped_paths", [])
+        if item.get("reason") != "r2_streaming_unverified_relay_chunks_retained"
+    ]
+    retention.update(
+        {
+            "local_retained_bytes": local_retained_bytes,
+            "r2_streaming_recovery_applied": True,
+            "r2_streaming_recovery_verified_object_key": object_key,
+            "r2_streaming_recovery_deleted_local": delete_verified_local,
+        }
+    )
+    write_json(retention_path, retention)
+
+    for name in ("local_collector_summary.json", "local_relay_dataset_proof_summary.json"):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        data = read_json(path)
+        data.update(
+            {
+                "r2_streaming_uploaded_chunks": uploaded,
+                "r2_streaming_verified_chunks": verified,
+                "r2_streaming_deleted_local_chunks": deleted,
+                "r2_streaming_unverified_chunks": unverified,
+                "local_spool_bytes_current": local_spool_bytes,
+            }
+        )
+        if name == "local_relay_dataset_proof_summary.json":
+            data["local_retained_bytes_final"] = local_retained_bytes
+            data["local_retention_summary"] = retention
+        write_json(path, data)
+
+    return {
+        "verified_marked_chunks": changed,
+        "uploaded_chunks": uploaded,
+        "verified_chunks": verified,
+        "deleted_local_chunks": deleted,
+        "unverified_chunks": unverified,
+        "local_spool_bytes_current": local_spool_bytes,
+        "local_retained_bytes": local_retained_bytes,
+    }
 
 
 def classify_recovery(summary: dict[str, Any]) -> str:
@@ -76,6 +251,7 @@ def build_summary(
     retry_requested: bool = False,
     r2_health_verified: bool = False,
     retry_uploader: str | None = None,
+    recovery_update: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifests = {name: read_json(run_dir / name) for name in MANIFEST_NAMES}
     missing = [name for name in MANIFEST_NAMES if not (run_dir / name).exists()]
@@ -132,7 +308,10 @@ def build_summary(
         "retry_uploader_available": bool(retry_uploader),
         "retry_performed": False,
         "retry_blocked_reason": "",
+        "recovery_update": recovery_update or {},
     }
+    if recovery_update:
+        summary["retry_performed"] = True
     summary["classification"] = classify_recovery(summary)
     if summary["classification"] == "R2_STREAMING_RECOVERY_RETRY_BLOCKED_R2_HEALTH":
         summary["retry_blocked_reason"] = "r2_health_not_verified"
@@ -183,6 +362,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-unverified", action="store_true")
     parser.add_argument("--r2-health-verified", action="store_true")
     parser.add_argument(
+        "--mark-verified-object-key",
+        default="",
+        help="object key from a separately verified upload; updates manifests without printing secrets",
+    )
+    parser.add_argument(
+        "--delete-verified-local",
+        action="store_true",
+        help="delete retained local chunks only after --mark-verified-object-key verification",
+    )
+    parser.add_argument(
         "--retry-uploader",
         default="",
         help="approved uploader identifier; no secrets or command lines are accepted here",
@@ -194,11 +383,21 @@ def main() -> int:
     args = parse_args()
     run_dir = args.run_dir.resolve()
     report_root = (args.report_root or run_dir).resolve()
+    recovery_update = None
+    if args.mark_verified_object_key:
+        if not args.r2_health_verified:
+            raise SystemExit("--mark-verified-object-key requires --r2-health-verified")
+        recovery_update = apply_verified_upload(
+            run_dir,
+            object_key=args.mark_verified_object_key,
+            delete_verified_local=args.delete_verified_local,
+        )
     summary = build_summary(
         run_dir,
         retry_requested=args.retry_unverified,
         r2_health_verified=args.r2_health_verified,
         retry_uploader=args.retry_uploader or None,
+        recovery_update=recovery_update,
     )
     write_report(report_root, summary)
     print(json.dumps(summary, sort_keys=True))
