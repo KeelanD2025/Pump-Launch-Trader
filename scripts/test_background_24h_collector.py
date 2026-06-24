@@ -194,6 +194,35 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertEqual(rows[0]["early_burst_review_candidate_count"], "2")
             self.assertEqual(rows[0]["high_positive_unique_total"], "4")
 
+    def test_live_summary_uses_top_level_storage_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                collector.write_live_summary(
+                    {
+                        "state": "blocked",
+                        "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
+                        "pid": None,
+                        "process_alive": False,
+                        "local_collector_usage_mb": 8,
+                        "max_local_collector_usage_mb": 5000,
+                        "local_spool_bytes_current": 0,
+                        "local_spool_bytes_peak": 33554432,
+                        "local_spool_bytes_limit": 67108864,
+                        "local_disk_free_mb": 121917,
+                        "r2_streaming_uploaded_chunks": 28,
+                        "r2_streaming_verified_chunks": 28,
+                        "r2_streaming_deleted_local_chunks": 28,
+                        "r2_streaming_unverified_chunks": 0,
+                    }
+                )
+            text = (root / "live_summary.md").read_text()
+            self.assertIn("- process_alive: `false`", text)
+            self.assertIn("- local_collector_usage_mb: `8`", text)
+            self.assertIn("- local_spool_bytes_peak: `33554432`", text)
+            self.assertIn("- local_spool_bytes_limit: `67108864`", text)
+            self.assertIn("- local_disk_free_mb: `121917`", text)
+
     def test_gc_dry_run_does_not_delete_verified_bulk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "local_stream_collector"

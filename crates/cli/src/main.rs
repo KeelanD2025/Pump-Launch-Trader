@@ -48663,6 +48663,7 @@ struct LocalRelayStreamingShardEntry {
     verified: bool,
     local_deleted: bool,
     error: Option<String>,
+    retry_count: u64,
 }
 
 async fn local_relay_upload_r2_streaming_shard(
@@ -48691,7 +48692,7 @@ async fn local_relay_upload_r2_streaming_shard(
     );
     let prepared = client.prepare_upload(
         local_path,
-        bucket,
+        bucket.clone(),
         object_key.clone(),
         "application/x-ndjson",
         BTreeMap::from([
@@ -48706,19 +48707,65 @@ async fn local_relay_upload_r2_streaming_shard(
         ]),
         Some(false),
     )?;
-    let result = client.upload_prepared(&prepared, Some(true)).await?;
-    if !(result.uploaded && result.verified) {
-        bail!(
-            "R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD:{}",
-            local_path.display()
-        );
+    let mut last_result: Option<R2UploadResult> = None;
+    let mut last_error: Option<String> = None;
+    let mut retry_count = 0_u64;
+    for attempt in 0..3_u64 {
+        if attempt > 0 {
+            retry_count = retry_count.saturating_add(1);
+            tokio::time::sleep(match attempt {
+                1 => StdDuration::from_millis(500),
+                _ => StdDuration::from_secs(2),
+            })
+            .await;
+        }
+        match client.upload_prepared(&prepared, Some(true)).await {
+            Ok(result) if result.uploaded && result.verified => {
+                fs::remove_file(local_path).with_context(|| {
+                    format!(
+                        "delete verified relay streaming shard {}",
+                        local_path.display()
+                    )
+                })?;
+                return Ok(LocalRelayStreamingShardEntry {
+                    part_index,
+                    local_path: local_path.display().to_string(),
+                    object_key: Some(result.key),
+                    sequence_start,
+                    sequence_end,
+                    frame_count,
+                    byte_length: bytes.len() as u64,
+                    sha256,
+                    uploaded: result.uploaded,
+                    verified: result.verified,
+                    local_deleted: true,
+                    error: result.error,
+                    retry_count,
+                });
+            }
+            Ok(result) => {
+                last_error = result
+                    .error
+                    .clone()
+                    .or_else(|| Some("R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD".to_owned()));
+                last_result = Some(result);
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
     }
-    fs::remove_file(local_path).with_context(|| {
-        format!(
-            "delete verified relay streaming shard {}",
-            local_path.display()
-        )
-    })?;
+    let result = last_result.unwrap_or_else(|| R2UploadResult {
+        local_path: local_path.display().to_string(),
+        bucket: bucket.to_owned(),
+        key: object_key.clone(),
+        size_bytes: bytes.len() as u64,
+        checksum_sha256: sha256.clone(),
+        uploaded: false,
+        verified: false,
+        dry_run: false,
+        error: last_error.clone(),
+    });
     Ok(LocalRelayStreamingShardEntry {
         part_index,
         local_path: local_path.display().to_string(),
@@ -48730,8 +48777,9 @@ async fn local_relay_upload_r2_streaming_shard(
         sha256,
         uploaded: result.uploaded,
         verified: result.verified,
-        local_deleted: true,
-        error: result.error,
+        local_deleted: false,
+        error: result.error.or(last_error),
+        retry_count,
     })
 }
 
@@ -50151,7 +50199,7 @@ async fn run_live_local_stream_collector(
         "r2_streaming_upload_queue_depth": 0,
         "r2_streaming_upload_queue_max": 1,
         "r2_streaming_upload_timeout_count": 0,
-        "r2_streaming_retry_count": 0,
+        "r2_streaming_retry_count": r2_streaming_shards.iter().map(|entry| entry.retry_count).sum::<u64>(),
         "r2_streaming_backpressure_detected": false,
         "local_spool_bytes_current": path_size_bytes(&output_dir.join("relay_frames")),
         "local_spool_bytes_peak": if r2_streaming_enabled { r2_streaming_chunk_bytes } else { path_size_bytes(&output_dir.join("relay_frames")) },
@@ -50565,6 +50613,22 @@ fn local_relay_frame_integrity_verified(output_dir: &Path) -> bool {
         && output_dir.join("relay_frame_manifest.json").exists()
 }
 
+fn local_relay_r2_streaming_chunks_verified(output_dir: &Path) -> bool {
+    let relay_manifest = read_json_file_or_empty(&output_dir.join("relay_frame_manifest.json"));
+    if relay_manifest["storage_mode"].as_str() != Some("r2_streaming")
+        && relay_manifest["r2_streaming_enabled"].as_bool() != Some(true)
+    {
+        return true;
+    }
+    let streaming_shards = relay_manifest["streaming_shards"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    streaming_shards
+        .iter()
+        .all(|entry| entry["verified"].as_bool().unwrap_or(false))
+}
+
 fn local_relay_apply_r2_primary_retention(
     output_dir: &Path,
     retention_mode: LocalCollectorRetentionMode,
@@ -50583,6 +50647,7 @@ fn local_relay_apply_r2_primary_retention(
     let mut deleted_bytes = 0u64;
     let retention_enabled = retention_mode.deletes_bulk();
     let relay_frame_integrity_verified = local_relay_frame_integrity_verified(output_dir);
+    let relay_r2_streaming_chunks_verified = local_relay_r2_streaming_chunks_verified(output_dir);
 
     let bulk_candidates = [
         output_dir.join("relay_frames"),
@@ -50601,6 +50666,13 @@ fn local_relay_apply_r2_primary_retention(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name == "relay_frames");
+            if is_relay_frames && !relay_r2_streaming_chunks_verified {
+                skipped_paths.push(json!({
+                    "path": candidate.display().to_string(),
+                    "reason": "r2_streaming_unverified_relay_chunks_retained",
+                }));
+                continue;
+            }
             if is_relay_frames && relay_frame_integrity_verified {
                 let bytes = path_size_bytes(&candidate);
                 let files = local_relay_collect_files(&candidate)?;
@@ -65061,6 +65133,67 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|value| value.as_str() == Some("R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD"))
+        );
+    }
+
+    #[test]
+    fn phase107m_retention_keeps_unverified_r2_streaming_relay_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let relay_frames = temp.path().join("relay_frames");
+        fs::create_dir_all(&relay_frames).expect("relay frames dir");
+        fs::write(relay_frames.join("part-000001.ndjson"), "frame\n").expect("relay frame");
+        atomic_write_path(
+            &temp.path().join("r2_upload_result.json"),
+            br#"{"verified":true,"failed_files":[],"verified_files":["compact/manifest.json"]}"#,
+        )
+        .expect("r2 upload");
+        atomic_write_path(
+            &temp.path().join("local_collector_summary.json"),
+            br#"{
+                "frames_received":1,
+                "sequence_gap_count":0,
+                "hash_mismatch_count":0,
+                "malformed_frame_count":0,
+                "downstream_backpressure_count":0,
+                "receiver_unavailable_count":0
+            }"#,
+        )
+        .expect("collector summary");
+        atomic_write_path(
+            &temp.path().join("relay_frame_manifest.json"),
+            br#"{
+                "schema_version":"phase107g.relay_frame_manifest.v1",
+                "storage_mode":"r2_streaming",
+                "streaming_shards":[
+                    {
+                        "part_index":1,
+                        "local_path":"relay_frames/part-000001.ndjson",
+                        "object_key":null,
+                        "sequence_start":1,
+                        "sequence_end":1,
+                        "frame_count":1,
+                        "byte_length":6,
+                        "sha256":"abc",
+                        "uploaded":false,
+                        "verified":false,
+                        "local_deleted":false,
+                        "error":"transient upload failure",
+                        "retry_count":2
+                    }
+                ]
+            }"#,
+        )
+        .expect("relay manifest");
+        let summary = local_relay_apply_r2_primary_retention(
+            temp.path(),
+            LocalCollectorRetentionMode::KeepManifestsAfterVerifiedR2,
+        )
+        .expect("retention");
+        assert!(temp.path().join("relay_frames/part-000001.ndjson").exists());
+        assert!(
+            summary["skipped_paths"]
+                .to_string()
+                .contains("r2_streaming_unverified_relay_chunks_retained")
         );
     }
 

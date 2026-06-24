@@ -24,20 +24,33 @@ from typing import Any
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-STATUS_ROOT = REPO / "research_output" / "trading_strategy_pipeline" / "background_24h_collector"
+STATUS_ROOT = pathlib.Path(
+    os.environ.get(
+        "PUMP_BACKGROUND_24H_STATUS_ROOT",
+        str(REPO / "research_output" / "trading_strategy_pipeline" / "background_24h_collector"),
+    )
+).expanduser()
 STATUS_PATH = STATUS_ROOT / "status.json"
 LIVE_SUMMARY_PATH = STATUS_ROOT / "live_summary.md"
 EVENTS_PATH = STATUS_ROOT / "events.ndjson"
 SLICE_SUMMARIES_PATH = STATUS_ROOT / "slice_summaries.csv"
 REVIEW_QUEUE_PATH = STATUS_ROOT / "review_queue.csv"
+JUSTIFICATION_BASENAME = os.environ.get(
+    "PUMP_BACKGROUND_24H_JUSTIFICATION_BASENAME",
+    "BACKGROUND_24H_COLLECTION_JUSTIFICATION",
+)
 MASTER_JUSTIFICATION_JSON = (
-    REPO / "research_output" / "trading_strategy_pipeline" / "BACKGROUND_24H_COLLECTION_JUSTIFICATION.json"
+    STATUS_ROOT / f"{JUSTIFICATION_BASENAME}.json"
 )
 MASTER_JUSTIFICATION_MD = (
-    REPO / "research_output" / "trading_strategy_pipeline" / "BACKGROUND_24H_COLLECTION_JUSTIFICATION.md"
+    STATUS_ROOT / f"{JUSTIFICATION_BASENAME}.md"
 )
 DEFAULT_CONTROL_ENV = REPO / ".codex_runtime_env" / "relay_control.env"
-TARGET_GATE = "EARLY_BURST_BACKTEST_READINESS"
+TARGET_GATE = os.environ.get("PUMP_BACKGROUND_24H_TARGET_GATE", "EARLY_BURST_BACKTEST_READINESS")
+COLLECTION_REASON = os.environ.get(
+    "PUMP_BACKGROUND_24H_COLLECTION_REASON",
+    "targeted_early_burst_feature_complete_collection",
+)
 BASELINE_HIGH_POSITIVE_MINTS = 4
 TARGET_HIGH_POSITIVE_MINTS = 20
 MAX_TOTAL_RUNTIME_HOURS = 24
@@ -218,6 +231,12 @@ def merged_env(control_env: pathlib.Path) -> dict[str, str]:
     if r2_env:
         env.update(load_env_file(pathlib.Path(r2_env).expanduser()))
     env.update(control)
+    # Allow explicit runtime bucket overrides to win over sourced env files.
+    # The proven R2-streaming path can route report/calibration/compat objects
+    # to the dataset bucket when legacy bucket names are not provisioned.
+    for key in ("R2_REPORTS_BUCKET", "R2_CALIBRATION_BUCKET", "R2_PROVIDER_COMPAT_BUCKET"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
     return env
 
 
@@ -622,6 +641,41 @@ def write_live_summary(status: dict[str, Any]) -> None:
     hard_min = storage.get("hard_min_free_mb", preflight.get("required_mb", ""))
     recommended = storage.get("recommended_resume_free_mb", storage_recommended_resume_mb(storage_mode))
     preferred = storage.get("preferred_24h_free_mb", storage_preferred_24h_mb(storage_mode))
+
+    def first_present(*values: Any) -> Any:
+        for value in values:
+            if value is not None and value != "":
+                return value
+        return ""
+
+    local_usage_mb = first_present(
+        status.get("local_collector_usage_mb"),
+        storage.get("local_stream_collector_usage_mb"),
+    )
+    max_local_usage_mb = first_present(
+        status.get("max_local_collector_usage_mb"),
+        storage.get("max_local_collector_usage_mb"),
+        MAX_LOCAL_COLLECTOR_USAGE_MB,
+    )
+    spool_current = first_present(
+        status.get("local_spool_bytes_current"),
+        preflight.get("local_spool_bytes_current"),
+    )
+    spool_peak = first_present(
+        status.get("local_spool_bytes_peak"),
+        preflight.get("local_spool_bytes_peak"),
+    )
+    spool_limit = first_present(
+        status.get("local_spool_bytes_limit"),
+        preflight.get("local_spool_bytes_limit"),
+    )
+    disk_free_mb = first_present(
+        status.get("local_disk_free_mb"),
+        preflight.get("local_disk_free_mb"),
+        preflight.get("free_mb_output"),
+    )
+    output_root = first_present(status.get("configured_output_root"), preflight.get("configured_output_root"))
+    spool_root = first_present(status.get("configured_spool_root"), preflight.get("configured_spool_root"))
     lines = [
         "# Background 24h Targeted Collector",
         "",
@@ -645,12 +699,12 @@ def write_live_summary(status: dict[str, Any]) -> None:
         f"- hard_min_free_mb: `{hard_min}`",
         f"- recommended_resume_free_mb: `{recommended}`",
         f"- preferred_24h_free_mb: `{preferred}`",
-        f"- local_collector_usage_mb: `{storage.get('local_stream_collector_usage_mb', '')}`",
-        f"- max_local_collector_usage_mb: `{storage.get('max_local_collector_usage_mb', MAX_LOCAL_COLLECTOR_USAGE_MB)}`",
-        f"- local_spool_bytes_current: `{preflight.get('local_spool_bytes_current', '')}`",
-        f"- local_spool_bytes_peak: `{preflight.get('local_spool_bytes_peak', '')}`",
-        f"- local_spool_bytes_limit: `{preflight.get('local_spool_bytes_limit', '')}`",
-        f"- local_disk_free_mb: `{preflight.get('local_disk_free_mb', preflight.get('free_mb_output', ''))}`",
+        f"- local_collector_usage_mb: `{local_usage_mb}`",
+        f"- max_local_collector_usage_mb: `{max_local_usage_mb}`",
+        f"- local_spool_bytes_current: `{spool_current}`",
+        f"- local_spool_bytes_peak: `{spool_peak}`",
+        f"- local_spool_bytes_limit: `{spool_limit}`",
+        f"- local_disk_free_mb: `{disk_free_mb}`",
         f"- r2_streaming_spool_mb: `{R2_STREAMING_SPOOL_MB if is_r2_streaming_storage_mode(storage_mode) else ''}`",
         f"- r2_streaming_chunk_mb: `{R2_STREAMING_CHUNK_MB if is_r2_streaming_storage_mode(storage_mode) else ''}`",
         f"- r2_streaming_uploaded_chunks: `{status.get('r2_streaming_uploaded_chunks', '')}`",
@@ -660,8 +714,8 @@ def write_live_summary(status: dict[str, Any]) -> None:
         f"- r2_streaming_retry_count: `{status.get('r2_streaming_retry_count', '')}`",
         f"- r2_streaming_upload_timeout_count: `{status.get('r2_streaming_upload_timeout_count', '')}`",
         f"- r2_streaming_backpressure_detected: `{status.get('r2_streaming_backpressure_detected', '')}`",
-        f"- configured_output_root: `{preflight.get('configured_output_root', '')}`",
-        f"- configured_spool_root: `{preflight.get('configured_spool_root', '')}`",
+        f"- configured_output_root: `{output_root}`",
+        f"- configured_spool_root: `{spool_root}`",
         f"- replay/backtesting/tuning/paper/live/wallet: `blocked`",
         f"- launch_caps: `blocked`",
         "",
@@ -681,7 +735,7 @@ def write_master_justification(current_high_positive: int) -> dict[str, Any]:
         "schema_version": "phase107k.background_24h_collection_justification.v1",
         "written_at_utc": utc_stamp(),
         "collection_allowed": True,
-        "reason": "targeted_early_burst_feature_complete_collection",
+        "reason": COLLECTION_REASON,
         "target_gate": TARGET_GATE,
         "target_high_positive_unique_mints": TARGET_HIGH_POSITIVE_MINTS,
         "current_high_positive_unique_mints": current_high_positive,
@@ -700,7 +754,16 @@ def write_master_justification(current_high_positive: int) -> dict[str, Any]:
         "r2_streaming_chunk_mb": R2_STREAMING_CHUNK_MB if is_r2_streaming_storage_mode(storage_mode) else None,
         "retention_mode": "keep-manifests-after-verified-r2",
         "generic_collection_allowed": False,
+        "unsliced_collection_allowed": False,
+        "v1_controls_promotion": True,
+        "early_burst_review_artifacts_enabled": True,
         "launch_caps_remain_blocked": True,
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "paper_trading_enabled": False,
+        "live_trading_enabled": False,
+        "wallet_execution_enabled": False,
         "replay_backtesting_tuning_paper_live_wallet_execution": "blocked",
     }
     write_json(MASTER_JUSTIFICATION_JSON, payload)

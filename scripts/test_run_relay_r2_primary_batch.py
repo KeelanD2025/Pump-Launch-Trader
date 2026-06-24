@@ -666,6 +666,52 @@ class RelaySupervisorTests(unittest.TestCase):
                 "RELAY_LOCAL_DATASET_BLOCK_ASOF_ALPHA_FEATURES",
             )
 
+    def test_zero_attempt_provider_block_is_not_asof_alpha_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=19)
+            (root / "countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "counted_phase107b_result": False,
+                        "candidate_checkpoint_count": 0,
+                        "replay_eligible_candidate_count": 0,
+                        "off_vps_candidate_replay_allowed": False,
+                        "ready_for_off_vps_candidate_replay": False,
+                        "provider_data_loss_seen": True,
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                    }
+                )
+            )
+            (root / "hunter_summary.json").write_text(
+                json.dumps(
+                    {
+                        "attempted_launches": 0,
+                        "rich_tracked_launches": 0,
+                        "all_launches_seen": 19,
+                        "all_launches_indexed": 19,
+                        "provider_data_loss_seen": True,
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                    }
+                )
+            )
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertNotIn("asof_alpha_feature_validation", blockers)
+            self.assertIn("not_counted", blockers)
+            self.assertFalse(result.get("zero_attempt_no_signal", False))
+            self.assertTrue(result["asof_alpha_zero_attempt_expected"])
+            self.assertTrue(result["asof_alpha_feature_ok"])
+            self.assertEqual(
+                relay_supervisor.classify_blockers(blockers, result),
+                "RELAY_LOCAL_DATASET_BLOCK_PROVIDER",
+            )
+
     def test_no_signal_slice_satisfies_one_slice_batch_without_counted_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

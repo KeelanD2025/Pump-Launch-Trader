@@ -446,6 +446,25 @@ EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS = {
 }
 
 
+def zero_attempt_asof_expected_empty(result: dict[str, Any], asof_alpha: dict[str, Any]) -> bool:
+    """Return true when empty as-of alpha shards are expected for zero attempts.
+
+    As-of alpha features are emitted for rich-tracked material attempts, not for
+    every visible/all-launch cheap-follow-up row. A zero-attempt slice may still
+    be blocked by provider, R2, retention, or orchestration signals; this helper
+    only prevents the expected empty as-of feature tables from becoming the
+    blocker that masks the real classification.
+    """
+    if int(result.get("attempted_launches") or 0) != 0:
+        return False
+    if int(result.get("rich_tracked_launches") or 0) != 0:
+        return False
+    asof_blockers = set(asof_alpha.get("blockers") or [])
+    if not asof_blockers:
+        return True
+    return asof_blockers.issubset(EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS)
+
+
 def is_clean_zero_attempt_no_signal(
     result: dict[str, Any],
     blockers: list[str],
@@ -492,10 +511,7 @@ def is_clean_zero_attempt_no_signal(
     tolerated_blockers = {"asof_alpha_feature_validation", "not_counted"}
     if not set(blockers).issubset(tolerated_blockers):
         return False
-    asof_blockers = set(asof_alpha.get("blockers") or [])
-    if not asof_blockers:
-        return True
-    return asof_blockers.issubset(EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS)
+    return zero_attempt_asof_expected_empty(result, asof_alpha)
 
 
 def latest_run_id_remote_command(args: argparse.Namespace) -> str:
@@ -937,7 +953,14 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         blockers.append("retention_not_ok")
     if validator_proc.returncode != 0 or validator_json.get("blockers"):
         blockers.append("artifact_consistency")
-    if asof_alpha.get("ok") is not True:
+    if zero_attempt_asof_expected_empty(result, asof_alpha):
+        result["asof_alpha_zero_attempt_expected"] = True
+        result["asof_alpha_feature_expected_empty_reasons"] = sorted(
+            set(asof_alpha.get("blockers") or [])
+        )
+        result["asof_alpha_feature_ok"] = True
+        result["asof_alpha_feature_blockers"] = []
+    elif asof_alpha.get("ok") is not True:
         blockers.append("asof_alpha_feature_validation")
     if countability.get("counted_phase107b_result") is not True:
         blockers.append("not_counted")
@@ -957,8 +980,6 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         result["asof_alpha_feature_expected_empty_reasons"] = sorted(
             set(asof_alpha.get("blockers") or [])
         )
-        result["asof_alpha_feature_ok"] = True
-        result["asof_alpha_feature_blockers"] = []
         blockers = []
         result["classification"] = classify_blockers(blockers, result)
     return result, blockers
