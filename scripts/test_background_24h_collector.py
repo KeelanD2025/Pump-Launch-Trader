@@ -108,6 +108,26 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertFalse(gate["holder_rpc_enabled"])
             self.assertFalse(gate["rpc_mint_supply_canonical"])
 
+    def test_worker_clears_stale_blocker_before_next_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.patch_paths(root):
+                (root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
+                            "blocker": "supervisor_slice_failed",
+                            "last_slice_returncode": 2,
+                        }
+                    )
+                    + "\n"
+                )
+                with mock.patch.object(collector, "run_one_slice", return_value=2) as run_one_slice:
+                    rc = collector.worker(mock.Mock(control_env=root / "relay.env"))
+            self.assertEqual(rc, 2)
+            run_one_slice.assert_called_once()
+
     def test_json_from_stdout_accepts_pretty_printed_json(self) -> None:
         payload = collector.json_from_stdout('info line\n{\n  "free_mb_output": 10038,\n  "ok": true\n}\n')
         self.assertEqual(payload["free_mb_output"], 10038)
