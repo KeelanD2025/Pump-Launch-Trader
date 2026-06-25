@@ -1056,10 +1056,9 @@ def is_safe_provider_quarantine_slice(row: dict[str, Any]) -> bool:
 
 
 def mirror_slice(batch_index: int, batch_log_dir: pathlib.Path, report_summary: dict[str, Any]) -> dict[str, Any]:
-    summary_path = batch_log_dir / "batch_summary.ndjson"
-    rows = [json.loads(raw) for raw in summary_path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+    rows = batch_result_rows(batch_log_dir)
     if not rows:
-        raise CollectorError(f"missing batch summary row: {summary_path}")
+        raise CollectorError(f"missing batch result row: {batch_log_dir}")
     row = rows[-1]
     blocker = blocker_from_slice(row)
     high_positive = current_high_positive_count()
@@ -1267,17 +1266,30 @@ def latest_unmirrored_local_run_dir(rows: list[dict[str, str]]) -> pathlib.Path 
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def batch_result_rows(batch_log_dir: pathlib.Path) -> list[dict[str, Any]]:
+    summary_path = batch_log_dir / "batch_summary.ndjson"
+    if summary_path.exists():
+        return [json.loads(raw) for raw in summary_path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+    stop_path = batch_log_dir / "batch_stop.json"
+    if stop_path.exists():
+        stop = read_json(stop_path)
+        result = stop.get("result")
+        if isinstance(result, dict):
+            return [result]
+    return []
+
+
 def batch_log_for_run(run_id: str) -> dict[str, Any]:
-    for summary_path in sorted(STATUS_ROOT.glob("batch_*/slice_*/batch_summary.ndjson"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for slice_dir in sorted(STATUS_ROOT.glob("batch_*/slice_*"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
-            rows = [json.loads(raw) for raw in summary_path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+            rows = batch_result_rows(slice_dir)
         except (OSError, json.JSONDecodeError):
             continue
         if not rows or str(rows[-1].get("run", "")) != run_id:
             continue
-        batch_index = safe_int(summary_path.parents[1].name.removeprefix("batch_"))
+        batch_index = safe_int(slice_dir.parent.name.removeprefix("batch_"))
         return {
-            "batch_log_dir": str(summary_path.parent),
+            "batch_log_dir": str(slice_dir),
             "batch_index": batch_index,
             "summary": rows[-1],
         }
@@ -1341,11 +1353,102 @@ def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_pa
     }
 
 
+def recovered_clean_remote_broken_pipe_resume_status(rows: list[dict[str, str]], status_payload: dict[str, Any]) -> dict[str, Any]:
+    if status_payload.get("classification") != "BACKGROUND_24H_COLLECTION_BLOCK_RELAY":
+        return {"ok": False, "reason": "previous_stop_not_relay_block"}
+    if str(status_payload.get("blocker", "")) != "supervisor_slice_failed":
+        return {"ok": False, "reason": "previous_relay_blocker_not_supervisor_slice_failed"}
+    run_dir = latest_unmirrored_local_run_dir(rows)
+    if run_dir is None:
+        return {"ok": False, "reason": "no_unmirrored_failed_run_dir"}
+
+    proof = read_json(run_dir / "local_relay_dataset_proof_summary.json")
+    countability = read_json(run_dir / "countability_decision.json")
+    collector_exit = read_json(run_dir / "local_collector_exit_status.json")
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    retention = read_json(run_dir / "local_retention_summary.json")
+    r2_streaming = read_json(run_dir / "r2_streaming_upload_manifest.json")
+    service_exit = read_json(run_dir / "service_exit_status.json")
+    batch_log = batch_log_for_run(run_dir.name)
+    batch_summary = batch_log.get("summary") or {}
+    logs_dir = run_dir.with_name(f"{run_dir.name}-logs")
+    vps_after = logs_dir / "vps_after.txt"
+    vps_after_text = vps_after.read_text(encoding="utf-8", errors="replace") if vps_after.exists() else ""
+    vps = batch_summary.get("vps_safety") if isinstance(batch_summary.get("vps_safety"), dict) else {}
+
+    blockers: list[str] = []
+    if proof.get("classification") != "RELAY_LOCAL_DATASET_PASS":
+        blockers.append("clean_remote_rc_local_proof_not_pass")
+    if countability.get("counted_phase107b_result") is not True:
+        blockers.append("clean_remote_rc_countability_not_counted")
+    if batch_summary.get("classification") != "RELAY_LOCAL_DATASET_BLOCK_ORCHESTRATION":
+        blockers.append("clean_remote_rc_batch_not_orchestration_block")
+    if batch_summary.get("remote_rc") != 1:
+        blockers.append("clean_remote_rc_not_one")
+    if batch_summary.get("local_rc") != 0:
+        blockers.append("clean_remote_rc_local_rc_not_zero")
+    if "Broken pipe" not in vps_after_text:
+        blockers.append("clean_remote_rc_missing_broken_pipe_tail")
+    if safe_int(proof.get("candidate_checkpoint_count")) != 0 or safe_int(countability.get("candidate_checkpoint_count")) != 0:
+        blockers.append("clean_remote_rc_candidate_checkpoint_present")
+    if safe_int(proof.get("replay_eligible_candidate_count")) != 0 or safe_int(countability.get("replay_eligible_candidate_count")) != 0:
+        blockers.append("clean_remote_rc_replay_candidate_present")
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if safe_int(proof.get(key, collector_exit.get(key))) != 0 or safe_int(batch_summary.get(key)) != 0:
+            blockers.append(f"clean_remote_rc_{key}_nonzero")
+    if safe_int(proof.get("upstream_provider_blocker_count")) != 0 or safe_int(batch_summary.get("upstream_provider_blocker_count")) != 0:
+        blockers.append("clean_remote_rc_provider_blocker_nonzero")
+    if proof.get("provider_data_loss_seen") is True or countability.get("provider_data_loss_seen") is True:
+        blockers.append("clean_remote_rc_provider_data_loss_seen")
+    if proof.get("provider_blocker_class") or countability.get("provider_blocker_class"):
+        blockers.append("clean_remote_rc_provider_blocker_class_present")
+    if r2_upload.get("verified") is not True or r2_upload.get("failed_files") or safe_int(batch_summary.get("r2_failed")) != 0:
+        blockers.append("clean_remote_rc_r2_not_verified")
+    if retention.get("ok") is not True:
+        blockers.append("clean_remote_rc_retention_not_ok")
+    if r2_streaming and safe_int(r2_streaming.get("unverified_chunks")) != 0:
+        blockers.append("clean_remote_rc_r2_streaming_unverified_chunks")
+    if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
+        blockers.append("clean_remote_rc_service_exit_not_clean")
+    if safe_int(vps.get("forbidden_recent")) != 0:
+        blockers.append("clean_remote_rc_vps_forbidden_artifacts")
+    if safe_int(vps.get("relay_running")) != 0:
+        blockers.append("clean_remote_rc_vps_relay_still_running")
+    if vps.get("material_candidate_service") != "inactive" or vps.get("material_hunter_service") != "inactive":
+        blockers.append("clean_remote_rc_old_material_hunter_active")
+
+    return {
+        "ok": not blockers,
+        "reason": "recovered_remote_broken_pipe_after_clean_local_close"
+        if not blockers
+        else "clean_remote_rc_recovery_failed",
+        "blockers": blockers,
+        "run_dir": str(run_dir),
+        "run_id": run_dir.name,
+        "batch_log_dir": batch_log.get("batch_log_dir", ""),
+        "batch_index": batch_log.get("batch_index", 0),
+    }
+
+
+def normalized_clean_remote_broken_pipe_row(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    normalized["classification"] = "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE"
+    normalized["remote_rc_recovered_from_local_validation"] = True
+    normalized["remote_rc_recovery_reason"] = "remote_broken_pipe_after_clean_local_close"
+    return normalized
+
+
 def mirror_recovered_provider_quarantine_if_needed(resume_payload: dict[str, Any]) -> dict[str, Any]:
     recovery = resume_payload.get("provider_block_recovery") or {}
     run_id = str(recovery.get("run_id", ""))
     batch_log_dir = str(recovery.get("batch_log_dir", ""))
-    if not resume_payload.get("resume_allowed") or not run_id or not batch_log_dir:
+    if not resume_payload.get("resume_allowed") or recovery.get("ok") is not True or not run_id or not batch_log_dir:
         return resume_payload
     if any(row.get("slice_id") == run_id for row in completed_slice_rows()):
         resume_payload["recovered_provider_slice_already_mirrored"] = True
@@ -1374,11 +1477,53 @@ def mirror_recovered_provider_quarantine_if_needed(resume_payload: dict[str, Any
     return resume_payload
 
 
+def mirror_recovered_clean_remote_broken_pipe_if_needed(resume_payload: dict[str, Any]) -> dict[str, Any]:
+    recovery = resume_payload.get("clean_remote_rc_recovery") or {}
+    run_id = str(recovery.get("run_id", ""))
+    batch_log_dir_raw = str(recovery.get("batch_log_dir", ""))
+    batch_log_dir = pathlib.Path(batch_log_dir_raw)
+    if not resume_payload.get("resume_allowed") or recovery.get("ok") is not True or not run_id or not batch_log_dir_raw:
+        return resume_payload
+    if any(row.get("slice_id") == run_id for row in completed_slice_rows()):
+        resume_payload["recovered_clean_remote_rc_slice_already_mirrored"] = True
+        return resume_payload
+    try:
+        rows = batch_result_rows(batch_log_dir)
+        if not rows:
+            raise CollectorError(f"missing batch result row: {batch_log_dir}")
+        normalized = normalized_clean_remote_broken_pipe_row(rows[-1])
+        summary_path = batch_log_dir / "batch_summary.ndjson"
+        if not summary_path.exists():
+            summary_path.write_text(json.dumps(normalized, sort_keys=True) + "\n", encoding="utf-8")
+        mirrored = mirror_slice(
+            safe_int(recovery.get("batch_index"), 1),
+            batch_log_dir,
+            report_summary_from_outputs(),
+        )
+    except (CollectorError, OSError, json.JSONDecodeError) as exc:
+        blockers = list(resume_payload.get("blockers") or [])
+        blockers.append(f"clean_remote_rc_mirror_failed:{type(exc).__name__}")
+        resume_payload.update(
+            {
+                "resume_allowed": False,
+                "reason": "clean_remote_rc_mirror_failed",
+                "blockers": blockers,
+            }
+        )
+        return resume_payload
+    resume_payload["recovered_clean_remote_rc_slice_mirrored"] = True
+    resume_payload["recovered_clean_remote_rc_slice_row"] = mirrored
+    resume_payload["completed_slices_preserved"] = len(completed_slice_rows())
+    resume_payload["next_slice_index"] = len(completed_slice_rows()) + 1
+    return resume_payload
+
+
 def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
     rows = completed_slice_rows()
     status_payload = read_json(STATUS_PATH)
     active = pid_running(safe_int(status_payload.get("pid"), 0) or None)
     provider_recovery = recovered_provider_block_resume_status(rows, status_payload)
+    clean_remote_rc_recovery = recovered_clean_remote_broken_pipe_resume_status(rows, status_payload)
     row_blockers = [r.get("blocker_if_any", "") for r in rows if r.get("blocker_if_any")]
     r2_failures = sum(safe_int(r.get("r2_failed_files")) for r in rows)
     artifact_failures = sum(1 for r in rows if str(r.get("artifact_consistency_ok")).lower() == "false")
@@ -1398,7 +1543,8 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
     blockers: list[str] = []
     if active:
         blockers.append("collector_process_still_active")
-    if not previous_stop_was_local_disk_only(status_payload) and not provider_recovery.get("ok"):
+    recovered_relay_stop = provider_recovery.get("ok") or clean_remote_rc_recovery.get("ok")
+    if not previous_stop_was_local_disk_only(status_payload) and not recovered_relay_stop:
         blockers.append("previous_stop_not_proven_local_disk_or_recovered_provider_only")
     if row_blockers:
         blockers.append("prior_slice_blockers_present")
@@ -1428,6 +1574,9 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
         "written_at_utc": utc_stamp(),
         "resume_allowed": allowed,
         "reason": (
+            clean_remote_rc_recovery.get("reason")
+            if allowed and clean_remote_rc_recovery.get("ok")
+            else
             provider_recovery.get("reason")
             if allowed and provider_recovery.get("ok")
             else "local_disk_capacity_recovered"
@@ -1439,7 +1588,9 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
         "next_slice_index": len(rows) + 1,
         "previous_stop_was_local_disk_only": previous_stop_was_local_disk_only(status_payload),
         "previous_stop_was_recovered_provider_only": provider_recovery.get("ok") is True,
+        "previous_stop_was_recovered_clean_remote_rc": clean_remote_rc_recovery.get("ok") is True,
         "provider_block_recovery": provider_recovery,
+        "clean_remote_rc_recovery": clean_remote_rc_recovery,
         "local_preflight_ok": preflight.get("returncode") == 0 and not preflight_disk_blockers,
         "local_storage_ready": storage.get("ok") is True,
         "local_storage_recovery": storage,
@@ -1790,6 +1941,7 @@ def recover(_: argparse.Namespace) -> int:
 def resume(args: argparse.Namespace) -> int:
     payload = resume_decision(args.control_env)
     payload = mirror_recovered_provider_quarantine_if_needed(payload)
+    payload = mirror_recovered_clean_remote_broken_pipe_if_needed(payload)
     write_resume_decision(payload)
     status_payload = aggregate_status(read_json(STATUS_PATH))
     status_payload.update(

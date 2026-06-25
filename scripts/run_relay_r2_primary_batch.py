@@ -1079,6 +1079,70 @@ def can_recover_missing_remote_rc(
     return True
 
 
+def can_recover_remote_broken_pipe_after_clean_local_close(
+    result: dict[str, Any],
+    blockers: list[str],
+    safety: dict[str, Any],
+    expected_latest_run_id: str,
+    remote_after_text: str,
+) -> bool:
+    """Recover the narrow clean-local-close relay broken-pipe case.
+
+    The local collector owns sequence/hash verification, material countability,
+    R2 verification, and artifact validation. A remote relay can still exit 1
+    with a broken pipe after the local receiver closes cleanly at the terminal
+    material window. Treat that as recoverable only when every local data and
+    VPS safety signal is clean and the remote tail explicitly shows the broken
+    pipe condition.
+    """
+    if blockers != ["remote_rc"]:
+        return False
+    if result.get("remote_rc") != 1:
+        return False
+    if result.get("remote_rc_poll_timeout_seen") is True:
+        return False
+    if "Broken pipe" not in remote_after_text:
+        return False
+    if result.get("local_rc") != 0:
+        return False
+    if result.get("counted_phase107b_result") is not True:
+        return False
+    if result.get("artifact_consistency_ok") is not True:
+        return False
+    if int(result.get("r2_failed") or 0) != 0:
+        return False
+    if result.get("provider_data_loss_seen") is True or result.get("provider_blocker_class"):
+        return False
+    if int(result.get("upstream_provider_blocker_count") or 0) != 0:
+        return False
+    for key in (
+        "sequence_gap_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_backpressure_count",
+        "receiver_unavailable_count",
+    ):
+        if int(result.get(key) or 0) != 0:
+            return False
+    if int(result.get("candidate_checkpoint_count") or 0) != 0:
+        return False
+    if int(result.get("replay_eligible_candidate_count") or 0) != 0:
+        return False
+    if result.get("off_vps_candidate_replay_allowed") is True:
+        return False
+    if int(safety.get("forbidden_recent") or 0) != 0:
+        return False
+    if int(safety.get("relay_running") or 0) != 0:
+        return False
+    if safety.get("material_candidate_service") == "active":
+        return False
+    if safety.get("material_hunter_service") == "active":
+        return False
+    if expected_latest_run_id and safety.get("latest_run_id") != expected_latest_run_id:
+        return False
+    return True
+
+
 def classify_slice(result: dict[str, Any]) -> str:
     if result.get("zero_attempt_no_signal") is True:
         if int(result.get("all_launches_seen") or 0) == 0:
@@ -1341,7 +1405,12 @@ def run_slice(
         local_log.close()
         local_err.close()
 
-    collect_remote_after(args, health_dir, log_dir / "vps_after.txt")
+    vps_after_path = log_dir / "vps_after.txt"
+    collect_remote_after(args, health_dir, vps_after_path)
+    try:
+        vps_after_text = vps_after_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        vps_after_text = ""
     result, blockers = validate_slice(out)
     result["slice_index"] = idx
     result["run"] = run_id
@@ -1380,6 +1449,16 @@ def run_slice(
     if can_recover_missing_remote_rc(result, blockers, safety, args.expected_latest_run_id):
         result["remote_rc_recovered_from_local_validation"] = True
         result["remote_rc_recovery_reason"] = "missing_remote_rc_with_clean_local_r2_and_vps_safety"
+        blockers = []
+    if can_recover_remote_broken_pipe_after_clean_local_close(
+        result,
+        blockers,
+        safety,
+        args.expected_latest_run_id,
+        vps_after_text,
+    ):
+        result["remote_rc_recovered_from_local_validation"] = True
+        result["remote_rc_recovery_reason"] = "remote_broken_pipe_after_clean_local_close"
         blockers = []
     return result, blockers
 

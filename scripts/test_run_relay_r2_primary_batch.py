@@ -931,6 +931,62 @@ class RelaySupervisorTests(unittest.TestCase):
             )
         )
 
+    def test_remote_broken_pipe_recovery_requires_clean_local_slice(self) -> None:
+        clean_result = {
+            "remote_rc": 1,
+            "remote_rc_poll_timeout_seen": False,
+            "local_rc": 0,
+            "counted_phase107b_result": True,
+            "artifact_consistency_ok": True,
+            "r2_failed": 0,
+            "provider_data_loss_seen": False,
+            "provider_blocker_class": None,
+            "upstream_provider_blocker_count": 0,
+            "sequence_gap_count": 0,
+            "hash_mismatch_count": 0,
+            "malformed_frame_count": 0,
+            "receiver_backpressure_count": 0,
+            "receiver_unavailable_count": 0,
+            "candidate_checkpoint_count": 0,
+            "replay_eligible_candidate_count": 0,
+            "off_vps_candidate_replay_allowed": False,
+        }
+        clean_safety = {
+            "forbidden_recent": 0,
+            "relay_running": 0,
+            "material_candidate_service": "inactive",
+            "material_hunter_service": "inactive",
+            "latest_run_id": "material-candidate-hunter-stable",
+        }
+        self.assertTrue(
+            relay_supervisor.can_recover_remote_broken_pipe_after_clean_local_close(
+                clean_result,
+                ["remote_rc"],
+                clean_safety,
+                "material-candidate-hunter-stable",
+                "relay_err_tail\nError: Broken pipe (os error 32)\n",
+            )
+        )
+        dirty_result = dict(clean_result, sequence_gap_count=1)
+        self.assertFalse(
+            relay_supervisor.can_recover_remote_broken_pipe_after_clean_local_close(
+                dirty_result,
+                ["remote_rc"],
+                clean_safety,
+                "material-candidate-hunter-stable",
+                "relay_err_tail\nError: Broken pipe (os error 32)\n",
+            )
+        )
+        self.assertFalse(
+            relay_supervisor.can_recover_remote_broken_pipe_after_clean_local_close(
+                clean_result,
+                ["remote_rc"],
+                clean_safety,
+                "material-candidate-hunter-stable",
+                "relay_err_tail\nError: provider auth failed\n",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
