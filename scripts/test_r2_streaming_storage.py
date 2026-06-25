@@ -228,6 +228,10 @@ class R2StreamingRecoveryTests(unittest.TestCase):
             stream = json.loads((run / "r2_streaming_upload_manifest.json").read_text())
             self.assertTrue(stream["ok"])
             self.assertEqual(stream["blockers"], [])
+            artifact = json.loads((run / "artifact_stream_manifest.json").read_text())
+            self.assertTrue(artifact["relay_frame_chunks"][0]["uploaded"])
+            self.assertTrue(artifact["relay_frame_chunks"][0]["verified"])
+            self.assertTrue(artifact["relay_frame_chunks"][0]["local_deleted"])
 
 
 if __name__ == "__main__":

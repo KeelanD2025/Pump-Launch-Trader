@@ -73,6 +73,7 @@ def _mark_verified_entries(
     *,
     object_key: str,
     delete_verified_local: bool,
+    deferred_delete_paths: set[pathlib.Path] | None = None,
 ) -> int:
     changed = 0
     for shard in entries:
@@ -95,8 +96,9 @@ def _mark_verified_entries(
         shard["verified"] = True
         shard["error"] = None
         if delete_verified_local:
-            local_path.unlink()
             shard["local_deleted"] = True
+            if deferred_delete_paths is not None:
+                deferred_delete_paths.add(local_path)
         else:
             shard["local_deleted"] = False
         changed += 1
@@ -117,10 +119,12 @@ def apply_verified_upload(
     relay_path = run_dir / "relay_frame_manifest.json"
     relay = read_json(relay_path)
     relay_entries = list(relay.get("streaming_shards") or [])
+    deferred_delete_paths: set[pathlib.Path] = set()
     changed = _mark_verified_entries(
         relay_entries,
         object_key=object_key,
         delete_verified_local=delete_verified_local,
+        deferred_delete_paths=deferred_delete_paths,
     )
     if changed == 0:
         raise ValueError("no retained local streaming chunks matched the verified object key")
@@ -134,9 +138,14 @@ def apply_verified_upload(
         artifact_entries,
         object_key=object_key,
         delete_verified_local=delete_verified_local,
+        deferred_delete_paths=deferred_delete_paths,
     )
     artifact["relay_frame_chunks"] = artifact_entries
     write_json(artifact_path, artifact)
+
+    for path in sorted(deferred_delete_paths):
+        if path.exists():
+            path.unlink()
 
     uploaded = sum(1 for entry in relay_entries if entry.get("uploaded") is True)
     verified = sum(1 for entry in relay_entries if entry.get("verified") is True)
