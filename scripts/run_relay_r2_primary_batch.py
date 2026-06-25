@@ -465,6 +465,33 @@ def zero_attempt_asof_expected_empty(result: dict[str, Any], asof_alpha: dict[st
     return asof_blockers.issubset(EXPECTED_ZERO_ATTEMPT_ASOF_BLOCKERS)
 
 
+def zero_attempt_provider_gap_recovered(result: dict[str, Any]) -> bool:
+    """Allow clean zero-attempt slices through recoverable provider reconnects.
+
+    Provider reconnect controls can appear in an otherwise clean cheap-only
+    slice. They are not material attempts and they do not imply replay/candidate
+    eligibility. Keep exhausted/data-loss cases blocked.
+    """
+    upstream_blockers = int(result.get("upstream_provider_blocker_count") or 0)
+    if result.get("provider_blocker_class"):
+        return False
+    if result.get("provider_data_loss_seen") is True:
+        return False
+    if upstream_blockers == 0:
+        return True
+    if int(result.get("upstream_reconnect_exhausted_count") or 0) != 0:
+        return False
+    for key in (
+        "r2_streaming_unverified_chunks",
+        "r2_streaming_upload_timeout_count",
+    ):
+        if int(result.get(key) or 0) != 0:
+            return False
+    if result.get("r2_streaming_backpressure_detected") is True:
+        return False
+    return True
+
+
 def is_clean_zero_attempt_no_signal(
     result: dict[str, Any],
     blockers: list[str],
@@ -493,11 +520,7 @@ def is_clean_zero_attempt_no_signal(
         return False
     if int(result.get("r2_failed") or 0) != 0:
         return False
-    if int(result.get("upstream_provider_blocker_count") or 0) != 0:
-        return False
-    if result.get("provider_blocker_class"):
-        return False
-    if result.get("provider_data_loss_seen") is True:
+    if not zero_attempt_provider_gap_recovered(result):
         return False
     for key in (
         "sequence_gap_count",
@@ -814,6 +837,9 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         or 0,
         "upstream_reconnect_count": summary.get("upstream_reconnect_count")
         or collector.get("upstream_reconnect_count")
+        or 0,
+        "upstream_reconnect_exhausted_count": summary.get("upstream_reconnect_exhausted_count")
+        or collector.get("upstream_reconnect_exhausted_count")
         or 0,
         "clean_segment_count": summary.get("clean_segment_count")
         or run_countability.get("clean_segment_count")

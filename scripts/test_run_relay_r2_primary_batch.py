@@ -712,6 +712,51 @@ class RelaySupervisorTests(unittest.TestCase):
                 "RELAY_LOCAL_DATASET_BLOCK_PROVIDER",
             )
 
+    def test_zero_attempt_recoverable_provider_gap_is_no_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=96)
+            (root / "local_relay_dataset_proof_summary.json").write_text(
+                json.dumps(
+                    {
+                        "classification": "RELAY_LOCAL_DATASET_BLOCK_COUNTABILITY",
+                        "relay_session_id": "relay-test",
+                        "duration_seconds": 900,
+                        "frames_received": 100,
+                        "sequence_gap_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "receiver_backpressure_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "upstream_provider_blocker_count": 2,
+                        "upstream_reconnect_count": 2,
+                        "upstream_reconnect_exhausted_count": 0,
+                        "provider_blocker_class": None,
+                        "provider_data_loss_seen": False,
+                        "attempted_launches": 0,
+                        "unique_attempted_mints": 0,
+                        "rejected_dead_count": 0,
+                        "r2_streaming_unverified_chunks": 0,
+                        "r2_streaming_upload_timeout_count": 0,
+                        "r2_streaming_backpressure_detected": False,
+                    }
+                )
+            )
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertEqual(blockers, [])
+            self.assertTrue(result["zero_attempt_no_signal"])
+            self.assertEqual(result["no_signal_reason"], "clean_cheap_only_no_rich_admission")
+            self.assertEqual(
+                relay_supervisor.classify_blockers(blockers, result),
+                "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL",
+            )
+
     def test_no_signal_slice_satisfies_one_slice_batch_without_counted_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
