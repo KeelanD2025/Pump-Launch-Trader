@@ -1113,8 +1113,10 @@ def can_recover_remote_broken_pipe_after_clean_local_close(
         return False
     if result.get("provider_data_loss_seen") is True or result.get("provider_blocker_class"):
         return False
-    if int(result.get("upstream_provider_blocker_count") or 0) != 0:
-        return False
+    # Provider-gap continuation can be cleanly counted by the local collector
+    # after dirty segments are quarantined. A downstream broken pipe after the
+    # terminal local close is still recoverable in that case, as long as no
+    # provider data loss/class blocker remains and all local/R2/VPS checks pass.
     for key in (
         "sequence_gap_count",
         "hash_mismatch_count",

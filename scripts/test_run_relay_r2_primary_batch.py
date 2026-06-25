@@ -967,6 +967,16 @@ class RelaySupervisorTests(unittest.TestCase):
                 "relay_err_tail\nError: Broken pipe (os error 32)\n",
             )
         )
+        clean_provider_gap_result = dict(clean_result, upstream_provider_blocker_count=1, upstream_reconnect_count=1)
+        self.assertTrue(
+            relay_supervisor.can_recover_remote_broken_pipe_after_clean_local_close(
+                clean_provider_gap_result,
+                ["remote_rc"],
+                clean_safety,
+                "material-candidate-hunter-stable",
+                "relay_err_tail\nError: Broken pipe (os error 32)\n",
+            )
+        )
         dirty_result = dict(clean_result, sequence_gap_count=1)
         self.assertFalse(
             relay_supervisor.can_recover_remote_broken_pipe_after_clean_local_close(

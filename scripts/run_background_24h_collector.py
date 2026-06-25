@@ -1402,8 +1402,10 @@ def recovered_clean_remote_broken_pipe_resume_status(rows: list[dict[str, str]],
     ):
         if safe_int(proof.get(key, collector_exit.get(key))) != 0 or safe_int(batch_summary.get(key)) != 0:
             blockers.append(f"clean_remote_rc_{key}_nonzero")
-    if safe_int(proof.get("upstream_provider_blocker_count")) != 0 or safe_int(batch_summary.get("upstream_provider_blocker_count")) != 0:
-        blockers.append("clean_remote_rc_provider_blocker_nonzero")
+    # Provider-gap continuation may legitimately set upstream_provider_blocker_count
+    # while the local collector still counts clean post-gap segments. Keep this
+    # recoverable for the narrow broken-pipe-after-local-close case, but continue
+    # blocking explicit provider data loss or provider blocker classes below.
     if proof.get("provider_data_loss_seen") is True or countability.get("provider_data_loss_seen") is True:
         blockers.append("clean_remote_rc_provider_data_loss_seen")
     if proof.get("provider_blocker_class") or countability.get("provider_blocker_class"):
