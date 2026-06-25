@@ -1440,7 +1440,10 @@ def recovered_clean_remote_broken_pipe_resume_status(rows: list[dict[str, str]],
 
 def normalized_clean_remote_broken_pipe_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
-    normalized["classification"] = "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE"
+    if safe_int(normalized.get("upstream_provider_blocker_count")) > 0:
+        normalized["classification"] = "RELAY_COLLECTION_PASS_PROVIDER_GAP_CONTINUED"
+    else:
+        normalized["classification"] = "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE"
     normalized["remote_rc_recovered_from_local_validation"] = True
     normalized["remote_rc_recovery_reason"] = "remote_broken_pipe_after_clean_local_close"
     return normalized

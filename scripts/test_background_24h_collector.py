@@ -1041,7 +1041,7 @@ class Background24hCollectorTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[1]["slice_id"], recovered.name)
-            self.assertEqual(rows[1]["classification"], "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE")
+            self.assertEqual(rows[1]["classification"], "RELAY_COLLECTION_PASS_PROVIDER_GAP_CONTINUED")
             payload = json.loads((root / "status.json").read_text())
             self.assertEqual(payload["slices_attempted"], 2)
             self.assertEqual(payload["counted_slices"], 2)
