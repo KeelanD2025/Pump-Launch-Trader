@@ -940,6 +940,19 @@ def completed_slice_rows() -> list[dict[str, str]]:
     return read_csv_rows(SLICE_SUMMARIES_PATH)
 
 
+def row_counts_as_success(row: dict[str, Any]) -> bool:
+    classification = str(row.get("classification", ""))
+    if row.get("blocker_if_any"):
+        return False
+    if "BLOCK" in classification or "NO_COUNT" in classification:
+        return False
+    return "PASS" in classification
+
+
+def counted_slice_count(rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in rows if row_counts_as_success(row))
+
+
 def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
     rows = completed_slice_rows()
     high_positive = current_high_positive_count()
@@ -950,7 +963,7 @@ def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
         **(base or read_json(STATUS_PATH) or {}),
         "updated_at_utc": utc_stamp(),
         "slices_attempted": len(rows),
-        "counted_slices": sum(1 for r in rows if "PASS" in r.get("classification", "")),
+        "counted_slices": counted_slice_count(rows),
         "current_high_positive_unique_mints": high_positive,
         "target_high_positive_unique_mints": TARGET_HIGH_POSITIVE_MINTS,
         "additional_high_positive_needed": max(0, TARGET_HIGH_POSITIVE_MINTS - high_positive),
@@ -991,6 +1004,8 @@ def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
         "wallet_execution_enabled": False,
         "launch_caps_remain_blocked": True,
     }
+    if not safe_int(payload.get("pid"), 0):
+        payload["process_alive"] = False
     return payload
 
 
@@ -1015,6 +1030,29 @@ def blocker_from_slice(row: dict[str, Any]) -> str:
     if vps.get("material_candidate_service") != "inactive" or vps.get("material_hunter_service") != "inactive":
         return "old_vps_material_hunter_active"
     return ""
+
+
+def is_safe_provider_quarantine_slice(row: dict[str, Any]) -> bool:
+    classification = str(row.get("classification", ""))
+    if classification != "RELAY_COLLECTION_PASS_PROVIDER_GAP_QUARANTINED_NO_COUNT":
+        return False
+    if blocker_from_slice(row):
+        return False
+    if row.get("safe_provider_quarantine_no_count") is not True:
+        return False
+    if row.get("partial_outputs_audit_only") is not True:
+        return False
+    if row.get("counted_phase107b_result") is not False:
+        return False
+    if str(row.get("provider_blocker_class", "")) != "provider_reconnect_exhausted":
+        return False
+    if safe_int(row.get("candidate_checkpoint_count")) != 0:
+        return False
+    if safe_int(row.get("replay_eligible_candidate_count")) != 0:
+        return False
+    if safe_int(row.get("r2_streaming_unverified_chunks")) != 0:
+        return False
+    return True
 
 
 def mirror_slice(batch_index: int, batch_log_dir: pathlib.Path, report_summary: dict[str, Any]) -> dict[str, Any]:
@@ -1140,7 +1178,7 @@ def write_final_report(classification: str, blocker: str = "") -> None:
         f"- classification: `{classification}`\n"
         f"- blocker: `{blocker}`\n"
         f"- total_slices_attempted: `{len(rows)}`\n"
-        f"- total_counted_slices: `{sum(1 for r in rows if 'PASS' in r.get('classification', ''))}`\n"
+        f"- total_counted_slices: `{counted_slice_count(rows)}`\n"
         f"- total_all_launches_indexed: `{sum(safe_int(r.get('all_launches_indexed')) for r in rows)}`\n"
         f"- total_cheap_followup_rows: `{sum(safe_int(r.get('cheap_followup_rows')) for r in rows)}`\n"
         f"- total_rich_tracked_launches: `{sum(safe_int(r.get('rich_tracked_launches')) for r in rows)}`\n"
@@ -1229,6 +1267,23 @@ def latest_unmirrored_local_run_dir(rows: list[dict[str, str]]) -> pathlib.Path 
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def batch_log_for_run(run_id: str) -> dict[str, Any]:
+    for summary_path in sorted(STATUS_ROOT.glob("batch_*/slice_*/batch_summary.ndjson"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            rows = [json.loads(raw) for raw in summary_path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not rows or str(rows[-1].get("run", "")) != run_id:
+            continue
+        batch_index = safe_int(summary_path.parents[1].name.removeprefix("batch_"))
+        return {
+            "batch_log_dir": str(summary_path.parent),
+            "batch_index": batch_index,
+            "summary": rows[-1],
+        }
+    return {}
+
+
 def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_payload: dict[str, Any]) -> dict[str, Any]:
     if status_payload.get("classification") != "BACKGROUND_24H_COLLECTION_BLOCK_RELAY":
         return {"ok": False, "reason": "previous_stop_not_relay_block"}
@@ -1249,8 +1304,6 @@ def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_pa
         blockers.append("failed_run_not_provider_block")
     if proof.get("provider_blocker_class") != "provider_reconnect_exhausted":
         blockers.append("provider_block_not_reconnect_exhausted")
-    if safe_int(proof.get("attempted_launches")) != 0:
-        blockers.append("provider_block_had_attempted_launches")
     if safe_int(proof.get("candidate_checkpoint_count")) != 0:
         blockers.append("provider_block_candidate_checkpoint_present")
     if safe_int(proof.get("replay_eligible_candidate_count")) != 0:
@@ -1272,13 +1325,53 @@ def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_pa
         blockers.append("provider_block_r2_streaming_unverified_chunks")
     if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
         blockers.append("provider_block_service_exit_not_clean")
+    batch_log = batch_log_for_run(run_dir.name)
+    if batch_log and not is_safe_provider_quarantine_slice(batch_log.get("summary", {})):
+        blockers.append("provider_block_batch_summary_not_safe_quarantine")
     return {
         "ok": not blockers,
-        "reason": "recovered_provider_reconnect_exhausted_zero_attempt_slice" if not blockers else "provider_block_recovery_failed",
+        "reason": "recovered_provider_reconnect_exhausted_quarantined_no_count_slice"
+        if not blockers
+        else "provider_block_recovery_failed",
         "blockers": blockers,
         "run_dir": str(run_dir),
         "run_id": run_dir.name,
+        "batch_log_dir": batch_log.get("batch_log_dir", ""),
+        "batch_index": batch_log.get("batch_index", 0),
     }
+
+
+def mirror_recovered_provider_quarantine_if_needed(resume_payload: dict[str, Any]) -> dict[str, Any]:
+    recovery = resume_payload.get("provider_block_recovery") or {}
+    run_id = str(recovery.get("run_id", ""))
+    batch_log_dir = str(recovery.get("batch_log_dir", ""))
+    if not resume_payload.get("resume_allowed") or not run_id or not batch_log_dir:
+        return resume_payload
+    if any(row.get("slice_id") == run_id for row in completed_slice_rows()):
+        resume_payload["recovered_provider_slice_already_mirrored"] = True
+        return resume_payload
+    try:
+        mirrored = mirror_slice(
+            safe_int(recovery.get("batch_index"), 1),
+            pathlib.Path(batch_log_dir),
+            report_summary_from_outputs(),
+        )
+    except (CollectorError, OSError, json.JSONDecodeError) as exc:
+        blockers = list(resume_payload.get("blockers") or [])
+        blockers.append(f"provider_block_mirror_failed:{type(exc).__name__}")
+        resume_payload.update(
+            {
+                "resume_allowed": False,
+                "reason": "provider_block_mirror_failed",
+                "blockers": blockers,
+            }
+        )
+        return resume_payload
+    resume_payload["recovered_provider_slice_mirrored"] = True
+    resume_payload["recovered_provider_slice_row"] = mirrored
+    resume_payload["completed_slices_preserved"] = len(completed_slice_rows())
+    resume_payload["next_slice_index"] = len(completed_slice_rows()) + 1
+    return resume_payload
 
 
 def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
@@ -1405,7 +1498,7 @@ def stop_classification(status: dict[str, Any], started_at: float) -> tuple[bool
         return True, "CANDIDATE_REVIEW_TRIGGERED", "candidate_or_replay_trigger"
     if high_positive >= TARGET_HIGH_POSITIVE_MINTS:
         return True, "BACKGROUND_24H_COLLECTION_STOPPED_TARGET_REACHED", "high_positive_target_reached"
-    if len(rows) >= MAX_TOTAL_SLICES:
+    if counted_slice_count(rows) >= MAX_TOTAL_SLICES:
         return True, "BACKGROUND_24H_COLLECTION_PASS", "max_slices_total_reached"
     if time.time() - started_at >= MAX_TOTAL_RUNTIME_HOURS * 3600:
         return True, "BACKGROUND_24H_COLLECTION_PASS", "max_runtime_reached"
@@ -1491,15 +1584,33 @@ def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_inde
     append_event({"event": "slice_start", "batch_index": batch_index, "slice_global_index": slice_global_index})
     proc = subprocess.run(cmd, cwd=REPO, env=env, text=True)
     reports = run_reports()
+    safe_quarantine_no_count = False
     if proc.returncode == 0:
         mirror_slice(batch_index, batch_log_dir, report_summary_from_outputs())
     else:
-        append_event({"event": "slice_blocked", "batch_index": batch_index, "returncode": proc.returncode})
+        try:
+            summary_path = batch_log_dir / "batch_summary.ndjson"
+            rows = [json.loads(raw) for raw in summary_path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+            safe_quarantine_no_count = bool(rows and is_safe_provider_quarantine_slice(rows[-1]))
+        except (OSError, json.JSONDecodeError):
+            safe_quarantine_no_count = False
+        if safe_quarantine_no_count:
+            mirror_slice(batch_index, batch_log_dir, report_summary_from_outputs())
+            append_event(
+                {
+                    "event": "slice_provider_quarantined_no_count",
+                    "batch_index": batch_index,
+                    "returncode": proc.returncode,
+                }
+            )
+        else:
+            append_event({"event": "slice_blocked", "batch_index": batch_index, "returncode": proc.returncode})
+    effective_returncode = 0 if safe_quarantine_no_count else proc.returncode
     status = aggregate_status(read_json(STATUS_PATH))
     status.update(
         {
-            "state": "running" if proc.returncode == 0 else "blocked",
-            "blocker": "" if proc.returncode == 0 else "supervisor_slice_failed",
+            "state": "running" if effective_returncode == 0 else "blocked",
+            "blocker": "" if effective_returncode == 0 else "supervisor_slice_failed",
             "last_slice_returncode": proc.returncode,
             "last_report_refresh_ok": reports.get("ok"),
             "current_batch_index": batch_index,
@@ -1508,7 +1619,7 @@ def run_one_slice(control_env: pathlib.Path, batch_index: int, slice_global_inde
     write_json(STATUS_PATH, status)
     write_live_summary(status)
     append_event({"event": "slice_complete", "batch_index": batch_index, "returncode": proc.returncode})
-    return proc.returncode
+    return effective_returncode
 
 
 def worker(args: argparse.Namespace) -> int:
@@ -1678,6 +1789,7 @@ def recover(_: argparse.Namespace) -> int:
 
 def resume(args: argparse.Namespace) -> int:
     payload = resume_decision(args.control_env)
+    payload = mirror_recovered_provider_quarantine_if_needed(payload)
     write_resume_decision(payload)
     status_payload = aggregate_status(read_json(STATUS_PATH))
     status_payload.update(
