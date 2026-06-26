@@ -128,9 +128,29 @@ def boolish(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def load_env_file(path: pathlib.Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        env[key] = value.strip().strip("'\"")
+    return env
+
+
 def mission_env(control_env: pathlib.Path) -> dict[str, str]:
     env = os.environ.copy()
+    control = load_env_file(control_env)
+    r2_env = control.get("PUMP_RELAY_R2_ENV_FILE")
+    if r2_env:
+        env.update(load_env_file(pathlib.Path(r2_env).expanduser()))
+    env.update(control)
     env.update(MISSION_ENV)
+    env["PUMP_RELAY_CONTROL_ENV_FILE"] = str(control_env)
     env["PUMP_RELAY_CONTROL_ENV"] = str(control_env)
     return env
 
@@ -308,14 +328,12 @@ def is_successful_slice(row: dict[str, Any]) -> bool:
 def preflight(control_env: pathlib.Path, *, allow_dirty: bool = False) -> dict[str, Any]:
     dirty = git_dirty_paths()
     active = active_forbidden_processes()
+    env = mission_env(control_env)
     relay_preflight = run_capture(
         [
-            sys.executable,
-            "scripts/relay_control_preflight.py",
-            "--control-env",
-            str(control_env),
-            "--json",
+            "./scripts/relay_control_config_preflight.sh",
         ],
+        env=env,
         timeout=120,
     )
     r2_preflight = run_capture(
@@ -326,7 +344,12 @@ def preflight(control_env: pathlib.Path, *, allow_dirty: bool = False) -> dict[s
             "--mode",
             "collection",
             "--verify-r2-health-live",
+            "--r2-spool-max-mb",
+            MISSION_ENV["PUMP_R2_STREAMING_SPOOL_MB"],
+            "--min-free-mb",
+            MISSION_ENV["PUMP_R2_STREAMING_MIN_FREE_MB"],
         ],
+        env=env,
         timeout=240,
     )
     blockers: list[str] = []
