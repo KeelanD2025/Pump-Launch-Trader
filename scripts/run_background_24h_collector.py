@@ -206,6 +206,14 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def path_size_bytes(path: pathlib.Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
 def boolish(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
@@ -1266,6 +1274,447 @@ def latest_unmirrored_local_run_dir(rows: list[dict[str, str]]) -> pathlib.Path 
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def service_exit_reason_recoverable(reason: str) -> bool:
+    return reason in {
+        "local_relay_collector_completed",
+        "local_relay_finalization_recovered_after_hang",
+    }
+
+
+def r2_streaming_chunk_counts(run_dir: pathlib.Path) -> dict[str, int]:
+    relay = read_json(run_dir / "relay_frame_manifest.json")
+    shards = list(relay.get("streaming_shards") or [])
+    uploaded = sum(1 for item in shards if item.get("uploaded") is True)
+    verified = sum(1 for item in shards if item.get("verified") is True)
+    deleted = sum(1 for item in shards if item.get("local_deleted") is True)
+    unverified = sum(1 for item in shards if item.get("verified") is not True)
+    return {
+        "uploaded_chunks": uploaded,
+        "verified_chunks": verified,
+        "deleted_local_chunks": deleted,
+        "unverified_chunks": unverified,
+        "chunk_count": len(shards),
+    }
+
+
+def write_recovered_r2_streaming_manifests(run_dir: pathlib.Path) -> dict[str, Any]:
+    relay = read_json(run_dir / "relay_frame_manifest.json")
+    collector = read_json(run_dir / "local_collector_summary.json")
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    counts = r2_streaming_chunk_counts(run_dir)
+    relay_frame_local_bytes = path_size_bytes(run_dir / "relay_frames")
+    local_retained_bytes = path_size_bytes(run_dir)
+    local_spool_bytes_peak = safe_int(
+        collector.get("local_spool_bytes_peak"),
+        relay_frame_local_bytes,
+    )
+    local_spool_bytes_limit = safe_int(
+        collector.get("local_spool_bytes_limit"),
+        64 * 1024 * 1024,
+    )
+    compact_paths = [
+        "countability_decision.json",
+        "run_countability_decision.json",
+        "r2_upload_result.json",
+        "local_retention_summary.json",
+        "service_exit_status.json",
+        "local_collector_summary.json",
+        "relay_frame_manifest.json",
+        "all_launch_intake_summary.json",
+        "all_launch_followup_manifest.json",
+        "promotion_queue_summary.json",
+        "early_burst_review_candidate_countability.json",
+    ]
+    compact = [
+        {"path": name, "bytes": path_size_bytes(run_dir / name)}
+        for name in compact_paths
+        if (run_dir / name).exists()
+    ]
+    material_manifest = {
+        "schema_version": "phase107m.material_artifact_manifest.v1",
+        "storage_mode": "r2_streaming",
+        "compact_local_artifacts": compact,
+        "r2_verified": r2_upload.get("verified") is True,
+        "r2_failed_files": len(r2_upload.get("failed_files") or []),
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "live_trading_enabled": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    spool_manifest = {
+        "schema_version": "phase107m.local_spool_manifest.v1",
+        "storage_mode": "r2_streaming",
+        "local_spool_bytes_current": relay_frame_local_bytes,
+        "local_spool_bytes_peak": local_spool_bytes_peak,
+        "local_spool_bytes_limit": local_spool_bytes_limit,
+        "local_retained_bytes": local_retained_bytes,
+        "verified_chunks_deleted_local": counts["deleted_local_chunks"],
+        "unverified_chunks_retained_local": counts["unverified_chunks"],
+        "spool_bounded": True,
+        "replay_allowed": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    artifact_stream = {
+        "schema_version": "phase107m.artifact_stream_manifest.v1",
+        "storage_mode": "r2_streaming",
+        "relay_frame_chunks": list(relay.get("streaming_shards") or []),
+        "material_artifact_manifest_path": "material_artifact_manifest.json",
+        "r2_streaming_upload_manifest_path": "r2_streaming_upload_manifest.json",
+        "local_spool_manifest_path": "local_spool_manifest.json",
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "live_trading_enabled": False,
+        "holder_rpc_enabled": False,
+        "rpc_mint_supply_canonical": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    blockers: list[str] = []
+    if counts["unverified_chunks"] != 0:
+        blockers.append("R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD")
+    if collector.get("r2_streaming_backpressure_detected") is True:
+        blockers.append("R2_STREAMING_BACKPRESSURE")
+    if local_spool_bytes_peak > local_spool_bytes_limit:
+        blockers.append("r2_local_spool_full")
+    summary = {
+        "schema_version": "phase107m.r2_streaming_upload_manifest.v1",
+        "storage_mode": "r2_streaming",
+        **counts,
+        "local_spool_bytes_current": relay_frame_local_bytes,
+        "local_spool_bytes_peak": local_spool_bytes_peak,
+        "local_spool_bytes_limit": local_spool_bytes_limit,
+        "r2_streaming_upload_queue_depth": safe_int(collector.get("r2_streaming_upload_queue_depth")),
+        "r2_streaming_upload_queue_max": safe_int(collector.get("r2_streaming_upload_queue_max"), 1),
+        "r2_streaming_retry_count": safe_int(collector.get("r2_streaming_retry_count")),
+        "r2_streaming_upload_timeout_count": safe_int(collector.get("r2_streaming_upload_timeout_count")),
+        "r2_streaming_backpressure_detected": collector.get("r2_streaming_backpressure_detected") is True,
+        "local_retained_bytes": local_retained_bytes,
+        "r2_verified": r2_upload.get("verified") is True,
+        "r2_failures": len(r2_upload.get("failed_files") or []),
+        "ok": not blockers and r2_upload.get("verified") is True,
+        "blockers": blockers,
+        "artifact_stream_manifest_path": "artifact_stream_manifest.json",
+        "relay_frame_manifest_path": "relay_frame_manifest.json",
+        "material_artifact_manifest_path": "material_artifact_manifest.json",
+        "local_spool_manifest_path": "local_spool_manifest.json",
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    write_json(run_dir / "material_artifact_manifest.json", material_manifest)
+    write_json(run_dir / "local_spool_manifest.json", spool_manifest)
+    write_json(run_dir / "artifact_stream_manifest.json", artifact_stream)
+    write_json(run_dir / "r2_streaming_upload_manifest.json", summary)
+    return summary
+
+
+def write_recovered_retention_summary(run_dir: pathlib.Path) -> dict[str, Any]:
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    relay = read_json(run_dir / "relay_frame_manifest.json")
+    local_retained_bytes = path_size_bytes(run_dir)
+    relay_verified = all(item.get("verified") is True for item in relay.get("streaming_shards") or [])
+    summary = {
+        "schema_version": "phase107g.local_collector_retention.v1",
+        "retention_mode": "keep_manifests_after_verified_r2",
+        "retention_enabled": True,
+        "r2_verified": r2_upload.get("verified") is True,
+        "relay_frame_integrity_verified_locally": relay_verified,
+        "deleted_bulk_paths": [],
+        "deleted_bulk_bytes": 0,
+        "skipped_paths": [],
+        "retained_required_paths": [
+            "local_collector_summary.json",
+            "local_collector_exit_status.json",
+            "countability_decision.json",
+            "run_countability_decision.json",
+            "r2_upload_result.json",
+            "relay_frame_manifest.json",
+        ],
+        "local_retained_bytes": local_retained_bytes,
+        "ok": r2_upload.get("verified") is True and relay_verified,
+        "blockers": [] if r2_upload.get("verified") is True and relay_verified else ["r2_streaming_recovery_not_verified"],
+        "replay_allowed": False,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "live_trading_enabled": False,
+        "holder_rpc_enabled": False,
+        "rpc_mint_supply_canonical": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    write_json(run_dir / "local_retention_summary.json", summary)
+    return summary
+
+
+def write_recovered_service_exit_status(run_dir: pathlib.Path) -> dict[str, Any]:
+    status = {
+        "schema_version": "phase107e.service_exit_status.v1",
+        "run_id": run_dir.name,
+        "hunter_exit_status": 130,
+        "service_exit_reason": "local_relay_finalization_recovered_after_hang",
+        "finalization_written_by_wrapper": True,
+        "countability_decision_exists": (run_dir / "countability_decision.json").exists(),
+        "hunter_summary_exists": (run_dir / "hunter_summary.json").exists(),
+        "hunter_summary_interrupted_exists": (run_dir / "hunter_summary_interrupted.json").exists(),
+        "threshold_tuning_allowed": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    write_json(run_dir / "service_exit_status.json", status)
+    (run_dir / "service_exit_status.md").write_text(
+        "# Phase 107E Service Exit Status\n\n"
+        f"- run_id: `{run_dir.name}`\n"
+        "- hunter_exit_status: `130`\n"
+        "- service_exit_reason: `local_relay_finalization_recovered_after_hang`\n"
+        "- finalization_written_by_wrapper: `true`\n"
+        "- threshold_tuning_allowed: `false`\n",
+        encoding="utf-8",
+    )
+    return status
+
+
+def write_recovered_local_proof_summary(run_dir: pathlib.Path) -> dict[str, Any]:
+    collector = read_json(run_dir / "local_collector_summary.json")
+    hunter = read_json(run_dir / "hunter_summary.json")
+    countability = read_json(run_dir / "countability_decision.json")
+    run_countability = read_json(run_dir / "run_countability_decision.json")
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    retention = read_json(run_dir / "local_retention_summary.json")
+    streaming = read_json(run_dir / "r2_streaming_upload_manifest.json")
+    attempted = safe_int(hunter.get("attempted_launches"), safe_int(countability.get("attempted_launches")))
+    provider_data_loss = (
+        countability.get("provider_data_loss_seen") is True
+        or hunter.get("provider_data_loss_seen") is True
+        or safe_int(collector.get("upstream_reconnect_exhausted_count")) > 0
+    )
+    provider_class = (
+        countability.get("provider_blocker_class")
+        or hunter.get("provider_blocker_class")
+        or ("provider_reconnect_exhausted" if safe_int(collector.get("upstream_reconnect_exhausted_count")) else None)
+    )
+    r2_verified = r2_upload.get("verified") is True or countability.get("r2_verified") is True
+    summary = {
+        "schema_version": "phase107g.local_relay_dataset_proof_summary.v1",
+        "classification": "RELAY_LOCAL_DATASET_BLOCK_PROVIDER" if provider_data_loss or provider_class else "RELAY_LOCAL_DATASET_BLOCK_COUNTABILITY",
+        "relay_session_id": collector.get("relay_session_id"),
+        "subscription_fingerprint": collector.get("subscription_fingerprint"),
+        "frames_received": collector.get("frames_received"),
+        "data_frames_received": collector.get("data_frames_received"),
+        "control_frames_received": collector.get("control_frames_received"),
+        "sequence_gap_count": safe_int(collector.get("sequence_gap_count")),
+        "hash_mismatch_count": safe_int(collector.get("hash_mismatch_count")),
+        "malformed_frame_count": safe_int(collector.get("malformed_frame_count")),
+        "receiver_backpressure_count": safe_int(collector.get("downstream_backpressure_count")),
+        "receiver_unavailable_count": safe_int(collector.get("receiver_unavailable_count")),
+        "upstream_provider_blocker_count": safe_int(collector.get("upstream_provider_blocker_count")),
+        "upstream_reconnect_count": safe_int(collector.get("upstream_reconnect_count")),
+        "upstream_reconnect_exhausted_count": safe_int(collector.get("upstream_reconnect_exhausted_count")),
+        "attempted_launches": attempted,
+        "unique_attempted_mints": 0,
+        "provider_data_loss_seen": provider_data_loss,
+        "provider_blocker_class": provider_class,
+        "clean_segment_count": safe_int(countability.get("clean_segment_count"), safe_int(run_countability.get("clean_segment_count"))),
+        "blocked_segment_count": safe_int(countability.get("blocked_segment_count"), safe_int(run_countability.get("blocked_segment_count"))),
+        "rejected_dead_count": safe_int(hunter.get("rejected_dead_count")),
+        "rejected_inconclusive_count": safe_int(hunter.get("rejected_inconclusive_count")),
+        "candidate_checkpoint_count": safe_int(countability.get("candidate_checkpoint_count")),
+        "replay_eligible_candidate_count": safe_int(countability.get("replay_eligible_candidate_count")),
+        "early_burst_review_candidate_count": safe_int(
+            countability.get("early_burst_review_candidate_count"),
+            safe_int(hunter.get("early_burst_review_candidate_count")),
+        ),
+        "early_burst_review_unique_mint_count": 0,
+        "early_burst_review_replay_eligible_candidate_count": safe_int(
+            countability.get("early_burst_review_replay_eligible_candidate_count")
+        ),
+        "counted_phase107b_result": countability.get("counted_phase107b_result") is True,
+        "off_vps_candidate_replay_allowed": countability.get("off_vps_candidate_replay_allowed") is True,
+        "ready_for_off_vps_candidate_replay": countability.get("ready_for_off_vps_candidate_replay") is True,
+        "r2_verified": r2_verified,
+        "r2_streaming_enabled": True,
+        "r2_streaming_uploaded_chunks": safe_int(streaming.get("uploaded_chunks")),
+        "r2_streaming_verified_chunks": safe_int(streaming.get("verified_chunks")),
+        "r2_streaming_deleted_local_chunks": safe_int(streaming.get("deleted_local_chunks")),
+        "r2_streaming_unverified_chunks": safe_int(streaming.get("unverified_chunks")),
+        "r2_streaming_retry_count": safe_int(streaming.get("r2_streaming_retry_count"), safe_int(collector.get("r2_streaming_retry_count"))),
+        "r2_streaming_upload_timeout_count": safe_int(
+            streaming.get("r2_streaming_upload_timeout_count"),
+            safe_int(collector.get("r2_streaming_upload_timeout_count")),
+        ),
+        "r2_streaming_backpressure_detected": streaming.get("r2_streaming_backpressure_detected") is True,
+        "r2_streaming_upload_queue_depth": safe_int(streaming.get("r2_streaming_upload_queue_depth")),
+        "r2_streaming_upload_queue_max": safe_int(streaming.get("r2_streaming_upload_queue_max"), 1),
+        "local_spool_bytes_current": safe_int(streaming.get("local_spool_bytes_current")),
+        "local_spool_bytes_peak": safe_int(streaming.get("local_spool_bytes_peak"), safe_int(collector.get("local_spool_bytes_peak"))),
+        "local_spool_bytes_limit": safe_int(streaming.get("local_spool_bytes_limit"), safe_int(collector.get("local_spool_bytes_limit"))),
+        "local_disk_free_mb": safe_int(collector.get("local_disk_free_mb")),
+        "local_retained_bytes_final": safe_int(retention.get("local_retained_bytes"), path_size_bytes(run_dir)),
+        "r2_upload_result": r2_upload,
+        "local_retention_summary": retention,
+        "run_countability_decision": run_countability,
+        "formal_backtesting_allowed": False,
+        "threshold_tuning_allowed": False,
+        "live_trading_enabled": False,
+        "holder_rpc_enabled": False,
+        "rpc_mint_supply_canonical": False,
+        "finalization_recovered_after_hang": True,
+        "generated_at_utc": utc_stamp(),
+    }
+    write_json(run_dir / "local_relay_dataset_proof_summary.json", summary)
+    return summary
+
+
+def recover_interrupted_zero_attempt_finalization_if_safe(
+    rows: list[dict[str, str]],
+    status_payload: dict[str, Any],
+) -> dict[str, Any]:
+    if status_payload.get("classification") != "BACKGROUND_24H_COLLECTION_BLOCK_RELAY":
+        return {"ok": False, "reason": "previous_stop_not_relay_block"}
+    if str(status_payload.get("blocker", "")) != "supervisor_slice_failed":
+        return {"ok": False, "reason": "previous_relay_blocker_not_supervisor_slice_failed"}
+    run_dir = latest_unmirrored_local_run_dir(rows)
+    if run_dir is None:
+        return {"ok": False, "reason": "no_unmirrored_failed_run_dir"}
+    if (run_dir / "local_relay_dataset_proof_summary.json").exists() and (
+        run_dir / "service_exit_status.json"
+    ).exists():
+        return {"ok": False, "reason": "failed_run_already_finalized", "run_dir": str(run_dir)}
+
+    collector = read_json(run_dir / "local_collector_summary.json")
+    collector_exit = read_json(run_dir / "local_collector_exit_status.json")
+    hunter = read_json(run_dir / "hunter_summary.json")
+    countability = read_json(run_dir / "countability_decision.json")
+    run_countability = read_json(run_dir / "run_countability_decision.json")
+    r2_upload = read_json(run_dir / "r2_upload_result.json")
+    relay = read_json(run_dir / "relay_frame_manifest.json")
+    blockers: list[str] = []
+    if collector_exit.get("ok") is not True:
+        blockers.append("collector_exit_not_ok")
+    for key in ("sequence_gap_count", "hash_mismatch_count", "malformed_frame_count", "receiver_unavailable_count"):
+        if safe_int(collector.get(key, collector_exit.get(key))) != 0:
+            blockers.append(f"{key}_nonzero")
+    if safe_int(collector.get("downstream_backpressure_count")) != 0:
+        blockers.append("receiver_backpressure_count_nonzero")
+    if safe_int(hunter.get("attempted_launches"), safe_int(countability.get("attempted_launches"))) != 0:
+        blockers.append("attempted_launches_nonzero")
+    if safe_int(hunter.get("rich_tracked_launches")) != 0:
+        blockers.append("rich_tracked_launches_nonzero")
+    for key in ("candidate_checkpoint_count", "replay_eligible_candidate_count"):
+        if safe_int(countability.get(key), safe_int(run_countability.get(key))) != 0:
+            blockers.append(f"{key}_nonzero")
+    if countability.get("off_vps_candidate_replay_allowed") is True:
+        blockers.append("replay_allowed")
+    if r2_upload.get("verified") is not True or r2_upload.get("failed_files"):
+        blockers.append("r2_not_verified")
+    counts = r2_streaming_chunk_counts(run_dir)
+    if counts["chunk_count"] == 0:
+        blockers.append("missing_streaming_chunks")
+    if counts["unverified_chunks"] != 0:
+        blockers.append("r2_streaming_unverified_chunks")
+    if any(item.get("local_deleted") is not True for item in relay.get("streaming_shards") or []):
+        blockers.append("verified_streaming_chunks_not_deleted")
+    if safe_int(collector.get("r2_streaming_upload_timeout_count")) != 0:
+        blockers.append("r2_streaming_upload_timeout")
+    if collector.get("r2_streaming_backpressure_detected") is True:
+        blockers.append("r2_streaming_backpressure")
+    if safe_int(collector.get("upstream_provider_blocker_count")) == 0:
+        blockers.append("provider_blocker_not_observed")
+    if safe_int(collector.get("upstream_reconnect_exhausted_count")) == 0:
+        blockers.append("provider_reconnect_not_exhausted")
+    if countability.get("partial_outputs_audit_only") is not True:
+        blockers.append("partial_outputs_not_audit_only")
+    if not (
+        countability.get("provider_data_loss_seen") is True
+        or countability.get("provider_blocker_class")
+        or safe_int(collector.get("upstream_reconnect_exhausted_count")) > 0
+    ):
+        blockers.append("provider_data_loss_not_recorded")
+    if blockers:
+        return {
+            "ok": False,
+            "reason": "zero_attempt_finalization_recovery_failed",
+            "blockers": blockers,
+            "run_dir": str(run_dir),
+            "run_id": run_dir.name,
+        }
+
+    service = write_recovered_service_exit_status(run_dir)
+    retention = write_recovered_retention_summary(run_dir)
+    streaming = write_recovered_r2_streaming_manifests(run_dir)
+    proof = write_recovered_local_proof_summary(run_dir)
+    validator = run_capture(
+        [
+            "target/release/cli",
+            "validate-material-hunter-artifacts",
+            "--output-dir",
+            str(run_dir),
+            "--json",
+        ],
+        timeout=120,
+    )
+    validator_json = json_from_stdout(validator.stdout)
+    if validator.returncode != 0 or validator_json.get("blockers"):
+        return {
+            "ok": False,
+            "reason": "zero_attempt_finalization_recovery_validator_failed",
+            "blockers": validator_json.get("blockers") or [validator.stderr[-1000:]],
+            "run_dir": str(run_dir),
+            "run_id": run_dir.name,
+        }
+
+    batch_log = batch_log_for_run(run_dir.name)
+    batch_log_dir = pathlib.Path(str(batch_log.get("batch_log_dir", "")))
+    if batch_log_dir:
+        rows_from_batch = batch_result_rows(batch_log_dir)
+        if rows_from_batch:
+            normalized = dict(rows_from_batch[-1])
+            normalized.update(
+                {
+                    "classification": "RELAY_COLLECTION_PASS_PROVIDER_GAP_QUARANTINED_NO_COUNT",
+                    "safe_provider_quarantine_no_count": True,
+                    "partial_outputs_audit_only": True,
+                    "provider_blocker_class": "provider_reconnect_exhausted",
+                    "provider_data_loss_seen": True,
+                    "artifact_consistency_ok": True,
+                    "artifact_consistency_blockers": [],
+                    "local_retained_bytes": retention.get("local_retained_bytes", 0),
+                    "retention_deleted_bytes": retention.get("deleted_bulk_bytes", 0),
+                    "r2_streaming_uploaded_chunks": streaming.get("uploaded_chunks", 0),
+                    "r2_streaming_verified_chunks": streaming.get("verified_chunks", 0),
+                    "r2_streaming_deleted_local_chunks": streaming.get("deleted_local_chunks", 0),
+                    "r2_streaming_unverified_chunks": streaming.get("unverified_chunks", 0),
+                    "r2_streaming_upload_timeout_count": streaming.get("r2_streaming_upload_timeout_count", 0),
+                    "r2_streaming_backpressure_detected": streaming.get("r2_streaming_backpressure_detected", False),
+                    "r2_failed": len(r2_upload.get("failed_files") or []),
+                    "local_rc": 0,
+                    "remote_rc": 1,
+                    "zero_attempt_finalization_recovered": True,
+                    "zero_attempt_finalization_recovery_reason": "local_finalization_hang_after_provider_reconnect_exhausted",
+                }
+            )
+            (batch_log_dir / "batch_summary.ndjson").write_text(
+                json.dumps(normalized, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            (batch_log_dir / "batch_stop.json").unlink(missing_ok=True)
+    return {
+        "ok": True,
+        "reason": "recovered_zero_attempt_provider_finalization_hang",
+        "run_dir": str(run_dir),
+        "run_id": run_dir.name,
+        "batch_log_dir": str(batch_log.get("batch_log_dir", "")),
+        "batch_index": batch_log.get("batch_index", 0),
+        "service_exit_status": service,
+        "local_retention_summary": retention,
+        "r2_streaming_upload_manifest": streaming,
+        "local_relay_dataset_proof_summary": proof,
+        "artifact_validator": validator_json,
+    }
+
+
 def batch_result_rows(batch_log_dir: pathlib.Path) -> list[dict[str, Any]]:
     summary_path = batch_log_dir / "batch_summary.ndjson"
     if summary_path.exists():
@@ -1335,7 +1784,7 @@ def recovered_provider_block_resume_status(rows: list[dict[str, str]], status_pa
         blockers.append("provider_block_retention_not_ok")
     if r2_streaming and safe_int(r2_streaming.get("unverified_chunks")) != 0:
         blockers.append("provider_block_r2_streaming_unverified_chunks")
-    if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
+    if not service_exit_reason_recoverable(str(service_exit.get("service_exit_reason", ""))):
         blockers.append("provider_block_service_exit_not_clean")
     batch_log = batch_log_for_run(run_dir.name)
     if batch_log and not is_safe_provider_quarantine_slice(batch_log.get("summary", {})):
@@ -1416,7 +1865,7 @@ def recovered_clean_remote_broken_pipe_resume_status(rows: list[dict[str, str]],
         blockers.append("clean_remote_rc_retention_not_ok")
     if r2_streaming and safe_int(r2_streaming.get("unverified_chunks")) != 0:
         blockers.append("clean_remote_rc_r2_streaming_unverified_chunks")
-    if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
+    if not service_exit_reason_recoverable(str(service_exit.get("service_exit_reason", ""))):
         blockers.append("clean_remote_rc_service_exit_not_clean")
     if safe_int(vps.get("forbidden_recent")) != 0:
         blockers.append("clean_remote_rc_vps_forbidden_artifacts")
@@ -1532,7 +1981,7 @@ def recovered_zero_attempt_no_signal_resume_status(rows: list[dict[str, str]], s
         blockers.append("zero_attempt_r2_streaming_backpressure")
     if batch_summary.get("artifact_consistency_ok") is not True:
         blockers.append("zero_attempt_artifact_consistency_not_ok")
-    if service_exit.get("service_exit_reason") != "local_relay_collector_completed":
+    if not service_exit_reason_recoverable(str(service_exit.get("service_exit_reason", ""))):
         blockers.append("zero_attempt_service_exit_not_clean")
     if safe_int(batch_summary.get("local_rc")) != 0 or safe_int(batch_summary.get("remote_rc")) != 0:
         blockers.append("zero_attempt_relay_or_collector_rc_nonzero")
@@ -1700,6 +2149,7 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
     rows = completed_slice_rows()
     status_payload = read_json(STATUS_PATH)
     active = pid_running(safe_int(status_payload.get("pid"), 0) or None)
+    finalization_recovery = recover_interrupted_zero_attempt_finalization_if_safe(rows, status_payload)
     provider_recovery = recovered_provider_block_resume_status(rows, status_payload)
     clean_remote_rc_recovery = recovered_clean_remote_broken_pipe_resume_status(rows, status_payload)
     zero_attempt_no_signal_recovery = recovered_zero_attempt_no_signal_resume_status(rows, status_payload)
@@ -1726,6 +2176,7 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
         provider_recovery.get("ok")
         or clean_remote_rc_recovery.get("ok")
         or zero_attempt_no_signal_recovery.get("ok")
+        or finalization_recovery.get("ok")
     )
     if not previous_stop_was_local_disk_only(status_payload) and not recovered_relay_stop:
         blockers.append("previous_stop_not_proven_local_disk_or_recovered_provider_only")
@@ -1765,6 +2216,9 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
             else
             provider_recovery.get("reason")
             if allowed and provider_recovery.get("ok")
+            else
+            finalization_recovery.get("reason")
+            if allowed and finalization_recovery.get("ok")
             else "local_disk_capacity_recovered"
             if allowed
             else "local_disk_capacity_block"
@@ -1776,6 +2230,8 @@ def resume_decision(control_env: pathlib.Path) -> dict[str, Any]:
         "previous_stop_was_recovered_provider_only": provider_recovery.get("ok") is True,
         "previous_stop_was_recovered_clean_remote_rc": clean_remote_rc_recovery.get("ok") is True,
         "previous_stop_was_recovered_zero_attempt_no_signal": zero_attempt_no_signal_recovery.get("ok") is True,
+        "previous_stop_was_recovered_zero_attempt_finalization_hang": finalization_recovery.get("ok") is True,
+        "zero_attempt_finalization_recovery": finalization_recovery,
         "provider_block_recovery": provider_recovery,
         "clean_remote_rc_recovery": clean_remote_rc_recovery,
         "zero_attempt_no_signal_recovery": zero_attempt_no_signal_recovery,

@@ -1067,6 +1067,224 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertEqual(payload["state"], "ready_to_resume")
             self.assertTrue(payload["last_resume_decision"]["previous_stop_was_recovered_zero_attempt_no_signal"])
 
+    def test_resume_recovers_zero_attempt_provider_finalization_hang(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "status"
+            repo = pathlib.Path(tmp) / "repo"
+            run_root = repo / "research_output" / "local_stream_collector"
+            recovered = run_root / "background-24h-early-burst-20260625T215545Z"
+            batch_log = root / "batch_004" / "slice_039_20260625T214023Z"
+            recovered.mkdir(parents=True)
+            batch_log.mkdir(parents=True)
+            root.mkdir(parents=True, exist_ok=True)
+            (recovered / "local_collector_summary.json").write_text(
+                json.dumps(
+                    {
+                        "relay_session_id": "relay-1",
+                        "subscription_fingerprint": "sub",
+                        "frames_received": 15370,
+                        "data_frames_received": 15365,
+                        "control_frames_received": 5,
+                        "sequence_gap_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "downstream_backpressure_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "upstream_provider_blocker_count": 2,
+                        "upstream_reconnect_count": 1,
+                        "upstream_reconnect_exhausted_count": 1,
+                        "r2_streaming_upload_timeout_count": 0,
+                        "r2_streaming_backpressure_detected": False,
+                        "local_spool_bytes_peak": 1024,
+                        "local_spool_bytes_limit": 2048,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "local_collector_exit_status.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "sequence_gap_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "hunter_summary.json").write_text(
+                json.dumps(
+                    {
+                        "attempted_launches": 0,
+                        "rich_tracked_launches": 0,
+                        "all_launches_seen": 37,
+                        "all_launches_indexed": 37,
+                        "cheap_only_launches": 37,
+                        "cheap_followup_rows": 259,
+                        "promotion_recommended_count": 26,
+                        "promotion_admitted_count": 0,
+                        "promotion_blocked_budget_count": 0,
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                        "provider_data_loss_seen": True,
+                        "early_burst_review_candidate_count": 0,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "counted_phase107b_result": False,
+                        "partial_outputs_audit_only": True,
+                        "provider_data_loss_seen": True,
+                        "provider_blocker_class": "provider_reconnect_exhausted",
+                        "candidate_checkpoint_count": 0,
+                        "replay_eligible_candidate_count": 0,
+                        "off_vps_candidate_replay_allowed": False,
+                        "clean_segment_count": 0,
+                        "blocked_segment_count": 2,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "run_countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "candidate_checkpoint_count": 0,
+                        "replay_eligible_candidate_count": 0,
+                        "clean_segment_count": 0,
+                        "blocked_segment_count": 2,
+                    }
+                )
+                + "\n"
+            )
+            (recovered / "r2_upload_result.json").write_text(
+                json.dumps({"verified": True, "failed_files": [], "uploaded_files": ["k"]}) + "\n"
+            )
+            (recovered / "relay_frame_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "storage_mode": "r2_streaming",
+                        "streaming_shards": [
+                            {
+                                "uploaded": True,
+                                "verified": True,
+                                "local_deleted": True,
+                                "local_path": str(recovered / "relay_frames" / "part-000001.ndjson"),
+                                "object_key": "r2/key",
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+            (batch_log / "batch_stop.json").write_text(
+                json.dumps(
+                    {
+                        "blockers": ["retention_not_ok", "artifact_consistency", "not_counted", "local_rc", "remote_rc"],
+                        "result": {
+                            "run": recovered.name,
+                            "relay_session_id": "relay-1",
+                            "classification": "RELAY_LOCAL_DATASET_BLOCK_R2",
+                            "counted_phase107b_result": False,
+                            "attempted_launches": 0,
+                            "all_launches_seen": 37,
+                            "all_launches_indexed": 37,
+                            "cheap_followup_rows": 259,
+                            "rich_tracked_launches": 0,
+                            "candidate_checkpoint_count": 0,
+                            "replay_eligible_candidate_count": 0,
+                            "off_vps_candidate_replay_allowed": False,
+                            "sequence_gap_count": 0,
+                            "hash_mismatch_count": 0,
+                            "malformed_frame_count": 0,
+                            "receiver_backpressure_count": 0,
+                            "receiver_unavailable_count": 0,
+                            "upstream_provider_blocker_count": 2,
+                            "upstream_reconnect_count": 1,
+                            "upstream_reconnect_exhausted_count": 1,
+                            "provider_data_loss_seen": True,
+                            "provider_blocker_class": "provider_reconnect_exhausted",
+                            "r2_failed": 0,
+                            "r2_streaming_uploaded_chunks": 1,
+                            "r2_streaming_verified_chunks": 1,
+                            "r2_streaming_deleted_local_chunks": 1,
+                            "r2_streaming_unverified_chunks": 0,
+                            "artifact_consistency_ok": False,
+                            "remote_rc": 1,
+                            "local_rc": -9,
+                            "vps_safety": {
+                                "forbidden_recent": 0,
+                                "relay_running": 0,
+                                "material_candidate_service": "inactive",
+                                "material_hunter_service": "inactive",
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+            with self.patch_paths(root), mock.patch.object(collector, "REPO", repo):
+                (root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "classification": "BACKGROUND_24H_COLLECTION_BLOCK_RELAY",
+                            "blocker": "supervisor_slice_failed",
+                            "pid": None,
+                        }
+                    )
+                    + "\n"
+                )
+                collector.write_csv_rows(
+                    root / "slice_summaries.csv",
+                    [
+                        {
+                            "slice_id": "background-24h-early-burst-20260625T212133Z",
+                            "classification": "RELAY_COLLECTION_PASS_COUNTED_NO_CANDIDATE",
+                            "r2_failed_files": "0",
+                            "artifact_consistency_ok": "true",
+                            "candidate_checkpoint_count": "0",
+                            "replay_eligible_candidate_count": "0",
+                        }
+                    ],
+                    collector.SLICE_FIELDS,
+                )
+                validator = mock.Mock(returncode=0, stdout=json.dumps({"ok": True, "blockers": []}), stderr="")
+                with mock.patch.object(collector, "run_capture", return_value=validator), mock.patch.object(
+                    collector,
+                    "ensure_local_storage_ready",
+                    return_value={
+                        "ok": True,
+                        "storage_mode": "r2_streaming",
+                        "preflight_after": {"returncode": 0, "free_mb_output": 6000, "required_mb": 4096},
+                    },
+                ), mock.patch.object(
+                    collector,
+                    "supervisor_status",
+                    return_value={
+                        "vps_safety": {
+                            "forbidden_recent": 0,
+                            "relay_running": 0,
+                            "material_candidate_service": "inactive",
+                            "material_hunter_service": "inactive",
+                        }
+                    },
+                ), mock.patch.object(collector, "current_high_positive_count", return_value=4):
+                    rc = collector.resume(type("Args", (), {"control_env": pathlib.Path("env")})())
+            self.assertEqual(rc, 0)
+            self.assertTrue((recovered / "service_exit_status.json").exists())
+            self.assertTrue((recovered / "local_relay_dataset_proof_summary.json").exists())
+            with (root / "slice_summaries.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1]["slice_id"], recovered.name)
+            self.assertEqual(rows[1]["classification"], "RELAY_COLLECTION_PASS_PROVIDER_GAP_QUARANTINED_NO_COUNT")
+            payload = json.loads((root / "status.json").read_text())
+            self.assertEqual(payload["state"], "ready_to_resume")
+            self.assertTrue(payload["last_resume_decision"]["previous_stop_was_recovered_zero_attempt_finalization_hang"])
+
     def test_resume_mirrors_clean_remote_broken_pipe_slice_as_counted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "status"
