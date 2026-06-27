@@ -36,6 +36,7 @@ def dummy_args(**overrides: object) -> types.SimpleNamespace:
         "dry_run": True,
         "cleanup_min_age_minutes": 0,
         "manage_reverse_tunnel": True,
+        "reuse_existing_reverse_tunnel": False,
         "tunnel_timeout_seconds": 60,
         "storage_mode": "r2-primary",
         "r2_streaming_spool_mb": 2048,
@@ -563,18 +564,40 @@ class RelaySupervisorTests(unittest.TestCase):
                 dummy_args(receiver_url="tcp://0.0.0.0:19097")
             )
 
-    def test_reverse_tunnel_reuses_existing_remote_receiver(self) -> None:
+    def test_reverse_tunnel_reuses_existing_remote_receiver_when_explicitly_allowed(self) -> None:
         ready = {"ok": True, "host": "127.0.0.1", "port": 19097}
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(relay_supervisor, "verify_remote_receiver", return_value=ready):
                 proc, stdout, stderr, result = relay_supervisor.start_or_reuse_reverse_tunnel(
-                    dummy_args(),
+                    dummy_args(reuse_existing_reverse_tunnel=True),
                     pathlib.Path(tmp),
                 )
         self.assertIsNone(proc)
         self.assertIsNone(stdout)
         self.assertIsNone(stderr)
         self.assertTrue(result["tunnel_reused"])
+
+    def test_reverse_tunnel_clears_stale_receiver_when_reuse_is_disabled(self) -> None:
+        ready = {"ok": True, "host": "127.0.0.1", "port": 19097}
+        cleanup = {"ok": True, "port": 19097, "pids": [123], "remaining": ""}
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_proc.returncode = None
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(relay_supervisor, "verify_remote_receiver", return_value=ready) as verify:
+                with mock.patch.object(relay_supervisor, "stop_remote_receiver_listener", return_value=cleanup):
+                    with mock.patch.object(relay_supervisor.subprocess, "Popen", return_value=fake_proc):
+                        proc, stdout, stderr, result = relay_supervisor.start_or_reuse_reverse_tunnel(
+                            dummy_args(),
+                            pathlib.Path(tmp),
+                        )
+            cleanup_written = (pathlib.Path(tmp) / "reverse_tunnel_cleanup.json").exists()
+        self.assertIs(proc, fake_proc)
+        self.assertIsNotNone(stdout)
+        self.assertIsNotNone(stderr)
+        self.assertTrue(result["tunnel_started"])
+        self.assertGreaterEqual(verify.call_count, 2)
+        self.assertTrue(cleanup_written)
 
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(

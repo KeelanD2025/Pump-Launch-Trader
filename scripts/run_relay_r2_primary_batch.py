@@ -663,6 +663,62 @@ PY
     return payload
 
 
+def stop_remote_receiver_listener(args: argparse.Namespace) -> dict[str, Any]:
+    """Clear a stale VPS loopback listener before opening our owned tunnel."""
+    host, port = parse_tcp_url(args.receiver_url)
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise BatchError(f"receiver URL must use VPS loopback, got host {host!r}")
+    remote = textwrap.dedent(
+        f"""
+        set -eu
+        port={int(port)}
+        if ! command -v ss >/dev/null 2>&1; then
+          printf '{{"ok":false,"blocker":"ss_unavailable","port":%s}}\\n' "$port"
+          exit 20
+        fi
+        listeners=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+        if [ -z "$listeners" ]; then
+          printf '{{"ok":true,"port":%s,"pids":[],"remaining":""}}\\n' "$port"
+          exit 0
+        fi
+        pids=$(printf '%s\\n' "$listeners" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+        if [ -z "$pids" ]; then
+          python3 - "$port" "$listeners" <<'PY'
+import json, sys
+print(json.dumps({"ok": False, "blocker": "listener_without_visible_pid", "port": int(sys.argv[1]), "listener": sys.argv[2]}))
+PY
+          exit 23
+        fi
+        for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+        sleep 1
+        for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+        remaining=$(ss -H -ltn "sport = :$port" 2>/dev/null || true)
+        python3 - "$port" "$pids" "$remaining" <<'PY'
+import json, sys
+remaining = sys.argv[3]
+print(json.dumps({
+    "ok": remaining.strip() == "",
+    "port": int(sys.argv[1]),
+    "pids": [int(pid) for pid in sys.argv[2].split() if pid.strip()],
+    "remaining": remaining,
+    "blocker": "" if remaining.strip() == "" else "listener_still_bound",
+}))
+PY
+        """
+    ).strip()
+    proc = ssh(args, remote, check=False)
+    try:
+        line = proc.stdout.strip().splitlines()[-1]
+        payload = json.loads(line)
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise BatchError(
+            f"remote receiver cleanup failed rc={proc.returncode}: stdout={proc.stdout[:1000]} stderr={proc.stderr[:1000]}"
+        ) from exc
+    if proc.returncode != 0 or payload.get("ok") is not True:
+        raise BatchError(f"remote receiver cleanup failed: {json.dumps(payload, sort_keys=True)}")
+    return payload
+
+
 def reverse_tunnel_command(args: argparse.Namespace) -> list[str]:
     remote_host, remote_port = parse_tcp_url(args.receiver_url)
     local_host, local_port = parse_tcp_url(args.listen_url)
@@ -688,16 +744,33 @@ def start_or_reuse_reverse_tunnel(
     args: argparse.Namespace,
     log_dir: pathlib.Path,
 ) -> tuple[subprocess.Popen[str] | None, Any, Any, dict[str, Any]]:
-    try:
-        receiver = verify_remote_receiver(args)
-        receiver["tunnel_reused"] = True
-        return None, None, None, receiver
-    except BatchError as exc:
-        rendered = str(exc)
-        if "receiver_bound_publicly" in rendered:
-            raise
+    if args.reuse_existing_reverse_tunnel:
+        try:
+            receiver = verify_remote_receiver(args)
+            receiver["tunnel_reused"] = True
+            return None, None, None, receiver
+        except BatchError as exc:
+            rendered = str(exc)
+            if "receiver_bound_publicly" in rendered:
+                raise
+            if not args.manage_reverse_tunnel:
+                raise
+    else:
         if not args.manage_reverse_tunnel:
-            raise
+            raise BatchError("reverse tunnel management disabled and receiver is not reusable")
+        try:
+            receiver = verify_remote_receiver(args)
+        except BatchError as exc:
+            if "receiver_bound_publicly" in str(exc):
+                raise
+        else:
+            cleanup = stop_remote_receiver_listener(args)
+            receiver["stale_listener_cleared"] = True
+            receiver["stale_listener_cleanup"] = cleanup
+            (log_dir / "reverse_tunnel_cleanup.json").write_text(
+                json.dumps(receiver, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     tunnel_stdout = (log_dir / "reverse_tunnel.log").open("w")
     tunnel_stderr = (log_dir / "reverse_tunnel.err").open("w")
@@ -1611,6 +1684,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tunnel-timeout-seconds", type=int, default=60)
     parser.add_argument("--no-manage-reverse-tunnel", dest="manage_reverse_tunnel", action="store_false")
     parser.set_defaults(manage_reverse_tunnel=True)
+    parser.add_argument(
+        "--reuse-existing-reverse-tunnel",
+        action="store_true",
+        help=(
+            "Reuse an already-bound VPS receiver port. Disabled by default so "
+            "mission slices own a fresh reverse tunnel and cannot inherit stale forwarding."
+        ),
+    )
     parser.add_argument("--remote-completion-grace-seconds", type=int, default=360)
     parser.add_argument("--local-finalization-timeout-seconds", type=int, default=900)
     parser.add_argument("--expected-latest-run-id", default=os.environ.get("EXPECTED_MATERIAL_LATEST_RUN_ID", ""))
