@@ -685,7 +685,7 @@ def stop_remote_receiver_listener(args: argparse.Namespace) -> dict[str, Any]:
         if [ -z "$pids" ]; then
           python3 - "$port" "$listeners" <<'PY'
 import json, sys
-print(json.dumps({"ok": False, "blocker": "listener_without_visible_pid", "port": int(sys.argv[1]), "listener": sys.argv[2]}))
+print(json.dumps({{"ok": False, "blocker": "listener_without_visible_pid", "port": int(sys.argv[1]), "listener": sys.argv[2]}}))
 PY
           exit 23
         fi
@@ -696,13 +696,13 @@ PY
         python3 - "$port" "$pids" "$remaining" <<'PY'
 import json, sys
 remaining = sys.argv[3]
-print(json.dumps({
+print(json.dumps({{
     "ok": remaining.strip() == "",
     "port": int(sys.argv[1]),
     "pids": [int(pid) for pid in sys.argv[2].split() if pid.strip()],
     "remaining": remaining,
     "blocker": "" if remaining.strip() == "" else "listener_still_bound",
-}))
+}}))
 PY
         """
     ).strip()

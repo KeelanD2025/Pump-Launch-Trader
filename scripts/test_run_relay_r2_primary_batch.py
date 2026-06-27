@@ -599,6 +599,19 @@ class RelaySupervisorTests(unittest.TestCase):
         self.assertGreaterEqual(verify.call_count, 2)
         self.assertTrue(cleanup_written)
 
+    def test_reverse_tunnel_stale_listener_without_pid_reports_batch_error(self) -> None:
+        stdout = (
+            '{"ok":false,"blocker":"listener_without_visible_pid",'
+            '"port":19097,"listener":"LISTEN 0 128 127.0.0.1:19097"}\n'
+        )
+        with mock.patch.object(
+            relay_supervisor,
+            "ssh",
+            return_value=types.SimpleNamespace(stdout=stdout, stderr="", returncode=23),
+        ):
+            with self.assertRaisesRegex(relay_supervisor.BatchError, "listener_without_visible_pid"):
+                relay_supervisor.stop_remote_receiver_listener(dummy_args())
+
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(
             relay_supervisor.classify_blockers(["local_finalization_timeout"], {}),
