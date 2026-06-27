@@ -108,6 +108,20 @@ class Background24hCollectorTests(unittest.TestCase):
             self.assertFalse(gate["holder_rpc_enabled"])
             self.assertFalse(gate["rpc_mint_supply_canonical"])
 
+    def test_deployed_sha_gate_allows_local_orchestration_only_delta(self) -> None:
+        self.assertFalse(
+            collector.remote_runtime_deploy_required(
+                [
+                    "scripts/run_relay_r2_primary_batch.py",
+                    "scripts/test_run_relay_r2_primary_batch.py",
+                ]
+            )
+        )
+
+    def test_deployed_sha_gate_blocks_runtime_delta(self) -> None:
+        self.assertTrue(collector.remote_runtime_deploy_required(["crates/cli/src/main.rs"]))
+        self.assertTrue(collector.remote_runtime_deploy_required(["config/default.toml"]))
+
     def test_worker_clears_stale_blocker_before_next_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

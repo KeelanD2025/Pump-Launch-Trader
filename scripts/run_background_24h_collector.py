@@ -890,7 +890,46 @@ def verify_deployed_sha(control_env: pathlib.Path) -> dict[str, Any]:
         timeout=60,
     )
     remote_sha = proc.stdout.strip()
-    return {"ok": proc.returncode == 0 and remote_sha == local_sha, "local_sha": local_sha, "deployed_sha": remote_sha}
+    payload = {"ok": proc.returncode == 0 and remote_sha == local_sha, "local_sha": local_sha, "deployed_sha": remote_sha}
+    if payload["ok"] or proc.returncode != 0 or not remote_sha:
+        return payload
+    changed_proc = run_capture(["git", "diff", "--name-only", f"{remote_sha}..{local_sha}"], timeout=60)
+    changed_paths = [line.strip() for line in changed_proc.stdout.splitlines() if line.strip()]
+    deploy_required = remote_runtime_deploy_required(changed_paths)
+    payload.update(
+        {
+            "changed_paths_since_deployed_sha": changed_paths,
+            "remote_runtime_deploy_required": deploy_required,
+            "local_orchestration_only_delta": not deploy_required,
+        }
+    )
+    if changed_proc.returncode == 0 and not deploy_required:
+        payload["ok"] = True
+        payload["reason"] = "local_orchestration_only_delta_no_vps_binary_deploy_required"
+    return payload
+
+
+def remote_runtime_deploy_required(changed_paths: list[str]) -> bool:
+    """Return true when a SHA delta affects code/config that runs on the VPS."""
+    local_only_exact = {
+        "scripts/run_relay_r2_primary_batch.py",
+        "scripts/run_background_24h_collector.py",
+        "scripts/run_clean_24h_r2_streaming_mission.py",
+    }
+    local_only_prefixes = (
+        "scripts/test_",
+        "research_output/",
+        "docs/",
+    )
+    if not changed_paths:
+        return True
+    for path in changed_paths:
+        if path in local_only_exact:
+            continue
+        if any(path.startswith(prefix) for prefix in local_only_prefixes):
+            continue
+        return True
+    return False
 
 
 def local_inflight_processes() -> list[str]:
