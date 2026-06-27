@@ -682,6 +682,29 @@ def stop_remote_receiver_listener(args: argparse.Namespace) -> dict[str, Any]:
           exit 0
         fi
         pids=$(printf '%s\\n' "$listeners" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+        if [ -z "$pids" ] && command -v sudo >/dev/null 2>&1; then
+          sudo_listeners=$(sudo -n ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+          if [ -n "$sudo_listeners" ]; then
+            pids=$(printf '%s\\n' "$sudo_listeners" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+            listeners="$sudo_listeners"
+          fi
+        fi
+        if [ -z "$pids" ]; then
+          if command -v lsof >/dev/null 2>&1; then
+            pids=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u || true)
+          fi
+          if [ -z "$pids" ] && command -v sudo >/dev/null 2>&1; then
+            pids=$(sudo -n lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u || true)
+          fi
+        fi
+        if [ -z "$pids" ]; then
+          if command -v fuser >/dev/null 2>&1; then
+            pids=$(fuser -n tcp "$port" 2>/dev/null | tr ' ' '\\n' | grep -E '^[0-9]+$' | sort -u || true)
+          fi
+          if [ -z "$pids" ] && command -v sudo >/dev/null 2>&1; then
+            pids=$(sudo -n fuser -n tcp "$port" 2>/dev/null | tr ' ' '\\n' | grep -E '^[0-9]+$' | sort -u || true)
+          fi
+        fi
         if [ -z "$pids" ]; then
           python3 - "$port" "$listeners" <<'PY'
 import json, sys
@@ -690,8 +713,14 @@ PY
           exit 23
         fi
         for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+        if command -v sudo >/dev/null 2>&1; then
+          for pid in $pids; do sudo -n kill -TERM "$pid" 2>/dev/null || true; done
+        fi
         sleep 1
         for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+        if command -v sudo >/dev/null 2>&1; then
+          for pid in $pids; do sudo -n kill -KILL "$pid" 2>/dev/null || true; done
+        fi
         remaining=$(ss -H -ltn "sport = :$port" 2>/dev/null || true)
         python3 - "$port" "$pids" "$remaining" <<'PY'
 import json, sys

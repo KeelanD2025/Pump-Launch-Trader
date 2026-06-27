@@ -612,6 +612,23 @@ class RelaySupervisorTests(unittest.TestCase):
             with self.assertRaisesRegex(relay_supervisor.BatchError, "listener_without_visible_pid"):
                 relay_supervisor.stop_remote_receiver_listener(dummy_args())
 
+    def test_reverse_tunnel_cleanup_uses_sudo_pid_fallbacks(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_ssh(args, remote: str, check: bool = False):  # noqa: ANN001
+            captured["remote"] = remote
+            stdout = '{"ok":true,"port":19097,"pids":[123],"remaining":""}\n'
+            return types.SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+        with mock.patch.object(relay_supervisor, "ssh", side_effect=fake_ssh):
+            result = relay_supervisor.stop_remote_receiver_listener(dummy_args())
+        remote = captured["remote"]
+        self.assertTrue(result["ok"])
+        self.assertIn("sudo -n ss -H -ltnp", remote)
+        self.assertIn("sudo -n lsof -nP -t", remote)
+        self.assertIn("sudo -n fuser -n tcp", remote)
+        self.assertIn("sudo -n kill -TERM", remote)
+
     def test_timeout_blockers_classify_as_orchestration_or_r2(self) -> None:
         self.assertEqual(
             relay_supervisor.classify_blockers(["local_finalization_timeout"], {}),
