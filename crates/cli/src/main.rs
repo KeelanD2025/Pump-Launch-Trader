@@ -70,7 +70,10 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 use tonic::Status;
-use yellowstone_grpc_proto::prelude::SubscribeUpdate;
+use yellowstone_grpc_proto::prelude::{
+    SubscribeUpdate, subscribe_request_filter_accounts_filter::Filter as AccountFilter,
+    subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
+};
 use yellowstone_grpc_proto::prost::Message as _;
 
 #[derive(Parser, Debug)]
@@ -354,6 +357,7 @@ enum Command {
     InspectRpcBudget,
     InspectDeshredCapability,
     InspectRawShredCapability,
+    InspectGeyserSubscription,
     EnvBootstrapCheck {
         #[arg(long)]
         env_file: Option<String>,
@@ -4149,6 +4153,7 @@ async fn main() -> Result<()> {
         Command::InspectRpcBudget => inspect_rpc_budget(&loaded),
         Command::InspectDeshredCapability => inspect_deshred_capability_command(&loaded),
         Command::InspectRawShredCapability => inspect_raw_shred_capability(&loaded),
+        Command::InspectGeyserSubscription => inspect_geyser_subscription_command(&loaded),
         Command::EnvBootstrapCheck {
             env_file,
             require_geyser,
@@ -6205,6 +6210,91 @@ fn inspect_raw_shred_capability(loaded: &LoadedConfig) -> Result<()> {
         "production_mode_allowed": production_mode_allowed,
         "production_supported": production_supported,
         "reason_if_unsupported": reason_if_unsupported,
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn inspect_geyser_subscription_command(loaded: &LoadedConfig) -> Result<()> {
+    let request =
+        GeyserIngestService::new(loaded.config.geyser.clone()).proto_subscription_request();
+    let mut hasher = Sha256::new();
+    hasher.update(request.encode_to_vec());
+    let mut account_filters = request
+        .accounts
+        .iter()
+        .map(|(name, filter)| {
+            let proto_filters = filter
+                .filters
+                .iter()
+                .map(|proto_filter| match proto_filter.filter.as_ref() {
+                    Some(AccountFilter::Datasize(value)) => json!({
+                        "kind": "datasize",
+                        "value": value,
+                    }),
+                    Some(AccountFilter::TokenAccountState(value)) => json!({
+                        "kind": "token_account_state",
+                        "value": value,
+                    }),
+                    Some(AccountFilter::Memcmp(memcmp)) => {
+                        let (data_kind, data_value) = match memcmp.data.as_ref() {
+                            Some(MemcmpData::Base58(value)) => ("base58", value.clone()),
+                            Some(MemcmpData::Base64(value)) => ("base64", value.clone()),
+                            Some(MemcmpData::Bytes(value)) => {
+                                ("bytes", format!("len:{}", value.len()))
+                            }
+                            None => ("none", String::new()),
+                        };
+                        json!({
+                            "kind": "memcmp",
+                            "offset": memcmp.offset,
+                            "data_kind": data_kind,
+                            "data": data_value,
+                        })
+                    }
+                    Some(_) => json!({
+                        "kind": "other",
+                    }),
+                    None => json!({
+                        "kind": "unknown",
+                    }),
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "filter_name": name,
+                "is_exact_holder_filter": name.starts_with("token_mint_"),
+                "expected_for_startup_snapshot": name.starts_with("token_mint_"),
+                "account_count": filter.account.len(),
+                "owner_filters": filter.owner,
+                "filters": proto_filters,
+                "nonempty_txn_signature": filter.nonempty_txn_signature,
+            })
+        })
+        .collect::<Vec<_>>();
+    account_filters.sort_by(|left, right| {
+        left["filter_name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["filter_name"].as_str().unwrap_or_default())
+    });
+    let payload = json!({
+        "command": "inspect-geyser-subscription",
+        "subscription_fingerprint": format!("{:x}", hasher.finalize()),
+        "commitment": request.commitment,
+        "account_filter_count": request.accounts.len(),
+        "transaction_filter_count": request.transactions.len(),
+        "slot_filter_count": request.slots.len(),
+        "block_filter_count": request.blocks.len(),
+        "block_meta_filter_count": request.blocks_meta.len(),
+        "account_filters": account_filters,
+        "exact_holder_filters_omit_nonempty_txn_signature": request.accounts.iter().all(|(name, filter)| {
+            !name.starts_with("token_mint_") || filter.nonempty_txn_signature.is_none()
+        }),
+        "normal_account_filters_keep_nonempty_txn_signature": request.accounts.iter().all(|(name, filter)| {
+            name.starts_with("token_mint_") || filter.nonempty_txn_signature == Some(true)
+        }),
+        "connects_to_provider": false,
+        "safe_metadata_only": true,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
@@ -38159,6 +38249,9 @@ fn event_kind(event: &NormalizedEvent) -> &'static str {
         EventPayload::TokenCreated(_) => "token_created",
         EventPayload::PumpBuy(_) => "pump_buy",
         EventPayload::PumpSell(_) => "pump_sell",
+        EventPayload::PumpFunMigration(_) => "pumpfun_migration",
+        EventPayload::PumpSwapPair(_) => "pumpswap_pair",
+        EventPayload::PumpSwapTrade(_) => "pumpswap_trade",
         EventPayload::BondingCurveUpdate(_) => "bonding_curve_update",
         EventPayload::HolderBalanceUpdate(_) => "holder_balance_update",
         EventPayload::WalletFunding(_) => "wallet_funding",
@@ -39930,6 +40023,7 @@ struct Phase107fActiveMint {
     candidate_300_written: bool,
     candidate_900_written: bool,
     candidate_1800_written: bool,
+    candidate_3600_written: bool,
 }
 
 impl Phase107fActiveMint {
@@ -39949,6 +40043,7 @@ impl Phase107fActiveMint {
             candidate_300_written: false,
             candidate_900_written: false,
             candidate_1800_written: false,
+            candidate_3600_written: false,
         }
     }
 
@@ -40895,6 +40990,15 @@ fn phase107f_write_health(
         "retained_events_count": 0,
         "retained_transaction_fingerprint_count": 0,
         "provider_updates": summary.transaction_updates + summary.account_updates + summary.slot_updates,
+        "provider_status": summary.provider_status,
+        "provider_blocker_class": summary.provider_blocker_class,
+        "provider_errors": summary.errors,
+        "connected": summary.connected,
+        "stream_completed_normally": summary.stream_completed_normally,
+        "provider_data_loss_seen": summary.provider_data_loss_seen,
+        "transaction_updates": summary.transaction_updates,
+        "account_updates": summary.account_updates,
+        "slot_updates": summary.slot_updates,
         "pump_updates": summary.pump_create_decoded,
         "provider_progress_stalled_seconds": summary.provider_progress_stalled_seconds,
         "pump_progress_stalled_seconds": summary.pump_progress_stalled_seconds,
@@ -41220,6 +41324,7 @@ async fn material_candidate_hunter_command(
         upload_r2,
         verify_r2,
         Phase107lEarlyBurstReviewConfig::disabled(),
+        None,
         output_dir,
         run_id,
         Arc::new(RealGeyserConnector),
@@ -41239,6 +41344,7 @@ async fn material_candidate_hunter_command_with_connector(
     upload_r2: bool,
     verify_r2: bool,
     early_burst_review_config: Phase107lEarlyBurstReviewConfig,
+    launch_intake_duration_seconds: Option<u64>,
     output_dir: &str,
     run_id: Option<String>,
     stream_connector: Arc<dyn GeyserStreamConnector>,
@@ -41273,6 +41379,9 @@ async fn material_candidate_hunter_command_with_connector(
         "max_attempted_launches": max_attempted_launches,
         "target_material_candidates": target_material_candidates,
         "max_concurrent_tracked_mints": max_concurrent_tracked_mints,
+        "launch_intake_duration_seconds": launch_intake_duration_seconds,
+        "token_lifecycle_target_seconds": PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS,
+        "curve_target_progress_pct": PHASE107B_CURVE_TARGET_PROGRESS_PCT,
         "live_trading_disabled": no_live_trading,
         "holder_rpc_disabled": no_rpc,
         "rpc_mint_supply_canonical": false,
@@ -41313,6 +41422,7 @@ async fn material_candidate_hunter_command_with_connector(
     let mut candidates_300 = 0u64;
     let mut candidates_900 = 0u64;
     let mut candidates_1800 = 0u64;
+    let mut candidates_3600 = 0u64;
     let mut rejected_dead = 0u64;
     let mut rejected_inconclusive = 0u64;
     let mut provider_confirmed_bundle_count = 0u64;
@@ -41345,6 +41455,12 @@ async fn material_candidate_hunter_command_with_connector(
         &cheap_followup_rows,
         &promotion_queue_rows,
         tracking_budgets,
+    )?;
+    phase107n_write_lifecycle_stream_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_events,
     )?;
     phase107f_write_health(
         &health_dir,
@@ -41472,6 +41588,8 @@ async fn material_candidate_hunter_command_with_connector(
 
             let mut stream_state_hint = MaterialHunterStreamStateHint::default();
             if is_successful_launch_create(&event) {
+                let outside_launch_intake = launch_intake_duration_seconds
+                    .is_some_and(|seconds| run_started_at.elapsed().as_secs() >= seconds);
                 let Some(mint) = phase107i_record_visible_launch(
                     &mut all_launch_rows,
                     &mut all_launch_seen_mints,
@@ -41524,6 +41642,16 @@ async fn material_candidate_hunter_command_with_connector(
                         &mint,
                         "already_rich_tracking",
                         false,
+                        false,
+                        false,
+                    );
+                } else if outside_launch_intake {
+                    cheap_launch_events.insert(mint.clone(), event.clone());
+                    phase107i_mark_rich_tracking_rejected(
+                        &mut all_launch_rows,
+                        &mint,
+                        "outside_lifecycle_intake_window",
+                        true,
                         false,
                         false,
                     );
@@ -41632,8 +41760,42 @@ async fn material_candidate_hunter_command_with_connector(
                         &promotion_queue_rows,
                         tracking_budgets,
                     )?;
+                    phase107n_write_lifecycle_stream_artifacts(
+                        &output_dir,
+                        &run_id,
+                        &all_launch_rows,
+                        &cheap_followup_events,
+                    )?;
                 }
             } else if let Some(mint) = event_mint_string(&event) {
+                if !all_launch_seen_mints.contains(&mint) {
+                    if let Some(reason) = phase107i_orphan_backfill_reason_for_event(&event) {
+                        if phase107i_record_pending_launch_backfill(
+                            &mut all_launch_rows,
+                            &mut all_launch_seen_mints,
+                            &run_id,
+                            stream_source,
+                            &subscription_fingerprint,
+                            current_segment_id,
+                            &event,
+                            reason,
+                        )
+                        .is_some()
+                        {
+                            cheap_followup_tracked_mints.insert(mint.clone());
+                            cheap_followup_events.entry(mint.clone()).or_default();
+                            stream_state_hint.active_mints.push(mint.clone());
+                            phase107i_write_all_launch_tracking_artifacts(
+                                &output_dir,
+                                &run_id,
+                                &all_launch_rows,
+                                &rich_slot_rows,
+                                max_attempted_launches,
+                                max_concurrent_tracked_mints,
+                            )?;
+                        }
+                    }
+                }
                 if let Some(events) = cheap_followup_events.get_mut(&mint) {
                     events.push(event.clone());
                 }
@@ -41816,6 +41978,12 @@ async fn material_candidate_hunter_command_with_connector(
                                 &promotion_queue_rows,
                                 tracking_budgets,
                             )?;
+                            phase107n_write_lifecycle_stream_artifacts(
+                                &output_dir,
+                                &run_id,
+                                &all_launch_rows,
+                                &cheap_followup_events,
+                            )?;
                         }
                     }
                 }
@@ -41856,13 +42024,16 @@ async fn material_candidate_hunter_command_with_connector(
                 let decision = phase107b_decide_token(
                     &analysis.post_event_rows,
                     &analysis.early_rule_rows,
+                    &analysis.asof_alpha_rows,
                     analysis.observed_horizon_seconds,
                 );
-                let final_candidate_horizon = duration_seconds.min(1800).max(300);
+                let final_candidate_horizon =
+                    duration_seconds.min(PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS).max(300);
                 let should_finalize = decision.final_state == "early_rejected_dead"
-                    || (decision.promoted && observed_horizon_seconds >= final_candidate_horizon)
                     || (observed_horizon_seconds >= 300
                         && decision.final_state.starts_with("early_rejected"));
+                let rich_tracking_release_due =
+                    decision.promoted && observed_horizon_seconds >= final_candidate_horizon;
                 if !should_finalize && !decision.promoted {
                     continue;
                 }
@@ -41920,6 +42091,11 @@ async fn material_candidate_hunter_command_with_connector(
                         active.candidate_1800_written = true;
                         wrote_candidate_checkpoint = true;
                     }
+                    if decision.survived_3600 && !active.candidate_3600_written {
+                        candidates_3600 = candidates_3600.saturating_add(1);
+                        active.candidate_3600_written = true;
+                        wrote_candidate_checkpoint = true;
+                    }
                     let candidate_row = json!({
                         "segment_id": active.segment_id,
                         "mint": mint,
@@ -41929,6 +42105,11 @@ async fn material_candidate_hunter_command_with_connector(
                         "survived_300s": decision.survived_300,
                         "survived_900s": decision.survived_900,
                         "survived_1800s": decision.survived_1800,
+                        "survived_3600s": decision.survived_3600,
+                        "curve_target_reached_90pct": decision.curve_target_reached_90pct,
+                        "bonding_curve_90pct_milestone": decision.curve_target_reached_90pct,
+                        "rich_tracking_status": if rich_tracking_release_due { "released_to_thin_lifecycle_watch" } else { "active" },
+                        "lifecycle_watch_status": "pre_migration_active",
                         "risk_timeline_rows": analysis.risk_timeline_rows.len(),
                         "pre_entry_risk_feature_rows": analysis.pre_entry_rows.len(),
                         "post_event_label_rows": analysis.post_event_rows.len(),
@@ -41987,6 +42168,27 @@ async fn material_candidate_hunter_command_with_connector(
                         map.insert("survived_300s".to_owned(), json!(decision.survived_300));
                         map.insert("survived_900s".to_owned(), json!(decision.survived_900));
                         map.insert("survived_1800s".to_owned(), json!(decision.survived_1800));
+                        map.insert("survived_3600s".to_owned(), json!(decision.survived_3600));
+                        map.insert(
+                            "curve_target_reached_90pct".to_owned(),
+                            json!(decision.curve_target_reached_90pct),
+                        );
+                        map.insert(
+                            "bonding_curve_90pct_milestone".to_owned(),
+                            json!(decision.curve_target_reached_90pct),
+                        );
+                        map.insert(
+                            "rich_tracking_status".to_owned(),
+                            json!(if rich_tracking_release_due {
+                                "released_to_thin_lifecycle_watch"
+                            } else {
+                                "active"
+                            }),
+                        );
+                        map.insert(
+                            "lifecycle_watch_status".to_owned(),
+                            json!("pre_migration_active"),
+                        );
                         map.insert(
                             "local_artifact_size_bytes".to_owned(),
                             json!(phase107b_dir_size_bytes(&output_dir).unwrap_or(0)),
@@ -42014,6 +42216,12 @@ async fn material_candidate_hunter_command_with_connector(
                     active.finalized = true;
                     stream_state_hint.inactive_mints.push(mint.clone());
                     finalized_now.push(mint.clone());
+                } else if rich_tracking_release_due {
+                    phase107i_mark_rich_tracking_released_to_lifecycle(
+                        &mut all_launch_rows,
+                        mint,
+                        &decision.reason,
+                    );
                 }
             }
             for mint in finalized_now {
@@ -42044,6 +42252,12 @@ async fn material_candidate_hunter_command_with_connector(
                 &promotion_queue_rows,
                 tracking_budgets,
             )?;
+            phase107n_write_lifecycle_stream_artifacts(
+                &output_dir,
+                &run_id,
+                &all_launch_rows,
+                &cheap_followup_events,
+            )?;
             if upload_r2 {
                 let due = last_r2_checkpoint_for_events
                     .lock()
@@ -42067,16 +42281,8 @@ async fn material_candidate_hunter_command_with_connector(
                 }
             }
 
-            let candidate_total = if duration_seconds >= 1800 {
-                candidates_1800
-            } else if duration_seconds >= 900 {
-                candidates_900
-            } else {
-                candidates_300
-            } as usize;
-            if candidate_total >= target_material_candidates
-                || (attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
-                    && active_mints.is_empty())
+            if attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
+                && active_mints.is_empty()
             {
                 return Ok(MaterialHunterStreamAction::Stop);
             }
@@ -42159,6 +42365,8 @@ async fn material_candidate_hunter_command_with_connector(
                         | "connection_failed"
                         | "provider_stream_closed_before_deadline"
                         | "client_backpressure_detected"
+                        | "stream_error"
+                        | "transient_stream_error"
                         | "stream_runtime_error"
                 )
             );
@@ -42257,6 +42465,8 @@ async fn material_candidate_hunter_command_with_connector(
                 survived_300: false,
                 survived_900: false,
                 survived_1800: false,
+                survived_3600: false,
+                curve_target_reached_90pct: false,
                 promoted: false,
                 provider_confirmed_bundle: false,
             };
@@ -42323,6 +42533,8 @@ async fn material_candidate_hunter_command_with_connector(
                     map.insert("survived_300s".to_owned(), json!(false));
                     map.insert("survived_900s".to_owned(), json!(false));
                     map.insert("survived_1800s".to_owned(), json!(false));
+                    map.insert("survived_3600s".to_owned(), json!(false));
+                    map.insert("curve_target_reached_90pct".to_owned(), json!(false));
                     map.insert("promoted_to_candidate_dataset".to_owned(), json!(false));
                     map.insert("tombstone_written".to_owned(), json!(true));
                 }
@@ -42352,6 +42564,12 @@ async fn material_candidate_hunter_command_with_connector(
             &cheap_followup_rows,
             &promotion_queue_rows,
             tracking_budgets,
+        )?;
+        phase107n_write_lifecycle_stream_artifacts(
+            &output_dir,
+            &run_id,
+            &all_launch_rows,
+            &cheap_followup_events,
         )?;
         if provider_blocked_run {
             for row in &mut candidate_rows {
@@ -42459,18 +42677,10 @@ async fn material_candidate_hunter_command_with_connector(
         )?;
         segment_records.push(segment_record);
         phase107f_write_run_segment_artifacts(&output_dir, &run_id, &segment_records)?;
-        let target_candidate_total = if duration_seconds >= 1800 {
-            candidates_1800
-        } else if duration_seconds >= 900 {
-            candidates_900
-        } else {
-            candidates_300
-        } as usize;
         let reconnect_allowed = provider_blocked_run
             && !interrupted.load(Ordering::SeqCst)
             && run_started_at.elapsed().as_secs() < duration_seconds
             && attempt_rows.len() < tracking_budgets.max_rich_promotions_per_slice
-            && target_candidate_total < target_material_candidates
             && stream_summary.provider_blocker_class.as_deref() != Some("stream_runtime_error")
             && stream_summary.provider_blocker_class.as_deref()
                 != Some("provider_reconnect_exhausted");
@@ -42559,6 +42769,11 @@ async fn material_candidate_hunter_command_with_connector(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
+            "bonding_curve_90pct_milestone",
+            "rich_tracking_status",
+            "lifecycle_watch_status",
             "holder_rpc_used",
             "rpc_mint_supply_canonical",
             "r2_verified",
@@ -42592,6 +42807,11 @@ async fn material_candidate_hunter_command_with_connector(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
+            "bonding_curve_90pct_milestone",
+            "rich_tracking_status",
+            "lifecycle_watch_status",
             "risk_timeline_rows",
             "pre_entry_risk_feature_rows",
             "post_event_label_rows",
@@ -42630,6 +42850,12 @@ async fn material_candidate_hunter_command_with_connector(
         &cheap_followup_rows,
         &promotion_queue_rows,
         tracking_budgets,
+    )?;
+    phase107n_write_lifecycle_stream_artifacts(
+        &output_dir,
+        &run_id,
+        &all_launch_rows,
+        &cheap_followup_events,
     )?;
     phase107h_write_asof_alpha_artifacts(&output_dir, &asof_alpha_rows)?;
     let mut early_burst_review_candidate_count = phase107l_write_early_burst_review_artifacts(
@@ -42718,6 +42944,7 @@ async fn material_candidate_hunter_command_with_connector(
         "candidates_300s_count": candidates_300,
         "candidates_900s_count": candidates_900,
         "candidates_1800s_count": candidates_1800,
+        "candidates_3600s_count": candidates_3600,
         "material_candidates_found": candidate_rows.len(),
         "total_attempted_launches": attempted_launches,
         "segment_count": segment_count,
@@ -42797,6 +43024,7 @@ async fn material_candidate_hunter_command_with_connector(
         "candidates_300s_count": candidates_300,
         "candidates_900s_count": candidates_900,
         "candidates_1800s_count": candidates_1800,
+        "candidates_3600s_count": candidates_3600,
         "candidate_checkpoint_count": candidate_checkpoint_count,
         "replay_eligible_candidate_count": run_replay_eligible_candidate_count,
         "early_burst_in_out_v1_review_artifacts_enabled": early_burst_review_config.enabled,
@@ -42896,6 +43124,11 @@ async fn material_candidate_hunter_command_with_connector(
                     "survived_300s",
                     "survived_900s",
                     "survived_1800s",
+                    "survived_3600s",
+                    "curve_target_reached_90pct",
+                    "bonding_curve_90pct_milestone",
+                    "rich_tracking_status",
+                    "lifecycle_watch_status",
                     "holder_rpc_used",
                     "rpc_mint_supply_canonical",
                     "r2_verified",
@@ -43162,6 +43395,8 @@ struct Phase107bDecision {
     survived_300: bool,
     survived_900: bool,
     survived_1800: bool,
+    survived_3600: bool,
+    curve_target_reached_90pct: bool,
     promoted: bool,
     provider_confirmed_bundle: bool,
 }
@@ -43176,11 +43411,32 @@ const PHASE107I_ALL_LAUNCH_INTAKE_FIELDS: &[&str] = &[
     "slot",
     "signature_if_available",
     "creator_or_authority_if_stream_authoritative",
+    "launch_instruction_variant",
+    "launch_instruction_account_count",
+    "launch_instruction_account_keys",
+    "launch_instruction_name",
+    "launch_instruction_symbol",
+    "launch_instruction_uri",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "metadata_account",
+    "token_program_used",
+    "token_2022_used",
+    "same_transaction_buy_present",
+    "same_transaction_buy_count",
+    "launch_transaction_fingerprint",
+    "launch_layout_source",
+    "launch_layout_known_at_launch",
     "source_kind",
     "subscription_fingerprint",
     "launch_detected_by",
+    "source_mode",
     "cheap_intake_status",
     "rich_tracking_status",
+    "lifecycle_watch_status",
+    "thin_lifecycle_tracking_started",
+    "launch_backfill_status",
+    "launch_backfill_reason",
     "rich_tracking_admitted",
     "rich_tracking_admission_time",
     "rich_tracking_rejection_reason",
@@ -43277,6 +43533,324 @@ const PHASE107K_ALL_LAUNCH_FOLLOWUP_FIELDS: &[&str] = &[
     "rpc_mint_supply_canonical",
     "threshold_tuning_allowed",
     "live_trading_enabled",
+];
+
+const PHASE107N_LIFECYCLE_TRADE_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "signature",
+    "trade_signature",
+    "slot",
+    "trade_slot",
+    "block_time_utc",
+    "source_observed_at_utc",
+    "instruction_index",
+    "trade_instruction_index",
+    "inner_instruction_index",
+    "trade_inner_instruction_index",
+    "event_type",
+    "decoded_instruction_name",
+    "is_buy",
+    "is_sell",
+    "user_wallet",
+    "buyer_wallet",
+    "seller_wallet",
+    "signer_wallet",
+    "fee_payer",
+    "creator_wallet",
+    "sol_amount",
+    "token_amount",
+    "quote_mint",
+    "token_program_used",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "strict_timing_eligible",
+    "parse_status",
+    "trade_parse_status",
+    "source_file",
+    "source_line_or_record_id",
+    "data_quality_flags",
+];
+
+const PHASE107N_LIFECYCLE_EXACT_RESERVE_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "signature",
+    "trade_signature",
+    "slot",
+    "trade_slot",
+    "block_time_utc",
+    "source_observed_at_utc",
+    "instruction_index",
+    "trade_instruction_index",
+    "inner_instruction_index",
+    "trade_inner_instruction_index",
+    "event_type",
+    "trade_event_type",
+    "decoded_instruction_name",
+    "reserve_update_signature",
+    "reserve_update_slot",
+    "reserve_update_instruction_index",
+    "reserve_linkage_status",
+    "ordered_account_delta_key",
+    "account_write_version_before",
+    "account_write_version_after",
+    "virtual_sol_reserves_before",
+    "virtual_token_reserves_before",
+    "real_sol_reserves_before",
+    "real_token_reserves_before",
+    "virtual_sol_reserves_after",
+    "virtual_token_reserves_after",
+    "real_sol_reserves_after",
+    "real_token_reserves_after",
+    "curve_progress_pct_before",
+    "curve_progress_pct_after",
+    "curve_price_before",
+    "curve_price_after",
+    "reserve_state_basis",
+    "reserve_basis",
+    "exact_reserve_available",
+    "reserve_parse_status",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "strict_timing_eligible",
+    "source_file",
+    "source_line_or_record_id",
+    "data_quality_flags",
+];
+
+const PHASE107N_ORDERED_ACCOUNT_DELTA_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "reserve_update_signature",
+    "reserve_update_slot",
+    "reserve_update_observed_at_utc",
+    "reserve_update_instruction_index",
+    "previous_update_signature",
+    "previous_update_slot",
+    "previous_update_observed_at_utc",
+    "account_write_version_before",
+    "account_write_version_after",
+    "ordered_account_delta_key",
+    "virtual_sol_reserves_before",
+    "virtual_token_reserves_before",
+    "real_sol_reserves_before",
+    "real_token_reserves_before",
+    "virtual_sol_reserves_after",
+    "virtual_token_reserves_after",
+    "real_sol_reserves_after",
+    "real_token_reserves_after",
+    "curve_progress_pct_before",
+    "curve_progress_pct_after",
+    "curve_price_before",
+    "curve_price_after",
+    "quote_reserve_delta_sol",
+    "token_reserve_delta_raw",
+    "exact_delta_available",
+    "reserve_linkage_status",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "strict_timing_eligible",
+    "source_file",
+    "source_line_or_record_id",
+    "data_quality_flags",
+];
+
+const PHASE107N_TRADE_RESERVE_LINKAGE_AUDIT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "trade_signature",
+    "trade_slot",
+    "trade_instruction_index",
+    "trade_inner_instruction_index",
+    "trade_event_type",
+    "reserve_update_signature",
+    "reserve_update_slot",
+    "reserve_update_instruction_index",
+    "ordered_account_delta_key",
+    "reserve_linkage_status",
+    "exact_reserve_available",
+    "trade_candidate_count",
+    "reserve_candidate_count",
+    "blocker_reason",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "strict_timing_eligible",
+    "data_quality_flags",
+];
+
+const PHASE107N_EXACT_RESERVE_ROOT_CAUSE_FIELDS: &[&str] = &[
+    "source_file",
+    "record_type",
+    "fields_present",
+    "fields_missing",
+    "parser_file",
+    "parser_function",
+    "can_patch_parser_without_upstream_change",
+    "exact_reason",
+];
+
+const PHASE107N_DECODED_LAUNCH_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "slot",
+    "signature",
+    "event_type",
+    "decoded_instruction_name",
+    "creator_wallet",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "launch_instruction_variant",
+    "launch_instruction_account_count",
+    "metadata_uri",
+    "token_program_used",
+    "same_transaction_buy_present",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "strict_timing_eligible",
+    "parse_status",
+    "source_file",
+    "source_line_or_record_id",
+    "data_quality_flags",
+];
+
+const PHASE107N_DECODED_HOLDER_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "slot",
+    "signature",
+    "token_account",
+    "token_account_pubkey",
+    "owner_wallet",
+    "holder_wallet",
+    "amount_raw",
+    "amount_ui",
+    "decimals",
+    "is_nonzero",
+    "holder_delta",
+    "holder_balance_after",
+    "holder_balance_before",
+    "update_source",
+    "update_type",
+    "source_confidence",
+    "complete_initial_snapshot_proven",
+    "account_subscription_initial_snapshot_proven",
+    "initial_snapshot_id",
+    "excluded_from_holder_count",
+    "exclusion_reason",
+    "source_mode",
+    "source_is_non_rpc",
+    "rpc_used",
+    "parse_status",
+    "source_file",
+    "source_line_or_record_id",
+    "data_quality_flags",
+];
+
+const PHASE107N_PUMPFUN_MIGRATION_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "slot",
+    "signature",
+    "instruction_index",
+    "event_type",
+    "decoded_instruction_name",
+    "program_id",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "post_migration_pool",
+    "post_migration_program",
+    "source_mode",
+    "source_file",
+    "parse_status",
+    "strict_strategy_eligible",
+    "data_quality_flags",
+];
+
+const PHASE107N_PUMPSWAP_PAIR_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "slot",
+    "signature",
+    "instruction_index",
+    "event_type",
+    "decoded_instruction_name",
+    "program_id",
+    "pool",
+    "base_mint",
+    "quote_mint",
+    "base_vault",
+    "quote_vault",
+    "source_mode",
+    "source_file",
+    "parse_status",
+    "strict_strategy_eligible",
+    "data_quality_flags",
+];
+
+const PHASE107N_PUMPSWAP_TRADE_EVENT_FIELDS: &[&str] = &[
+    "run_id",
+    "source_run_id",
+    "launch_id",
+    "mint",
+    "event_observed_at_utc",
+    "event_block_time_utc",
+    "slot",
+    "signature",
+    "instruction_index",
+    "event_type",
+    "decoded_instruction_name",
+    "program_id",
+    "pool",
+    "side",
+    "base_amount_delta",
+    "quote_amount_delta",
+    "price",
+    "liquidity_after",
+    "source_mode",
+    "source_file",
+    "parse_status",
+    "strict_strategy_eligible",
+    "data_quality_flags",
 ];
 
 const PHASE107K_PROMOTION_QUEUE_FIELDS: &[&str] = &[
@@ -43421,7 +43995,9 @@ const PHASE107L_EARLY_BURST_REVIEW_FIELDS: &[&str] = &[
     "replay_blocker_reason_codes",
 ];
 
-const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 7] = [5, 10, 30, 60, 120, 300, 900];
+const PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS: u64 = 3600;
+const PHASE107B_CURVE_TARGET_PROGRESS_PCT: f64 = 90.0;
+const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 9] = [5, 10, 30, 60, 120, 300, 900, 1800, 3600];
 
 const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
     "mint",
@@ -43490,6 +44066,59 @@ fn phase107i_token_creator_or_authority(event: &NormalizedEvent) -> String {
     }
 }
 
+fn phase107i_token_program_label(event: &NormalizedEvent) -> String {
+    match &event.payload {
+        EventPayload::TokenCreated(payload) => {
+            format!("{:?}", payload.token_program).to_lowercase()
+        }
+        _ => String::new(),
+    }
+}
+
+fn phase107i_token_2022_used(event: &NormalizedEvent) -> bool {
+    matches!(
+        &event.payload,
+        EventPayload::TokenCreated(payload)
+            if matches!(payload.token_program, common::TokenProgramType::Token2022)
+    )
+}
+
+fn phase107i_launch_layout_fields(event: &NormalizedEvent) -> serde_json::Value {
+    match &event.payload {
+        EventPayload::TokenCreated(payload) => json!({
+            "launch_instruction_variant": payload.create_instruction_variant,
+            "launch_instruction_account_count": payload.raw_account_list.len(),
+            "launch_instruction_account_keys": payload.raw_account_list
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("|"),
+            "launch_instruction_name": payload.name,
+            "launch_instruction_symbol": payload.symbol,
+            "launch_instruction_uri": payload.uri,
+            "bonding_curve": payload.bonding_curve_account.to_string(),
+            "associated_bonding_curve": payload
+                .associated_bonding_curve_account
+                .as_ref()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            "metadata_account": payload
+                .metadata_account
+                .as_ref()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            "token_program_used": phase107i_token_program_label(event),
+            "token_2022_used": phase107i_token_2022_used(event),
+            "same_transaction_buy_present": payload.same_transaction_buys > 0,
+            "same_transaction_buy_count": payload.same_transaction_buys,
+            "launch_transaction_fingerprint": payload.launch_transaction_fingerprint.clone().unwrap_or_default(),
+            "launch_layout_source": "local_stream_token_created_event",
+            "launch_layout_known_at_launch": true,
+        }),
+        _ => json!({}),
+    }
+}
+
 fn phase107i_find_row_mut<'a>(
     rows: &'a mut [serde_json::Value],
     mint: &str,
@@ -43519,7 +44148,7 @@ fn phase107i_record_visible_launch(
     if !seen_mints.insert(mint.clone()) {
         return Some(mint);
     }
-    rows.push(json!({
+    let mut row = json!({
         "run_id": run_id,
         "slice_id": run_id,
         "segment_id": current_segment_id,
@@ -43532,11 +44161,97 @@ fn phase107i_record_visible_launch(
         "source_kind": stream_source,
         "subscription_fingerprint": subscription_fingerprint,
         "launch_detected_by": "pump_token_created",
+        "source_mode": "live_relay_decoded_create",
         "cheap_intake_status": "indexed",
         "rich_tracking_status": "cheap_only",
+        "lifecycle_watch_status": "pre_migration_active",
+        "thin_lifecycle_tracking_started": true,
+        "launch_backfill_status": "create_observed",
+        "launch_backfill_reason": "",
         "rich_tracking_admitted": false,
         "rich_tracking_admission_time": "",
         "rich_tracking_rejection_reason": "",
+        "skipped_due_to_budget": false,
+        "skipped_due_to_existing_tombstone": false,
+        "skipped_due_to_data_quality": false,
+        "fast_dead_reason": "",
+        "tombstone_written": false,
+        "promoted_to_rich_tracking": false,
+        "promotion_reason": "",
+        "promotion_time": "",
+        "final_outcome_if_known": "",
+        "terminal_inconclusive": false,
+        "positive_outcome_label_if_later_known": false,
+        "high_positive_if_later_known": false,
+        "replay_eligible": false,
+        "candidate_checkpoint_seen": false,
+        "audit_only": true,
+    });
+    if let (Some(row_map), Some(layout_map)) = (
+        row.as_object_mut(),
+        phase107i_launch_layout_fields(event).as_object().cloned(),
+    ) {
+        for (key, value) in layout_map {
+            row_map.insert(key, value);
+        }
+    }
+    rows.push(row);
+    Some(mint)
+}
+
+fn phase107i_record_pending_launch_backfill(
+    rows: &mut Vec<serde_json::Value>,
+    seen_mints: &mut BTreeSet<String>,
+    run_id: &str,
+    stream_source: &str,
+    subscription_fingerprint: &str,
+    current_segment_id: usize,
+    event: &NormalizedEvent,
+    reason: &str,
+) -> Option<String> {
+    let mint = event_mint_string(event)?;
+    if !mint.ends_with("pump") || !seen_mints.insert(mint.clone()) {
+        return Some(mint);
+    }
+    rows.push(json!({
+        "run_id": run_id,
+        "slice_id": run_id,
+        "segment_id": current_segment_id,
+        "relay_session_id": "",
+        "mint": mint,
+        "launch_seen_at": event_received_ts(event),
+        "slot": event.meta.slot,
+        "signature_if_available": event_signature_string(event).unwrap_or_default(),
+        "creator_or_authority_if_stream_authoritative": "",
+        "launch_instruction_variant": "pending_create_backfill",
+        "launch_instruction_account_count": 0,
+        "launch_instruction_account_keys": "",
+        "launch_instruction_name": "",
+        "launch_instruction_symbol": "",
+        "launch_instruction_uri": "",
+        "bonding_curve": "",
+        "associated_bonding_curve": "",
+        "metadata_account": "",
+        "token_program_used": "",
+        "token_2022_used": false,
+        "same_transaction_buy_present": false,
+        "same_transaction_buy_count": 0,
+        "launch_transaction_fingerprint": "",
+        "launch_layout_source": "pending_create_tx_recovery",
+        "launch_layout_known_at_launch": false,
+        "source_kind": stream_source,
+        "subscription_fingerprint": subscription_fingerprint,
+        "launch_detected_by": reason,
+        "source_mode": "orphan_trade_or_migration_pending_create_backfill",
+        "cheap_intake_status": "pending_launch_backfill",
+        "rich_tracking_status": "not_admitted_pending_create_backfill",
+        "lifecycle_watch_status": "pre_migration_active",
+        "thin_lifecycle_tracking_started": true,
+        "launch_backfill_status": "pending_create_tx_recovery",
+        "launch_backfill_reason": reason,
+        "rich_tracking_admitted": false,
+        "rich_tracking_admission_time": "",
+        "rich_tracking_rejection_reason": "pending_create_tx_recovery",
         "skipped_due_to_budget": false,
         "skipped_due_to_existing_tombstone": false,
         "skipped_due_to_data_quality": false,
@@ -43567,6 +44282,8 @@ fn phase107i_mark_rich_tracking_admitted(
             row,
             &[
                 ("rich_tracking_status", json!("rich_active")),
+                ("lifecycle_watch_status", json!("pre_migration_active")),
+                ("thin_lifecycle_tracking_started", json!(true)),
                 ("rich_tracking_admitted", json!(true)),
                 (
                     "rich_tracking_admission_time",
@@ -43579,6 +44296,28 @@ fn phase107i_mark_rich_tracking_admitted(
                 ("promoted_to_rich_tracking", json!(true)),
                 ("promotion_reason", json!(promotion_reason)),
                 ("promotion_time", json!(admission_time)),
+            ],
+        );
+    }
+}
+
+fn phase107i_mark_rich_tracking_released_to_lifecycle(
+    rows: &mut [serde_json::Value],
+    mint: &str,
+    reason: &str,
+) {
+    if let Some(row) = phase107i_find_row_mut(rows, mint) {
+        phase107i_update_row(
+            row,
+            &[
+                (
+                    "rich_tracking_status",
+                    json!("released_to_thin_lifecycle_watch"),
+                ),
+                ("lifecycle_watch_status", json!("pre_migration_active")),
+                ("thin_lifecycle_tracking_started", json!(true)),
+                ("rich_tracking_rejection_reason", json!(reason)),
+                ("tombstone_written", json!(false)),
             ],
         );
     }
@@ -43597,6 +44336,8 @@ fn phase107i_mark_rich_tracking_rejected(
             row,
             &[
                 ("rich_tracking_status", json!("cheap_only")),
+                ("lifecycle_watch_status", json!("pre_migration_active")),
+                ("thin_lifecycle_tracking_started", json!(true)),
                 ("rich_tracking_rejection_reason", json!(reason)),
                 ("skipped_due_to_budget", json!(skipped_due_to_budget)),
                 (
@@ -43629,6 +44370,14 @@ fn phase107i_mark_final_outcome(
             row,
             &[
                 ("rich_tracking_status", json!("rich_released")),
+                (
+                    "lifecycle_watch_status",
+                    json!(if tombstone_written {
+                        "terminal_dead"
+                    } else {
+                        "pre_migration_active"
+                    }),
+                ),
                 ("fast_dead_reason", json!(fast_dead_reason)),
                 ("tombstone_written", json!(tombstone_written)),
                 ("final_outcome_if_known", json!(final_state)),
@@ -43657,6 +44406,26 @@ fn phase107i_promotion_reason_for_event(event: &NormalizedEvent) -> Option<&'sta
     }
 }
 
+fn phase107i_orphan_backfill_reason_for_event(event: &NormalizedEvent) -> Option<&'static str> {
+    let mint = event_mint_string(event)?;
+    if !mint.ends_with("pump") {
+        return None;
+    }
+    match &event.payload {
+        EventPayload::PumpBuy(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("orphan_pump_buy_pending_create_backfill")
+        }
+        EventPayload::PumpSell(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("orphan_pump_sell_pending_create_backfill")
+        }
+        EventPayload::BondingCurveUpdate(_) => {
+            Some("orphan_bonding_curve_update_pending_create_backfill")
+        }
+        EventPayload::ObservedTransaction(_) => Some("orphan_transaction_pending_create_backfill"),
+        _ => None,
+    }
+}
+
 fn phase107i_attempt_row(
     run_id: &str,
     current_segment_id: usize,
@@ -43680,6 +44449,11 @@ fn phase107i_attempt_row(
         "survived_300s": false,
         "survived_900s": false,
         "survived_1800s": false,
+        "survived_3600s": false,
+        "curve_target_reached_90pct": false,
+        "bonding_curve_90pct_milestone": false,
+        "rich_tracking_status": "rich_active",
+        "lifecycle_watch_status": "pre_migration_active",
         "holder_rpc_used": false,
         "rpc_mint_supply_canonical": false,
         "r2_verified": false,
@@ -45108,6 +45882,1497 @@ fn phase107i_write_all_launch_tracking_artifacts(
     Ok(())
 }
 
+fn phase107n_event_data_quality_flags(event: &NormalizedEvent) -> String {
+    event
+        .meta
+        .data_quality_flags
+        .iter()
+        .map(|flag| format!("{flag:?}").to_lowercase())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn phase107n_join_flags(left: String, right: &str) -> String {
+    [left.as_str(), right]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn phase107n_event_block_time(event: &NormalizedEvent) -> String {
+    event
+        .meta
+        .block_time
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn phase107n_event_instruction_index(event: &NormalizedEvent) -> serde_json::Value {
+    event
+        .meta
+        .instruction_index
+        .map(|value| json!(value))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn phase107n_event_inner_instruction_index(event: &NormalizedEvent) -> serde_json::Value {
+    event
+        .meta
+        .inner_instruction_index
+        .map(|value| json!(value))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn phase107n_event_source_record_id(event: &NormalizedEvent) -> String {
+    format!(
+        "{}:{}:{}",
+        event_signature_string(event).unwrap_or_default(),
+        event
+            .meta
+            .instruction_index
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        event
+            .meta
+            .inner_instruction_index
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn phase107n_strict_5s_eligible(event: &NormalizedEvent, events: &[NormalizedEvent]) -> bool {
+    let Some(create) = events
+        .iter()
+        .filter(|item| matches!(item.payload, EventPayload::TokenCreated(_)))
+        .min_by_key(|item| item.meta.received_at_wall_time)
+    else {
+        return false;
+    };
+    event.meta.received_at_wall_time
+        <= create.meta.received_at_wall_time + time::Duration::seconds(5)
+}
+
+fn phase107n_curve_progress_from_reserve(
+    reserve: Option<&common::ReserveSnapshot>,
+) -> serde_json::Value {
+    reserve
+        .and_then(|snapshot| {
+            let real_token_reserves_ui = common::raw_tokens_to_ui(
+                snapshot.real_token_reserves,
+                common::DEFAULT_PUMP_TOKEN_DECIMALS,
+            );
+            common::pump_curve_progress_pct_from_real_token_reserves_ui(real_token_reserves_ui)
+        })
+        .map(|value| decimal_to_json(Some(value)))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn phase107n_insert_reserve_snapshot(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    suffix: &str,
+    reserve: Option<&common::ReserveSnapshot>,
+) {
+    let Some(reserve) = reserve else {
+        return;
+    };
+    map.insert(
+        format!("virtual_sol_reserves_{suffix}"),
+        decimal_to_json(Some(common::lamports_to_sol(
+            reserve.virtual_quote_reserves,
+        ))),
+    );
+    map.insert(
+        format!("virtual_token_reserves_{suffix}"),
+        decimal_to_json(Some(reserve.virtual_token_reserves)),
+    );
+    map.insert(
+        format!("real_sol_reserves_{suffix}"),
+        decimal_to_json(Some(common::lamports_to_sol(reserve.real_quote_reserves))),
+    );
+    map.insert(
+        format!("real_token_reserves_{suffix}"),
+        decimal_to_json(Some(reserve.real_token_reserves)),
+    );
+}
+
+fn phase107n_reserve_snapshot_from_curve_update(
+    payload: &common::BondingCurveUpdateEvent,
+) -> common::ReserveSnapshot {
+    common::ReserveSnapshot {
+        virtual_quote_reserves: payload.virtual_quote_reserves,
+        virtual_token_reserves: payload.virtual_token_reserves,
+        real_quote_reserves: payload.real_quote_reserves,
+        real_token_reserves: payload.real_token_reserves,
+    }
+}
+
+fn phase107n_curve_price_from_reserve(
+    reserve: Option<&common::ReserveSnapshot>,
+) -> serde_json::Value {
+    reserve
+        .and_then(|snapshot| {
+            common::pump_virtual_reserve_price_sol_per_token(
+                snapshot.virtual_quote_reserves,
+                snapshot.virtual_token_reserves,
+                common::DEFAULT_PUMP_TOKEN_DECIMALS,
+            )
+        })
+        .map(|value| decimal_to_json(Some(value)))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn phase107n_reserve_signature(
+    event: &NormalizedEvent,
+    payload: &common::BondingCurveUpdateEvent,
+) -> String {
+    event_signature_string(event)
+        .or_else(|| payload.caused_by_signature.clone())
+        .unwrap_or_default()
+}
+
+fn phase107n_event_signature_or_empty(event: &NormalizedEvent) -> String {
+    event_signature_string(event).unwrap_or_default()
+}
+
+fn phase107n_trade_event_type(event: &NormalizedEvent) -> Option<&'static str> {
+    match &event.payload {
+        EventPayload::PumpBuy(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("buy")
+        }
+        EventPayload::PumpSell(payload) if payload.status != common::TransactionStatus::Failed => {
+            Some("sell")
+        }
+        _ => None,
+    }
+}
+
+fn phase107n_trade_status(event: &NormalizedEvent) -> &'static str {
+    match &event.payload {
+        EventPayload::PumpBuy(payload) if payload.status == common::TransactionStatus::Failed => {
+            "failed_trade"
+        }
+        EventPayload::PumpSell(payload) if payload.status == common::TransactionStatus::Failed => {
+            "failed_trade"
+        }
+        EventPayload::PumpBuy(_) | EventPayload::PumpSell(_) => "successful_trade",
+        _ => "not_trade",
+    }
+}
+
+fn phase107n_optional_pubkey(value: &Option<common::PubkeyValue>) -> String {
+    value
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn phase107n_pumpfun_migration_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::PumpFunMigration(payload) = &event.payload else {
+                return None;
+            };
+            Some(json!({
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "launch_id": phase107k_row_string(launch, "launch_id"),
+                "mint": mint,
+                "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                "event_block_time_utc": phase107n_event_block_time(event),
+                "slot": payload.slot.unwrap_or(event.meta.slot),
+                "signature": payload.signature.clone().or_else(|| event_signature_string(event)).unwrap_or_default(),
+                "instruction_index": payload.instruction_index.map(|value| json!(value)).unwrap_or_else(|| phase107n_event_instruction_index(event)),
+                "event_type": "migrate",
+                "decoded_instruction_name": payload.parse_status.strip_prefix("non_rpc_decoded_").unwrap_or("migrate"),
+                "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+                "bonding_curve": phase107n_optional_pubkey(&payload.bonding_curve),
+                "associated_bonding_curve": phase107n_optional_pubkey(&payload.associated_bonding_curve),
+                "post_migration_pool": phase107n_optional_pubkey(&payload.migration_pool),
+                "post_migration_program": phase107n_optional_pubkey(&payload.pump_amm_program),
+                "source_mode": "local_stream_pumpfun_migration_event",
+                "source_file": "normalized_live_sidecar_event_stream",
+                "parse_status": payload.parse_status.clone(),
+                "strict_strategy_eligible": false,
+                "data_quality_flags": phase107n_event_data_quality_flags(event),
+            }))
+        })
+        .collect()
+}
+
+fn phase107n_pumpswap_pair_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::PumpSwapPair(payload) = &event.payload else {
+                return None;
+            };
+            Some(json!({
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "launch_id": phase107k_row_string(launch, "launch_id"),
+                "mint": mint,
+                "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                "event_block_time_utc": phase107n_event_block_time(event),
+                "slot": payload.slot.unwrap_or(event.meta.slot),
+                "signature": payload.signature.clone().or_else(|| event_signature_string(event)).unwrap_or_default(),
+                "instruction_index": payload.instruction_index.map(|value| json!(value)).unwrap_or_else(|| phase107n_event_instruction_index(event)),
+                "event_type": "pumpswap_pair_create",
+                "decoded_instruction_name": "pumpswap_pair",
+                "program_id": payload.program_id.to_string(),
+                "pool": phase107n_optional_pubkey(&payload.pair_address),
+                "base_mint": phase107n_optional_pubkey(&payload.base_mint),
+                "quote_mint": phase107n_optional_pubkey(&payload.quote_mint),
+                "base_vault": phase107n_optional_pubkey(&payload.base_vault),
+                "quote_vault": phase107n_optional_pubkey(&payload.quote_vault),
+                "source_mode": payload.source_mode.clone(),
+                "source_file": "normalized_live_sidecar_event_stream",
+                "parse_status": payload.parse_status.clone(),
+                "strict_strategy_eligible": payload.strict_strategy_eligible,
+                "data_quality_flags": phase107n_event_data_quality_flags(event),
+            }))
+        })
+        .collect()
+}
+
+fn phase107n_pumpswap_trade_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::PumpSwapTrade(payload) = &event.payload else {
+                return None;
+            };
+            Some(json!({
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "launch_id": phase107k_row_string(launch, "launch_id"),
+                "mint": mint,
+                "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                "event_block_time_utc": phase107n_event_block_time(event),
+                "slot": payload.slot.unwrap_or(event.meta.slot),
+                "signature": payload.signature.clone().or_else(|| event_signature_string(event)).unwrap_or_default(),
+                "instruction_index": payload.instruction_index.map(|value| json!(value)).unwrap_or_else(|| phase107n_event_instruction_index(event)),
+                "event_type": match payload.side.as_str() {
+                    "buy" => "pumpswap_buy",
+                    "sell" => "pumpswap_sell",
+                    _ => "pumpswap_trade_unknown",
+                },
+                "decoded_instruction_name": "pumpswap_trade",
+                "program_id": payload.program_id.to_string(),
+                "pool": phase107n_optional_pubkey(&payload.pair_address),
+                "side": payload.side.clone(),
+                "base_amount_delta": decimal_to_json(payload.base_amount_delta),
+                "quote_amount_delta": decimal_to_json(payload.quote_amount_delta),
+                "price": decimal_to_json(payload.price),
+                "liquidity_after": decimal_to_json(payload.liquidity_after),
+                "source_mode": payload.source_mode.clone(),
+                "source_file": "normalized_live_sidecar_event_stream",
+                "parse_status": payload.parse_status.clone(),
+                "strict_strategy_eligible": payload.strict_strategy_eligible,
+                "data_quality_flags": phase107n_event_data_quality_flags(event),
+            }))
+        })
+        .collect()
+}
+
+fn phase107n_holder_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::HolderBalanceUpdate(payload) = &event.payload else {
+                return None;
+            };
+            if payload.mint.to_string() != mint {
+                return None;
+            }
+            let decimals = payload.token_decimals;
+            let amount_ui = decimals
+                .map(|value| common::raw_tokens_to_ui(payload.new_balance, value));
+            let update_source = payload.update_reason.clone();
+            let account_subscription_initial_snapshot = update_source
+                == "geyser_spl_token_account_subscription_initial_snapshot";
+            let holder_source_mode = if account_subscription_initial_snapshot {
+                "geyser_spl_token_account_subscription_initial_snapshot"
+            } else {
+                "local_stream_holder_balance_update"
+            };
+            let initial_snapshot_id = if account_subscription_initial_snapshot {
+                format!(
+                    "{}:{}:{}",
+                    mint,
+                    event.meta.slot,
+                    event.meta.account_write_version.unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
+            Some(json!({
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "launch_id": phase107k_row_string(launch, "launch_id"),
+                "mint": mint,
+                "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                "event_block_time_utc": phase107n_event_block_time(event),
+                "slot": event.meta.slot,
+                "signature": payload.caused_by_signature.clone().or_else(|| event_signature_string(event)).unwrap_or_default(),
+                "token_account": payload.token_account.to_string(),
+                "token_account_pubkey": payload.token_account.to_string(),
+                "owner_wallet": payload.owner_wallet.to_string(),
+                "holder_wallet": payload.owner_wallet.to_string(),
+                "amount_raw": payload.new_balance.to_string(),
+                "amount_ui": decimal_to_json(amount_ui),
+                "decimals": decimals.map(|value| json!(value)).unwrap_or(serde_json::Value::Null),
+                "is_nonzero": payload.new_balance > Decimal::ZERO,
+                "holder_delta": payload.delta.to_string(),
+                "holder_balance_after": payload.new_balance.to_string(),
+                "holder_balance_before": decimal_to_json(payload.old_balance),
+                "update_source": update_source,
+                "update_type": if payload.new_balance == Decimal::ZERO {
+                    "token_account_zero_or_closed"
+                } else if payload.old_balance.is_none() {
+                    "token_account_balance_created_or_observed"
+                } else {
+                    "token_account_balance_update"
+                },
+                "source_confidence": payload.confidence.to_string(),
+                "complete_initial_snapshot_proven": account_subscription_initial_snapshot,
+                "account_subscription_initial_snapshot_proven": account_subscription_initial_snapshot,
+                "initial_snapshot_id": initial_snapshot_id,
+                "excluded_from_holder_count": false,
+                "exclusion_reason": "",
+                "source_mode": holder_source_mode,
+                "source_is_non_rpc": true,
+                "rpc_used": false,
+                "parse_status": "non_rpc_holder_balance_update",
+                "source_file": "normalized_live_sidecar_event_stream",
+                "source_line_or_record_id": phase107n_event_source_record_id(event),
+                "data_quality_flags": phase107n_event_data_quality_flags(event),
+            }))
+        })
+        .collect()
+}
+
+fn phase107n_ordered_delta_key(mint: &str, signature: &str, write_version: u64) -> String {
+    format!("{mint}:{signature}:{write_version}")
+}
+
+fn phase107n_ordered_account_delta_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut previous_snapshot: Option<common::ReserveSnapshot> = None;
+    let mut previous_signature = String::new();
+    let mut previous_slot = serde_json::Value::Null;
+    let mut previous_observed_at = String::new();
+    let mut previous_write_version: Option<u64> = None;
+    for event in events {
+        let EventPayload::BondingCurveUpdate(payload) = &event.payload else {
+            continue;
+        };
+        let strict_eligible = phase107n_strict_5s_eligible(event, events);
+        let current_snapshot = phase107n_reserve_snapshot_from_curve_update(payload);
+        let signature = phase107n_reserve_signature(event, payload);
+        let write_version = payload.account_write_version.unwrap_or(0);
+        let ordered_key = phase107n_ordered_delta_key(mint, &signature, write_version);
+        let flags = phase107n_event_data_quality_flags(event);
+        let stale_or_non_monotonic = flags
+            .split('|')
+            .any(|flag| matches!(flag, "staleaccount" | "stale_account"))
+            || previous_write_version
+                .map(|previous| previous >= write_version && previous_signature != signature)
+                .unwrap_or(false);
+        let exact_delta_available = previous_snapshot.is_some() && !stale_or_non_monotonic;
+        let reserve_linkage_status = if previous_snapshot.is_none() {
+            "missing_prior_account_state"
+        } else if stale_or_non_monotonic {
+            "non_monotonic_or_stale_account_update"
+        } else {
+            "ordered_account_delta"
+        };
+        let quote_delta_sol = payload
+            .quote_reserve_delta
+            .map(common::lamports_to_sol)
+            .map(|value| decimal_to_json(Some(value)))
+            .unwrap_or(serde_json::Value::Null);
+        rows.push(json!({
+            "run_id": run_id,
+            "source_run_id": run_id,
+            "launch_id": "",
+            "mint": mint,
+            "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+            "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+            "reserve_update_signature": signature.clone(),
+            "reserve_update_slot": event.meta.slot,
+            "reserve_update_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+            "reserve_update_instruction_index": phase107n_event_instruction_index(event),
+            "previous_update_signature": previous_signature.clone(),
+            "previous_update_slot": previous_slot.clone(),
+            "previous_update_observed_at_utc": previous_observed_at.clone(),
+            "account_write_version_before": previous_write_version.map(|value| json!(value)).unwrap_or(serde_json::Value::Null),
+            "account_write_version_after": payload.account_write_version.map(|value| json!(value)).unwrap_or(serde_json::Value::Null),
+            "ordered_account_delta_key": ordered_key,
+            "virtual_sol_reserves_before": previous_snapshot
+                .as_ref()
+                .map(|snapshot| decimal_to_json(Some(common::lamports_to_sol(snapshot.virtual_quote_reserves))))
+                .unwrap_or(serde_json::Value::Null),
+            "virtual_token_reserves_before": previous_snapshot
+                .as_ref()
+                .map(|snapshot| decimal_to_json(Some(snapshot.virtual_token_reserves)))
+                .unwrap_or(serde_json::Value::Null),
+            "real_sol_reserves_before": previous_snapshot
+                .as_ref()
+                .map(|snapshot| decimal_to_json(Some(common::lamports_to_sol(snapshot.real_quote_reserves))))
+                .unwrap_or(serde_json::Value::Null),
+            "real_token_reserves_before": previous_snapshot
+                .as_ref()
+                .map(|snapshot| decimal_to_json(Some(snapshot.real_token_reserves)))
+                .unwrap_or(serde_json::Value::Null),
+            "virtual_sol_reserves_after": decimal_to_json(Some(common::lamports_to_sol(current_snapshot.virtual_quote_reserves))),
+            "virtual_token_reserves_after": decimal_to_json(Some(current_snapshot.virtual_token_reserves)),
+            "real_sol_reserves_after": decimal_to_json(Some(common::lamports_to_sol(current_snapshot.real_quote_reserves))),
+            "real_token_reserves_after": decimal_to_json(Some(current_snapshot.real_token_reserves)),
+            "curve_progress_pct_before": phase107n_curve_progress_from_reserve(previous_snapshot.as_ref()),
+            "curve_progress_pct_after": decimal_to_json(payload.curve_progress_pct),
+            "curve_price_before": phase107n_curve_price_from_reserve(previous_snapshot.as_ref()),
+            "curve_price_after": decimal_to_json(payload.price_sol_per_token),
+            "quote_reserve_delta_sol": quote_delta_sol,
+            "token_reserve_delta_raw": decimal_to_json(payload.token_reserve_delta),
+            "exact_delta_available": exact_delta_available,
+            "reserve_linkage_status": reserve_linkage_status,
+            "source_mode": "local_stream_ordered_account_delta",
+            "source_is_non_rpc": true,
+            "rpc_used": false,
+            "strict_timing_eligible": strict_eligible,
+            "source_file": "normalized_live_sidecar_event_stream",
+            "source_line_or_record_id": phase107n_event_source_record_id(event),
+            "data_quality_flags": flags,
+        }));
+        previous_snapshot = Some(current_snapshot);
+        previous_signature = signature;
+        previous_slot = json!(event.meta.slot);
+        previous_observed_at = event.meta.received_at_wall_time.to_string();
+        previous_write_version = Some(write_version);
+    }
+    rows
+}
+
+fn phase107n_find_ordered_delta_for_signature<'a>(
+    ordered_delta_rows: &'a [serde_json::Value],
+    signature: &str,
+) -> Vec<&'a serde_json::Value> {
+    ordered_delta_rows
+        .iter()
+        .filter(|row| row["reserve_update_signature"].as_str() == Some(signature))
+        .collect()
+}
+
+fn phase107n_exact_reserve_row_from_delta(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    trade_event: &NormalizedEvent,
+    trade_event_type: &str,
+    delta_row: &serde_json::Value,
+    strict_eligible: bool,
+) -> serde_json::Value {
+    json!({
+        "run_id": run_id,
+        "source_run_id": run_id,
+        "launch_id": "",
+        "mint": mint,
+        "event_observed_at_utc": trade_event.meta.received_at_wall_time.to_string(),
+        "event_block_time_utc": phase107n_event_block_time(trade_event),
+        "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+        "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+        "signature": phase107n_event_signature_or_empty(trade_event),
+        "trade_signature": phase107n_event_signature_or_empty(trade_event),
+        "slot": trade_event.meta.slot,
+        "trade_slot": trade_event.meta.slot,
+        "block_time_utc": phase107n_event_block_time(trade_event),
+        "source_observed_at_utc": trade_event.meta.received_at_wall_time.to_string(),
+        "instruction_index": phase107n_event_instruction_index(trade_event),
+        "trade_instruction_index": phase107n_event_instruction_index(trade_event),
+        "inner_instruction_index": phase107n_event_inner_instruction_index(trade_event),
+        "trade_inner_instruction_index": phase107n_event_inner_instruction_index(trade_event),
+        "event_type": trade_event_type,
+        "trade_event_type": trade_event_type,
+        "decoded_instruction_name": trade_event_type,
+        "reserve_update_signature": delta_row["reserve_update_signature"].clone(),
+        "reserve_update_slot": delta_row["reserve_update_slot"].clone(),
+        "reserve_update_instruction_index": delta_row["reserve_update_instruction_index"].clone(),
+        "reserve_linkage_status": "exact_contiguous_account_delta",
+        "ordered_account_delta_key": delta_row["ordered_account_delta_key"].clone(),
+        "account_write_version_before": delta_row["account_write_version_before"].clone(),
+        "account_write_version_after": delta_row["account_write_version_after"].clone(),
+        "virtual_sol_reserves_before": delta_row["virtual_sol_reserves_before"].clone(),
+        "virtual_token_reserves_before": delta_row["virtual_token_reserves_before"].clone(),
+        "real_sol_reserves_before": delta_row["real_sol_reserves_before"].clone(),
+        "real_token_reserves_before": delta_row["real_token_reserves_before"].clone(),
+        "virtual_sol_reserves_after": delta_row["virtual_sol_reserves_after"].clone(),
+        "virtual_token_reserves_after": delta_row["virtual_token_reserves_after"].clone(),
+        "real_sol_reserves_after": delta_row["real_sol_reserves_after"].clone(),
+        "real_token_reserves_after": delta_row["real_token_reserves_after"].clone(),
+        "curve_progress_pct_before": delta_row["curve_progress_pct_before"].clone(),
+        "curve_progress_pct_after": delta_row["curve_progress_pct_after"].clone(),
+        "curve_price_before": delta_row["curve_price_before"].clone(),
+        "curve_price_after": delta_row["curve_price_after"].clone(),
+        "reserve_state_basis": "exact_account_delta",
+        "reserve_basis": "exact_account_delta",
+        "exact_reserve_available": true,
+        "reserve_parse_status": "non_rpc_exact_ordered_account_delta",
+        "source_mode": "local_stream_exact_account_delta",
+        "source_is_non_rpc": true,
+        "rpc_used": false,
+        "strict_timing_eligible": strict_eligible,
+        "source_file": "ordered_bonding_curve_account_delta_rows.csv",
+        "source_line_or_record_id": delta_row["ordered_account_delta_key"].clone(),
+        "data_quality_flags": phase107n_event_data_quality_flags(trade_event),
+    })
+}
+
+fn phase107n_trade_reserve_linkage_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+    ordered_delta_rows: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut audit_rows = Vec::new();
+    let mut exact_rows = Vec::new();
+    let mut trades_by_signature = BTreeMap::<String, usize>::new();
+    for event in events {
+        let Some(_) = phase107n_trade_event_type(event) else {
+            continue;
+        };
+        let signature = phase107n_event_signature_or_empty(event);
+        if !signature.is_empty() {
+            *trades_by_signature.entry(signature).or_default() += 1;
+        }
+    }
+    for trade_event in events {
+        let Some(trade_event_type) = phase107n_trade_event_type(trade_event) else {
+            continue;
+        };
+        let signature = phase107n_event_signature_or_empty(trade_event);
+        let strict_eligible = phase107n_strict_5s_eligible(trade_event, events);
+        let trade_candidate_count = trades_by_signature.get(&signature).copied().unwrap_or(0);
+        let reserve_candidates =
+            phase107n_find_ordered_delta_for_signature(ordered_delta_rows, &signature);
+        let exact_reserve_candidates = reserve_candidates
+            .iter()
+            .copied()
+            .filter(|row| row["exact_delta_available"].as_bool().unwrap_or(false))
+            .collect::<Vec<_>>();
+        let (status, blocker, chosen_delta) = if signature.is_empty() {
+            ("missing_trade_signature", "trade_signature_missing", None)
+        } else if trade_candidate_count != 1 {
+            (
+                "ambiguous_trade_signature",
+                "multiple_trade_events_share_signature_for_mint",
+                None,
+            )
+        } else if reserve_candidates.is_empty() {
+            (
+                "missing_matching_reserve_update",
+                "no_bonding_curve_account_update_with_trade_signature",
+                None,
+            )
+        } else if exact_reserve_candidates.is_empty() {
+            (
+                "matching_update_without_prior_state",
+                "reserve_update_lacks_contiguous_prior_account_state",
+                None,
+            )
+        } else if exact_reserve_candidates.len() != 1 {
+            (
+                "ambiguous_matching_reserve_update",
+                "multiple_exact_account_deltas_share_trade_signature",
+                None,
+            )
+        } else {
+            (
+                "exact_contiguous_account_delta",
+                "",
+                exact_reserve_candidates.first().copied(),
+            )
+        };
+        if let Some(delta_row) = chosen_delta {
+            exact_rows.push(phase107n_exact_reserve_row_from_delta(
+                run_id,
+                mint,
+                launch,
+                trade_event,
+                trade_event_type,
+                delta_row,
+                strict_eligible,
+            ));
+        }
+        audit_rows.push(json!({
+            "run_id": run_id,
+            "source_run_id": run_id,
+            "launch_id": "",
+            "mint": mint,
+            "trade_signature": signature,
+            "trade_slot": trade_event.meta.slot,
+            "trade_instruction_index": phase107n_event_instruction_index(trade_event),
+            "trade_inner_instruction_index": phase107n_event_inner_instruction_index(trade_event),
+            "trade_event_type": trade_event_type,
+            "reserve_update_signature": chosen_delta
+                .map(|row| row["reserve_update_signature"].clone())
+                .unwrap_or(serde_json::Value::Null),
+            "reserve_update_slot": chosen_delta
+                .map(|row| row["reserve_update_slot"].clone())
+                .unwrap_or(serde_json::Value::Null),
+            "reserve_update_instruction_index": chosen_delta
+                .map(|row| row["reserve_update_instruction_index"].clone())
+                .unwrap_or(serde_json::Value::Null),
+            "ordered_account_delta_key": chosen_delta
+                .map(|row| row["ordered_account_delta_key"].clone())
+                .unwrap_or(serde_json::Value::Null),
+            "reserve_linkage_status": status,
+            "exact_reserve_available": chosen_delta.is_some(),
+            "trade_candidate_count": trade_candidate_count,
+            "reserve_candidate_count": reserve_candidates.len(),
+            "blocker_reason": blocker,
+            "source_mode": "local_stream_trade_reserve_linkage_audit",
+            "source_is_non_rpc": true,
+            "rpc_used": false,
+            "strict_timing_eligible": strict_eligible,
+            "data_quality_flags": phase107n_join_flags(phase107n_event_data_quality_flags(trade_event), phase107n_trade_status(trade_event)),
+        }));
+    }
+    (audit_rows, exact_rows)
+}
+
+fn phase107n_trade_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for event in events {
+        let strict_eligible = phase107n_strict_5s_eligible(event, events);
+        match &event.payload {
+            EventPayload::PumpBuy(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                rows.push(json!({
+                    "run_id": run_id,
+                    "source_run_id": run_id,
+                    "launch_id": "",
+                    "mint": mint,
+                    "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "event_block_time_utc": phase107n_event_block_time(event),
+                    "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+                    "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+                    "signature": event_signature_string(event).unwrap_or_default(),
+                    "trade_signature": event_signature_string(event).unwrap_or_default(),
+                    "slot": event.meta.slot,
+                    "trade_slot": event.meta.slot,
+                    "block_time_utc": phase107n_event_block_time(event),
+                    "source_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "instruction_index": phase107n_event_instruction_index(event),
+                    "trade_instruction_index": phase107n_event_instruction_index(event),
+                    "inner_instruction_index": phase107n_event_inner_instruction_index(event),
+                    "trade_inner_instruction_index": phase107n_event_inner_instruction_index(event),
+                    "event_type": "buy",
+                    "decoded_instruction_name": "buy",
+                    "is_buy": true,
+                    "is_sell": false,
+                    "user_wallet": payload.buyer.to_string(),
+                    "buyer_wallet": payload.buyer.to_string(),
+                    "seller_wallet": "",
+                    "signer_wallet": payload.payer.to_string(),
+                    "fee_payer": payload.payer.to_string(),
+                    "creator_wallet": phase107k_row_string(launch, "creator_or_authority_if_stream_authoritative"),
+                    "sol_amount": decimal_to_json(Some(common::lamports_to_sol(payload.quote_in))),
+                    "token_amount": decimal_to_json(Some(payload.token_out)),
+                    "quote_mint": "",
+                    "token_program_used": phase107k_row_string(launch, "token_program_used"),
+                    "source_mode": "local_stream_decoded_trade_event",
+                    "source_is_non_rpc": true,
+                    "rpc_used": false,
+                    "strict_timing_eligible": strict_eligible,
+                    "parse_status": "non_rpc_decoded_trade_instruction",
+                    "trade_parse_status": "non_rpc_decoded_trade_instruction",
+                    "source_file": "normalized_live_sidecar_event_stream",
+                    "source_line_or_record_id": phase107n_event_source_record_id(event),
+                    "data_quality_flags": phase107n_event_data_quality_flags(event),
+                }));
+            }
+            EventPayload::PumpSell(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                rows.push(json!({
+                    "run_id": run_id,
+                    "source_run_id": run_id,
+                    "launch_id": "",
+                    "mint": mint,
+                    "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "event_block_time_utc": phase107n_event_block_time(event),
+                    "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+                    "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+                    "signature": event_signature_string(event).unwrap_or_default(),
+                    "trade_signature": event_signature_string(event).unwrap_or_default(),
+                    "slot": event.meta.slot,
+                    "trade_slot": event.meta.slot,
+                    "block_time_utc": phase107n_event_block_time(event),
+                    "source_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "instruction_index": phase107n_event_instruction_index(event),
+                    "trade_instruction_index": phase107n_event_instruction_index(event),
+                    "inner_instruction_index": phase107n_event_inner_instruction_index(event),
+                    "trade_inner_instruction_index": phase107n_event_inner_instruction_index(event),
+                    "event_type": "sell",
+                    "decoded_instruction_name": "sell",
+                    "is_buy": false,
+                    "is_sell": true,
+                    "user_wallet": payload.seller.to_string(),
+                    "buyer_wallet": "",
+                    "seller_wallet": payload.seller.to_string(),
+                    "signer_wallet": payload.seller.to_string(),
+                    "fee_payer": payload.seller.to_string(),
+                    "creator_wallet": phase107k_row_string(launch, "creator_or_authority_if_stream_authoritative"),
+                    "sol_amount": decimal_to_json(Some(common::lamports_to_sol(payload.quote_out))),
+                    "token_amount": decimal_to_json(Some(payload.token_in)),
+                    "quote_mint": "",
+                    "token_program_used": phase107k_row_string(launch, "token_program_used"),
+                    "source_mode": "local_stream_decoded_trade_event",
+                    "source_is_non_rpc": true,
+                    "rpc_used": false,
+                    "strict_timing_eligible": strict_eligible,
+                    "parse_status": "non_rpc_decoded_trade_instruction",
+                    "trade_parse_status": "non_rpc_decoded_trade_instruction",
+                    "source_file": "normalized_live_sidecar_event_stream",
+                    "source_line_or_record_id": phase107n_event_source_record_id(event),
+                    "data_quality_flags": phase107n_event_data_quality_flags(event),
+                }));
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn phase107n_reserve_rows_for_mint(
+    run_id: &str,
+    mint: &str,
+    launch: &serde_json::Value,
+    events: &[NormalizedEvent],
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for event in events {
+        let strict_eligible = phase107n_strict_5s_eligible(event, events);
+        match &event.payload {
+            EventPayload::PumpBuy(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                let exact_available =
+                    payload.reserves_before.is_some() && payload.reserves_after.is_some();
+                let mut row = serde_json::Map::new();
+                row.insert("run_id".to_owned(), json!(run_id));
+                row.insert("source_run_id".to_owned(), json!(run_id));
+                row.insert("launch_id".to_owned(), json!(""));
+                row.insert("mint".to_owned(), json!(mint));
+                row.insert(
+                    "event_observed_at_utc".to_owned(),
+                    json!(event.meta.received_at_wall_time.to_string()),
+                );
+                row.insert(
+                    "event_block_time_utc".to_owned(),
+                    json!(phase107n_event_block_time(event)),
+                );
+                row.insert("bonding_curve".to_owned(), launch["bonding_curve"].clone());
+                row.insert(
+                    "associated_bonding_curve".to_owned(),
+                    launch["associated_bonding_curve"].clone(),
+                );
+                row.insert(
+                    "signature".to_owned(),
+                    json!(event_signature_string(event).unwrap_or_default()),
+                );
+                row.insert(
+                    "trade_signature".to_owned(),
+                    json!(event_signature_string(event).unwrap_or_default()),
+                );
+                row.insert("slot".to_owned(), json!(event.meta.slot));
+                row.insert("trade_slot".to_owned(), json!(event.meta.slot));
+                row.insert(
+                    "block_time_utc".to_owned(),
+                    json!(phase107n_event_block_time(event)),
+                );
+                row.insert(
+                    "source_observed_at_utc".to_owned(),
+                    json!(event.meta.received_at_wall_time.to_string()),
+                );
+                row.insert(
+                    "instruction_index".to_owned(),
+                    phase107n_event_instruction_index(event),
+                );
+                row.insert(
+                    "trade_instruction_index".to_owned(),
+                    phase107n_event_instruction_index(event),
+                );
+                row.insert(
+                    "inner_instruction_index".to_owned(),
+                    phase107n_event_inner_instruction_index(event),
+                );
+                row.insert(
+                    "trade_inner_instruction_index".to_owned(),
+                    phase107n_event_inner_instruction_index(event),
+                );
+                row.insert("event_type".to_owned(), json!("buy"));
+                row.insert("trade_event_type".to_owned(), json!("buy"));
+                row.insert("decoded_instruction_name".to_owned(), json!("buy"));
+                row.insert(
+                    "reserve_linkage_status".to_owned(),
+                    json!(if exact_available {
+                        "trade_event_embedded_before_after_reserves"
+                    } else {
+                        "missing_trade_embedded_before_after_reserves"
+                    }),
+                );
+                phase107n_insert_reserve_snapshot(
+                    &mut row,
+                    "before",
+                    payload.reserves_before.as_ref(),
+                );
+                phase107n_insert_reserve_snapshot(
+                    &mut row,
+                    "after",
+                    payload.reserves_after.as_ref(),
+                );
+                row.insert(
+                    "curve_progress_pct_before".to_owned(),
+                    phase107n_curve_progress_from_reserve(payload.reserves_before.as_ref()),
+                );
+                row.insert(
+                    "curve_progress_pct_after".to_owned(),
+                    phase107n_curve_progress_from_reserve(payload.reserves_after.as_ref()),
+                );
+                row.insert(
+                    "curve_price_before".to_owned(),
+                    if payload.price_before.is_some() {
+                        decimal_to_json(payload.price_before)
+                    } else {
+                        phase107n_curve_price_from_reserve(payload.reserves_before.as_ref())
+                    },
+                );
+                row.insert(
+                    "curve_price_after".to_owned(),
+                    if payload.price_after.is_some() {
+                        decimal_to_json(payload.price_after)
+                    } else {
+                        phase107n_curve_price_from_reserve(payload.reserves_after.as_ref())
+                    },
+                );
+                let reserve_basis = if exact_available {
+                    "exact_reserve_event"
+                } else {
+                    "unavailable"
+                };
+                row.insert("reserve_state_basis".to_owned(), json!(reserve_basis));
+                row.insert("reserve_basis".to_owned(), json!(reserve_basis));
+                row.insert("exact_reserve_available".to_owned(), json!(exact_available));
+                row.insert(
+                    "reserve_parse_status".to_owned(),
+                    json!(if exact_available {
+                        "non_rpc_trade_reserves_decoded"
+                    } else {
+                        "trade_event_without_reserve_state"
+                    }),
+                );
+                row.insert(
+                    "source_mode".to_owned(),
+                    json!("local_stream_decoded_trade_event"),
+                );
+                row.insert("source_is_non_rpc".to_owned(), json!(true));
+                row.insert("rpc_used".to_owned(), json!(false));
+                row.insert("strict_timing_eligible".to_owned(), json!(strict_eligible));
+                row.insert(
+                    "source_file".to_owned(),
+                    json!("normalized_live_sidecar_event_stream"),
+                );
+                row.insert(
+                    "source_line_or_record_id".to_owned(),
+                    json!(phase107n_event_source_record_id(event)),
+                );
+                row.insert(
+                    "data_quality_flags".to_owned(),
+                    json!(phase107n_event_data_quality_flags(event)),
+                );
+                rows.push(serde_json::Value::Object(row));
+            }
+            EventPayload::PumpSell(payload)
+                if payload.status != common::TransactionStatus::Failed =>
+            {
+                let exact_available =
+                    payload.reserves_before.is_some() && payload.reserves_after.is_some();
+                let mut row = serde_json::Map::new();
+                row.insert("run_id".to_owned(), json!(run_id));
+                row.insert("source_run_id".to_owned(), json!(run_id));
+                row.insert("launch_id".to_owned(), json!(""));
+                row.insert("mint".to_owned(), json!(mint));
+                row.insert(
+                    "event_observed_at_utc".to_owned(),
+                    json!(event.meta.received_at_wall_time.to_string()),
+                );
+                row.insert(
+                    "event_block_time_utc".to_owned(),
+                    json!(phase107n_event_block_time(event)),
+                );
+                row.insert("bonding_curve".to_owned(), launch["bonding_curve"].clone());
+                row.insert(
+                    "associated_bonding_curve".to_owned(),
+                    launch["associated_bonding_curve"].clone(),
+                );
+                row.insert(
+                    "signature".to_owned(),
+                    json!(event_signature_string(event).unwrap_or_default()),
+                );
+                row.insert(
+                    "trade_signature".to_owned(),
+                    json!(event_signature_string(event).unwrap_or_default()),
+                );
+                row.insert("slot".to_owned(), json!(event.meta.slot));
+                row.insert("trade_slot".to_owned(), json!(event.meta.slot));
+                row.insert(
+                    "block_time_utc".to_owned(),
+                    json!(phase107n_event_block_time(event)),
+                );
+                row.insert(
+                    "source_observed_at_utc".to_owned(),
+                    json!(event.meta.received_at_wall_time.to_string()),
+                );
+                row.insert(
+                    "instruction_index".to_owned(),
+                    phase107n_event_instruction_index(event),
+                );
+                row.insert(
+                    "trade_instruction_index".to_owned(),
+                    phase107n_event_instruction_index(event),
+                );
+                row.insert(
+                    "inner_instruction_index".to_owned(),
+                    phase107n_event_inner_instruction_index(event),
+                );
+                row.insert(
+                    "trade_inner_instruction_index".to_owned(),
+                    phase107n_event_inner_instruction_index(event),
+                );
+                row.insert("event_type".to_owned(), json!("sell"));
+                row.insert("trade_event_type".to_owned(), json!("sell"));
+                row.insert("decoded_instruction_name".to_owned(), json!("sell"));
+                row.insert(
+                    "reserve_linkage_status".to_owned(),
+                    json!(if exact_available {
+                        "trade_event_embedded_before_after_reserves"
+                    } else {
+                        "missing_trade_embedded_before_after_reserves"
+                    }),
+                );
+                phase107n_insert_reserve_snapshot(
+                    &mut row,
+                    "before",
+                    payload.reserves_before.as_ref(),
+                );
+                phase107n_insert_reserve_snapshot(
+                    &mut row,
+                    "after",
+                    payload.reserves_after.as_ref(),
+                );
+                row.insert(
+                    "curve_progress_pct_before".to_owned(),
+                    phase107n_curve_progress_from_reserve(payload.reserves_before.as_ref()),
+                );
+                row.insert(
+                    "curve_progress_pct_after".to_owned(),
+                    phase107n_curve_progress_from_reserve(payload.reserves_after.as_ref()),
+                );
+                row.insert(
+                    "curve_price_before".to_owned(),
+                    if payload.price_before.is_some() {
+                        decimal_to_json(payload.price_before)
+                    } else {
+                        phase107n_curve_price_from_reserve(payload.reserves_before.as_ref())
+                    },
+                );
+                row.insert(
+                    "curve_price_after".to_owned(),
+                    if payload.price_after.is_some() {
+                        decimal_to_json(payload.price_after)
+                    } else {
+                        phase107n_curve_price_from_reserve(payload.reserves_after.as_ref())
+                    },
+                );
+                let reserve_basis = if exact_available {
+                    "exact_reserve_event"
+                } else {
+                    "unavailable"
+                };
+                row.insert("reserve_state_basis".to_owned(), json!(reserve_basis));
+                row.insert("reserve_basis".to_owned(), json!(reserve_basis));
+                row.insert("exact_reserve_available".to_owned(), json!(exact_available));
+                row.insert(
+                    "reserve_parse_status".to_owned(),
+                    json!(if exact_available {
+                        "non_rpc_trade_reserves_decoded"
+                    } else {
+                        "trade_event_without_reserve_state"
+                    }),
+                );
+                row.insert(
+                    "source_mode".to_owned(),
+                    json!("local_stream_decoded_trade_event"),
+                );
+                row.insert("source_is_non_rpc".to_owned(), json!(true));
+                row.insert("rpc_used".to_owned(), json!(false));
+                row.insert("strict_timing_eligible".to_owned(), json!(strict_eligible));
+                row.insert(
+                    "source_file".to_owned(),
+                    json!("normalized_live_sidecar_event_stream"),
+                );
+                row.insert(
+                    "source_line_or_record_id".to_owned(),
+                    json!(phase107n_event_source_record_id(event)),
+                );
+                row.insert(
+                    "data_quality_flags".to_owned(),
+                    json!(phase107n_event_data_quality_flags(event)),
+                );
+                rows.push(serde_json::Value::Object(row));
+            }
+            EventPayload::BondingCurveUpdate(payload) => {
+                rows.push(json!({
+                    "run_id": run_id,
+                    "source_run_id": run_id,
+                    "launch_id": "",
+                    "mint": mint,
+                    "event_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "event_block_time_utc": phase107n_event_block_time(event),
+                    "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+                    "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+                    "signature": event_signature_string(event).unwrap_or_else(|| payload.caused_by_signature.clone().unwrap_or_default()),
+                    "slot": event.meta.slot,
+                    "block_time_utc": phase107n_event_block_time(event),
+                    "source_observed_at_utc": event.meta.received_at_wall_time.to_string(),
+                    "instruction_index": phase107n_event_instruction_index(event),
+                    "inner_instruction_index": phase107n_event_inner_instruction_index(event),
+                    "event_type": "reserve_update",
+                    "decoded_instruction_name": "bonding_curve_update",
+                    "virtual_sol_reserves_after": decimal_to_json(Some(common::lamports_to_sol(payload.virtual_quote_reserves))),
+                    "virtual_token_reserves_after": decimal_to_json(Some(payload.virtual_token_reserves)),
+                    "real_sol_reserves_after": decimal_to_json(Some(common::lamports_to_sol(payload.real_quote_reserves))),
+                    "real_token_reserves_after": decimal_to_json(Some(payload.real_token_reserves)),
+                    "curve_progress_pct_after": decimal_to_json(payload.curve_progress_pct),
+                    "curve_price_after": decimal_to_json(payload.price_sol_per_token),
+                    "reserve_state_basis": "reserve_account_snapshot",
+                    "reserve_basis": "reserve_account_snapshot",
+                    "exact_reserve_available": false,
+                    "reserve_linkage_status": "snapshot_only_no_trade_local_before_state",
+                    "reserve_parse_status": "non_rpc_bonding_curve_update_snapshot",
+                    "source_mode": "local_stream_reserve_snapshot",
+                    "source_is_non_rpc": true,
+                    "rpc_used": false,
+                    "strict_timing_eligible": strict_eligible,
+                    "source_file": "normalized_live_sidecar_event_stream",
+                    "source_line_or_record_id": phase107n_event_source_record_id(event),
+                    "data_quality_flags": phase107n_event_data_quality_flags(event),
+                }));
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn phase107n_decoded_launch_rows(
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    all_launch_rows
+        .iter()
+        .map(|launch| {
+            let launch_seen_at = phase107k_row_string(launch, "launch_seen_at");
+            json!({
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "launch_id": "",
+                "mint": phase107k_row_string(launch, "mint"),
+                "event_observed_at_utc": launch_seen_at,
+                "event_block_time_utc": "",
+                "slot": launch["slot"].clone(),
+                "signature": phase107k_row_string(launch, "signature_if_available"),
+                "event_type": "launch_create",
+                "decoded_instruction_name": phase107k_row_string(launch, "launch_instruction_variant"),
+                "creator_wallet": phase107k_row_string(launch, "creator_or_authority_if_stream_authoritative"),
+                "bonding_curve": phase107k_row_string(launch, "bonding_curve"),
+                "associated_bonding_curve": phase107k_row_string(launch, "associated_bonding_curve"),
+                "launch_instruction_variant": phase107k_row_string(launch, "launch_instruction_variant"),
+                "launch_instruction_account_count": launch["launch_instruction_account_count"].clone(),
+                "metadata_uri": phase107k_row_string(launch, "launch_instruction_uri"),
+                "token_program_used": phase107k_row_string(launch, "token_program_used"),
+                "same_transaction_buy_present": launch["same_transaction_buy_present"].clone(),
+                "source_mode": "local_stream_token_created_event",
+                "source_is_non_rpc": true,
+                "rpc_used": false,
+                "strict_timing_eligible": true,
+                "parse_status": "non_rpc_decoded_launch_create_event",
+                "source_file": "all_launch_intake_ledger.csv",
+                "source_line_or_record_id": phase107k_row_string(launch, "mint"),
+                "data_quality_flags": "",
+            })
+        })
+        .collect()
+}
+
+fn phase107n_write_lifecycle_stream_artifacts(
+    output_dir: &Path,
+    run_id: &str,
+    all_launch_rows: &[serde_json::Value],
+    events_by_mint: &BTreeMap<String, Vec<NormalizedEvent>>,
+) -> Result<()> {
+    let launch_rows = phase107n_decoded_launch_rows(run_id, all_launch_rows);
+    let mut trade_rows = Vec::<serde_json::Value>::new();
+    let mut reserve_rows = Vec::<serde_json::Value>::new();
+    let mut migration_rows = Vec::<serde_json::Value>::new();
+    let mut pumpswap_pair_rows = Vec::<serde_json::Value>::new();
+    let mut pumpswap_trade_rows = Vec::<serde_json::Value>::new();
+    let mut holder_rows = Vec::<serde_json::Value>::new();
+    let mut ordered_delta_rows = Vec::<serde_json::Value>::new();
+    let mut linkage_audit_rows = Vec::<serde_json::Value>::new();
+    for launch in all_launch_rows {
+        let Some(mint) = launch["mint"].as_str() else {
+            continue;
+        };
+        let Some(events) = events_by_mint.get(mint) else {
+            continue;
+        };
+        trade_rows.extend(phase107n_trade_rows_for_mint(run_id, mint, launch, events));
+        migration_rows.extend(phase107n_pumpfun_migration_rows_for_mint(
+            run_id, mint, launch, events,
+        ));
+        pumpswap_pair_rows.extend(phase107n_pumpswap_pair_rows_for_mint(
+            run_id, mint, launch, events,
+        ));
+        pumpswap_trade_rows.extend(phase107n_pumpswap_trade_rows_for_mint(
+            run_id, mint, launch, events,
+        ));
+        holder_rows.extend(phase107n_holder_rows_for_mint(run_id, mint, launch, events));
+        reserve_rows.extend(phase107n_reserve_rows_for_mint(
+            run_id, mint, launch, events,
+        ));
+        let mint_ordered_delta_rows =
+            phase107n_ordered_account_delta_rows_for_mint(run_id, mint, launch, events);
+        let (mint_linkage_rows, mint_exact_rows) = phase107n_trade_reserve_linkage_for_mint(
+            run_id,
+            mint,
+            launch,
+            events,
+            &mint_ordered_delta_rows,
+        );
+        ordered_delta_rows.extend(mint_ordered_delta_rows);
+        linkage_audit_rows.extend(mint_linkage_rows);
+        reserve_rows.extend(mint_exact_rows);
+    }
+    write_json_rows_csv(
+        &output_dir.join("all_launch_trade_event_rows.csv"),
+        PHASE107N_LIFECYCLE_TRADE_EVENT_FIELDS,
+        &trade_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("decoded_launch_event_rows.csv"),
+        PHASE107N_DECODED_LAUNCH_EVENT_FIELDS,
+        &launch_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("decoded_trade_event_rows.csv"),
+        PHASE107N_LIFECYCLE_TRADE_EVENT_FIELDS,
+        &trade_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("quant_pumpfun_migration_event_rows.csv"),
+        PHASE107N_PUMPFUN_MIGRATION_EVENT_FIELDS,
+        &migration_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("quant_pumpswap_pair_event_rows.csv"),
+        PHASE107N_PUMPSWAP_PAIR_EVENT_FIELDS,
+        &pumpswap_pair_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("quant_pumpswap_trade_event_rows.csv"),
+        PHASE107N_PUMPSWAP_TRADE_EVENT_FIELDS,
+        &pumpswap_trade_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("all_launch_exact_reserve_rows.csv"),
+        PHASE107N_LIFECYCLE_EXACT_RESERVE_FIELDS,
+        &reserve_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("decoded_reserve_event_rows.csv"),
+        PHASE107N_LIFECYCLE_EXACT_RESERVE_FIELDS,
+        &reserve_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("ordered_bonding_curve_account_delta_rows.csv"),
+        PHASE107N_ORDERED_ACCOUNT_DELTA_FIELDS,
+        &ordered_delta_rows,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("trade_reserve_linkage_audit.csv"),
+        PHASE107N_TRADE_RESERVE_LINKAGE_AUDIT_FIELDS,
+        &linkage_audit_rows,
+    )?;
+    let exact_reserve_rows = reserve_rows
+        .iter()
+        .filter(|row| {
+            row["exact_reserve_available"].as_bool().unwrap_or(false)
+                && matches!(
+                    row["reserve_state_basis"].as_str(),
+                    Some("exact_reserve_event" | "exact_account_delta")
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    write_json_rows_csv(
+        &output_dir.join("exact_reserve_state_rows.csv"),
+        PHASE107N_LIFECYCLE_EXACT_RESERVE_FIELDS,
+        &exact_reserve_rows,
+    )?;
+    let reserve_snapshot_rows = reserve_rows
+        .iter()
+        .filter(|row| row["reserve_state_basis"].as_str() == Some("reserve_account_snapshot"))
+        .count();
+    let exact_account_delta_rows = exact_reserve_rows
+        .iter()
+        .filter(|row| row["reserve_state_basis"].as_str() == Some("exact_account_delta"))
+        .count();
+    let ordered_delta_available_rows = ordered_delta_rows
+        .iter()
+        .filter(|row| row["exact_delta_available"].as_bool().unwrap_or(false))
+        .count();
+    let exact_reserve_required_fields = "virtual_sol_reserves_before|virtual_token_reserves_before|real_sol_reserves_before|real_token_reserves_before|virtual_sol_reserves_after|virtual_token_reserves_after|real_sol_reserves_after|real_token_reserves_after|curve_progress_pct_before|curve_progress_pct_after|curve_price_before|curve_price_after";
+    let decoded_trade_without_reserves = reserve_rows
+        .iter()
+        .filter(|row| row["reserve_state_basis"].as_str() == Some("unavailable"))
+        .count();
+    let exact_root_cause_rows = vec![
+        json!({
+            "source_file": "normalized_live_sidecar_event_stream|all_launch_trade_event_rows.csv|decoded_trade_event_rows.csv",
+            "record_type": "pump_buy_sell_trade_event",
+            "fields_present": "mint|signature|slot|instruction_index|inner_instruction_index|event_type|is_buy|is_sell|user_wallet|buyer_wallet|seller_wallet|signer_wallet|fee_payer|sol_amount|token_amount|source_observed_at_utc|rpc_used|source_is_non_rpc",
+            "fields_missing": exact_reserve_required_fields,
+            "parser_file": "crates/runtime/src/live_source.rs|crates/cli/src/main.rs",
+            "parser_function": "LiveSourceNormalizer::normalize_transaction buy/sell arms|phase107n_reserve_rows_for_mint",
+            "can_patch_parser_without_upstream_change": "false",
+            "exact_reason": format!(
+                "{} decoded non-RPC buy/sell event rows have no embedded reserves_before/reserves_after or price_before/price_after values. Exact rows must come from embedded trade reserves or the ordered account-delta linkage path.",
+                decoded_trade_without_reserves
+            ),
+        }),
+        json!({
+            "source_file": "normalized_live_sidecar_event_stream|all_launch_exact_reserve_rows.csv|decoded_reserve_event_rows.csv",
+            "record_type": "bonding_curve_update_snapshot",
+            "fields_present": "mint|signature_if_available|slot|event_observed_at_utc|virtual_sol_reserves_after|virtual_token_reserves_after|real_sol_reserves_after|real_token_reserves_after|curve_progress_pct_after|curve_price_after|reserve_state_basis=reserve_account_snapshot",
+            "fields_missing": "virtual_sol_reserves_before|virtual_token_reserves_before|real_sol_reserves_before|real_token_reserves_before|curve_progress_pct_before|curve_price_before|trade_instruction_index|trade_inner_instruction_index|trade_event_type|tp_sl_intra_interval_order",
+            "parser_file": "crates/runtime/src/live_source.rs|crates/cli/src/main.rs",
+            "parser_function": "pending_curve_update_from_decoded|bonding_curve_event_from_pending|phase107n_reserve_rows_for_mint",
+            "can_patch_parser_without_upstream_change": "true",
+            "exact_reason": format!(
+                "{} reserve-account snapshot rows provide post-state only. The patched writer exports {} ordered account-delta rows, of which {} have contiguous prior state.",
+                reserve_snapshot_rows,
+                ordered_delta_rows.len(),
+                ordered_delta_available_rows
+            ),
+        }),
+        json!({
+            "source_file": "relay_frames/*.ndjson",
+            "record_type": "yellowstone_subscribe_update_protobuf_relay_frame",
+            "fields_present": "payload_base64|payload_codec|payload_hash|payload_len|provider|source_kind|received_at_unix_nanos|sequence|subscription_fingerprint",
+            "fields_missing": "decoded_account_pubkey|decoded_account_owner|decoded_account_data_fields|account_pre_state|account_post_state|trade_before_reserves|trade_after_reserves|instruction_to_account_delta_linkage",
+            "parser_file": "crates/ingest-geyser/src/lib.rs|crates/runtime/src/live_source.rs|crates/cli/src/main.rs",
+            "parser_function": "account_update_from_proto|LiveSourceNormalizer::normalize_account|phase107n_write_lifecycle_stream_artifacts",
+            "can_patch_parser_without_upstream_change": "false",
+            "exact_reason": "Persisted relay frames retain opaque Yellowstone protobuf payloads plus envelope metadata; the lifecycle artifact writer consumes normalized events and decoded CSV outputs, not a persisted before/after account-delta stream.",
+        }),
+    ];
+    write_json_rows_csv(
+        &output_dir.join("exact_reserve_root_cause_audit.csv"),
+        PHASE107N_EXACT_RESERVE_ROOT_CAUSE_FIELDS,
+        &exact_root_cause_rows,
+    )?;
+    let exact_schema_patch = format!(
+        "# Exact Reserve Upstream Schema Patch\n\n\
+## Decision\n\n\
+Strict lifecycle backtest readiness requires trade-local reserve before/after state from the non-RPC producer.\n\n\
+- decoded_trade_rows: `{}`\n\
+- decoded_trade_rows_without_reserves: `{}`\n\
+- reserve_account_snapshot_rows: `{}`\n\
+- ordered_account_delta_rows: `{}`\n\
+- ordered_account_delta_available_rows: `{}`\n\
+- exact_account_delta_rows: `{}`\n\
+- exact_reserve_event_rows: `{}`\n\n\
+## Required Producer Fields\n\n\
+Every non-RPC Pump buy/sell event must include `{}` plus stable event ordering fields `signature`, `slot`, `instruction_index`, `inner_instruction_index`, and `event_observed_at_utc`.\n\n\
+## Rust Patch Target\n\n\
+- `crates/runtime/src/live_source.rs`: populate `PumpBuyEvent.reserves_before`, `PumpBuyEvent.reserves_after`, `PumpSellEvent.reserves_before`, and `PumpSellEvent.reserves_after` from live account state deltas.\n\
+- `crates/runtime/src/live_source.rs`: retain previous BondingCurve reserve state keyed by account/signature so account updates can be linked to the causing buy/sell instruction.\n\
+- `crates/cli/src/main.rs`: `phase107n_reserve_rows_for_mint` already emits `exact_reserve_event` rows when those upstream fields exist.\n\n\
+## Constraint\n\n\
+Do not fabricate reserve values from post-state snapshots. Reserve-account snapshots are proxy/interpolation candidates only unless they can prove conservative TP/SL ordering.\n",
+        trade_rows.len(),
+        decoded_trade_without_reserves,
+        reserve_snapshot_rows,
+        ordered_delta_rows.len(),
+        ordered_delta_available_rows,
+        exact_account_delta_rows,
+        exact_reserve_rows.len(),
+        exact_reserve_required_fields
+    );
+    fs::write(
+        output_dir.join("exact_reserve_upstream_schema_patch.md"),
+        exact_schema_patch,
+    )?;
+    write_json_rows_csv(
+        &output_dir.join("decoded_holder_event_rows.csv"),
+        PHASE107N_DECODED_HOLDER_EVENT_FIELDS,
+        &holder_rows,
+    )?;
+    let unavailable_reserve_rows = reserve_rows
+        .iter()
+        .filter(|row| row["reserve_state_basis"].as_str() == Some("unavailable"))
+        .count();
+    let summary = json!({
+        "schema_version": "phase107n.lifecycle_stream_event_artifacts.v1",
+        "run_id": run_id,
+        "launch_event_rows": launch_rows.len(),
+        "trade_event_rows": trade_rows.len(),
+        "buy_rows": trade_rows.iter().filter(|row| row["is_buy"].as_bool().unwrap_or(false)).count(),
+        "sell_rows": trade_rows.iter().filter(|row| row["is_sell"].as_bool().unwrap_or(false)).count(),
+        "pumpfun_migration_event_rows": migration_rows.len(),
+        "pumpswap_pair_event_rows": pumpswap_pair_rows.len(),
+        "pumpswap_trade_event_rows": pumpswap_trade_rows.len(),
+        "reserve_rows": reserve_rows.len(),
+        "exact_reserve_rows": exact_reserve_rows.len(),
+        "exact_account_delta_rows": exact_account_delta_rows,
+        "ordered_account_delta_rows": ordered_delta_rows.len(),
+        "ordered_account_delta_available_rows": ordered_delta_available_rows,
+        "trade_reserve_linkage_audit_rows": linkage_audit_rows.len(),
+        "reserve_account_snapshot_rows": reserve_snapshot_rows,
+        "unavailable_reserve_rows": unavailable_reserve_rows,
+        "holder_event_rows": holder_rows.len(),
+        "decoded_launch_event_rows_path": "decoded_launch_event_rows.csv",
+        "decoded_trade_event_rows_path": "decoded_trade_event_rows.csv",
+        "pumpfun_migration_event_rows_path": "quant_pumpfun_migration_event_rows.csv",
+        "pumpswap_pair_event_rows_path": "quant_pumpswap_pair_event_rows.csv",
+        "pumpswap_trade_event_rows_path": "quant_pumpswap_trade_event_rows.csv",
+        "decoded_reserve_event_rows_path": "decoded_reserve_event_rows.csv",
+        "decoded_holder_event_rows_path": "decoded_holder_event_rows.csv",
+        "exact_reserve_state_rows_path": "exact_reserve_state_rows.csv",
+        "ordered_bonding_curve_account_delta_rows_path": "ordered_bonding_curve_account_delta_rows.csv",
+        "trade_reserve_linkage_audit_path": "trade_reserve_linkage_audit.csv",
+        "exact_reserve_root_cause_audit_path": "exact_reserve_root_cause_audit.csv",
+        "exact_reserve_upstream_schema_patch_path": "exact_reserve_upstream_schema_patch.md",
+        "stream_schema_capability_report_path": "stream_schema_capability_report.md",
+        "source_mode": "local_stream_tail_adapter",
+        "source_is_non_rpc": true,
+        "rpc_used": false,
+        "live_trading_enabled": false,
+        "paper_trading_enabled": false,
+        "replay_allowed": false,
+        "wallet_execution_enabled": false,
+        "no_actual_fills_claimed": true,
+        "generated_at": OffsetDateTime::now_utc(),
+    });
+    fs::write(
+        output_dir.join("all_launch_lifecycle_stream_event_manifest.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    let capability_report = format!(
+        "# Stream Schema Capability Report\n\n\
+- run_id: `{run_id}`\n\
+- generated_at_utc: `{}`\n\
+- source_mode: `local_stream_tail_adapter`\n\
+- source_is_non_rpc: `true`\n\
+- rpc_used: `false`\n\
+- decoded_launch_event_rows: `{}`\n\
+- decoded_trade_event_rows: `{}`\n\
+- decoded_buy_rows: `{}`\n\
+- decoded_sell_rows: `{}`\n\
+- pumpfun_migration_event_rows: `{}`\n\
+- pumpswap_pair_event_rows: `{}`\n\
+- pumpswap_trade_event_rows: `{}`\n\
+- decoded_reserve_event_rows: `{}`\n\
+- ordered_bonding_curve_account_delta_rows: `{}`\n\
+- ordered_account_delta_available_rows: `{}`\n\
+- trade_reserve_linkage_audit_rows: `{}`\n\
+- exact_reserve_state_rows: `{}`\n\
+- exact_reserve_root_cause_audit: `exact_reserve_root_cause_audit.csv`\n\
+- exact_reserve_upstream_schema_patch: `exact_reserve_upstream_schema_patch.md`\n\
+- reserve_account_snapshot_rows: `{}`\n\
+- decoded_holder_event_rows: `{}`\n\n\
+## Capability Notes\n\n\
+- Buy/sell rows are emitted only when the normalized non-RPC stream contains decoded Pump buy/sell instructions.\n\
+- Exact before/after reserve rows are emitted only when decoded trade events carry reserve snapshots; absent reserves remain `unavailable`.\n\
+- Reserve account snapshots are labelled `reserve_account_snapshot`, not `exact_reserve_event`.\n\
+- Holder-level rows are emitted only from normalized `HolderBalanceUpdate` events with token account, owner, balance, decimals, slot, and timestamp.\n\
+- Pump.fun migration rows are emitted only from decoded `migrate*` instructions; PumpSwap rows remain header-only unless normalized PumpSwap pair/trade events are present.\n\
+- No live trading, paper trading, replay, wallet execution, actual fill claims, or RPC historical backfill are enabled by this producer artifact writer.\n",
+        OffsetDateTime::now_utc(),
+        launch_rows.len(),
+        trade_rows.len(),
+        trade_rows
+            .iter()
+            .filter(|row| row["is_buy"].as_bool().unwrap_or(false))
+            .count(),
+        trade_rows
+            .iter()
+            .filter(|row| row["is_sell"].as_bool().unwrap_or(false))
+            .count(),
+        migration_rows.len(),
+        pumpswap_pair_rows.len(),
+        pumpswap_trade_rows.len(),
+        reserve_rows.len(),
+        ordered_delta_rows.len(),
+        ordered_delta_available_rows,
+        linkage_audit_rows.len(),
+        exact_reserve_rows.len(),
+        reserve_snapshot_rows,
+        holder_rows.len(),
+    );
+    fs::write(
+        output_dir.join("stream_schema_capability_report.md"),
+        capability_report,
+    )?;
+    Ok(())
+}
+
 fn phase107h_decimal_ratio(numerator: Decimal, denominator: Decimal) -> Option<Decimal> {
     if denominator == Decimal::ZERO {
         None
@@ -45697,6 +47962,8 @@ fn phase107b_write_incremental_checkpoint(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
             "holder_rpc_used",
             "rpc_mint_supply_canonical",
             "r2_verified",
@@ -45730,6 +47997,8 @@ fn phase107b_write_incremental_checkpoint(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
             "risk_timeline_rows",
             "pre_entry_risk_feature_rows",
             "post_event_label_rows",
@@ -46014,6 +48283,8 @@ fn phase107f_write_segment_artifacts(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
             "holder_rpc_used",
             "rpc_mint_supply_canonical",
             "r2_verified",
@@ -46047,6 +48318,8 @@ fn phase107f_write_segment_artifacts(
             "survived_300s",
             "survived_900s",
             "survived_1800s",
+            "survived_3600s",
+            "curve_target_reached_90pct",
             "risk_timeline_rows",
             "pre_entry_risk_feature_rows",
             "post_event_label_rows",
@@ -46669,6 +48942,7 @@ fn phase107b_rule_rows_from_window(
 fn phase107b_decide_token(
     labels: &[serde_json::Value],
     early_rule_rows: &[serde_json::Value],
+    asof_alpha_rows: &[serde_json::Value],
     duration_seconds: u64,
 ) -> Phase107bDecision {
     let mut early_warning_families = early_rule_rows
@@ -46695,6 +48969,7 @@ fn phase107b_decide_token(
     let holder_collapse = phase107b_label_bool(labels, "holder_collapse").unwrap_or(false);
     let dump = phase107b_label_bool(labels, "top_holder_or_dev_dumped").unwrap_or(false);
     let liquidity_exit = phase107b_label_bool(labels, "liquidity_exit_proxy").unwrap_or(false);
+    let curve_target_reached_90pct = phase107b_curve_target_reached_90pct(asof_alpha_rows);
     let rug_like_by_300 = dead_60
         || dead_180
         || dead_300
@@ -46741,6 +49016,8 @@ fn phase107b_decide_token(
             survived_300: false,
             survived_900: false,
             survived_1800: false,
+            survived_3600: false,
+            curve_target_reached_90pct: false,
             promoted: false,
             provider_confirmed_bundle: false,
         };
@@ -46759,6 +49036,8 @@ fn phase107b_decide_token(
             survived_300: false,
             survived_900: false,
             survived_1800: false,
+            survived_3600: false,
+            curve_target_reached_90pct,
             promoted: false,
             provider_confirmed_bundle: false,
         };
@@ -46773,12 +49052,16 @@ fn phase107b_decide_token(
             survived_300: false,
             survived_900: false,
             survived_1800: false,
+            survived_3600: false,
+            curve_target_reached_90pct,
             promoted: false,
             provider_confirmed_bundle: false,
         };
     }
     Phase107bDecision {
-        final_state: if duration_seconds >= 1800 {
+        final_state: if duration_seconds >= PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS {
+            "material_candidate_3600s".to_owned()
+        } else if duration_seconds >= 1800 {
             "material_candidate_1800s".to_owned()
         } else if duration_seconds >= 900 {
             "material_candidate_900s".to_owned()
@@ -46786,15 +49069,33 @@ fn phase107b_decide_token(
             "survived_300s_candidate".to_owned()
         },
         reason: "survived_early_death_gates".to_owned(),
-        tracked_until_seconds: duration_seconds.min(1800).max(300),
+        tracked_until_seconds: duration_seconds
+            .min(PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS)
+            .max(300),
         early_warning_families,
         rug_like_by_300: false,
         survived_300: true,
         survived_900: duration_seconds >= 900,
         survived_1800: duration_seconds >= 1800,
+        survived_3600: duration_seconds >= PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS,
+        curve_target_reached_90pct,
         promoted: true,
         provider_confirmed_bundle: false,
     }
+}
+
+fn phase107b_curve_target_reached_90pct(asof_alpha_rows: &[serde_json::Value]) -> bool {
+    asof_alpha_rows.iter().any(|row| {
+        row["horizon_reached"].as_bool().unwrap_or(false)
+            && phase107b_json_value_to_f64(&row["curve_progress_proxy_asof"])
+                .is_some_and(|progress| progress >= PHASE107B_CURVE_TARGET_PROGRESS_PCT)
+    })
+}
+
+fn phase107b_json_value_to_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
 }
 
 fn phase107b_label_bool(labels: &[serde_json::Value], label_id: &str) -> Option<bool> {
@@ -47029,6 +49330,8 @@ fn phase107b_write_candidate_token(
         "survived_300s": decision.survived_300,
         "survived_900s": decision.survived_900,
         "survived_1800s": decision.survived_1800,
+        "survived_3600s": decision.survived_3600,
+        "curve_target_reached_90pct": decision.curve_target_reached_90pct,
         "holder_rpc_used": false,
         "rpc_mint_supply_canonical": false,
         "threshold_tuning_allowed": false,
@@ -47992,6 +50295,8 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
                     | "finalized_candidate"
                     | "material_candidate_900s"
                     | "material_candidate_1800s"
+                    | "material_candidate_3600s"
+                    | "curve_target_reached_90pct"
             )
         {
             final_outcomes_by_mint
@@ -48012,6 +50317,8 @@ fn validate_material_hunter_artifact_consistency(output_dir: &Path) -> Result<se
             let has_replay = outcomes.contains("replay_eligible_candidate")
                 || outcomes.contains("material_candidate_900s")
                 || outcomes.contains("material_candidate_1800s")
+                || outcomes.contains("material_candidate_3600s")
+                || outcomes.contains("curve_target_reached_90pct")
                 || outcomes.contains("finalized_candidate");
             let has_dead =
                 outcomes.contains("early_rejected_dead") || outcomes.contains("finalized_rejected");
@@ -48786,6 +51093,9 @@ async fn local_relay_upload_r2_streaming_shard(
 type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
 const LOCAL_RELAY_MATERIAL_SUBSCRIPTION_TIMEOUT: StdDuration = StdDuration::from_secs(150);
 const LOCAL_RELAY_PLANNED_STOP_MATERIAL_GRACE: StdDuration = StdDuration::from_secs(30);
+// Fresh PumpSwap parity runs can deliver >8k relay frames before the material
+// hunter drains the bridge. Keep this bounded, but sized for the observed burst.
+const LOCAL_RELAY_MATERIAL_UPDATE_CHANNEL_CAPACITY: usize = 65_536;
 
 enum RelayMaterialSendOutcome {
     Sent,
@@ -48798,7 +51108,12 @@ async fn send_relay_material_update(
     update: RelayMaterialUpdate,
 ) -> RelayMaterialSendOutcome {
     match tokio::time::timeout(StdDuration::from_secs(15), material_tx.send(update)).await {
-        Ok(Ok(())) => RelayMaterialSendOutcome::Sent,
+        Ok(Ok(())) => {
+            // Ready sends can otherwise monopolize the LocalSet until the relay
+            // bridge is full, starving the non-local material-hunter drain.
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
+            RelayMaterialSendOutcome::Sent
+        }
         Ok(Err(_)) => RelayMaterialSendOutcome::Closed,
         Err(_) => RelayMaterialSendOutcome::TimedOut,
     }
@@ -48924,12 +51239,26 @@ fn local_relay_material_completion_cap_reached(
     false
 }
 
+fn local_relay_material_terminal_blocker_exists(output_dir: &Path) -> bool {
+    let heartbeat = read_json_file_or_empty(&output_dir.join("health/heartbeat.json"));
+    let safe_to_continue = heartbeat["safe_to_continue"].as_bool().unwrap_or(true);
+    let blocker_reason = heartbeat["blocker_reason"].as_str().unwrap_or("");
+    let current_state = heartbeat["current_state"].as_str().unwrap_or("");
+    !safe_to_continue
+        && (!blocker_reason.is_empty()
+            || matches!(
+                current_state,
+                "provider_zero_updates" | "stream_error" | "provider_blocked"
+            ))
+}
+
 fn local_relay_material_forward_complete(
     output_dir: &Path,
     caps: Option<LocalRelayMaterialCompletionCaps>,
 ) -> bool {
     local_relay_material_terminal_artifacts_exist(output_dir)
         || local_relay_material_completion_cap_reached(output_dir, caps)
+        || local_relay_material_terminal_blocker_exists(output_dir)
 }
 
 fn local_relay_handle_material_send_timeout(
@@ -50375,10 +52704,13 @@ async fn local_stream_collector_command(
                     let output_path = PathBuf::from(&output_dir);
                     fs::create_dir_all(&output_path)?;
                     let (material_tx, material_rx) =
-                        tokio::sync::mpsc::channel::<RelayMaterialUpdate>(8_192);
+                        tokio::sync::mpsc::channel::<RelayMaterialUpdate>(
+                            LOCAL_RELAY_MATERIAL_UPDATE_CHANNEL_CAPACITY,
+                        );
                     let connector = Arc::new(LocalRelayGeyserConnector::new(material_rx));
-                    let material_duration_seconds =
+                    let _requested_material_duration_seconds =
                         material_duration_seconds.unwrap_or(duration_seconds);
+                    let material_lifecycle_duration_seconds = duration_seconds;
                     let material_run_id = run_id.unwrap_or_else(|| {
                         format!(
                             "local-relay-material-hunter-{}",
@@ -50392,7 +52724,7 @@ async fn local_stream_collector_command(
                     let mut hunter_task = tokio::task::spawn_local(async move {
                         material_candidate_hunter_command_with_connector(
                             &hunter_loaded,
-                            material_duration_seconds,
+                            material_lifecycle_duration_seconds,
                             max_attempted_launches,
                             target_material_candidates,
                             max_concurrent_tracked_mints,
@@ -50401,6 +52733,7 @@ async fn local_stream_collector_command(
                             upload_r2,
                             verify_r2,
                             review_config,
+                            Some(_requested_material_duration_seconds),
                             &hunter_output,
                             run_id,
                             hunter_connector,
@@ -50431,11 +52764,8 @@ async fn local_stream_collector_command(
                         storage_mode,
                         r2_streaming_chunk_mb,
                         Some(material_tx),
-                        Some(material_duration_seconds),
-                        Some(LocalRelayMaterialCompletionCaps {
-                            max_attempted_launches: Some(max_attempted_launches),
-                            target_material_candidates: Some(target_material_candidates),
-                        }),
+                        Some(material_lifecycle_duration_seconds),
+                        None,
                         false,
                     )
                     .await;
@@ -60729,6 +63059,9 @@ fn payload_kind_name(payload: &common::EventPayload) -> &'static str {
         common::EventPayload::TokenCreated(_) => "token_created",
         common::EventPayload::PumpBuy(_) => "pump_buy",
         common::EventPayload::PumpSell(_) => "pump_sell",
+        common::EventPayload::PumpFunMigration(_) => "pumpfun_migration",
+        common::EventPayload::PumpSwapPair(_) => "pumpswap_pair",
+        common::EventPayload::PumpSwapTrade(_) => "pumpswap_trade",
         common::EventPayload::BondingCurveUpdate(_) => "bonding_curve_update",
         common::EventPayload::HolderBalanceUpdate(_) => "holder_balance_update",
         common::EventPayload::WalletFunding(_) => "wallet_funding",
@@ -62835,7 +65168,7 @@ mod tests {
             "rule_id": "volume_evaporated_by_60s",
             "rule_fired": true,
         })];
-        let decision = phase107b_decide_token(&labels, &early, 1800);
+        let decision = phase107b_decide_token(&labels, &early, &[], 1800);
         assert_eq!(decision.final_state, "early_rejected_dead");
         assert!(!decision.promoted);
         assert!(decision.tracked_until_seconds <= 60);
@@ -62844,7 +65177,7 @@ mod tests {
     #[test]
     fn phase107b_material_candidate_requires_survival_gate() {
         let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
-        let decision = phase107b_decide_token(&labels, &[], 1800);
+        let decision = phase107b_decide_token(&labels, &[], &[], 1800);
         assert_eq!(decision.final_state, "material_candidate_1800s");
         assert!(decision.promoted);
         assert!(decision.survived_300);
@@ -62855,7 +65188,7 @@ mod tests {
     #[test]
     fn phase107b_material_candidate_requires_observed_300s_horizon() {
         let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
-        let decision = phase107b_decide_token(&labels, &[], 120);
+        let decision = phase107b_decide_token(&labels, &[], &[], 120);
         assert_eq!(decision.final_state, "terminal_inconclusive");
         assert!(!decision.promoted);
         assert!(!decision.survived_300);
@@ -62868,7 +65201,7 @@ mod tests {
             "rule_id": "same_slot_bundle_like_plus_holder_concentration",
             "rule_fired": true,
         })];
-        let decision = phase107b_decide_token(&labels, &early, 900);
+        let decision = phase107b_decide_token(&labels, &early, &[], 900);
         assert_ne!(decision.final_state, "early_rejected_dead");
         assert!(decision.promoted);
         assert_eq!(decision.provider_confirmed_bundle, false);
@@ -62881,13 +65214,29 @@ mod tests {
             false,
             "insufficient_price_path",
         )];
-        let decision = phase107b_decide_token(&labels, &[], 1800);
+        let decision = phase107b_decide_token(&labels, &[], &[], 1800);
         assert_eq!(
             decision.final_state,
             "early_rejected_unavailable_required_data"
         );
         assert!(!decision.promoted);
         assert_eq!(decision.reason, "inconclusive_missing_required_data");
+    }
+
+    #[test]
+    fn phase107b_curve_target_reached_is_milestone_not_terminal() {
+        let labels = vec![phase107b_bool_label("rug_like_outcome", false, "")];
+        let asof_rows = vec![json!({
+            "horizon_seconds": 60,
+            "horizon_reached": true,
+            "curve_progress_proxy_asof": "91.25",
+        })];
+        let decision = phase107b_decide_token(&labels, &[], &asof_rows, 60);
+        assert_ne!(decision.final_state, "curve_target_reached_90pct");
+        assert_eq!(decision.final_state, "terminal_inconclusive");
+        assert!(!decision.promoted);
+        assert!(decision.curve_target_reached_90pct);
+        assert!(!decision.survived_300);
     }
 
     #[test]
@@ -62919,6 +65268,15 @@ mod tests {
     fn phase107f_health_heartbeat_is_written_by_cli() {
         let temp = tempfile::tempdir().expect("tempdir");
         let stream_summary = MaterialHunterStreamSummary {
+            provider_status: "stream_error".to_owned(),
+            provider_blocker_class: Some("stream_error".to_owned()),
+            errors: vec!["unit stream error".to_owned()],
+            connected: true,
+            provider_data_loss_seen: true,
+            stream_completed_normally: false,
+            transaction_updates: 30,
+            account_updates: 10,
+            slot_updates: 2,
             grpc_reader_update_count: 42,
             grpc_reader_poll_latency_ms_p95: 7,
             grpc_update_interarrival_ms_p99: 11,
@@ -63011,6 +65369,16 @@ mod tests {
         assert_eq!(heartbeat["run_id"], "run");
         assert_eq!(heartbeat["current_state"], "startup");
         assert_eq!(heartbeat["safe_to_continue"], true);
+        assert_eq!(heartbeat["provider_status"], "stream_error");
+        assert_eq!(heartbeat["provider_blocker_class"], "stream_error");
+        assert_eq!(heartbeat["provider_errors"][0], "unit stream error");
+        assert_eq!(heartbeat["connected"], true);
+        assert_eq!(heartbeat["stream_completed_normally"], false);
+        assert_eq!(heartbeat["provider_data_loss_seen"], true);
+        assert_eq!(heartbeat["transaction_updates"], 30);
+        assert_eq!(heartbeat["account_updates"], 10);
+        assert_eq!(heartbeat["slot_updates"], 2);
+        assert_eq!(heartbeat["provider_updates"], 42);
         assert_eq!(heartbeat["grpc_reader_update_count"], 42);
         assert_eq!(heartbeat["grpc_reader_poll_latency_ms_p95"], 7);
         assert_eq!(heartbeat["grpc_update_interarrival_ms_p99"], 11);
@@ -64339,6 +66707,43 @@ mod tests {
     }
 
     #[test]
+    fn phase107g_material_send_timeout_after_terminal_source_blocker_is_graceful() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("health")).expect("health dir");
+        fs::write(
+            temp.path().join("health/heartbeat.json"),
+            r#"{"safe_to_continue":false,"blocker_reason":"stream_error","current_state":"provider_blocked"}"#,
+        )
+        .expect("heartbeat");
+        let now = Instant::now();
+        let deadline = Some(now + StdDuration::from_secs(60));
+        let mut completed = false;
+        let mut skipped_after_completion = 0;
+        let mut skipped_after_deadline = 0;
+        let mut backpressure = 0;
+        let mut errors = Vec::new();
+
+        assert!(local_relay_material_terminal_blocker_exists(temp.path()));
+        assert!(local_relay_material_forward_complete(temp.path(), None));
+        assert!(!local_relay_handle_material_send_timeout(
+            now,
+            deadline,
+            None,
+            temp.path(),
+            &mut completed,
+            &mut skipped_after_completion,
+            &mut skipped_after_deadline,
+            &mut backpressure,
+            &mut errors,
+        ));
+        assert!(completed);
+        assert_eq!(skipped_after_completion, 1);
+        assert_eq!(skipped_after_deadline, 0);
+        assert_eq!(backpressure, 0);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn phase107g_material_send_timeout_after_attempt_cap_is_graceful() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(temp.path().join("health")).expect("health dir");
@@ -64385,6 +66790,106 @@ mod tests {
         assert_eq!(skipped_after_deadline, 0);
         assert_eq!(backpressure, 0);
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn phase107g_local_relay_material_bridge_capacity_covers_fresh_pumpswap_bursts() {
+        assert_eq!(LOCAL_RELAY_MATERIAL_UPDATE_CHANNEL_CAPACITY, 65_536);
+        assert!(LOCAL_RELAY_MATERIAL_UPDATE_CHANNEL_CAPACITY > 8_199 * 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn phase107g_material_send_yields_to_bridge_receiver_on_ready_sends() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RelayMaterialUpdate>(1024);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_for_task = received.clone();
+        tokio::spawn(async move {
+            while let Some(_update) = rx.recv().await {
+                let count = received_for_task.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= 64 {
+                    break;
+                }
+            }
+        });
+
+        for slot in 0..64 {
+            let outcome = send_relay_material_update(
+                &tx,
+                Ok(SubscribeUpdate {
+                    filters: Vec::new(),
+                    update_oneof: Some(
+                        yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                            yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                                slot,
+                                parent: slot.checked_sub(1),
+                                status: yellowstone_grpc_proto::prelude::SlotStatus::SlotConfirmed
+                                    as i32,
+                                dead_error: None,
+                            },
+                        ),
+                    ),
+                    created_at: None,
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, RelayMaterialSendOutcome::Sent));
+        }
+
+        assert!(
+            received.load(Ordering::SeqCst) > 0,
+            "ready sends should yield so the local relay receiver can drain before capacity is exhausted"
+        );
+    }
+
+    #[test]
+    fn phase107g_material_send_yields_to_nonlocal_receiver_from_localset() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<RelayMaterialUpdate>(1024);
+            let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received_for_task = received.clone();
+            tokio::spawn(async move {
+                while let Some(_update) = rx.recv().await {
+                    let count = received_for_task.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count >= 64 {
+                        break;
+                    }
+                }
+            });
+
+            for slot in 0..64 {
+                let outcome = send_relay_material_update(
+                    &tx,
+                    Ok(SubscribeUpdate {
+                        filters: Vec::new(),
+                        update_oneof: Some(
+                            yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Slot(
+                                yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                                    slot,
+                                    parent: slot.checked_sub(1),
+                                    status:
+                                        yellowstone_grpc_proto::prelude::SlotStatus::SlotConfirmed
+                                            as i32,
+                                    dead_error: None,
+                                },
+                            ),
+                        ),
+                        created_at: None,
+                    }),
+                )
+                .await;
+                assert!(matches!(outcome, RelayMaterialSendOutcome::Sent));
+            }
+
+            assert!(
+                received.load(Ordering::SeqCst) > 0,
+                "timer-yielded local relay sends should schedule the non-local bridge receiver"
+            );
+        }));
     }
 
     #[test]

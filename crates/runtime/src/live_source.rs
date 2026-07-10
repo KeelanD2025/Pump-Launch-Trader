@@ -13,8 +13,8 @@ use common::{
     BondingCurveUpdateEvent, Canonicality, DEFAULT_PUMP_TOKEN_DECIMALS, DataGapEvent, DataGapType,
     EventMeta, EventPayload, EventSource, GapSeverity, HolderBalanceUpdateEvent, Lamports,
     LoadedConfig, NormalizedEvent, ObservedTransactionEvent, PUMP_TOTAL_SUPPLY_UI, PubkeyValue,
-    PumpBuyEvent, PumpSellEvent, QuoteAssetType, RawEventReference, TokenCreatedEvent,
-    TokenProgramType, TransactionStatus, WalletFundingEvent, monotonic_now_ns,
+    PumpBuyEvent, PumpFunMigrationEvent, PumpSellEvent, QuoteAssetType, RawEventReference,
+    TokenCreatedEvent, TokenProgramType, TransactionStatus, WalletFundingEvent, monotonic_now_ns,
     price_lamports_per_raw_token, pump_curve_progress_pct_from_real_token_reserves_raw,
     pump_market_cap_quote_1b, pump_market_cap_quote_total_supply,
     pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
@@ -37,7 +37,7 @@ use tonic::{
     metadata::{Ascii, MetadataKey, MetadataValue},
     service::Interceptor,
 };
-use tracing::warn;
+use tracing::{info, warn};
 use yellowstone_grpc_proto::prelude::{
     SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestFilterDeshredTransactions,
     SubscribeRequestPing, SubscribeUpdate, SubscribeUpdateDeshred, geyser_client::GeyserClient,
@@ -51,6 +51,8 @@ const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+#[cfg(test)]
+const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 pub type SubscribeUpdateStream =
     Pin<Box<dyn Stream<Item = std::result::Result<SubscribeUpdate, Status>> + Send>>;
@@ -192,6 +194,7 @@ impl GeyserStreamConnector for RealGeyserConnector {
         let mut client = GeyserClient::with_interceptor(channel, interceptor)
             .max_decoding_message_size(max_size);
 
+        log_geyser_subscription_filter_metadata(&request);
         let (request_tx, request_rx) = mpsc::channel::<SubscribeRequest>(4);
         request_tx
             .send(request)
@@ -221,6 +224,39 @@ impl GeyserStreamConnector for RealGeyserConnector {
             client.subscribe(stream).await?;
         Ok(Box::pin(response.into_inner()))
     }
+}
+
+fn log_geyser_subscription_filter_metadata(request: &SubscribeRequest) {
+    let mut account_filters = request
+        .accounts
+        .iter()
+        .map(|(name, filter)| {
+            serde_json::json!({
+                "name": name,
+                "account_count": filter.account.len(),
+                "owner_count": filter.owner.len(),
+                "filter_count": filter.filters.len(),
+                "nonempty_txn_signature": filter.nonempty_txn_signature,
+            })
+        })
+        .collect::<Vec<_>>();
+    account_filters.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+    });
+    let account_filter_metadata =
+        serde_json::to_string(&account_filters).unwrap_or_else(|_| "[]".to_owned());
+    info!(
+        target: "stream_exact_holder",
+        account_filter_count = request.accounts.len(),
+        transaction_filter_count = request.transactions.len(),
+        slot_filter_count = request.slots.len(),
+        block_filter_count = request.blocks.len(),
+        block_meta_filter_count = request.blocks_meta.len(),
+        account_filters = %account_filter_metadata,
+        "geyser_subscription_filter_metadata"
+    );
 }
 
 #[async_trait]
@@ -347,6 +383,7 @@ pub struct GeyserEventNormalizer {
     mint_to_creator: HashMap<String, String>,
     seen_buy_mints: HashSet<String>,
     pending_curve_updates_by_curve_pubkey: HashMap<String, Vec<PendingCurveUpdate>>,
+    reserve_state_by_curve_pubkey: HashMap<String, ReserveStateCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +403,15 @@ struct PendingCurveUpdate {
     write_version: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ReserveStateCache {
+    last_seen_slot: u64,
+    last_seen_signature: Option<String>,
+    last_seen_write_version: u64,
+    virtual_quote: Decimal,
+    virtual_token: Decimal,
+}
+
 impl GeyserEventNormalizer {
     pub fn from_loaded(loaded: &LoadedConfig) -> Result<Self> {
         let mut idls = Vec::new();
@@ -378,6 +424,7 @@ impl GeyserEventNormalizer {
             mint_to_creator: HashMap::new(),
             seen_buy_mints: HashSet::new(),
             pending_curve_updates_by_curve_pubkey: HashMap::new(),
+            reserve_state_by_curve_pubkey: HashMap::new(),
         })
     }
 
@@ -690,6 +737,72 @@ impl GeyserEventNormalizer {
                         }),
                     });
                 }
+                "migrate" | "migrate_v2" | "migrate_bonding_curve_creator" => {
+                    let Some(mint) = migration_mint_hint(&account_map, &decoded.args, &update)
+                    else {
+                        continue;
+                    };
+                    events.push(NormalizedEvent {
+                        meta: instruction_meta,
+                        payload: EventPayload::PumpFunMigration(PumpFunMigrationEvent {
+                            mint: PubkeyValue(mint),
+                            quote_mint: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["quote_mint", "quote"],
+                            ),
+                            bonding_curve: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["bonding_curve"],
+                            ),
+                            associated_bonding_curve: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &[
+                                    "associated_bonding_curve",
+                                    "associated_base_bonding_curve",
+                                    "associated_quote_bonding_curve",
+                                ],
+                            ),
+                            migration_pool: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["pool", "migration_pool"],
+                            ),
+                            pump_amm_program: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["pump_amm", "pump_amm_program"],
+                            ),
+                            pool_authority: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["pool_authority"],
+                            ),
+                            pool_base_token_account: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &["pool_base_token_account", "pool_authority_mint_account"],
+                            ),
+                            pool_quote_token_account: account_or_arg_pubkey(
+                                &account_map,
+                                &decoded.args,
+                                &[
+                                    "pool_quote_token_account",
+                                    "pool_authority_wsol_account",
+                                    "pool_authority_quote_account",
+                                ],
+                            ),
+                            user: account_or_arg_pubkey(&account_map, &decoded.args, &["user"]),
+                            signature: Some(update.signature.clone()),
+                            slot: Some(update.slot),
+                            instruction_index: Some(instruction_index as u32),
+                            status,
+                            parse_status: format!("non_rpc_decoded_{}", decoded.name),
+                        }),
+                    });
+                }
                 _ => {}
             }
         }
@@ -711,6 +824,10 @@ impl GeyserEventNormalizer {
         else {
             return Vec::new();
         };
+        if let Some(event) = holder_balance_event_from_token_account_update(&meta, &update, &bytes)
+        {
+            return vec![event];
+        }
         for idl in &self.idls {
             let Ok(decoded) = idl.decode_account(&bytes) else {
                 continue;
@@ -734,7 +851,7 @@ impl GeyserEventNormalizer {
                     .push(pending);
                 continue;
             };
-            return vec![bonding_curve_event_from_pending(pending, &mint)];
+            return vec![self.bonding_curve_event_from_pending_with_cache(pending, &mint)];
         }
         Vec::new()
     }
@@ -748,8 +865,48 @@ impl GeyserEventNormalizer {
             .remove(curve_pubkey)
             .unwrap_or_default()
             .into_iter()
-            .map(|pending| bonding_curve_event_from_pending(pending, mint))
+            .map(|pending| self.bonding_curve_event_from_pending_with_cache(pending, mint))
             .collect()
+    }
+
+    fn bonding_curve_event_from_pending_with_cache(
+        &mut self,
+        pending: PendingCurveUpdate,
+        mint: &str,
+    ) -> NormalizedEvent {
+        let previous = self
+            .reserve_state_by_curve_pubkey
+            .get(&pending.curve_pubkey)
+            .cloned();
+        let quote_delta = previous
+            .as_ref()
+            .map(|state| pending.virtual_quote - state.virtual_quote);
+        let token_delta = previous
+            .as_ref()
+            .map(|state| pending.virtual_token - state.virtual_token);
+        let current = ReserveStateCache {
+            last_seen_slot: pending.meta.slot,
+            last_seen_signature: pending.transaction_signature.clone(),
+            last_seen_write_version: pending.write_version,
+            virtual_quote: pending.virtual_quote,
+            virtual_token: pending.virtual_token,
+        };
+        let curve_pubkey = pending.curve_pubkey.clone();
+        let mut event = bonding_curve_event_from_pending(pending, mint, quote_delta, token_delta);
+        if let Some(previous) = previous {
+            if previous.last_seen_slot > event.meta.slot
+                || previous.last_seen_write_version >= current.last_seen_write_version
+                    && previous.last_seen_signature != current.last_seen_signature
+            {
+                event
+                    .meta
+                    .data_quality_flags
+                    .push(common::DataQualityFlag::StaleAccount);
+            }
+        }
+        self.reserve_state_by_curve_pubkey
+            .insert(curve_pubkey, current);
+        event
     }
 
     fn decode_instruction(
@@ -867,6 +1024,10 @@ pub enum MaterialUpdateClass {
     PumpTradeUntrackedMint,
     PumpTradeUnknownMint,
     PumpTradeTombstonedMint,
+    PumpMigrationActiveMint,
+    PumpMigrationUntrackedMint,
+    PumpMigrationUnknownMint,
+    PumpMigrationTombstonedMint,
     TransactionActiveMint,
     TransactionActiveAccount,
     TransactionMappingHintOnly,
@@ -893,6 +1054,10 @@ impl MaterialUpdateClass {
             Self::PumpTradeUntrackedMint => "pump_trade_untracked_mint",
             Self::PumpTradeUnknownMint => "pump_trade_unknown_mint",
             Self::PumpTradeTombstonedMint => "pump_trade_tombstoned_mint",
+            Self::PumpMigrationActiveMint => "pump_migration_active_mint",
+            Self::PumpMigrationUntrackedMint => "pump_migration_untracked_mint",
+            Self::PumpMigrationUnknownMint => "pump_migration_unknown_mint",
+            Self::PumpMigrationTombstonedMint => "pump_migration_tombstoned_mint",
             Self::TransactionActiveMint => "transaction_active_mint",
             Self::TransactionActiveAccount => "transaction_active_account",
             Self::TransactionMappingHintOnly => "transaction_mapping_hint_only",
@@ -920,6 +1085,10 @@ impl MaterialUpdateClass {
             "pump_trade_untracked_mint" => Self::PumpTradeUntrackedMint,
             "pump_trade_unknown_mint" => Self::PumpTradeUnknownMint,
             "pump_trade_tombstoned_mint" => Self::PumpTradeTombstonedMint,
+            "pump_migration_active_mint" => Self::PumpMigrationActiveMint,
+            "pump_migration_untracked_mint" => Self::PumpMigrationUntrackedMint,
+            "pump_migration_unknown_mint" => Self::PumpMigrationUnknownMint,
+            "pump_migration_tombstoned_mint" => Self::PumpMigrationTombstonedMint,
             "transaction_active_mint" => Self::TransactionActiveMint,
             "transaction_active_account" => Self::TransactionActiveAccount,
             "transaction_mapping_hint_only" => Self::TransactionMappingHintOnly,
@@ -1349,6 +1518,17 @@ fn material_hunter_dispatch_for_class(
         ),
         MaterialUpdateClass::PumpTradeActiveMint | MaterialUpdateClass::TransactionActiveMint => (
             ProcessingLane::TradeDelta,
+            MaterialUpdateRelevance::ActiveTracked,
+            true,
+            false,
+            false,
+            true,
+        ),
+        MaterialUpdateClass::PumpMigrationActiveMint
+        | MaterialUpdateClass::PumpMigrationUntrackedMint
+        | MaterialUpdateClass::PumpMigrationUnknownMint
+        | MaterialUpdateClass::PumpMigrationTombstonedMint => (
+            ProcessingLane::ArtifactEvent,
             MaterialUpdateRelevance::ActiveTracked,
             true,
             false,
@@ -3106,7 +3286,8 @@ fn apply_material_hunter_state_hint(
         state.active_mints.insert(mint.clone());
     }
     for mint in &hint.inactive_mints {
-        state.active_mints.remove(mint);
+        state.tombstoned_mints.remove(mint);
+        state.active_mints.insert(mint.clone());
     }
     for mint in &hint.tombstoned_mints {
         state.active_mints.remove(mint);
@@ -3324,6 +3505,12 @@ fn material_hunter_pump_discriminator_name(data: &[u8]) -> Option<&'static str> 
         || discriminator == anchor_discriminator("global", "sell_v2")
     {
         return Some("sell");
+    }
+    if discriminator == anchor_discriminator("global", "migrate")
+        || discriminator == anchor_discriminator("global", "migrate_v2")
+        || discriminator == anchor_discriminator("global", "migrate_bonding_curve_creator")
+    {
+        return Some("migrate");
     }
     Some("other")
 }
@@ -3609,6 +3796,7 @@ fn material_hunter_prefilter_pump_instruction(
     let mut saw_malformed = false;
     let mut saw_create = false;
     let mut saw_trade = false;
+    let mut saw_migration = false;
     for instruction in &message.instructions {
         let Some(program_id) = message
             .account_keys
@@ -3624,6 +3812,7 @@ fn material_hunter_prefilter_pump_instruction(
         match material_hunter_pump_discriminator_name(&instruction.data) {
             Some("create") | Some("create_v2") => saw_create = true,
             Some("buy") | Some("sell") => saw_trade = true,
+            Some("migrate") => saw_migration = true,
             Some("other") => {}
             None => saw_malformed = true,
             _ => {}
@@ -3635,6 +3824,38 @@ fn material_hunter_prefilter_pump_instruction(
     if saw_create {
         return Some(MaterialHunterPumpPrefilter::new(
             MaterialUpdateClass::PumpTokenCreated,
+            MaterialHunterPumpPrefilterDecision::DeepProcess,
+            mint,
+            account,
+        ));
+    }
+    if saw_migration {
+        let Some(mint_value) = mint.clone() else {
+            return Some(MaterialHunterPumpPrefilter::new(
+                MaterialUpdateClass::PumpMigrationUnknownMint,
+                MaterialHunterPumpPrefilterDecision::DeepProcess,
+                mint,
+                account,
+            ));
+        };
+        if tombstoned_mints.contains(&mint_value) {
+            return Some(MaterialHunterPumpPrefilter::new(
+                MaterialUpdateClass::PumpMigrationTombstonedMint,
+                MaterialHunterPumpPrefilterDecision::DeepProcess,
+                mint,
+                account,
+            ));
+        }
+        if active_mints.contains(&mint_value) {
+            return Some(MaterialHunterPumpPrefilter::new(
+                MaterialUpdateClass::PumpMigrationActiveMint,
+                MaterialHunterPumpPrefilterDecision::DeepProcess,
+                mint,
+                account,
+            ));
+        }
+        return Some(MaterialHunterPumpPrefilter::new(
+            MaterialUpdateClass::PumpMigrationUntrackedMint,
             MaterialHunterPumpPrefilterDecision::DeepProcess,
             mint,
             account,
@@ -3667,7 +3888,7 @@ fn material_hunter_prefilter_pump_instruction(
         }
         return Some(MaterialHunterPumpPrefilter::new(
             MaterialUpdateClass::PumpTradeUntrackedMint,
-            MaterialHunterPumpPrefilterDecision::SkipUntracked,
+            MaterialHunterPumpPrefilterDecision::DeepProcess,
             mint,
             account,
         ));
@@ -5028,8 +5249,7 @@ where
                                     apply_material_hunter_state_hint(
                                         &relevance_state_for_router,
                                         &MaterialHunterStreamStateHint {
-                                            inactive_mints: vec![mint.clone()],
-                                            tombstoned_mints: vec![mint.clone()],
+                                            active_mints: vec![mint.clone()],
                                             ..MaterialHunterStreamStateHint::default()
                                         },
                                     );
@@ -5784,7 +6004,7 @@ pub async fn smoke_geyser_provider_with_connector(
                     _ => {}
                 }
 
-                let pump_programs = &loaded.config.pump.program_ids;
+                let pump_programs = &loaded.config.geyser.program_filters;
                 let pump_candidate = match update.update_oneof.as_ref() {
                     Some(UpdateOneof::Transaction(tx)) => tx
                         .transaction
@@ -5998,7 +6218,11 @@ pub async fn smoke_deshred_provider_with_connector(
     }
 
     let mut normalizer = GeyserEventNormalizer::from_loaded(loaded)?;
-    let request = build_deshred_request(&config, &loaded.config.pump.program_ids);
+    let program_filter_ids = deshred_program_filter_ids(
+        &loaded.config.pump.program_ids,
+        &loaded.config.pump.pump_swap_program_ids,
+    );
+    let request = build_deshred_request(&config, &program_filter_ids);
     let stream_result = connector.connect_and_subscribe(&config, request).await;
     let mut stream = match stream_result {
         Ok(stream) => {
@@ -6100,9 +6324,23 @@ pub async fn smoke_deshred_provider_with_connector(
     Ok(summary)
 }
 
+pub fn deshred_program_filter_ids(
+    pump_program_ids: &[String],
+    pump_swap_program_ids: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut program_filter_ids = Vec::new();
+    for program_id in pump_program_ids.iter().chain(pump_swap_program_ids.iter()) {
+        if !program_id.is_empty() && seen.insert(program_id.clone()) {
+            program_filter_ids.push(program_id.clone());
+        }
+    }
+    program_filter_ids
+}
+
 pub fn build_deshred_request(
     config: &common::DeshredConfig,
-    pump_program_ids: &[String],
+    program_filter_ids: &[String],
 ) -> SubscribeDeshredRequest {
     let mut request = SubscribeDeshredRequest::default();
     if config.subscribe_transactions {
@@ -6111,7 +6349,7 @@ pub fn build_deshred_request(
             SubscribeRequestFilterDeshredTransactions {
                 vote: Some(false),
                 account_include: if config.program_filters_from_pump_ids {
-                    pump_program_ids.to_vec()
+                    program_filter_ids.to_vec()
                 } else {
                     Vec::new()
                 },
@@ -6277,12 +6515,12 @@ pub async fn run_geyser_source_with_connector(
 
 pub async fn run_deshred_source_with_connector(
     config: common::DeshredConfig,
-    pump_program_ids: Vec<String>,
+    program_filter_ids: Vec<String>,
     mut normalizer: GeyserEventNormalizer,
     connector: Arc<dyn DeshredStreamConnector>,
     sender: mpsc::Sender<NormalizedEvent>,
 ) -> Result<()> {
-    let request = build_deshred_request(&config, &pump_program_ids);
+    let request = build_deshred_request(&config, &program_filter_ids);
     let mut attempts = 0usize;
     let max_attempts = config.max_reconnect_attempts.max(1) as usize;
     let mut emitted_disconnect_gap = false;
@@ -6496,6 +6734,35 @@ fn value_pubkey(map: &BTreeMap<String, Value>, key: &str) -> Option<PubkeyValue>
 
 fn account_alias(map: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| map.get(*key).cloned())
+}
+
+fn account_or_arg_pubkey(
+    account_map: &HashMap<String, String>,
+    args: &BTreeMap<String, Value>,
+    keys: &[&str],
+) -> Option<PubkeyValue> {
+    account_alias(account_map, keys)
+        .map(PubkeyValue)
+        .or_else(|| keys.iter().find_map(|key| value_pubkey(args, key)))
+}
+
+fn migration_mint_hint(
+    account_map: &HashMap<String, String>,
+    args: &BTreeMap<String, Value>,
+    update: &TransactionUpdate,
+) -> Option<String> {
+    account_alias(account_map, &["mint", "base_mint"])
+        .or_else(|| value_pubkey(args, "mint").map(|value| value.0))
+        .or_else(|| value_pubkey(args, "base_mint").map(|value| value.0))
+        .or_else(|| {
+            update
+                .pre_token_balances
+                .iter()
+                .chain(update.post_token_balances.iter())
+                .map(|balance| balance.mint.trim())
+                .find(|mint| mint.ends_with("pump"))
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn quote_asset_type(args: &BTreeMap<String, Value>) -> QuoteAssetType {
@@ -6742,6 +7009,54 @@ fn token_amount(balance: &TransactionTokenBalance) -> Decimal {
     Decimal::from_str(&balance.amount).unwrap_or(Decimal::ZERO)
 }
 
+fn holder_balance_event_from_token_account_update(
+    meta: &EventMeta,
+    update: &AccountUpdate,
+    data: &[u8],
+) -> Option<NormalizedEvent> {
+    if update.owner != SPL_TOKEN_PROGRAM_ID && update.owner != TOKEN_2022_PROGRAM_ID {
+        return None;
+    }
+    if data.len() < 72 {
+        return None;
+    }
+    let mint = bs58::encode(&data[0..32]).into_string();
+    let owner_wallet = bs58::encode(&data[32..64]).into_string();
+    if mint == SYSTEM_PROGRAM_ID || owner_wallet == SYSTEM_PROGRAM_ID {
+        return None;
+    }
+    let amount_raw = u64::from_le_bytes(data[64..72].try_into().ok()?);
+    let decimals = if mint == WSOL_MINT {
+        9
+    } else {
+        DEFAULT_PUMP_TOKEN_DECIMALS
+    };
+    let mut holder_meta = meta.clone();
+    holder_meta.account_pubkey = Some(PubkeyValue(update.pubkey.clone()));
+    holder_meta.account_write_version = Some(update.write_version);
+    holder_meta.signature = update.transaction_signature.clone();
+    let update_reason = if update.is_startup {
+        "geyser_spl_token_account_subscription_initial_snapshot"
+    } else {
+        "geyser_spl_token_account_update"
+    };
+    Some(NormalizedEvent {
+        meta: holder_meta,
+        payload: EventPayload::HolderBalanceUpdate(HolderBalanceUpdateEvent {
+            mint: PubkeyValue(mint),
+            owner_wallet: PubkeyValue(owner_wallet),
+            token_account: PubkeyValue(update.pubkey.clone()),
+            token_decimals: Some(decimals),
+            old_balance: None,
+            new_balance: Decimal::from(amount_raw),
+            delta: Decimal::ZERO,
+            caused_by_signature: update.transaction_signature.clone(),
+            update_reason: update_reason.to_owned(),
+            confidence: Decimal::ONE,
+        }),
+    })
+}
+
 fn estimate_lamport_gain(update: &TransactionUpdate, account: &str) -> Option<Decimal> {
     let index = update.account_keys.iter().position(|key| key == account)?;
     let pre = update.pre_balances.get(index).copied().unwrap_or_default();
@@ -6807,7 +7122,12 @@ fn pending_curve_update_from_decoded(
     }
 }
 
-fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> NormalizedEvent {
+fn bonding_curve_event_from_pending(
+    pending: PendingCurveUpdate,
+    mint: &str,
+    quote_reserve_delta: Option<Decimal>,
+    token_reserve_delta: Option<Decimal>,
+) -> NormalizedEvent {
     let token_decimals = DEFAULT_PUMP_TOKEN_DECIMALS;
     let price_lamports_per_raw =
         price_lamports_per_raw_token(pending.virtual_quote, pending.virtual_token);
@@ -6868,8 +7188,8 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
             curve_progress_source: Some("real_token_reserves_ui_minus_reserved".to_owned()),
             curve_progress_confidence: curve_progress_pct.map(|_| Decimal::ONE),
             curve_completion_pct: curve_progress_pct,
-            quote_reserve_delta: None,
-            token_reserve_delta: None,
+            quote_reserve_delta,
+            token_reserve_delta,
             update_reason: "geyser_account_update".to_owned(),
             caused_by_signature: pending.transaction_signature,
             account_write_version: Some(pending.write_version),
@@ -6879,12 +7199,16 @@ fn bonding_curve_event_from_pending(pending: PendingCurveUpdate, mint: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use common::{
         Canonicality, EventMeta, EventPayload, EventSource, NormalizedEvent, PubkeyValue,
         QuoteAssetType, TokenCreatedEvent, TokenProgramType, TransactionStatus,
         config::LoadedConfig,
     };
-    use ingest_geyser::{GeyserIngestService, TransactionTokenBalance, TransactionUpdate};
+    use ingest_geyser::{
+        AccountUpdate, GeyserIngestService, TransactionInstruction, TransactionTokenBalance,
+        TransactionUpdate,
+    };
     use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, Message, SlotStatus, SubscribeUpdate, SubscribeUpdateAccount,
         SubscribeUpdateAccountInfo, SubscribeUpdateDeshred, SubscribeUpdateDeshredTransaction,
@@ -7482,7 +7806,7 @@ mod tests {
     }
 
     #[test]
-    fn pump_trade_untracked_mint_is_cheap_counted_and_skipped() {
+    fn pump_trade_untracked_mint_is_deep_processed_for_launch_recovery() {
         let mint = bs58::encode([11u8; 32]).into_string();
         let update = geyser_pump_instruction_update("buy", Some(&mint));
         let prefilter =
@@ -7491,9 +7815,125 @@ mod tests {
         assert_eq!(prefilter.update_class, "pump_trade_untracked_mint");
         assert_eq!(
             prefilter.decision,
-            MaterialHunterPumpPrefilterDecision::SkipUntracked
+            MaterialHunterPumpPrefilterDecision::DeepProcess
         );
         assert_eq!(prefilter.mint.as_deref(), Some(mint.as_str()));
+    }
+
+    #[test]
+    fn pump_migration_is_deep_processed_not_other() {
+        let mint = bs58::encode([19u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("migrate", Some(&mint));
+        let prefilter =
+            material_hunter_prefilter_pump_instruction(&update, &HashSet::new(), &HashSet::new())
+                .expect("pump prefilter");
+        assert_eq!(prefilter.update_class, "pump_migration_untracked_mint");
+        assert_eq!(
+            prefilter.decision,
+            MaterialHunterPumpPrefilterDecision::DeepProcess
+        );
+        assert_eq!(prefilter.mint.as_deref(), Some(mint.as_str()));
+    }
+
+    #[test]
+    fn normalizer_emits_pumpfun_migration_event() {
+        let loaded = loaded_config();
+        let mut normalizer = GeyserEventNormalizer::from_loaded(&loaded).expect("normalizer");
+        let mint = bs58::encode([21u8; 32]).into_string();
+        let mut accounts = (0..25)
+            .map(|index| format!("migration-account-{index}"))
+            .collect::<Vec<_>>();
+        accounts[2] = mint.clone();
+        accounts[3] = "bonding-curve".to_owned();
+        accounts[4] = "associated-bonding-curve".to_owned();
+        accounts[5] = "migration-user".to_owned();
+        accounts[8] = PUMPSWAP_PROGRAM_ID.to_owned();
+        accounts[9] = "migration-pool".to_owned();
+        accounts[10] = "pool-authority".to_owned();
+        accounts[17] = "pool-base-token-account".to_owned();
+        accounts[18] = "pool-quote-token-account".to_owned();
+        let update = TransactionUpdate {
+            slot: 42,
+            signature: "migration-signature".to_owned(),
+            transaction_index: Some(0),
+            succeeded: true,
+            error_code: None,
+            account_keys: accounts.clone(),
+            instructions: vec![TransactionInstruction {
+                program_id: PUMP_PROGRAM_ID.to_owned(),
+                accounts,
+                data_hex: hex::encode(anchor_discriminator("global", "migrate")),
+            }],
+            inner_instructions: Vec::new(),
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
+            pre_token_balances: Vec::new(),
+            post_token_balances: Vec::new(),
+            loaded_writable_addresses: Vec::new(),
+            loaded_readonly_addresses: Vec::new(),
+            compute_units_consumed: None,
+            fee_lamports: 5000,
+        };
+        let events = normalizer.normalize_transaction(test_meta(42, "migration-signature"), update);
+        let migration = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::PumpFunMigration(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("migration event");
+
+        assert_eq!(migration.mint.0, mint);
+        assert_eq!(
+            migration
+                .migration_pool
+                .as_ref()
+                .map(|value| value.0.as_str()),
+            Some("migration-pool")
+        );
+        assert_eq!(
+            migration
+                .pump_amm_program
+                .as_ref()
+                .map(|value| value.0.as_str()),
+            Some(PUMPSWAP_PROGRAM_ID)
+        );
+        assert_eq!(migration.parse_status, "non_rpc_decoded_migrate");
+    }
+
+    #[test]
+    fn inactive_hint_keeps_lifecycle_routing_until_tombstone() {
+        let relevance = Arc::new(std::sync::Mutex::new(
+            MaterialHunterRelevanceState::default(),
+        ));
+        apply_material_hunter_state_hint(
+            &relevance,
+            &MaterialHunterStreamStateHint {
+                active_mints: vec!["mint-live".to_owned()],
+                ..MaterialHunterStreamStateHint::default()
+            },
+        );
+        apply_material_hunter_state_hint(
+            &relevance,
+            &MaterialHunterStreamStateHint {
+                inactive_mints: vec!["mint-live".to_owned()],
+                ..MaterialHunterStreamStateHint::default()
+            },
+        );
+        let state = relevance.lock().expect("relevance");
+        assert!(state.active_mints.contains("mint-live"));
+        assert!(!state.tombstoned_mints.contains("mint-live"));
+        drop(state);
+        apply_material_hunter_state_hint(
+            &relevance,
+            &MaterialHunterStreamStateHint {
+                tombstoned_mints: vec!["mint-live".to_owned()],
+                ..MaterialHunterStreamStateHint::default()
+            },
+        );
+        let state = relevance.lock().expect("relevance");
+        assert!(!state.active_mints.contains("mint-live"));
+        assert!(state.tombstoned_mints.contains("mint-live"));
     }
 
     #[test]
@@ -8117,6 +8557,51 @@ mod tests {
     }
 
     #[test]
+    fn startup_spl_token_account_update_emits_holder_initial_snapshot() {
+        let loaded = loaded_config();
+        let mut normalizer = GeyserEventNormalizer::from_loaded(&loaded).expect("normalizer");
+        let mint = bs58::encode([9u8; 32]).into_string();
+        let owner_wallet = bs58::encode([8u8; 32]).into_string();
+        let token_account = bs58::encode([7u8; 32]).into_string();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[9u8; 32]);
+        data.extend_from_slice(&[8u8; 32]);
+        data.extend_from_slice(&123_456u64.to_le_bytes());
+        data.resize(165, 0);
+
+        let events = normalizer.normalize_account(
+            holder_test_meta(),
+            AccountUpdate {
+                slot: 42,
+                pubkey: token_account.clone(),
+                owner: SPL_TOKEN_PROGRAM_ID.to_owned(),
+                is_startup: true,
+                lamports: 1,
+                executable: false,
+                write_version: 3,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+                transaction_signature: None,
+            },
+        );
+
+        assert_eq!(events.len(), 1);
+        let EventPayload::HolderBalanceUpdate(update) = &events[0].payload else {
+            panic!("expected holder balance update");
+        };
+        assert_eq!(update.mint.0, mint);
+        assert_eq!(update.owner_wallet.0, owner_wallet);
+        assert_eq!(update.token_account.0, token_account);
+        assert_eq!(update.token_decimals, Some(DEFAULT_PUMP_TOKEN_DECIMALS));
+        assert_eq!(update.old_balance, None);
+        assert_eq!(update.new_balance, Decimal::from(123_456u64));
+        assert_eq!(update.delta, Decimal::ZERO);
+        assert_eq!(
+            update.update_reason,
+            "geyser_spl_token_account_subscription_initial_snapshot"
+        );
+    }
+
+    #[test]
     fn curve_update_before_token_created_is_buffered_and_flushed() {
         let loaded = loaded_config();
         let mut normalizer = GeyserEventNormalizer::from_loaded(&loaded).expect("normalizer");
@@ -8312,6 +8797,52 @@ mod tests {
         assert!(capability.supported_by_client);
         assert!(capability.exposes_signature);
         assert!(capability.exposes_loaded_addresses);
+    }
+
+    #[test]
+    fn deshred_program_filters_include_pumpswap_ids_once() {
+        let pump_program_ids = vec![
+            "pump-program".to_owned(),
+            "shared-program".to_owned(),
+            String::new(),
+        ];
+        let pump_swap_program_ids = vec![
+            "pumpswap-program".to_owned(),
+            "shared-program".to_owned(),
+            String::new(),
+        ];
+
+        let program_filter_ids =
+            deshred_program_filter_ids(&pump_program_ids, &pump_swap_program_ids);
+
+        assert_eq!(
+            program_filter_ids,
+            vec!["pump-program", "shared-program", "pumpswap-program"]
+        );
+    }
+
+    #[test]
+    fn deshred_request_account_filter_includes_pumpswap_program() {
+        let config = common::DeshredConfig {
+            subscribe_transactions: true,
+            program_filters_from_pump_ids: true,
+            ..common::DeshredConfig::default()
+        };
+        let program_filter_ids = deshred_program_filter_ids(
+            &["pump-program".to_owned()],
+            &["pumpswap-program".to_owned()],
+        );
+
+        let request = build_deshred_request(&config, &program_filter_ids);
+
+        let filter = request
+            .deshred_transactions
+            .get("pump_programs")
+            .expect("pump program deshred filter");
+        assert_eq!(
+            filter.account_include,
+            vec!["pump-program".to_owned(), "pumpswap-program".to_owned()]
+        );
     }
 
     #[test]

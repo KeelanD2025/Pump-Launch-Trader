@@ -38,8 +38,15 @@ subscribe_blocks_meta = true
 geyser_only_allowed = true
 ping_interval_ms = 15000
 max_decoded_message_size = 67108864
-program_filters = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
+program_filters = [
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+]
 account_filters = []
+account_owner_filters = []
+account_nonempty_txn_signature_required = true
+exact_holder_startup_snapshots_enabled = true
+exact_holder_nonempty_txn_signature_required = false
 
 [ingest.shred]
 enabled = true
@@ -86,8 +93,15 @@ subscribe_accounts = true
 subscribe_slots = true
 subscribe_blocks = false
 geyser_only_allowed = true
-program_filters = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
+program_filters = [
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+]
 account_filters = []
+account_owner_filters = []
+account_nonempty_txn_signature_required = true
+exact_holder_startup_snapshots_enabled = true
+exact_holder_nonempty_txn_signature_required = false
 
 [shred]
 bind_addr = "0.0.0.0:19001"
@@ -97,7 +111,7 @@ tentative_ttl_ms = 2500
 
 [pump]
 program_ids = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
-pump_swap_program_ids = []
+pump_swap_program_ids = ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"]
 idl_paths = ["../fixtures/idl/pump_mock_idl.json"]
 
 [storage]

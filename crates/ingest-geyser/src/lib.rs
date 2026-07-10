@@ -17,10 +17,14 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, CompiledInstruction, SubscribeRequest, SubscribeRequestFilterAccounts,
+    SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
     SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
     SubscribeRequestFilterTransactions, SubscribeUpdate, SubscribeUpdateAccount,
     SubscribeUpdateBlock, SubscribeUpdateBlockMeta, SubscribeUpdateDeshredTransaction,
-    SubscribeUpdateSlot, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+    SubscribeUpdateSlot, SubscribeUpdateTransaction,
+    subscribe_request_filter_accounts_filter::Filter as AccountFilter,
+    subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
+    subscribe_update::UpdateOneof,
 };
 use yellowstone_grpc_proto::prost_types::Timestamp;
 
@@ -47,6 +51,14 @@ pub struct YellowstoneSubscriptionRequest {
     pub commitment: SlotCommitment,
     pub program_filters: Vec<String>,
     pub account_filters: Vec<String>,
+    pub account_owner_filters: Vec<String>,
+    pub account_data_size_filters: Vec<u64>,
+    pub account_token_account_state_filter: bool,
+    pub account_token_mint_offset: u64,
+    pub account_token_mint_filters: Vec<String>,
+    pub account_nonempty_txn_signature_required: bool,
+    pub exact_holder_startup_snapshots_enabled: bool,
+    pub exact_holder_nonempty_txn_signature_required: bool,
     pub max_inflight_messages: usize,
 }
 
@@ -134,6 +146,8 @@ pub struct AccountUpdate {
     pub slot: u64,
     pub pubkey: String,
     pub owner: String,
+    #[serde(default)]
+    pub is_startup: bool,
     #[serde(default)]
     pub lamports: u64,
     #[serde(default)]
@@ -255,6 +269,20 @@ impl GeyserIngestService {
             },
             program_filters: self.config.program_filters.clone(),
             account_filters: self.config.account_filters.clone(),
+            account_owner_filters: self.config.resolved_account_owner_filters(),
+            account_data_size_filters: self.config.account_data_size_filters.clone(),
+            account_token_account_state_filter: self.config.account_token_account_state_filter,
+            account_token_mint_offset: self.config.account_token_mint_offset,
+            account_token_mint_filters: self.config.account_token_mint_filters.clone(),
+            account_nonempty_txn_signature_required: self
+                .config
+                .account_nonempty_txn_signature_required,
+            exact_holder_startup_snapshots_enabled: self
+                .config
+                .exact_holder_startup_snapshots_enabled,
+            exact_holder_nonempty_txn_signature_required: self
+                .config
+                .exact_holder_nonempty_txn_signature_required,
             max_inflight_messages: self.config.max_inflight_messages,
         }
     }
@@ -280,15 +308,42 @@ impl GeyserIngestService {
             );
         }
         if self.config.subscribe_accounts {
-            request.accounts.insert(
-                "pump_accounts".to_owned(),
-                SubscribeRequestFilterAccounts {
-                    account: self.config.account_filters.clone(),
-                    owner: self.config.program_filters.clone(),
-                    filters: Vec::new(),
-                    nonempty_txn_signature: Some(true),
-                },
-            );
+            let account_owner_filters = self.config.resolved_account_owner_filters();
+            if self.config.account_token_mint_filters.is_empty() {
+                request.accounts.insert(
+                    "pump_accounts".to_owned(),
+                    SubscribeRequestFilterAccounts {
+                        account: self.config.account_filters.clone(),
+                        owner: account_owner_filters,
+                        filters: self.account_proto_filters(None),
+                        nonempty_txn_signature: self.account_nonempty_txn_signature_policy(),
+                    },
+                );
+            } else {
+                if !self.config.account_filters.is_empty() {
+                    request.accounts.insert(
+                        "pump_accounts_explicit".to_owned(),
+                        SubscribeRequestFilterAccounts {
+                            account: self.config.account_filters.clone(),
+                            owner: account_owner_filters.clone(),
+                            filters: self.account_proto_filters(None),
+                            nonempty_txn_signature: self.account_nonempty_txn_signature_policy(),
+                        },
+                    );
+                }
+                for (idx, mint) in self.config.account_token_mint_filters.iter().enumerate() {
+                    request.accounts.insert(
+                        format!("token_mint_{idx}"),
+                        SubscribeRequestFilterAccounts {
+                            account: Vec::new(),
+                            owner: account_owner_filters.clone(),
+                            filters: self.account_proto_filters(Some(mint)),
+                            nonempty_txn_signature: self
+                                .exact_holder_nonempty_txn_signature_policy(),
+                        },
+                    );
+                }
+            }
         }
         if self.config.subscribe_slots {
             request.slots.insert(
@@ -316,6 +371,48 @@ impl GeyserIngestService {
                 .insert("block_meta".to_owned(), SubscribeRequestFilterBlocksMeta {});
         }
         request
+    }
+
+    fn account_nonempty_txn_signature_policy(&self) -> Option<bool> {
+        Some(self.config.account_nonempty_txn_signature_required)
+    }
+
+    fn exact_holder_nonempty_txn_signature_policy(&self) -> Option<bool> {
+        if self.config.exact_holder_startup_snapshots_enabled
+            && !self.config.exact_holder_nonempty_txn_signature_required
+        {
+            None
+        } else {
+            Some(self.config.exact_holder_nonempty_txn_signature_required)
+        }
+    }
+
+    fn account_proto_filters(
+        &self,
+        mint: Option<&str>,
+    ) -> Vec<SubscribeRequestFilterAccountsFilter> {
+        let mut filters = Vec::new();
+        for data_size in &self.config.account_data_size_filters {
+            filters.push(SubscribeRequestFilterAccountsFilter {
+                filter: Some(AccountFilter::Datasize(*data_size)),
+            });
+        }
+        if self.config.account_token_account_state_filter {
+            filters.push(SubscribeRequestFilterAccountsFilter {
+                filter: Some(AccountFilter::TokenAccountState(true)),
+            });
+        }
+        if let Some(mint) = mint {
+            filters.push(SubscribeRequestFilterAccountsFilter {
+                filter: Some(AccountFilter::Memcmp(
+                    SubscribeRequestFilterAccountsFilterMemcmp {
+                        offset: self.config.account_token_mint_offset,
+                        data: Some(MemcmpData::Base58(mint.to_owned())),
+                    },
+                )),
+            });
+        }
+        filters
     }
 
     pub fn health(&self) -> &StreamHealth {
@@ -704,6 +801,7 @@ fn account_update_from_proto(update: SubscribeUpdateAccount) -> Option<AccountUp
         slot: update.slot,
         pubkey: bytes_to_pubkey(&account.pubkey),
         owner: bytes_to_pubkey(&account.owner),
+        is_startup: update.is_startup,
         lamports: account.lamports,
         executable: account.executable,
         write_version: account.write_version,
@@ -916,6 +1014,10 @@ mod tests {
     use common::config::LoadedConfig;
     use futures::stream;
     use time::OffsetDateTime;
+    use yellowstone_grpc_proto::prelude::{
+        subscribe_request_filter_accounts_filter::Filter as AccountFilter,
+        subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
+    };
 
     use super::{
         AccountUpdate, GeyserEnvelope, GeyserIngestService, GeyserMessage, IngestOutput,
@@ -937,7 +1039,175 @@ mod tests {
         let service = service();
         let request = service.subscription_request();
         assert_eq!(request.commitment, SlotCommitment::Processed);
-        assert_eq!(request.program_filters.len(), 1);
+        assert!(
+            request
+                .program_filters
+                .iter()
+                .any(|program| program == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        );
+        assert!(
+            request
+                .program_filters
+                .iter()
+                .any(|program| program == "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+        );
+        assert_eq!(request.account_owner_filters, request.program_filters);
+    }
+
+    #[test]
+    fn account_owner_filters_can_target_spl_token_vault_accounts() {
+        let mut service = service();
+        service.config.account_filters = vec!["vault-token-account".to_owned()];
+        service.config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        let request = service.subscription_request();
+        assert_eq!(request.account_filters, vec!["vault-token-account"]);
+        assert_eq!(
+            request.account_owner_filters,
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+        );
+
+        let proto = service.proto_subscription_request();
+        let account_filter = proto
+            .accounts
+            .get("pump_accounts")
+            .expect("account subscription configured");
+        assert_eq!(account_filter.account, vec!["vault-token-account"]);
+        assert_eq!(
+            account_filter.owner,
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+        );
+    }
+
+    #[test]
+    fn normal_program_account_filter_can_keep_nonempty_txn_signature_policy() {
+        let mut service = service();
+        service.config.account_filters = vec!["vault-token-account".to_owned()];
+        service.config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        service.config.account_nonempty_txn_signature_required = true;
+
+        let proto = service.proto_subscription_request();
+        let account_filter = proto
+            .accounts
+            .get("pump_accounts")
+            .expect("normal account subscription configured");
+
+        assert_eq!(account_filter.nonempty_txn_signature, Some(true));
+    }
+
+    #[test]
+    fn exact_holder_mint_filter_allows_startup_snapshots() {
+        let mut service = service();
+        service.config.account_filters = Vec::new();
+        service.config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        service.config.account_data_size_filters = vec![165];
+        service.config.account_token_account_state_filter = true;
+        service.config.account_token_mint_offset = 0;
+        service.config.account_token_mint_filters = vec!["Mint111".to_owned()];
+        service.config.exact_holder_startup_snapshots_enabled = true;
+        service.config.exact_holder_nonempty_txn_signature_required = false;
+
+        let proto = service.proto_subscription_request();
+        let filter = proto
+            .accounts
+            .get("token_mint_0")
+            .expect("mint-scoped account subscription");
+
+        assert_eq!(filter.nonempty_txn_signature, None);
+    }
+
+    #[test]
+    fn account_token_mint_filters_build_one_account_subscription_per_mint() {
+        let mut service = service();
+        service.config.account_filters = Vec::new();
+        service.config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        service.config.account_data_size_filters = vec![165];
+        service.config.account_token_account_state_filter = true;
+        service.config.account_token_mint_offset = 0;
+        service.config.account_token_mint_filters =
+            vec!["Mint111".to_owned(), "Mint222".to_owned()];
+
+        let request = service.subscription_request();
+        assert_eq!(
+            request.account_token_mint_filters,
+            vec!["Mint111", "Mint222"]
+        );
+        assert_eq!(request.account_data_size_filters, vec![165]);
+        assert!(request.account_token_account_state_filter);
+
+        let proto = service.proto_subscription_request();
+        assert!(!proto.accounts.contains_key("pump_accounts"));
+        for (idx, mint) in ["Mint111", "Mint222"].iter().enumerate() {
+            let filter = proto
+                .accounts
+                .get(&format!("token_mint_{idx}"))
+                .expect("mint-scoped account subscription");
+            assert_eq!(
+                filter.owner,
+                vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+            );
+            assert_eq!(filter.nonempty_txn_signature, None);
+            assert_eq!(filter.filters.len(), 3);
+            assert!(matches!(
+                filter.filters[0].filter,
+                Some(AccountFilter::Datasize(165))
+            ));
+            assert!(matches!(
+                filter.filters[1].filter,
+                Some(AccountFilter::TokenAccountState(true))
+            ));
+            match &filter.filters[2].filter {
+                Some(AccountFilter::Memcmp(memcmp)) => {
+                    assert_eq!(memcmp.offset, 0);
+                    assert_eq!(memcmp.data, Some(MemcmpData::Base58((*mint).to_owned())));
+                }
+                other => panic!("expected mint memcmp filter, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exact_holder_mint_filter_uses_spl_token_owner_datasize_and_mint_memcmp() {
+        let mut service = service();
+        service.config.account_filters = Vec::new();
+        service.config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        service.config.account_data_size_filters = vec![165];
+        service.config.account_token_account_state_filter = true;
+        service.config.account_token_mint_offset = 0;
+        service.config.account_token_mint_filters = vec!["MintExactHolder".to_owned()];
+
+        let proto = service.proto_subscription_request();
+        let filter = proto
+            .accounts
+            .get("token_mint_0")
+            .expect("mint-scoped account subscription");
+
+        assert_eq!(
+            filter.owner,
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+        );
+        assert!(matches!(
+            filter.filters[0].filter,
+            Some(AccountFilter::Datasize(165))
+        ));
+        assert!(matches!(
+            filter.filters[1].filter,
+            Some(AccountFilter::TokenAccountState(true))
+        ));
+        match &filter.filters[2].filter {
+            Some(AccountFilter::Memcmp(memcmp)) => {
+                assert_eq!(memcmp.offset, 0);
+                assert_eq!(
+                    memcmp.data,
+                    Some(MemcmpData::Base58("MintExactHolder".to_owned()))
+                );
+            }
+            other => panic!("expected mint memcmp filter, got {other:?}"),
+        }
     }
 
     #[test]
@@ -982,6 +1252,7 @@ mod tests {
             slot: 11,
             pubkey: "11111111111111111111111111111111".to_owned(),
             owner: "11111111111111111111111111111111".to_owned(),
+            is_startup: false,
             lamports: 1,
             executable: false,
             write_version: 10,

@@ -32,22 +32,23 @@ impl LoadedConfig {
         let base_path = base_path.as_ref().to_path_buf();
         let base_raw = fs::read_to_string(&base_path)?;
         let mut merged = toml::from_str::<toml::Value>(&base_raw)?;
-        let path = if let Some(override_path) = override_path {
+        if let Some(override_path) = override_path {
             let override_path = override_path.as_ref().to_path_buf();
             let override_raw = fs::read_to_string(&override_path)?;
             let override_value = toml::from_str::<toml::Value>(&override_raw)?;
             merge_toml_value(&mut merged, override_value);
-            override_path
-        } else {
-            base_path
-        };
+        }
         let mut config: AppConfig = merged.try_into()?;
         config.apply_defaults();
         let canonical = toml::to_string_pretty(&config).map_err(|error| {
             QuantError::Config(format!("failed to canonicalize config: {error}"))
         })?;
         let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-        Ok(Self { path, hash, config })
+        Ok(Self {
+            path: base_path,
+            hash,
+            config,
+        })
     }
 
     pub fn resolve_path(&self, relative: &str) -> PathBuf {
@@ -184,6 +185,7 @@ impl AppConfig {
         } else {
             self.ingest.geyser = Some(self.geyser.clone());
         }
+        self.sync_post_migration_program_filters();
         if let Some(shred) = self.ingest.shred.clone() {
             self.shred = shred;
         } else {
@@ -214,6 +216,24 @@ impl AppConfig {
             self.metadata.hot_path_fetch_enabled = false;
             self.confirmation.source = "geyser_stream".to_owned();
             self.confirmation.allow_rpc_status_fallback = false;
+        }
+    }
+
+    fn sync_post_migration_program_filters(&mut self) {
+        let mut program_filters = self.geyser.program_filters.clone();
+        append_unique_nonempty(&mut program_filters, &self.pump.program_ids);
+        append_unique_nonempty(&mut program_filters, &self.pump.pump_swap_program_ids);
+        self.geyser.program_filters = program_filters.clone();
+        if let Some(geyser) = self.ingest.geyser.as_mut() {
+            geyser.program_filters = program_filters;
+        }
+    }
+}
+
+fn append_unique_nonempty(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !value.is_empty() && !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
         }
     }
 }
@@ -2317,9 +2337,33 @@ pub struct GeyserConfig {
     pub program_filters: Vec<String>,
     #[serde(default)]
     pub account_filters: Vec<String>,
+    #[serde(default)]
+    pub account_owner_filters: Vec<String>,
+    #[serde(default)]
+    pub account_data_size_filters: Vec<u64>,
+    #[serde(default)]
+    pub account_token_account_state_filter: bool,
+    #[serde(default)]
+    pub account_token_mint_offset: u64,
+    #[serde(default)]
+    pub account_token_mint_filters: Vec<String>,
+    #[serde(default = "default_true")]
+    pub account_nonempty_txn_signature_required: bool,
+    #[serde(default = "default_true")]
+    pub exact_holder_startup_snapshots_enabled: bool,
+    #[serde(default)]
+    pub exact_holder_nonempty_txn_signature_required: bool,
 }
 
 impl GeyserConfig {
+    pub fn resolved_account_owner_filters(&self) -> Vec<String> {
+        if self.account_owner_filters.is_empty() {
+            self.program_filters.clone()
+        } else {
+            self.account_owner_filters.clone()
+        }
+    }
+
     fn apply_defaults(&mut self) {
         if self.endpoint_env.is_empty() {
             self.endpoint_env = "GEYSER_ENDPOINT".to_owned();
@@ -2365,7 +2409,7 @@ impl GeyserConfig {
             self.material_hunter_partition_queue_capacity = 2_048;
         }
         if self.material_hunter_router_queue_capacity == 0 {
-            self.material_hunter_router_queue_capacity = self.max_inflight_messages.max(8_192);
+            self.material_hunter_router_queue_capacity = self.max_inflight_messages.max(65_536);
         }
         if self.material_hunter_artifact_writer_queue_capacity == 0 {
             self.material_hunter_artifact_writer_queue_capacity = 2_048;
@@ -4157,7 +4201,7 @@ const fn default_material_hunter_partition_queue_capacity() -> usize {
 }
 
 const fn default_material_hunter_router_queue_capacity() -> usize {
-    8_192
+    65_536
 }
 
 const fn default_material_hunter_artifact_writer_queue_capacity() -> usize {
@@ -4771,6 +4815,7 @@ mod tests {
             .join("default.toml");
         let loaded = LoadedConfig::from_file(&root).expect("config should load");
         let official_pump_program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        let official_pumpswap_program = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
         assert!(
             loaded
                 .config
@@ -4792,6 +4837,15 @@ mod tests {
         assert!(
             loaded
                 .config
+                .geyser
+                .program_filters
+                .iter()
+                .any(|program| program == official_pumpswap_program),
+            "default Geyser filters must subscribe to the official PumpSwap program"
+        );
+        assert!(
+            loaded
+                .config
                 .ingest
                 .geyser
                 .as_ref()
@@ -4800,6 +4854,46 @@ mod tests {
                 .iter()
                 .any(|program| program == official_pump_program),
             "default ingest Geyser filters must subscribe to the official Pump.fun program"
+        );
+        assert!(
+            loaded
+                .config
+                .ingest
+                .geyser
+                .as_ref()
+                .expect("default ingest Geyser config")
+                .program_filters
+                .iter()
+                .any(|program| program == official_pumpswap_program),
+            "default ingest Geyser filters must subscribe to the official PumpSwap program"
+        );
+        assert_eq!(
+            loaded.config.geyser.resolved_account_owner_filters(),
+            loaded.config.geyser.program_filters,
+            "default account owner filters must preserve existing Pump/PumpSwap account-update behavior"
+        );
+        assert!(
+            loaded.config.geyser.account_nonempty_txn_signature_required,
+            "default broad account subscriptions should preserve transaction-signature filtering"
+        );
+        assert!(
+            loaded.config.geyser.exact_holder_startup_snapshots_enabled,
+            "exact-holder mint-filtered account subscriptions must allow startup/current snapshots"
+        );
+        assert!(
+            !loaded
+                .config
+                .geyser
+                .exact_holder_nonempty_txn_signature_required,
+            "exact-holder mint-filtered account subscriptions must not require transaction signatures"
+        );
+        let mut explicit_vault_owner_config = loaded.config.geyser.clone();
+        explicit_vault_owner_config.account_owner_filters =
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()];
+        assert_eq!(
+            explicit_vault_owner_config.resolved_account_owner_filters(),
+            vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
+            "explicit SPL Token owner filters are required for PumpSwap vault account updates"
         );
     }
 
@@ -4845,6 +4939,16 @@ enabled = true
         assert!(loaded.config.r2.upload_enabled);
         assert!(!loaded.config.r2.dry_run);
         assert!(loaded.config.autopilot.enabled);
-        assert_eq!(loaded.path, overlay);
+        assert_eq!(loaded.path, base);
+        assert!(
+            loaded
+                .resolve_path(&loaded.config.pump.idl_paths[0])
+                .ends_with("vendor/pumpfun/idl/pump.json")
+        );
+        assert!(
+            loaded
+                .resolve_path(&loaded.config.pump.idl_paths[0])
+                .exists()
+        );
     }
 }

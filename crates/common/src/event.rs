@@ -383,6 +383,60 @@ pub struct PumpSellEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunMigrationEvent {
+    pub mint: PubkeyValue,
+    pub quote_mint: Option<PubkeyValue>,
+    pub bonding_curve: Option<PubkeyValue>,
+    pub associated_bonding_curve: Option<PubkeyValue>,
+    pub migration_pool: Option<PubkeyValue>,
+    pub pump_amm_program: Option<PubkeyValue>,
+    pub pool_authority: Option<PubkeyValue>,
+    pub pool_base_token_account: Option<PubkeyValue>,
+    pub pool_quote_token_account: Option<PubkeyValue>,
+    pub user: Option<PubkeyValue>,
+    pub signature: Option<String>,
+    pub slot: Option<u64>,
+    pub instruction_index: Option<u32>,
+    pub status: TransactionStatus,
+    pub parse_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpSwapPairEvent {
+    pub mint: PubkeyValue,
+    pub pair_address: Option<PubkeyValue>,
+    pub program_id: PubkeyValue,
+    pub base_mint: Option<PubkeyValue>,
+    pub quote_mint: Option<PubkeyValue>,
+    pub base_vault: Option<PubkeyValue>,
+    pub quote_vault: Option<PubkeyValue>,
+    pub signature: Option<String>,
+    pub slot: Option<u64>,
+    pub instruction_index: Option<u32>,
+    pub source_mode: String,
+    pub parse_status: String,
+    pub strict_strategy_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpSwapTradeEvent {
+    pub mint: PubkeyValue,
+    pub pair_address: Option<PubkeyValue>,
+    pub program_id: PubkeyValue,
+    pub signature: Option<String>,
+    pub slot: Option<u64>,
+    pub instruction_index: Option<u32>,
+    pub side: String,
+    pub base_amount_delta: Option<Decimal>,
+    pub quote_amount_delta: Option<Decimal>,
+    pub price: Option<Decimal>,
+    pub liquidity_after: Option<Decimal>,
+    pub source_mode: String,
+    pub parse_status: String,
+    pub strict_strategy_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveSnapshot {
     pub virtual_quote_reserves: Decimal,
     pub virtual_token_reserves: Decimal,
@@ -790,6 +844,9 @@ pub enum EventPayload {
     TokenCreated(TokenCreatedEvent),
     PumpBuy(PumpBuyEvent),
     PumpSell(PumpSellEvent),
+    PumpFunMigration(PumpFunMigrationEvent),
+    PumpSwapPair(PumpSwapPairEvent),
+    PumpSwapTrade(PumpSwapTradeEvent),
     BondingCurveUpdate(BondingCurveUpdateEvent),
     HolderBalanceUpdate(HolderBalanceUpdateEvent),
     WalletFunding(WalletFundingEvent),
@@ -820,6 +877,9 @@ impl NormalizedEvent {
             .or_else(|| match &self.payload {
                 EventPayload::ObservedTransaction(event) => event.signature_hint.as_deref(),
                 EventPayload::WalletFunding(event) => Some(event.signature.as_str()),
+                EventPayload::PumpFunMigration(event) => event.signature.as_deref(),
+                EventPayload::PumpSwapPair(event) => event.signature.as_deref(),
+                EventPayload::PumpSwapTrade(event) => event.signature.as_deref(),
                 EventPayload::TentativeSellIntentDetected(event) => event.signature.as_deref(),
                 EventPayload::ShredSellIntentResolved(event) => {
                     event.canonical_signature.as_deref()
@@ -833,6 +893,9 @@ impl NormalizedEvent {
             EventPayload::TokenCreated(event) => Some(&event.mint),
             EventPayload::PumpBuy(event) => Some(&event.mint),
             EventPayload::PumpSell(event) => Some(&event.mint),
+            EventPayload::PumpFunMigration(event) => Some(&event.mint),
+            EventPayload::PumpSwapPair(event) => Some(&event.mint),
+            EventPayload::PumpSwapTrade(event) => Some(&event.mint),
             EventPayload::BondingCurveUpdate(event) => Some(&event.mint),
             EventPayload::HolderBalanceUpdate(event) => Some(&event.mint),
             EventPayload::TentativeSellIntentDetected(event) => Some(&event.mint),
@@ -856,6 +919,9 @@ impl NormalizedEvent {
             EventPayload::TokenCreated(_)
                 | EventPayload::PumpBuy(_)
                 | EventPayload::PumpSell(_)
+                | EventPayload::PumpFunMigration(_)
+                | EventPayload::PumpSwapPair(_)
+                | EventPayload::PumpSwapTrade(_)
                 | EventPayload::BondingCurveUpdate(_)
                 | EventPayload::HolderBalanceUpdate(_)
                 | EventPayload::WalletFunding(_)

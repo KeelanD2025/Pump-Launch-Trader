@@ -480,7 +480,7 @@ pub struct MockShredLiveSource {
 #[derive(Clone)]
 pub struct DeshredLiveSource {
     pub config: common::DeshredConfig,
-    pub pump_program_ids: Vec<String>,
+    pub program_filter_ids: Vec<String>,
     normalizer: GeyserEventNormalizer,
     connector: Arc<dyn DeshredStreamConnector>,
 }
@@ -554,7 +554,7 @@ impl EarlyIntentEventSource for DeshredLiveSource {
     async fn run(&mut self, sender: tokio::sync::mpsc::Sender<NormalizedEvent>) -> Result<()> {
         run_deshred_source_with_connector(
             self.config.clone(),
-            self.pump_program_ids.clone(),
+            self.program_filter_ids.clone(),
             self.normalizer.clone(),
             self.connector.clone(),
             sender,
@@ -568,7 +568,10 @@ impl DeshredLiveSource {
         let config = loaded.config.ingest.deshred.clone().unwrap_or_default();
         Ok(Self {
             config,
-            pump_program_ids: loaded.config.pump.program_ids.clone(),
+            program_filter_ids: live_source::deshred_program_filter_ids(
+                &loaded.config.pump.program_ids,
+                &loaded.config.pump.pump_swap_program_ids,
+            ),
             normalizer: GeyserEventNormalizer::from_loaded(loaded)?,
             connector: Arc::new(RealDeshredConnector),
         })
@@ -943,6 +946,9 @@ impl Supervisor {
             EventPayload::TokenCreated(_) => "token_created",
             EventPayload::PumpBuy(_) => "pump_buy",
             EventPayload::PumpSell(_) => "pump_sell",
+            EventPayload::PumpFunMigration(_) => "pumpfun_migration",
+            EventPayload::PumpSwapPair(_) => "pumpswap_pair",
+            EventPayload::PumpSwapTrade(_) => "pumpswap_trade",
             EventPayload::BondingCurveUpdate(_) => "bonding_curve_update",
             EventPayload::HolderBalanceUpdate(_) => "holder_balance_update",
             EventPayload::WalletFunding(_) => "wallet_funding",
@@ -972,6 +978,41 @@ impl Supervisor {
                 vec![event.owner_wallet.0.clone(), event.token_account.0.clone()]
             }
             EventPayload::BondingCurveUpdate(event) => vec![event.mint.0.clone()],
+            EventPayload::PumpFunMigration(event) => vec![
+                event.mint.0.clone(),
+                event
+                    .migration_pool
+                    .as_ref()
+                    .map(|value| value.0.clone())
+                    .unwrap_or_default(),
+            ]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect(),
+            EventPayload::PumpSwapPair(event) => vec![
+                event.mint.0.clone(),
+                event
+                    .pair_address
+                    .as_ref()
+                    .map(|value| value.0.clone())
+                    .unwrap_or_default(),
+                event.program_id.0.clone(),
+            ]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect(),
+            EventPayload::PumpSwapTrade(event) => vec![
+                event.mint.0.clone(),
+                event
+                    .pair_address
+                    .as_ref()
+                    .map(|value| value.0.clone())
+                    .unwrap_or_default(),
+                event.program_id.0.clone(),
+            ]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect(),
             EventPayload::ObservedTransaction(event) => event.program_ids.clone(),
             _ => Vec::new(),
         }
@@ -5331,6 +5372,9 @@ fn payload_label(payload: &EventPayload) -> &'static str {
         EventPayload::TokenCreated(_) => "token_created",
         EventPayload::PumpBuy(_) => "pump_buy",
         EventPayload::PumpSell(_) => "pump_sell",
+        EventPayload::PumpFunMigration(_) => "pumpfun_migration",
+        EventPayload::PumpSwapPair(_) => "pumpswap_pair",
+        EventPayload::PumpSwapTrade(_) => "pumpswap_trade",
         EventPayload::BondingCurveUpdate(_) => "bonding_curve_update",
         EventPayload::HolderBalanceUpdate(_) => "holder_balance_update",
         EventPayload::WalletFunding(_) => "wallet_funding",

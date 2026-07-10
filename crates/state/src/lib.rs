@@ -7,14 +7,14 @@ use common::{
     BondingCurveUpdateEvent, Canonicality, DEFAULT_PUMP_TOKEN_DECIMALS,
     DangerousSellerClassification, DataGapEvent, EarlyIntentSource, EventPayload, EventSource,
     HolderBalanceUpdateEvent, NormalizedEvent, PUMP_TOTAL_SUPPLY_UI, PubkeyValue, PumpBuyEvent,
-    PumpSellEvent, QuoteAssetType, ReasonCode, ShredEmergencyExitArmedEvent,
-    ShredEmergencyExitTriggeredEvent, ShredSellIntentResolvedEvent,
-    TentativeMaliciousSellWarningEvent, TentativeSellConfirmationState,
-    TentativeSellIntentDetectedEvent, TentativeSellResolutionOutcome, TentativeSellRiskLevel,
-    TokenProgramType, TtlConfig, WalletFundingEvent, price_lamports_per_raw_token,
-    price_sol_per_ui_token, pump_curve_progress_pct_from_real_token_reserves_raw,
-    pump_market_cap_quote_1b, pump_market_cap_quote_total_supply,
-    pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
+    PumpFunMigrationEvent, PumpSellEvent, PumpSwapPairEvent, PumpSwapTradeEvent, QuoteAssetType,
+    ReasonCode, ShredEmergencyExitArmedEvent, ShredEmergencyExitTriggeredEvent,
+    ShredSellIntentResolvedEvent, TentativeMaliciousSellWarningEvent,
+    TentativeSellConfirmationState, TentativeSellIntentDetectedEvent,
+    TentativeSellResolutionOutcome, TentativeSellRiskLevel, TokenProgramType, TtlConfig,
+    WalletFundingEvent, price_lamports_per_raw_token, price_sol_per_ui_token,
+    pump_curve_progress_pct_from_real_token_reserves_raw, pump_market_cap_quote_1b,
+    pump_market_cap_quote_total_supply, pump_virtual_reserve_price_sol_per_token, raw_tokens_to_ui,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1619,6 +1619,9 @@ impl StateEngine {
                     self.apply_sell(payload, event)
                 }
             }
+            EventPayload::PumpFunMigration(payload) => self.apply_pumpfun_migration(payload, event),
+            EventPayload::PumpSwapPair(payload) => self.apply_pumpswap_pair(payload, event),
+            EventPayload::PumpSwapTrade(payload) => self.apply_pumpswap_trade(payload, event),
             EventPayload::BondingCurveUpdate(payload) => self.apply_curve_update(payload, event)?,
             EventPayload::HolderBalanceUpdate(payload) => {
                 self.apply_holder_update(payload, event)?
@@ -1896,6 +1899,68 @@ impl StateEngine {
             .tokens_sold
             .entry(payload.mint.0.clone())
             .or_default() += payload.token_in;
+    }
+
+    fn apply_pumpfun_migration(
+        &mut self,
+        payload: &PumpFunMigrationEvent,
+        event: &NormalizedEvent,
+    ) {
+        let token = self
+            .tokens
+            .entry(payload.mint.0.clone())
+            .or_insert_with(|| TokenState::new(payload.mint.clone(), event.meta.source));
+        token.quote_mint = payload
+            .quote_mint
+            .clone()
+            .or_else(|| token.quote_mint.clone());
+        token.bonding_curve = payload
+            .bonding_curve
+            .clone()
+            .or_else(|| token.bonding_curve.clone());
+        token.associated_bonding_curve = payload
+            .associated_bonding_curve
+            .clone()
+            .or_else(|| token.associated_bonding_curve.clone());
+        mark_migrated_followthrough(
+            token,
+            event,
+            "pumpfun_migration_event",
+            &self.ttl,
+            &mut self.tentative_signatures,
+        );
+    }
+
+    fn apply_pumpswap_pair(&mut self, payload: &PumpSwapPairEvent, event: &NormalizedEvent) {
+        let token = self
+            .tokens
+            .entry(payload.mint.0.clone())
+            .or_insert_with(|| TokenState::new(payload.mint.clone(), event.meta.source));
+        token.quote_mint = payload
+            .quote_mint
+            .clone()
+            .or_else(|| token.quote_mint.clone());
+        mark_migrated_followthrough(
+            token,
+            event,
+            "pumpswap_pair_event",
+            &self.ttl,
+            &mut self.tentative_signatures,
+        );
+    }
+
+    fn apply_pumpswap_trade(&mut self, payload: &PumpSwapTradeEvent, event: &NormalizedEvent) {
+        let token = self
+            .tokens
+            .entry(payload.mint.0.clone())
+            .or_insert_with(|| TokenState::new(payload.mint.clone(), event.meta.source));
+        mark_migrated_followthrough(
+            token,
+            event,
+            "pumpswap_trade_event",
+            &self.ttl,
+            &mut self.tentative_signatures,
+        );
     }
 
     fn apply_curve_update(
@@ -2256,6 +2321,18 @@ impl StateEngine {
                 common::TokenTerminalVariant::Completed => TokenLifecycle::Completed,
             };
             let reason = terminal_variant_label(payload.variant);
+            if payload.variant == common::TokenTerminalVariant::Migrated {
+                let _ = transition_token(
+                    token,
+                    target,
+                    reason,
+                    event.meta.received_at_wall_time,
+                    ttl_for_config(&self.ttl, target),
+                );
+                token.expires_at = None;
+                token.update_memory_bytes();
+                return;
+            }
             let _ = transition_token(
                 token,
                 target,
@@ -2371,6 +2448,8 @@ impl StateEngine {
         if let Some(token) = self.tokens.get_mut(&mint) {
             let target = if token.lifecycle == TokenLifecycle::DataGap {
                 TokenLifecycle::DataGap
+            } else if token.lifecycle == TokenLifecycle::Migrated {
+                TokenLifecycle::Migrated
             } else if token.trade_stats.buy_count + token.trade_stats.sell_count >= 4
                 || token.holder_state.nonzero_holder_count >= 4
                 || token.trade_stats.unique_buyers.len() >= 3
@@ -2405,8 +2484,11 @@ impl StateEngine {
                     transitions.push(transition);
                 }
             }
-            token.expires_at =
-                Some(event.meta.received_at_wall_time + ttl_for_config(&self.ttl, token.lifecycle));
+            token.expires_at = if token.lifecycle == TokenLifecycle::Migrated {
+                None
+            } else {
+                Some(event.meta.received_at_wall_time + ttl_for_config(&self.ttl, token.lifecycle))
+            };
             token.update_memory_bytes();
         }
         transitions
@@ -2474,11 +2556,38 @@ fn event_updates_exit_threat_inputs(event: &NormalizedEvent) -> bool {
         EventPayload::TokenCreated(_)
             | EventPayload::PumpBuy(_)
             | EventPayload::PumpSell(_)
+            | EventPayload::PumpFunMigration(_)
+            | EventPayload::PumpSwapPair(_)
+            | EventPayload::PumpSwapTrade(_)
             | EventPayload::BondingCurveUpdate(_)
             | EventPayload::HolderBalanceUpdate(_)
             | EventPayload::TokenTerminal(_)
             | EventPayload::DataGap(_)
     )
+}
+
+fn mark_migrated_followthrough(
+    token: &mut TokenState,
+    event: &NormalizedEvent,
+    reason: &str,
+    ttl: &TtlConfig,
+    tentative_signatures: &mut HashMap<String, String>,
+) {
+    if let Some(signature) = event.signature() {
+        token.canonical_signatures.insert(signature.to_owned());
+        token.tentative_signatures.remove(signature);
+        tentative_signatures.remove(signature);
+        token.tentative_only = false;
+    }
+    let _ = transition_token(
+        token,
+        TokenLifecycle::Migrated,
+        reason,
+        event.meta.received_at_wall_time,
+        ttl_for_config(ttl, TokenLifecycle::Migrated),
+    );
+    token.expires_at = None;
+    token.update_memory_bytes();
 }
 
 fn terminal_variant_label(variant: common::TokenTerminalVariant) -> &'static str {
@@ -2532,9 +2641,10 @@ fn ttl_for_config(ttl: &TtlConfig, lifecycle: TokenLifecycle) -> time::Duration 
             time::Duration::seconds(ttl.discarded_summary_secs as i64)
         }
         TokenLifecycle::RugArchive => time::Duration::seconds(ttl.research_sample_secs as i64),
-        TokenLifecycle::Completed | TokenLifecycle::Migrated | TokenLifecycle::DataGap => {
+        TokenLifecycle::Completed | TokenLifecycle::DataGap => {
             time::Duration::seconds(ttl.discarded_summary_secs as i64)
         }
+        TokenLifecycle::Migrated => time::Duration::seconds(ttl.active_deep_secs as i64),
     }
 }
 
@@ -2855,8 +2965,9 @@ pub fn compute_hhi(balances: Vec<Decimal>) -> Decimal {
 mod tests {
     use common::{
         BondingCurveUpdateEvent, EventMeta, EventPayload, EventSource, HolderBalanceUpdateEvent,
-        NormalizedEvent, ObservedTransactionEvent, PumpBuyEvent, PumpSellEvent, QuoteAssetType,
-        TokenCreatedEvent, TokenProgramType, TransactionStatus, TtlConfig,
+        NormalizedEvent, ObservedTransactionEvent, PumpBuyEvent, PumpFunMigrationEvent,
+        PumpSellEvent, QuoteAssetType, TokenCreatedEvent, TokenProgramType, TokenTerminalEvent,
+        TokenTerminalVariant, TransactionStatus, TtlConfig,
     };
 
     use super::*;
@@ -3074,6 +3185,65 @@ mod tests {
             engine.token(&pubkey("mint")).unwrap().lifecycle,
             TokenLifecycle::ActiveLight
         );
+    }
+
+    #[test]
+    fn migration_terminal_variant_keeps_lifecycle_active_for_followthrough() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let migrated = NormalizedEvent {
+            meta: meta(EventSource::GeyserProcessed, Canonicality::Processed, 5),
+            payload: EventPayload::TokenTerminal(TokenTerminalEvent {
+                mint: pubkey("mint"),
+                variant: TokenTerminalVariant::Migrated,
+                reason_codes: vec![],
+                details: std::collections::BTreeMap::new(),
+            }),
+        };
+        let _ = engine.apply_event(&migrated).expect("migration");
+        let token = engine.token(&pubkey("mint")).expect("token");
+        assert_eq!(token.lifecycle, TokenLifecycle::Migrated);
+        assert!(token.expires_at.is_none());
+        assert!(engine.discarded_summary(&pubkey("mint")).is_none());
+        let _ = engine
+            .apply_event(&buy("post-mig-buy", "buyer-c", 3, 120))
+            .expect("buy");
+        assert_eq!(
+            engine.token(&pubkey("mint")).unwrap().lifecycle,
+            TokenLifecycle::Migrated
+        );
+    }
+
+    #[test]
+    fn pumpfun_migration_event_keeps_lifecycle_active_for_followthrough() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let migration = NormalizedEvent {
+            meta: meta(EventSource::GeyserProcessed, Canonicality::Processed, 7),
+            payload: EventPayload::PumpFunMigration(PumpFunMigrationEvent {
+                mint: pubkey("mint"),
+                quote_mint: None,
+                bonding_curve: Some(pubkey("bonding")),
+                associated_bonding_curve: Some(pubkey("associated")),
+                migration_pool: Some(pubkey("pool")),
+                pump_amm_program: Some(pubkey("pamm")),
+                pool_authority: None,
+                pool_base_token_account: None,
+                pool_quote_token_account: None,
+                user: None,
+                signature: Some("migration-sig".to_owned()),
+                slot: Some(7),
+                instruction_index: Some(0),
+                status: common::TransactionStatus::Success,
+                parse_status: "non_rpc_decoded_migrate".to_owned(),
+            }),
+        };
+        let _ = engine.apply_event(&migration).expect("migration");
+        let token = engine.token(&pubkey("mint")).expect("token");
+        assert_eq!(token.lifecycle, TokenLifecycle::Migrated);
+        assert!(token.expires_at.is_none());
+        assert_eq!(token.bonding_curve.as_ref(), Some(&pubkey("bonding")));
+        assert!(engine.discarded_summary(&pubkey("mint")).is_none());
     }
 
     #[test]
