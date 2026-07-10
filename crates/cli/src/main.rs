@@ -41411,6 +41411,13 @@ async fn material_candidate_hunter_command_with_connector(
     let mut all_launch_seen_mints = BTreeSet::<String>::new();
     let mut cheap_launch_events = BTreeMap::<String, NormalizedEvent>::new();
     let mut cheap_followup_events = BTreeMap::<String, Vec<NormalizedEvent>>::new();
+    let exact_holder_mint_filters = loaded
+        .config
+        .geyser
+        .account_token_mint_filters
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut cheap_followup_tracked_mints = BTreeSet::<String>::new();
     let mut cheap_followup_rows = Vec::<serde_json::Value>::new();
     let mut cheap_followup_emitted = BTreeSet::<String>::new();
@@ -41768,6 +41775,11 @@ async fn material_candidate_hunter_command_with_connector(
                     )?;
                 }
             } else if let Some(mint) = event_mint_string(&event) {
+                if exact_holder_mint_filters.contains(&mint)
+                    && matches!(&event.payload, EventPayload::HolderBalanceUpdate(_))
+                {
+                    cheap_followup_events.entry(mint.clone()).or_default();
+                }
                 if !all_launch_seen_mints.contains(&mint) {
                     if let Some(reason) = phase107i_orphan_backfill_reason_for_event(&event) {
                         if phase107i_record_pending_launch_backfill(
@@ -47098,6 +47110,31 @@ fn phase107n_write_lifecycle_stream_artifacts(
         ordered_delta_rows.extend(mint_ordered_delta_rows);
         linkage_audit_rows.extend(mint_linkage_rows);
         reserve_rows.extend(mint_exact_rows);
+    }
+    let launch_mints = all_launch_rows
+        .iter()
+        .filter_map(|launch| launch["mint"].as_str())
+        .collect::<BTreeSet<_>>();
+    for (mint, events) in events_by_mint {
+        if launch_mints.contains(mint.as_str()) {
+            continue;
+        }
+        if events
+            .iter()
+            .any(|event| matches!(&event.payload, EventPayload::HolderBalanceUpdate(_)))
+        {
+            let synthetic_launch = json!({
+                "mint": mint,
+                "launch_id": "",
+                "source_mode": "exact_holder_mint_filter_without_launch_row",
+            });
+            holder_rows.extend(phase107n_holder_rows_for_mint(
+                run_id,
+                mint,
+                &synthetic_launch,
+                events,
+            ));
+        }
     }
     write_json_rows_csv(
         &output_dir.join("all_launch_trade_event_rows.csv"),

@@ -4197,6 +4197,38 @@ fn material_hunter_token_account_mint_mappings(update: &SubscribeUpdate) -> Vec<
     mappings
 }
 
+#[derive(Debug, Clone)]
+struct MaterialHunterTokenAccountUpdateHint {
+    pubkey: Vec<u8>,
+    account: String,
+    mint: String,
+}
+
+fn material_hunter_token_account_update_hint(
+    update: &SubscribeUpdate,
+) -> Option<MaterialHunterTokenAccountUpdateHint> {
+    let Some(UpdateOneof::Account(account_update)) = update.update_oneof.as_ref() else {
+        return None;
+    };
+    let account = account_update.account.as_ref()?;
+    if account.pubkey.is_empty() || account.data.len() < 72 {
+        return None;
+    }
+    let owner = bs58::encode(&account.owner).into_string();
+    if owner != SPL_TOKEN_PROGRAM_ID && owner != TOKEN_2022_PROGRAM_ID {
+        return None;
+    }
+    let mint = bs58::encode(&account.data[0..32]).into_string();
+    if mint == SYSTEM_PROGRAM_ID {
+        return None;
+    }
+    Some(MaterialHunterTokenAccountUpdateHint {
+        pubkey: account.pubkey.clone(),
+        account: bs58::encode(&account.pubkey).into_string(),
+        mint,
+    })
+}
+
 fn material_hunter_partition_for_update_with_account_map(
     update: &SubscribeUpdate,
     partitions: usize,
@@ -4777,6 +4809,11 @@ where
             let mut account_partition_pins = HashMap::<Vec<u8>, usize>::new();
             let mut seen_transaction_signatures = HashSet::<String>::new();
             let mut transaction_signature_lru = VecDeque::<String>::new();
+            let exact_holder_mint_filters = config_for_router
+                .account_token_mint_filters
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
             let pressure_config =
                 MaterialHunterActiveMintPressureConfig::from_geyser(&config_for_router);
             let mut active_mint_pressure = MaterialHunterActiveMintPressureState::default();
@@ -4793,6 +4830,16 @@ where
                         for (account, mint) in material_hunter_token_account_mint_mappings(&update)
                         {
                             token_account_to_mint.entry(account).or_insert(mint);
+                        }
+                        let token_account_hint = material_hunter_token_account_update_hint(&update);
+                        if let Some(hint) = token_account_hint.as_ref() {
+                            if active_mints.contains(&hint.mint)
+                                || exact_holder_mint_filters.contains(&hint.mint)
+                            {
+                                token_account_to_mint
+                                    .entry(hint.pubkey.clone())
+                                    .or_insert_with(|| hint.mint.clone());
+                            }
                         }
                         let signature = material_hunter_transaction_signature_hint(&update);
                         let duplicate_signature = signature
@@ -4829,6 +4876,15 @@ where
                             material_hunter_transaction_mint_hint(&update);
                         let mut transaction_hint_account =
                             material_hunter_transaction_account_hint(&update);
+                        if let Some(hint) = token_account_hint.as_ref() {
+                            if active_mints.contains(&hint.mint)
+                                || exact_holder_mint_filters.contains(&hint.mint)
+                            {
+                                update_class = MaterialUpdateClass::TokenAccountChangeActiveMint;
+                                transaction_hint_mint = Some(hint.mint.clone());
+                                transaction_hint_account = Some(hint.account.clone());
+                            }
+                        }
                         let mut classification_recorded = false;
                         let mut module_dispatched = false;
                         if duplicate_signature {
@@ -7739,6 +7795,14 @@ mod tests {
             "token_account_update_untracked"
         );
         assert!(material_hunter_update_needs_worker(&update));
+    }
+
+    #[test]
+    fn material_hunter_token_account_update_hint_decodes_mint_and_account() {
+        let update = geyser_token_account_update(7);
+        let hint = material_hunter_token_account_update_hint(&update).expect("token account hint");
+        assert_eq!(hint.account, bs58::encode([7u8; 32]).into_string());
+        assert_eq!(hint.mint, bs58::encode([1u8; 32]).into_string());
     }
 
     #[test]
