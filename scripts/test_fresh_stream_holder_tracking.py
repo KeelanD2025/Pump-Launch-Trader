@@ -211,10 +211,47 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                     {
                         "mint": mint,
                         "launch_id": "launch-fresh",
+                        "event_observed_at_utc": "2026-01-01T00:00:09Z",
+                        "slot": 19,
+                        "signature": "failed-migration-signature",
+                        "decoded_instruction_name": "migrate",
+                        "transaction_status": "failed",
+                        "migration_confirmed": False,
+                        "migration_evidence_type": "decoded_failed_pump_liquidity_migration_attempt",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
+                        "post_migration_pool": "pool-one",
+                        "pool_base_token_account": "pool-base-vault",
+                        "pool_quote_token_account": "pool-quote-vault",
+                    },
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-fresh",
+                        "event_observed_at_utc": "2026-01-01T00:00:09.500000Z",
+                        "slot": 19,
+                        "signature": "creator-migration-signature",
+                        "decoded_instruction_name": "migrate_bonding_curve_creator",
+                        "transaction_status": "success",
+                        "migration_confirmed": False,
+                        "migration_evidence_type": "decoded_non_liquidity_migration_instruction",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
+                    },
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-fresh",
                         "event_observed_at_utc": "2026-01-01T00:00:10Z",
                         "slot": 20,
                         "signature": "migration-signature",
+                        "decoded_instruction_name": "migrate",
+                        "transaction_status": "success",
+                        "migration_confirmed": True,
+                        "migration_evidence_type": "decoded_successful_pump_liquidity_migration",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
                         "post_migration_pool": "pool-one",
+                        "pool_base_token_account": "pool-base-vault",
+                        "pool_quote_token_account": "pool-quote-vault",
                     }
                 ],
             )
@@ -230,14 +267,7 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             )
             write_csv(
                 amm / "pumpswap_pool_vault_rows.csv",
-                [
-                    {
-                        "pool": "pool-one",
-                        "mint": mint,
-                        "pool_base_token_account": "pool-base-vault",
-                        "pool_quote_token_account": "pool-quote-vault",
-                    }
-                ],
+                [],
             )
             write_csv(amm / "pumpswap_live_relay_pumpswap_pair_event_rows.csv", [])
             (amm / "pumpswap_amm_coverage_gate.json").write_text(
@@ -288,8 +318,14 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertEqual(proof["pre_gap_source_integrity_mint_count"], 1)
             self.assertEqual(proof["source_quality_counts"][MODULE.OBSERVED], 1)
             self.assertEqual(proof["best_proven_source_quality_counts"][MODULE.NEAR_EXACT], 1)
-            self.assertEqual(proof["observed_migration_rows"], 1)
+            self.assertEqual(proof["observed_migration_rows"], 3)
+            self.assertEqual(proof["confirmed_migration_evidence_rows"], 1)
+            self.assertEqual(proof["confirmed_fresh_migration_rows"], 1)
+            self.assertEqual(proof["rejected_migration_rows"], 2)
+            self.assertEqual(proof["unconfirmed_migration_rows_rejected"], 2)
             self.assertEqual(proof["non_fresh_migration_rows_rejected"], 0)
+            self.assertEqual(proof["rejected_migration_mints"], [])
+            self.assertEqual(proof["mints_with_rejected_migration_evidence"], [mint])
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertEqual(guard["currently_accepted_mints"], [])
@@ -327,6 +363,14 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 (output / "exact_holder_migration_carry_forward_audit.json").read_text()
             )
             self.assertEqual(migration_audit["carry_forward_complete_rows"], 1)
+            self.assertEqual(migration_audit["confirmed_migration_evidence_rows"], 1)
+            self.assertEqual(migration_audit["unconfirmed_migration_rows_rejected"], 2)
+            with (output / "exact_holder_rejected_migration_evidence_rows.csv").open(
+                newline=""
+            ) as handle:
+                rejected_migrations = list(csv.DictReader(handle))
+            self.assertEqual(len(rejected_migrations), 2)
+            self.assertTrue(all(row["rejection_reason"] for row in rejected_migrations))
             migration_proof = json.loads(
                 (output / "exact_holder_fresh_launch_to_migration_proof_report.json").read_text()
             )

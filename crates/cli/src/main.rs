@@ -43803,11 +43803,19 @@ const PHASE107N_PUMPFUN_MIGRATION_EVENT_FIELDS: &[&str] = &[
     "instruction_index",
     "event_type",
     "decoded_instruction_name",
+    "transaction_status",
+    "migration_confirmed",
+    "migration_evidence_type",
     "program_id",
     "bonding_curve",
     "associated_bonding_curve",
+    "quote_mint",
     "post_migration_pool",
     "post_migration_program",
+    "pool_authority",
+    "pool_base_token_account",
+    "pool_quote_token_account",
+    "migration_user",
     "source_mode",
     "source_file",
     "parse_status",
@@ -46073,6 +46081,14 @@ fn phase107n_trade_status(event: &NormalizedEvent) -> &'static str {
     }
 }
 
+fn phase107n_transaction_status_name(status: common::TransactionStatus) -> &'static str {
+    match status {
+        common::TransactionStatus::Success => "success",
+        common::TransactionStatus::Failed => "failed",
+        common::TransactionStatus::Unknown => "unknown",
+    }
+}
+
 fn phase107n_optional_pubkey(value: &Option<common::PubkeyValue>) -> String {
     value
         .as_ref()
@@ -46092,6 +46108,31 @@ fn phase107n_pumpfun_migration_rows_for_mint(
             let EventPayload::PumpFunMigration(payload) = &event.payload else {
                 return None;
             };
+            let decoded_instruction_name = payload
+                .parse_status
+                .strip_prefix("non_rpc_decoded_")
+                .unwrap_or("unknown_migration_instruction");
+            let liquidity_migration_instruction =
+                matches!(decoded_instruction_name, "migrate" | "migrate_v2");
+            let migration_confirmed = payload.status == common::TransactionStatus::Success
+                && liquidity_migration_instruction;
+            let event_type = match decoded_instruction_name {
+                "migrate_bonding_curve_creator" => "migrate_bonding_curve_creator",
+                "migrate" | "migrate_v2" if migration_confirmed => "migrate",
+                _ => "migration_attempt",
+            };
+            let migration_evidence_type = match (liquidity_migration_instruction, payload.status) {
+                (true, common::TransactionStatus::Success) => {
+                    "decoded_successful_pump_liquidity_migration"
+                }
+                (true, common::TransactionStatus::Failed) => {
+                    "decoded_failed_pump_liquidity_migration_attempt"
+                }
+                (true, common::TransactionStatus::Unknown) => {
+                    "decoded_unknown_status_pump_liquidity_migration_attempt"
+                }
+                (false, _) => "decoded_non_liquidity_migration_instruction",
+            };
             Some(json!({
                 "run_id": run_id,
                 "source_run_id": run_id,
@@ -46102,13 +46143,21 @@ fn phase107n_pumpfun_migration_rows_for_mint(
                 "slot": payload.slot.unwrap_or(event.meta.slot),
                 "signature": payload.signature.clone().or_else(|| event_signature_string(event)).unwrap_or_default(),
                 "instruction_index": payload.instruction_index.map(|value| json!(value)).unwrap_or_else(|| phase107n_event_instruction_index(event)),
-                "event_type": "migrate",
-                "decoded_instruction_name": payload.parse_status.strip_prefix("non_rpc_decoded_").unwrap_or("migrate"),
+                "event_type": event_type,
+                "decoded_instruction_name": decoded_instruction_name,
+                "transaction_status": phase107n_transaction_status_name(payload.status),
+                "migration_confirmed": migration_confirmed,
+                "migration_evidence_type": migration_evidence_type,
                 "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
                 "bonding_curve": phase107n_optional_pubkey(&payload.bonding_curve),
                 "associated_bonding_curve": phase107n_optional_pubkey(&payload.associated_bonding_curve),
+                "quote_mint": phase107n_optional_pubkey(&payload.quote_mint),
                 "post_migration_pool": phase107n_optional_pubkey(&payload.migration_pool),
                 "post_migration_program": phase107n_optional_pubkey(&payload.pump_amm_program),
+                "pool_authority": phase107n_optional_pubkey(&payload.pool_authority),
+                "pool_base_token_account": phase107n_optional_pubkey(&payload.pool_base_token_account),
+                "pool_quote_token_account": phase107n_optional_pubkey(&payload.pool_quote_token_account),
+                "migration_user": phase107n_optional_pubkey(&payload.user),
                 "source_mode": "local_stream_pumpfun_migration_event",
                 "source_file": "normalized_live_sidecar_event_stream",
                 "parse_status": payload.parse_status.clone(),
@@ -68122,6 +68171,98 @@ mod tests {
             payload.mint = common::PubkeyValue(mint.to_owned());
         }
         event
+    }
+
+    #[test]
+    fn phase107n_migration_rows_export_confirmation_and_vault_evidence() {
+        fn migration_event(
+            signature: &str,
+            status: common::TransactionStatus,
+            parse_status: &str,
+        ) -> NormalizedEvent {
+            let mut meta = common::EventMeta::new(
+                common::EventSource::GeyserProcessed,
+                common::Canonicality::Processed,
+                42,
+            );
+            meta.signature = Some(signature.to_owned());
+            NormalizedEvent {
+                meta,
+                payload: EventPayload::PumpFunMigration(common::PumpFunMigrationEvent {
+                    mint: common::PubkeyValue("mint-one".to_owned()),
+                    quote_mint: Some(common::PubkeyValue("quote-mint".to_owned())),
+                    bonding_curve: Some(common::PubkeyValue("curve".to_owned())),
+                    associated_bonding_curve: Some(common::PubkeyValue("curve-token".to_owned())),
+                    migration_pool: Some(common::PubkeyValue("pool".to_owned())),
+                    pump_amm_program: Some(common::PubkeyValue(
+                        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".to_owned(),
+                    )),
+                    pool_authority: Some(common::PubkeyValue("pool-authority".to_owned())),
+                    pool_base_token_account: Some(common::PubkeyValue(
+                        "pool-base-vault".to_owned(),
+                    )),
+                    pool_quote_token_account: Some(common::PubkeyValue(
+                        "pool-quote-vault".to_owned(),
+                    )),
+                    user: Some(common::PubkeyValue("migration-user".to_owned())),
+                    signature: Some(signature.to_owned()),
+                    slot: Some(42),
+                    instruction_index: Some(2),
+                    status,
+                    parse_status: parse_status.to_owned(),
+                }),
+            }
+        }
+
+        let events = vec![
+            migration_event(
+                "migration-success",
+                common::TransactionStatus::Success,
+                "non_rpc_decoded_migrate",
+            ),
+            migration_event(
+                "migration-failed",
+                common::TransactionStatus::Failed,
+                "non_rpc_decoded_migrate_v2",
+            ),
+            migration_event(
+                "creator-migration",
+                common::TransactionStatus::Success,
+                "non_rpc_decoded_migrate_bonding_curve_creator",
+            ),
+        ];
+        let rows = phase107n_pumpfun_migration_rows_for_mint(
+            "run-one",
+            "mint-one",
+            &json!({"launch_id": "launch-one"}),
+            &events,
+        );
+
+        assert_eq!(rows.len(), 3);
+        let confirmed = rows
+            .iter()
+            .find(|row| row["signature"] == "migration-success")
+            .expect("confirmed migration row");
+        assert_eq!(confirmed["transaction_status"], "success");
+        assert_eq!(confirmed["migration_confirmed"], true);
+        assert_eq!(confirmed["event_type"], "migrate");
+        assert_eq!(confirmed["pool_base_token_account"], "pool-base-vault");
+        assert_eq!(confirmed["pool_quote_token_account"], "pool-quote-vault");
+
+        let failed = rows
+            .iter()
+            .find(|row| row["signature"] == "migration-failed")
+            .expect("failed migration attempt row");
+        assert_eq!(failed["transaction_status"], "failed");
+        assert_eq!(failed["migration_confirmed"], false);
+        assert_eq!(failed["event_type"], "migration_attempt");
+
+        let creator = rows
+            .iter()
+            .find(|row| row["signature"] == "creator-migration")
+            .expect("creator migration row");
+        assert_eq!(creator["migration_confirmed"], false);
+        assert_eq!(creator["event_type"], "migrate_bonding_curve_creator");
     }
 
     fn phase107i_test_all_launch_row(

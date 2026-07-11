@@ -25,6 +25,7 @@ NEAR_EXACT = "near_exact_stream_from_launch"
 OBSERVED = "observed_subset_stream"
 PROXY = "proxy_only"
 ALLOWED_STRATEGY_QUALITY = {EXACT, NEAR_EXACT}
+CONFIRMED_MIGRATION_INSTRUCTIONS = {"migrate", "migrate_v2"}
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -535,16 +536,65 @@ def build(args: argparse.Namespace) -> int:
 
     migration_by_mint: dict[str, dict[str, Any]] = {}
     rejected_migration_mints: set[str] = set()
+    rejected_migration_rows: list[dict[str, Any]] = []
+    confirmed_migration_evidence_rows = 0
+    confirmed_fresh_migration_rows = 0
+    non_fresh_migration_rows_rejected = 0
+    unconfirmed_migration_rows_rejected = 0
     for row in migration_rows:
         mint = first(row, "mint")
         ts = parse_time(first(row, "event_observed_at_utc"))
-        if mint not in eligible_mints or ts is None:
+        instruction = first(row, "decoded_instruction_name")
+        transaction_status = first(row, "transaction_status", "status").lower()
+        explicitly_confirmed = boolish(row.get("migration_confirmed"))
+        confirmed = (
+            explicitly_confirmed
+            and transaction_status == "success"
+            and instruction in CONFIRMED_MIGRATION_INSTRUCTIONS
+        )
+        if confirmed:
+            confirmed_migration_evidence_rows += 1
+
+        rejection_reasons: list[str] = []
+        if mint not in eligible_mints:
+            rejection_reasons.append("mint_not_in_fresh_tracker_scope")
+            non_fresh_migration_rows_rejected += 1
+        if ts is None:
+            rejection_reasons.append("migration_timestamp_missing")
+        if not explicitly_confirmed:
+            rejection_reasons.append("migration_confirmation_missing_or_false")
+        if transaction_status != "success":
+            rejection_reasons.append("migration_transaction_not_successful")
+        if instruction not in CONFIRMED_MIGRATION_INSTRUCTIONS:
+            rejection_reasons.append("not_liquidity_migrate_instruction")
+        if not confirmed:
+            unconfirmed_migration_rows_rejected += 1
+
+        if rejection_reasons:
             if mint:
                 rejected_migration_mints.add(mint)
+            rejected_migration_rows.append(
+                {
+                    "mint": mint,
+                    "launch_id": first(row, "launch_id"),
+                    "event_observed_at_utc": first(row, "event_observed_at_utc"),
+                    "slot": first(row, "slot"),
+                    "signature": first(row, "signature"),
+                    "decoded_instruction_name": instruction,
+                    "transaction_status": transaction_status,
+                    "migration_confirmed": explicitly_confirmed,
+                    "migration_evidence_type": first(row, "migration_evidence_type"),
+                    "post_migration_pool": first(row, "post_migration_pool", "pool"),
+                    "rejection_reason": "|".join(rejection_reasons),
+                }
+            )
             continue
+        confirmed_fresh_migration_rows += 1
         previous = migration_by_mint.get(mint)
         if previous is None or ts < parse_time(first(previous, "event_observed_at_utc")):
             migration_by_mint[mint] = row
+    mints_with_rejected_migration_evidence = sorted(rejected_migration_mints)
+    rejected_migration_mints.difference_update(migration_by_mint)
 
     pair_candidates = pair_rows + root_pair_rows
     pair_by_mint: dict[str, dict[str, Any]] = {}
@@ -569,6 +619,28 @@ def build(args: argparse.Namespace) -> int:
             if account:
                 excluded_accounts[account] = field
                 excluded_account_mints[account].add(mint)
+    # Migration instruction accounts remain authoritative stream evidence even
+    # when the transaction fails; they identify curve/program accounts that
+    # must never be counted as circulating holders.
+    for row in migration_rows:
+        mint = first(row, "mint")
+        if mint not in eligible_mints:
+            continue
+        for field in ("bonding_curve", "associated_bonding_curve"):
+            account = first(row, field)
+            if account:
+                excluded_accounts[account] = field
+                excluded_account_mints[account].add(mint)
+    # Pool vaults are accepted only from a confirmed successful migration.
+    for mint, row in migration_by_mint.items():
+        pool = first(row, "post_migration_pool", "pool")
+        for field in ("pool_base_token_account", "pool_quote_token_account"):
+            account = first(row, field)
+            if account:
+                excluded_accounts[account] = field
+                excluded_account_mints[account].add(mint)
+                if pool:
+                    excluded_account_pools[account].add(pool)
     for row in pool_vault_rows:
         mint = first(row, "mint", "base_mint")
         if mint not in eligible_mints:
@@ -950,16 +1022,37 @@ def build(args: argparse.Namespace) -> int:
     write_csv(output / "exact_holder_migration_carry_forward_rows.csv", carry_rows, CARRY_FIELDS)
     write_csv(output / "exact_holder_pre_to_post_state_continuity.csv", continuity_rows, CARRY_FIELDS)
     write_csv(output / "exact_holder_post_migration_state_rows.csv", post_rows, ACCOUNT_FIELDS)
+    rejected_migration_fields = [
+        "mint",
+        "launch_id",
+        "event_observed_at_utc",
+        "slot",
+        "signature",
+        "decoded_instruction_name",
+        "transaction_status",
+        "migration_confirmed",
+        "migration_evidence_type",
+        "post_migration_pool",
+        "rejection_reason",
+    ]
+    write_csv(
+        output / "exact_holder_rejected_migration_evidence_rows.csv",
+        rejected_migration_rows,
+        rejected_migration_fields,
+    )
     write_json(
         output / "exact_holder_migration_carry_forward_audit.json",
         {
-            "schema_version": "exact_holder_migration_carry_forward_audit.v1",
+            "schema_version": "exact_holder_migration_carry_forward_audit.v2",
             "generated_at_utc": utc_now(),
             "observed_migration_rows": len(migration_rows),
+            "confirmed_migration_evidence_rows": confirmed_migration_evidence_rows,
+            "confirmed_fresh_migration_rows": confirmed_fresh_migration_rows,
             "fresh_migrations": len(carry_rows),
-            "non_fresh_migration_rows_rejected": sum(
-                first(row, "mint") not in eligible_mints for row in migration_rows
-            ),
+            "rejected_migration_rows": len(rejected_migration_rows),
+            "non_fresh_migration_rows_rejected": non_fresh_migration_rows_rejected,
+            "unconfirmed_migration_rows_rejected": unconfirmed_migration_rows_rejected,
+            "mints_with_rejected_migration_evidence": mints_with_rejected_migration_evidence,
             "rejected_migration_mints": sorted(rejected_migration_mints),
             "carry_forward_complete_rows": sum(boolish(row["carry_forward_complete"]) for row in carry_rows),
             "pool_vaults_counted_as_holders": False,
@@ -1105,9 +1198,12 @@ def build(args: argparse.Namespace) -> int:
         "holder_concentration_rows": len(concentration_rows),
         "fresh_migrations": len(migration_by_mint),
         "observed_migration_rows": len(migration_rows),
-        "non_fresh_migration_rows_rejected": sum(
-            first(row, "mint") not in eligible_mints for row in migration_rows
-        ),
+        "confirmed_migration_evidence_rows": confirmed_migration_evidence_rows,
+        "confirmed_fresh_migration_rows": confirmed_fresh_migration_rows,
+        "rejected_migration_rows": len(rejected_migration_rows),
+        "non_fresh_migration_rows_rejected": non_fresh_migration_rows_rejected,
+        "unconfirmed_migration_rows_rejected": unconfirmed_migration_rows_rejected,
+        "mints_with_rejected_migration_evidence": mints_with_rejected_migration_evidence,
         "rejected_migration_mints": sorted(rejected_migration_mints),
         "post_migration_holder_rows": len(post_rows),
         "decision_time_exact_or_near_exact_rows": decision_ready_rows,
