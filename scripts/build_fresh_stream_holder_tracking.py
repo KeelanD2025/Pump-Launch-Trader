@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
@@ -132,9 +132,35 @@ def utc_now() -> str:
 
 
 def parse_time(value: Any) -> datetime | None:
+    if isinstance(value, (list, tuple)):
+        if len(value) < 6:
+            return None
+        try:
+            year, ordinal, hour, minute, second, nanosecond = (int(part) for part in value[:6])
+            offset_parts = [int(part) for part in value[6:9]]
+            offset_parts.extend([0] * (3 - len(offset_parts)))
+            offset_seconds = offset_parts[0] * 3600 + offset_parts[1] * 60 + offset_parts[2]
+            parsed = datetime(
+                year,
+                1,
+                1,
+                hour,
+                minute,
+                second,
+                nanosecond // 1_000,
+                tzinfo=timezone(timedelta(seconds=offset_seconds)),
+            ) + timedelta(days=ordinal - 1)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed.astimezone(timezone.utc)
     text = str(value or "").strip()
     if not text:
         return None
+    if text.startswith("["):
+        try:
+            return parse_time(json.loads(text))
+        except json.JSONDecodeError:
+            return None
     text = text.replace(" +00:00:00", "+00:00").replace(" UTC", "+00:00")
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
@@ -242,7 +268,11 @@ def source_type_for(row: dict[str, Any]) -> str:
             first(row, "update_type"),
         ]
     ).lower()
-    if "spl_token_account_subscription" in source or "account_subscription" in source:
+    if (
+        "spl_token_account_subscription" in source
+        or "account_subscription" in source
+        or "geyser_spl_token_account_update" in source
+    ):
         return "geyser_spl_token_account_update"
     if "token_balance" in source or "prepost" in source or "pre_post" in source:
         return "transaction_pre_post_token_balances"
@@ -384,20 +414,24 @@ def build(args: argparse.Namespace) -> int:
 
     activation_dt = time_from_nanos(manifest.get("tracker_activation_unix_nanos"))
     manifest_session = str(manifest.get("relay_session_id", ""))
-    provider_gap_count = sum(
-        1
+    integrity_gap_rows = [
+        row
         for row in gap_rows
         if boolish(row.get("provider_data_loss_seen"))
         or boolish(row.get("client_backpressure_detected"))
         or first(row, "blocker_class", "provider_blocker_class")
         in {"provider_lagged_data_loss", "relay_sequence_gap", "relay_downstream_backpressure"}
+    ]
+    provider_gap_count = len(integrity_gap_rows)
+    gap_times = [parse_time(first(row, "created_at", "event_observed_at_utc", "source_ts")) for row in integrity_gap_rows]
+    summary_gap_count = max(
+        intish(local_summary.get("sequence_gap_count")),
+        intish(local_summary.get("downstream_backpressure_count")),
     )
-    source_integrity = (
+    base_source_integrity = (
         boolish(manifest.get("dynamic_fresh_launch_tracking_enabled"))
         and intish(manifest.get("subscription_update_failures")) == 0
-        and provider_gap_count == 0
-        and intish(local_summary.get("sequence_gap_count")) == 0
-        and intish(local_summary.get("downstream_backpressure_count")) == 0
+        and summary_gap_count <= provider_gap_count
         and intish(local_summary.get("unverified_chunk_count")) == 0
     )
 
@@ -471,6 +505,18 @@ def build(args: argparse.Namespace) -> int:
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
     write_csv(output / "exact_holder_tracker_gap_audit.csv", tracker_gap_rows, ["mint", "launch_id", "gap_type", "gap_reason"])
 
+    source_integrity_by_mint: dict[str, bool] = {}
+    for mint in eligible_mints:
+        tracker_started = time_from_nanos(tracker_by_mint[mint].get("tracker_created_at_unix_nanos"))
+        launch_started = parse_time(first(launch_by_mint.get(mint, {}), "event_observed_at_utc", "source_ts"))
+        tracking_started = tracker_started or launch_started
+        gap_after_tracking_started = any(
+            gap_time is None or tracking_started is None or gap_time >= tracking_started
+            for gap_time in gap_times
+        )
+        source_integrity_by_mint[mint] = base_source_integrity and not gap_after_tracking_started
+    source_integrity = bool(eligible_mints) and all(source_integrity_by_mint.values())
+
     migration_by_mint: dict[str, dict[str, Any]] = {}
     for row in migration_rows:
         mint = first(row, "mint")
@@ -541,7 +587,7 @@ def build(args: argparse.Namespace) -> int:
             tracker_by_mint[mint],
             holder_by_mint_raw.get(mint, []),
             launch_signature,
-            source_integrity,
+            source_integrity_by_mint.get(mint, False),
         )
         quality_by_mint[mint] = quality
         quality_reasons[mint] = reasons
@@ -613,7 +659,7 @@ def build(args: argparse.Namespace) -> int:
                 "source_quality": quality_by_mint[mint],
                 "transaction_balance_rows": sum(row["source_type"].startswith("transaction") for row in mint_rows),
                 "account_subscription_rows": sum(row["source_type"] == "geyser_spl_token_account_update" for row in mint_rows),
-                "source_integrity_proven": source_integrity,
+                "source_integrity_proven": source_integrity_by_mint.get(mint, False),
                 "quality_reasons": "|".join(quality_reasons[mint]),
             }
         )
@@ -926,6 +972,8 @@ def build(args: argparse.Namespace) -> int:
         "source_quality_counts": dict(quality_counts),
         "provider_or_sequence_gap_count": provider_gap_count,
         "source_integrity_proven": source_integrity,
+        "source_integrity_mint_count": sum(source_integrity_by_mint.values()),
+        "source_gap_affected_mint_count": sum(not value for value in source_integrity_by_mint.values()),
         "rpc_used": False,
         "dex_as_holder_truth": False,
         "proxy_as_exact": False,

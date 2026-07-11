@@ -135,7 +135,7 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                     "decimals": "6",
                     "holder_balance_before": "0",
                     "holder_balance_after": "50000000",
-                    "update_source": "geyser_spl_token_account_subscription_update",
+                    "update_source": "geyser_spl_token_account_update",
                     "update_type": "token_account_balance_update",
                 },
                 {
@@ -151,7 +151,7 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                     "decimals": "6",
                     "holder_balance_before": "0",
                     "holder_balance_after": "400000000",
-                    "update_source": "geyser_spl_token_account_subscription_update",
+                    "update_source": "geyser_spl_token_account_update",
                     "update_type": "token_account_balance_update",
                 },
                 {
@@ -167,11 +167,22 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                     "decimals": "6",
                     "holder_balance_before": "0",
                     "holder_balance_after": "1",
-                    "update_source": "geyser_spl_token_account_subscription_update",
+                    "update_source": "geyser_spl_token_account_update",
                     "update_type": "token_account_balance_update",
                 },
             ]
             write_csv(run / "decoded_holder_event_rows.csv", holder_rows)
+            write_csv(
+                run / "run_gap_events.csv",
+                [
+                    {
+                        "provider_data_loss_seen": True,
+                        "client_backpressure_detected": False,
+                        "blocker_class": "provider_lagged_data_loss",
+                        "created_at": "[2025,365,23,59,59,0,0,0,0]",
+                    }
+                ],
+            )
             write_csv(
                 run / "quant_pumpfun_migration_event_rows.csv",
                 [
@@ -186,7 +197,6 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 ],
             )
             write_csv(run / "quant_pumpswap_pair_event_rows.csv", [])
-            write_csv(run / "run_gap_events.csv", [])
             (run / "local_collector_summary.json").write_text(
                 json.dumps(
                     {
@@ -247,6 +257,9 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             proof = json.loads((output / "exact_holder_fresh_launch_proof_report.json").read_text())
             self.assertEqual(proof["verdict"], "near_exact_holder_fresh_launch_tracking_ready")
             self.assertEqual(proof["source_quality_counts"][MODULE.NEAR_EXACT], 1)
+            self.assertGreater(proof["token_account_update_rows"], 0)
+            self.assertEqual(proof["provider_or_sequence_gap_count"], 1)
+            self.assertTrue(proof["source_integrity_proven"])
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertNotIn(old_mint, guard["accepted_mints"])
