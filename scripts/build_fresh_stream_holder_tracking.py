@@ -1017,7 +1017,8 @@ def build(args: argparse.Namespace) -> int:
     write_json(output / "exact_holder_fresh_lifecycle_contract.json", contract)
     (output / "exact_holder_fresh_lifecycle_contract.md").write_text(
         "# Fresh Stream Holder Contract\n\n"
-        "Only Pump.fun mints decoded after the relay tracker activation and enrolled by the same create update are accepted. "
+        "Only Pump.fun mints decoded after relay tracker activation and enrolled by the same create update enter the acceptance scope; "
+        "exact or near-exact source quality is still required to pass. "
         "RPC and Dex holder truth are forbidden. Trade-participant proxies remain research-only. Pool, curve, program, and burn accounts are excluded.\n"
     )
     write_json(output / "exact_holder_acceptance_policy.json", {"schema_version": "exact_holder_acceptance_policy.v1", **policy})
@@ -1027,7 +1028,13 @@ def build(args: argparse.Namespace) -> int:
             "schema_version": "exact_holder_no_stale_mint_guard.v1",
             **policy,
             "tracker_manifest_mints": sorted(tracker_by_mint),
-            "accepted_mints": sorted(eligible_mints),
+            "fresh_tracker_scope_mints": sorted(eligible_mints),
+            "accepted_mints": sorted(
+                mint for mint in eligible_mints if quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY
+            ),
+            "source_quality_rejected_mints": sorted(
+                mint for mint in eligible_mints if quality_by_mint.get(mint) not in ALLOWED_STRATEGY_QUALITY
+            ),
             "non_manifest_launch_rows_rejected": sum(first(row, "mint") not in tracker_by_mint for row in launch_rows),
         },
     )
