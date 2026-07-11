@@ -325,8 +325,6 @@ def quality_for_mint(
         reasons.append("mint_scoped_token_account_updates_missing")
     if not source_integrity:
         reasons.append("stream_continuity_not_proven")
-    if tracker.get("retired_reason"):
-        reasons.append(str(tracker["retired_reason"]))
     if full_snapshot and source_integrity and boolish(tracker.get("tracker_created")):
         return EXACT, reasons
     if (
@@ -334,7 +332,6 @@ def quality_for_mint(
         and baseline_rows
         and account_rows
         and source_integrity
-        and not tracker.get("retired_reason")
     ):
         return NEAR_EXACT, reasons
     if holder_rows:
@@ -564,6 +561,11 @@ def build(args: argparse.Namespace) -> int:
                 "confirmed_internal_launch": decoded,
                 "tracker_manifest_member": mint in tracker_by_mint,
                 "tracker_created": tracker_created,
+                "tracker_active": tracker.get("active", ""),
+                "tracker_retired_ts": fmt_time(
+                    time_from_nanos(tracker.get("retired_at_unix_nanos"))
+                ),
+                "tracker_retired_reason": first(tracker, "retired_reason"),
                 "tracker_created_ts": fmt_time(tracker_created_dt),
                 "tracker_delay_ms": tracker.get("tracker_delay_ms", ""),
                 "tracker_source": tracker.get("tracker_source", ""),
@@ -571,6 +573,7 @@ def build(args: argparse.Namespace) -> int:
                 "eligible_for_exact_holder_acceptance": False,
                 "currently_eligible_for_exact_holder_acceptance": False,
                 "acceptance_valid_until": "",
+                "acceptance_valid_until_reason": "",
                 "ineligible_reason": "|".join(ineligible),
             }
         )
@@ -596,6 +599,9 @@ def build(args: argparse.Namespace) -> int:
         "confirmed_internal_launch",
         "tracker_manifest_member",
         "tracker_created",
+        "tracker_active",
+        "tracker_retired_ts",
+        "tracker_retired_reason",
         "tracker_created_ts",
         "tracker_delay_ms",
         "tracker_source",
@@ -603,6 +609,7 @@ def build(args: argparse.Namespace) -> int:
         "eligible_for_exact_holder_acceptance",
         "currently_eligible_for_exact_holder_acceptance",
         "acceptance_valid_until",
+        "acceptance_valid_until_reason",
         "ineligible_reason",
     ]
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
@@ -649,11 +656,33 @@ def build(args: argparse.Namespace) -> int:
     )
 
     all_gap_times_parseable = all(gap_time is not None for gap_time in gap_times)
+    retired_tracker_mints = {
+        mint
+        for mint, tracker in tracker_by_mint.items()
+        if tracker.get("retired_at_unix_nanos") is not None
+        or tracker.get("active") is False
+        or (
+            isinstance(tracker.get("active"), str)
+            and str(tracker.get("active")).lower() == "false"
+        )
+    }
+    capacity_evicted_tracker_mints = {
+        mint
+        for mint in retired_tracker_mints
+        if "capacity" in first(tracker_by_mint[mint], "retired_reason").lower()
+    }
+    ttl_expired_tracker_mints = {
+        mint
+        for mint in retired_tracker_mints
+        if "ttl" in first(tracker_by_mint[mint], "retired_reason").lower()
+    }
     first_gap_by_mint: dict[str, datetime | None] = {}
+    continuity_cutoff_reason_by_mint: dict[str, str] = {}
     pre_gap_integrity_by_mint: dict[str, bool] = {}
     source_integrity_by_mint: dict[str, bool] = {}
     for mint in eligible_mints:
-        tracker_started = time_from_nanos(tracker_by_mint[mint].get("tracker_created_at_unix_nanos"))
+        tracker = tracker_by_mint[mint]
+        tracker_started = time_from_nanos(tracker.get("tracker_created_at_unix_nanos"))
         launch_started = parse_time(first(launch_by_mint.get(mint, {}), "event_observed_at_utc", "source_ts"))
         tracking_started = tracker_started or launch_started
         relevant_gaps = sorted(
@@ -661,9 +690,29 @@ def build(args: argparse.Namespace) -> int:
             for gap_time in gap_times
             if gap_time is not None and tracking_started is not None and gap_time >= tracking_started
         )
-        first_gap_by_mint[mint] = relevant_gaps[0] if relevant_gaps else None
+        cutoff_candidates: list[tuple[datetime, str]] = [
+            (gap_time, "provider_or_sequence_gap") for gap_time in relevant_gaps
+        ]
+        retired_at = time_from_nanos(tracker.get("retired_at_unix_nanos"))
+        active_value = tracker.get("active")
+        retirement_declared = retired_at is not None or active_value is False or (
+            isinstance(active_value, str) and active_value.lower() == "false"
+        )
+        retired_reason = first(tracker, "retired_reason") or "tracker_retired"
+        if retired_at is not None:
+            cutoff_candidates.append((retired_at, retired_reason))
+        elif retirement_declared and tracking_started is not None:
+            cutoff_candidates.append((tracking_started, "tracker_retirement_timestamp_missing"))
+        if cutoff_candidates:
+            cutoff, cutoff_reason = min(cutoff_candidates, key=lambda item: item[0])
+            first_gap_by_mint[mint] = cutoff
+            continuity_cutoff_reason_by_mint[mint] = cutoff_reason
+        else:
+            first_gap_by_mint[mint] = None
+            continuity_cutoff_reason_by_mint[mint] = ""
         pre_gap_integrity_by_mint[mint] = (
             base_source_integrity and all_gap_times_parseable and tracking_started is not None
+            and not (retirement_declared and retired_at is None)
         )
         source_integrity_by_mint[mint] = (
             pre_gap_integrity_by_mint[mint] and first_gap_by_mint[mint] is None
@@ -832,7 +881,11 @@ def build(args: argparse.Namespace) -> int:
             quality_reasons[mint] = list(reasons)
         else:
             quality_by_mint[mint] = OBSERVED if holder_by_mint_raw.get(mint) else PROXY
-            quality_reasons[mint] = [*reasons, f"stream_continuity_lost_at_{fmt_time(first_gap)}"]
+            cutoff_reason = continuity_cutoff_reason_by_mint.get(mint, "unknown")
+            quality_reasons[mint] = [
+                *reasons,
+                f"stream_continuity_lost_{cutoff_reason}_at_{fmt_time(first_gap)}",
+            ]
 
     def quality_at_time(mint: str, source_ts: datetime | None) -> str:
         proven_quality = proven_quality_by_mint.get(mint, PROXY)
@@ -853,6 +906,7 @@ def build(args: argparse.Namespace) -> int:
         row["eligible_for_exact_holder_acceptance"] = accepted
         row["currently_eligible_for_exact_holder_acceptance"] = current_accepted
         row["acceptance_valid_until"] = fmt_time(first_gap_by_mint.get(mint))
+        row["acceptance_valid_until_reason"] = continuity_cutoff_reason_by_mint.get(mint, "")
         if mint in eligible_mints and not accepted:
             row["ineligible_reason"] = f"source_quality_{proven_quality}_not_exact_or_near_exact"
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
@@ -1310,6 +1364,9 @@ def build(args: argparse.Namespace) -> int:
                 "source_quality": quality_by_mint.get(mint, PROXY),
                 "best_proven_source_quality": proven_quality_by_mint.get(mint, PROXY),
                 "near_exact_valid_until": fmt_time(first_gap_by_mint.get(mint)),
+                "near_exact_valid_until_reason": continuity_cutoff_reason_by_mint.get(
+                    mint, ""
+                ),
                 "migration_seen": mint in migration_by_mint,
                 "carry_forward_complete": carry.get("carry_forward_complete", False),
                 "decision_time_rows": sum(row["mint"] == mint for row in decision_output),
@@ -1318,7 +1375,7 @@ def build(args: argparse.Namespace) -> int:
                 "gap_reason": "|".join(quality_reasons.get(mint, [])),
             }
         )
-    proof_fields = ["mint", "launch_id", "internal_launch_row", "tracker_created", "token_account_update_rows", "tx_balance_reconstruction_rows", "holder_balance_state_rows", "source_quality", "best_proven_source_quality", "near_exact_valid_until", "migration_seen", "carry_forward_complete", "decision_time_rows", "eligible_for_exact_holder_acceptance", "currently_eligible_for_exact_holder_acceptance", "gap_reason"]
+    proof_fields = ["mint", "launch_id", "internal_launch_row", "tracker_created", "token_account_update_rows", "tx_balance_reconstruction_rows", "holder_balance_state_rows", "source_quality", "best_proven_source_quality", "near_exact_valid_until", "near_exact_valid_until_reason", "migration_seen", "carry_forward_complete", "decision_time_rows", "eligible_for_exact_holder_acceptance", "currently_eligible_for_exact_holder_acceptance", "gap_reason"]
     write_csv(output / "exact_holder_proof_window_rows.csv", proof_rows, proof_fields)
 
     proof_report = {
@@ -1355,6 +1412,12 @@ def build(args: argparse.Namespace) -> int:
         ),
         "fresh_launches": len(eligible_mints),
         "trackers_created": sum(boolish(row.get("tracker_created")) for row in trackers),
+        "retired_trackers": len(retired_tracker_mints),
+        "retired_tracker_mints": sorted(retired_tracker_mints),
+        "capacity_evicted_trackers": len(capacity_evicted_tracker_mints),
+        "capacity_evicted_tracker_mints": sorted(capacity_evicted_tracker_mints),
+        "ttl_expired_trackers": len(ttl_expired_tracker_mints),
+        "ttl_expired_tracker_mints": sorted(ttl_expired_tracker_mints),
         "token_account_update_rows": len(account_rows),
         "tx_balance_reconstruction_rows": len(tx_rows),
         "holder_balance_state_rows": len(normalized_rows),
@@ -1405,6 +1468,7 @@ def build(args: argparse.Namespace) -> int:
         "holder_tracker_created_at_launch_required": True,
         "confirmed_internal_create_instruction_required": True,
         "pending_create_backfill_allowed_for_acceptance": False,
+        "tracker_retirement_ends_near_exact_validity": True,
         "stream_only_required": True,
         "rpc_holder_snapshot_allowed": False,
         "dex_as_holder_truth": False,
@@ -1419,6 +1483,7 @@ def build(args: argparse.Namespace) -> int:
         "full_strategy_quality_allowed": [EXACT, NEAR_EXACT],
         "quality_is_time_bounded": True,
         "provider_gap_downgrades_rows_at_or_after_gap": True,
+        "tracker_retirement_ends_near_exact_validity": True,
         "policy": policy,
         "proxy_holder_allowed_for_research_only": True,
         "safety_flags": SAFETY_FALSE,
@@ -1469,6 +1534,9 @@ def build(args: argparse.Namespace) -> int:
             "confirmed_launches_without_tracker_mints": sorted(confirmed_launches_without_tracker),
             "post_manifest_confirmed_launch_mints": sorted(post_manifest_confirmed_launch_mints),
             "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
+            "retired_tracker_mints": sorted(retired_tracker_mints),
+            "capacity_evicted_tracker_mints": sorted(capacity_evicted_tracker_mints),
+            "ttl_expired_tracker_mints": sorted(ttl_expired_tracker_mints),
             "manifest_trackers_without_confirmed_internal_launch_mints": sorted(
                 manifest_trackers_without_confirmed_launch
             ),
@@ -1564,6 +1632,9 @@ def build(args: argparse.Namespace) -> int:
         ),
         "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
         "launch_tracker_coverage_complete": launch_tracker_gate,
+        "retired_trackers": len(retired_tracker_mints),
+        "capacity_evicted_trackers": len(capacity_evicted_tracker_mints),
+        "ttl_expired_trackers": len(ttl_expired_tracker_mints),
         "exact_mints": proven_quality_counts[EXACT],
         "near_exact_mints": proven_quality_counts[NEAR_EXACT],
         "observed_subset_mints": quality_counts[OBSERVED],

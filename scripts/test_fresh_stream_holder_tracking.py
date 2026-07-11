@@ -57,7 +57,9 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "tracker_created_at_unix_nanos": activation_nanos + 1_010_000_000,
                         "tracker_delay_ms": 10,
                         "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
-                        "active": True,
+                        "active": False,
+                        "retired_at_unix_nanos": activation_nanos + 18_000_000_000,
+                        "retired_reason": "capacity_evicted",
                     }
                 ],
             }
@@ -363,6 +365,9 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertEqual(proof["confirmed_launches_without_tracker_mints"], [])
             self.assertEqual(proof["confirmed_launch_tracker_coverage_pct"], 100.0)
             self.assertTrue(proof["launch_tracker_coverage_complete"])
+            self.assertEqual(proof["retired_trackers"], 1)
+            self.assertEqual(proof["capacity_evicted_trackers"], 1)
+            self.assertEqual(proof["ttl_expired_trackers"], 0)
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertEqual(guard["currently_accepted_mints"], [])
@@ -391,7 +396,10 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertEqual(tracker["eligible_for_fresh_tracker_scope"], "True")
             self.assertEqual(tracker["eligible_for_exact_holder_acceptance"], "True")
             self.assertEqual(tracker["currently_eligible_for_exact_holder_acceptance"], "False")
-            self.assertEqual(tracker["acceptance_valid_until"], "2026-01-01T00:00:20Z")
+            self.assertEqual(tracker["tracker_active"], "False")
+            self.assertEqual(tracker["tracker_retired_reason"], "capacity_evicted")
+            self.assertEqual(tracker["acceptance_valid_until"], "2026-01-01T00:00:18Z")
+            self.assertEqual(tracker["acceptance_valid_until_reason"], "capacity_evicted")
 
             with (output / "exact_holder_balance_state_rows.csv").open(newline="") as handle:
                 balances = list(csv.DictReader(handle))
