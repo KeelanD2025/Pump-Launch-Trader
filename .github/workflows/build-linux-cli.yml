@@ -163,6 +163,9 @@ jobs:
       - name: Run test suite
         run: cargo test -q
 
+      - name: Run fresh stream holder tests
+        run: python3 scripts/test_fresh_stream_holder_tracking.py
+
       - name: Build release CLI
         run: cargo build --release -p cli
 
