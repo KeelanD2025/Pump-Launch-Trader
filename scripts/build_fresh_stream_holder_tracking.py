@@ -492,6 +492,17 @@ def build(args: argparse.Namespace) -> int:
         if mint and mint not in tracker_by_mint:
             tracker_by_mint[mint] = row
 
+    manifest_launch_slot_cutoff = max(
+        (intish(row.get("launch_slot")) for row in tracker_by_mint.values()),
+        default=0,
+    )
+
+    def launch_is_within_manifest_window(row: dict[str, Any]) -> bool:
+        if not tracker_by_mint:
+            return True
+        launch_slot = intish(first(row, "slot"))
+        return launch_slot <= manifest_launch_slot_cutoff if launch_slot else True
+
     for row in rejected_launch_rows:
         row["tracker_manifest_member"] = row["mint"] in tracker_by_mint
 
@@ -537,7 +548,10 @@ def build(args: argparse.Namespace) -> int:
         if not after_activation:
             ineligible.append("launch_not_after_tracker_activation")
         if mint not in tracker_by_mint:
-            ineligible.append("tracker_manifest_row_missing")
+            if launch and not launch_is_within_manifest_window(launch):
+                ineligible.append("launch_after_manifest_snapshot_not_assessed")
+            else:
+                ineligible.append("tracker_manifest_row_missing")
         elif not tracker_created:
             ineligible.append(first(tracker, "ineligible_reason") or "tracker_not_created")
         if tracker_created and decoded and after_activation:
@@ -561,8 +575,18 @@ def build(args: argparse.Namespace) -> int:
             }
         )
         if ineligible:
+            gap_type = (
+                "manifest_snapshot_boundary"
+                if "launch_after_manifest_snapshot_not_assessed" in ineligible
+                else "tracker_acceptance_gap"
+            )
             tracker_gap_rows.append(
-                {"mint": mint, "launch_id": launch_id, "gap_type": "tracker_acceptance_gap", "gap_reason": "|".join(ineligible)}
+                {
+                    "mint": mint,
+                    "launch_id": launch_id,
+                    "gap_type": gap_type,
+                    "gap_reason": "|".join(ineligible),
+                }
             )
 
     launch_fields = [
@@ -591,20 +615,35 @@ def build(args: argparse.Namespace) -> int:
         and (launch_ts := parse_time(first(row, "event_observed_at_utc", "source_ts")))
         and launch_ts >= activation_dt
     }
-    confirmed_launches_with_tracker = {
+    confirmed_launch_mints_within_manifest_window = {
         mint
         for mint in confirmed_post_activation_mints
+        if launch_is_within_manifest_window(launch_by_mint[mint])
+    }
+    post_manifest_confirmed_launch_mints = (
+        confirmed_post_activation_mints - confirmed_launch_mints_within_manifest_window
+    )
+    confirmed_launches_with_tracker = {
+        mint
+        for mint in confirmed_launch_mints_within_manifest_window
         if boolish(tracker_by_mint.get(mint, {}).get("tracker_created"))
     }
-    confirmed_launches_without_tracker = confirmed_post_activation_mints - confirmed_launches_with_tracker
+    confirmed_launches_without_tracker = (
+        confirmed_launch_mints_within_manifest_window - confirmed_launches_with_tracker
+    )
     manifest_trackers_without_confirmed_launch = set(tracker_by_mint) - set(launch_by_mint)
     confirmed_launch_tracker_coverage_pct = (
-        round(len(confirmed_launches_with_tracker) / len(confirmed_post_activation_mints) * 100, 4)
-        if confirmed_post_activation_mints
+        round(
+            len(confirmed_launches_with_tracker)
+            / len(confirmed_launch_mints_within_manifest_window)
+            * 100,
+            4,
+        )
+        if confirmed_launch_mints_within_manifest_window
         else 0.0
     )
     launch_tracker_gate = (
-        bool(confirmed_post_activation_mints)
+        bool(confirmed_launch_mints_within_manifest_window)
         and not confirmed_launches_without_tracker
         and not manifest_trackers_without_confirmed_launch
     )
@@ -1294,6 +1333,12 @@ def build(args: argparse.Namespace) -> int:
         "confirmed_internal_launch_rows": len(confirmed_launch_rows),
         "confirmed_internal_launch_mints": len(launch_by_mint),
         "confirmed_post_activation_launch_mints": len(confirmed_post_activation_mints),
+        "manifest_launch_slot_cutoff": manifest_launch_slot_cutoff,
+        "confirmed_launch_mints_within_manifest_window": len(
+            confirmed_launch_mints_within_manifest_window
+        ),
+        "post_manifest_confirmed_launch_mints": len(post_manifest_confirmed_launch_mints),
+        "post_manifest_confirmed_launch_mint_ids": sorted(post_manifest_confirmed_launch_mints),
         "rejected_launch_evidence_rows": len(rejected_launch_rows),
         "pending_create_backfill_rows_rejected": sum(
             row["decoded_instruction_name"] == "pending_create_backfill"
@@ -1416,7 +1461,13 @@ def build(args: argparse.Namespace) -> int:
             "non_manifest_confirmed_launch_rows_rejected": sum(
                 first(row, "mint") not in tracker_by_mint for row in confirmed_launch_rows
             ),
+            "non_manifest_confirmed_launch_rows_within_snapshot_rejected": sum(
+                first(row, "mint") not in tracker_by_mint
+                and launch_is_within_manifest_window(row)
+                for row in confirmed_launch_rows
+            ),
             "confirmed_launches_without_tracker_mints": sorted(confirmed_launches_without_tracker),
+            "post_manifest_confirmed_launch_mints": sorted(post_manifest_confirmed_launch_mints),
             "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
             "manifest_trackers_without_confirmed_internal_launch_mints": sorted(
                 manifest_trackers_without_confirmed_launch
@@ -1501,6 +1552,11 @@ def build(args: argparse.Namespace) -> int:
         "full_strategy_dataset_ready": full_ready,
         "fresh_launches": len(eligible_mints),
         "confirmed_post_activation_launch_mints": len(confirmed_post_activation_mints),
+        "manifest_launch_slot_cutoff": manifest_launch_slot_cutoff,
+        "confirmed_launch_mints_within_manifest_window": len(
+            confirmed_launch_mints_within_manifest_window
+        ),
+        "post_manifest_confirmed_launch_mints": len(post_manifest_confirmed_launch_mints),
         "confirmed_launches_with_tracker": len(confirmed_launches_with_tracker),
         "confirmed_launches_without_tracker": len(confirmed_launches_without_tracker),
         "manifest_trackers_without_confirmed_internal_launch": len(

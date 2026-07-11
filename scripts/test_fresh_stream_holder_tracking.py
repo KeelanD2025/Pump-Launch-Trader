@@ -451,7 +451,9 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             strategy.mkdir()
 
             tracked_mint = "TrackedFreshMintpump"
+            tracked_anchor_mint = "TrackedAnchorMintpump"
             untracked_mint = "UntrackedFreshMintpump"
+            post_manifest_mint = "PostManifestFreshMintpump"
             activation = datetime(2026, 1, 1, tzinfo=timezone.utc)
             activation_nanos = int(activation.timestamp() * 1_000_000_000)
             manifest_path = root / "manifest.json"
@@ -473,6 +475,19 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                                 "tracker_created": True,
                                 "tracker_created_at_unix_nanos": activation_nanos
                                 + 1_010_000_000,
+                                "tracker_delay_ms": 10,
+                                "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
+                                "active": True,
+                            },
+                            {
+                                "mint": tracked_anchor_mint,
+                                "launch_slot": 12,
+                                "launch_signature": "tracked-anchor-launch",
+                                "launch_observed_at_unix_nanos": activation_nanos
+                                + 3_000_000_000,
+                                "tracker_created": True,
+                                "tracker_created_at_unix_nanos": activation_nanos
+                                + 3_010_000_000,
                                 "tracker_delay_ms": 10,
                                 "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
                                 "active": True,
@@ -515,6 +530,38 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "creator_wallet": "untracked-creator",
                         "bonding_curve": "untracked-curve",
                         "associated_bonding_curve": "untracked-curve-token",
+                    },
+                    {
+                        "mint": tracked_anchor_mint,
+                        "launch_id": "launch-tracked-anchor",
+                        "event_observed_at_utc": "2026-01-01T00:00:03Z",
+                        "slot": 12,
+                        "signature": "tracked-anchor-launch",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "tracked-anchor-creator",
+                        "bonding_curve": "tracked-anchor-curve",
+                        "associated_bonding_curve": "tracked-anchor-curve-token",
+                    },
+                    {
+                        "mint": post_manifest_mint,
+                        "launch_id": "launch-post-manifest",
+                        "event_observed_at_utc": "2026-01-01T00:00:04Z",
+                        "slot": 13,
+                        "signature": "post-manifest-launch",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "post-manifest-creator",
+                        "bonding_curve": "post-manifest-curve",
+                        "associated_bonding_curve": "post-manifest-curve-token",
                     },
                 ],
             )
@@ -585,9 +632,17 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 proof["verdict"],
                 "partial_fresh_launches_tracked_no_migration_yet",
             )
-            self.assertEqual(proof["confirmed_launches_with_tracker"], 1)
+            self.assertEqual(proof["confirmed_launches_with_tracker"], 2)
             self.assertEqual(proof["confirmed_launches_without_tracker"], 1)
-            self.assertEqual(proof["confirmed_launch_tracker_coverage_pct"], 50.0)
+            self.assertEqual(
+                proof["confirmed_launch_tracker_coverage_pct"],
+                66.6667,
+            )
+            self.assertEqual(proof["post_manifest_confirmed_launch_mints"], 1)
+            self.assertEqual(
+                proof["post_manifest_confirmed_launch_mint_ids"],
+                [post_manifest_mint],
+            )
             self.assertFalse(proof["launch_tracker_coverage_complete"])
 
             readiness = json.loads((output / "full_strategy_dataset_readiness.json").read_text())
@@ -602,6 +657,14 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 tracker_gaps = list(csv.DictReader(handle))
             untracked_gap = next(row for row in tracker_gaps if row["mint"] == untracked_mint)
             self.assertIn("tracker_manifest_row_missing", untracked_gap["gap_reason"])
+            post_manifest_gap = next(
+                row for row in tracker_gaps if row["mint"] == post_manifest_mint
+            )
+            self.assertEqual(post_manifest_gap["gap_type"], "manifest_snapshot_boundary")
+            self.assertIn(
+                "launch_after_manifest_snapshot_not_assessed",
+                post_manifest_gap["gap_reason"],
+            )
 
 
 if __name__ == "__main__":
