@@ -520,10 +520,13 @@ def build(args: argparse.Namespace) -> int:
     source_integrity = bool(eligible_mints) and all(source_integrity_by_mint.values())
 
     migration_by_mint: dict[str, dict[str, Any]] = {}
+    rejected_migration_mints: set[str] = set()
     for row in migration_rows:
         mint = first(row, "mint")
         ts = parse_time(first(row, "event_observed_at_utc"))
         if mint not in eligible_mints or ts is None:
+            if mint:
+                rejected_migration_mints.add(mint)
             continue
         previous = migration_by_mint.get(mint)
         if previous is None or ts < parse_time(first(previous, "event_observed_at_utc")):
@@ -848,7 +851,12 @@ def build(args: argparse.Namespace) -> int:
         {
             "schema_version": "exact_holder_migration_carry_forward_audit.v1",
             "generated_at_utc": utc_now(),
+            "observed_migration_rows": len(migration_rows),
             "fresh_migrations": len(carry_rows),
+            "non_fresh_migration_rows_rejected": sum(
+                first(row, "mint") not in eligible_mints for row in migration_rows
+            ),
+            "rejected_migration_mints": sorted(rejected_migration_mints),
             "carry_forward_complete_rows": sum(boolish(row["carry_forward_complete"]) for row in carry_rows),
             "pool_vaults_counted_as_holders": False,
             "rpc_used": False,
@@ -978,6 +986,11 @@ def build(args: argparse.Namespace) -> int:
         "holder_balance_state_rows": len(normalized_rows),
         "holder_concentration_rows": len(concentration_rows),
         "fresh_migrations": len(migration_by_mint),
+        "observed_migration_rows": len(migration_rows),
+        "non_fresh_migration_rows_rejected": sum(
+            first(row, "mint") not in eligible_mints for row in migration_rows
+        ),
+        "rejected_migration_mints": sorted(rejected_migration_mints),
         "post_migration_holder_rows": len(post_rows),
         "decision_time_exact_or_near_exact_rows": decision_ready_rows,
         "source_quality_counts": dict(quality_counts),

@@ -260,6 +260,8 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertGreater(proof["token_account_update_rows"], 0)
             self.assertEqual(proof["provider_or_sequence_gap_count"], 1)
             self.assertTrue(proof["source_integrity_proven"])
+            self.assertEqual(proof["observed_migration_rows"], 1)
+            self.assertEqual(proof["non_fresh_migration_rows_rejected"], 0)
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertNotIn(old_mint, guard["accepted_mints"])
