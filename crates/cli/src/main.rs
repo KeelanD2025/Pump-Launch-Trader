@@ -461,6 +461,10 @@ enum Command {
         #[arg(long, default_value = "/run/pump-launch-quant/stream-relay")]
         health_dir: String,
         #[arg(long)]
+        exact_holder_bootstrap_checkpoint: Option<String>,
+        #[arg(long, default_value_t = 600)]
+        exact_holder_bootstrap_max_age_seconds: u64,
+        #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         json: bool,
@@ -4612,6 +4616,8 @@ async fn main() -> Result<()> {
             receiver_url,
             duration_seconds,
             health_dir,
+            exact_holder_bootstrap_checkpoint,
+            exact_holder_bootstrap_max_age_seconds,
             dry_run,
             json,
         } => {
@@ -4620,6 +4626,8 @@ async fn main() -> Result<()> {
                 receiver_url.as_deref(),
                 duration_seconds,
                 &health_dir,
+                exact_holder_bootstrap_checkpoint.as_deref(),
+                exact_holder_bootstrap_max_age_seconds,
                 dry_run,
                 json,
             )
@@ -51492,6 +51500,7 @@ fn build_relay_health_summary(
             .geyser
             .exact_holder_fresh_launch_dynamic_enabled,
         exact_holder_tracker_activation_unix_nanos: None,
+        exact_holder_relay_started_at_unix_nanos: None,
         exact_holder_dynamic_max_mints: loaded.config.geyser.exact_holder_dynamic_max_mints,
         exact_holder_dynamic_ttl_seconds: loaded.config.geyser.exact_holder_dynamic_ttl_seconds,
         exact_holder_fresh_launch_observations: 0,
@@ -51500,6 +51509,13 @@ fn build_relay_health_summary(
         exact_holder_capacity_evictions: 0,
         exact_holder_ttl_expirations: 0,
         exact_holder_active_mint_count: 0,
+        exact_holder_bootstrap_applied: false,
+        exact_holder_bootstrap_source_run_id: None,
+        exact_holder_bootstrap_source_relay_session_id: None,
+        exact_holder_bootstrap_checkpoint_sha256: None,
+        exact_holder_bootstrapped_tracker_count: 0,
+        exact_holder_bootstrap_expired_tracker_count: 0,
+        exact_holder_handoff_generation: 0,
         exact_holder_tracker_rows: Vec::new(),
     }
 }
@@ -51507,6 +51523,286 @@ fn build_relay_health_summary(
 #[derive(Debug, Clone)]
 struct RelayFreshHolderMint {
     tracker_created_at: Instant,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayFreshHolderHandoffCheckpoint {
+    schema_version: String,
+    captured_at_unix_nanos: u64,
+    source_run_finalized_at_unix_nanos: u64,
+    source_run_id: String,
+    source_relay_session_id: String,
+    source_manifest_sha256: String,
+    source_manifest_json: String,
+    immediately_preceding_mission_slice: bool,
+    source_local_collector_exit_ok: bool,
+    source_r2_unverified_chunks: u64,
+    source_receiver_backpressure_count: u64,
+    source_holder_rpc_used: bool,
+    source_live_trading_enabled: bool,
+    source_replay_run: bool,
+    source_backtesting_run: bool,
+    source_threshold_tuning_run: bool,
+    stream_only_required: bool,
+    rpc_holder_snapshot_allowed: bool,
+    dex_as_holder_truth: bool,
+    proxy_as_exact: bool,
+    pool_vaults_counted_as_holders: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayFreshHolderTrackerManifestInput {
+    schema_version: String,
+    relay_session_id: String,
+    tracker_activation_unix_nanos: Option<u64>,
+    dynamic_fresh_launch_tracking_enabled: bool,
+    max_active_mints: usize,
+    mint_ttl_seconds: u64,
+    #[serde(default)]
+    active_mints: Vec<String>,
+    #[serde(default)]
+    tracker_rows: Vec<FreshHolderTrackerActivation>,
+    stream_only_required: bool,
+    rpc_holder_snapshot_allowed: bool,
+    dex_as_holder_truth: bool,
+    proxy_as_exact: bool,
+    pool_vaults_counted_as_holders: bool,
+    #[serde(default)]
+    handoff_generation: u64,
+}
+
+fn relay_apply_fresh_holder_bootstrap(
+    checkpoint_path: &Path,
+    max_checkpoint_age_seconds: u64,
+    config: &common::GeyserConfig,
+    summary: &mut RelayHealthSummary,
+) -> Result<(BTreeMap<String, RelayFreshHolderMint>, HashSet<String>)> {
+    if !config.exact_holder_fresh_launch_dynamic_enabled {
+        bail!("exact-holder bootstrap requires dynamic fresh-launch tracking");
+    }
+    if max_checkpoint_age_seconds == 0 {
+        bail!("exact-holder bootstrap checkpoint max age must be positive");
+    }
+    let checkpoint_bytes = fs::read(checkpoint_path).with_context(|| {
+        format!(
+            "read exact-holder bootstrap checkpoint {}",
+            checkpoint_path.display()
+        )
+    })?;
+    let checkpoint_sha256 = format!("{:x}", Sha256::digest(&checkpoint_bytes));
+    let checkpoint: RelayFreshHolderHandoffCheckpoint = serde_json::from_slice(&checkpoint_bytes)
+        .with_context(|| {
+        format!(
+            "decode exact-holder bootstrap checkpoint {}",
+            checkpoint_path.display()
+        )
+    })?;
+    if checkpoint.schema_version != "exact_holder_tracker_handoff_checkpoint.v1" {
+        bail!(
+            "unsupported exact-holder bootstrap checkpoint schema {}",
+            checkpoint.schema_version
+        );
+    }
+    if checkpoint.source_run_id.is_empty()
+        || !checkpoint
+            .source_run_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("exact-holder bootstrap checkpoint has invalid source run id");
+    }
+    if checkpoint.source_relay_session_id.is_empty() {
+        bail!("exact-holder bootstrap checkpoint source relay session is missing");
+    }
+    if !checkpoint.immediately_preceding_mission_slice || !checkpoint.source_local_collector_exit_ok
+    {
+        bail!("exact-holder bootstrap checkpoint is not a finalized immediate predecessor");
+    }
+    if checkpoint.source_r2_unverified_chunks != 0
+        || checkpoint.source_receiver_backpressure_count != 0
+        || checkpoint.source_holder_rpc_used
+        || checkpoint.source_live_trading_enabled
+        || checkpoint.source_replay_run
+        || checkpoint.source_backtesting_run
+        || checkpoint.source_threshold_tuning_run
+    {
+        bail!("exact-holder bootstrap checkpoint violates source safety requirements");
+    }
+    if !checkpoint.stream_only_required
+        || checkpoint.rpc_holder_snapshot_allowed
+        || checkpoint.dex_as_holder_truth
+        || checkpoint.proxy_as_exact
+        || checkpoint.pool_vaults_counted_as_holders
+    {
+        bail!("exact-holder bootstrap checkpoint violates holder source policy");
+    }
+
+    let now_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+    let future_tolerance_nanos = 5_000_000_000u64;
+    if checkpoint.captured_at_unix_nanos > now_unix_nanos.saturating_add(future_tolerance_nanos)
+        || checkpoint.source_run_finalized_at_unix_nanos
+            > checkpoint
+                .captured_at_unix_nanos
+                .saturating_add(future_tolerance_nanos)
+    {
+        bail!("exact-holder bootstrap checkpoint timestamps are in the future");
+    }
+    let checkpoint_age_nanos = now_unix_nanos.saturating_sub(checkpoint.captured_at_unix_nanos);
+    if checkpoint_age_nanos > max_checkpoint_age_seconds.saturating_mul(1_000_000_000) {
+        bail!(
+            "exact-holder bootstrap checkpoint is stale age_seconds={} max_seconds={}",
+            checkpoint_age_nanos / 1_000_000_000,
+            max_checkpoint_age_seconds
+        );
+    }
+    let source_finalization_age_nanos =
+        now_unix_nanos.saturating_sub(checkpoint.source_run_finalized_at_unix_nanos);
+    if source_finalization_age_nanos > max_checkpoint_age_seconds.saturating_mul(1_000_000_000) {
+        bail!(
+            "exact-holder bootstrap source slice is stale age_seconds={} max_seconds={}",
+            source_finalization_age_nanos / 1_000_000_000,
+            max_checkpoint_age_seconds
+        );
+    }
+
+    let source_manifest_sha256 = format!(
+        "{:x}",
+        Sha256::digest(checkpoint.source_manifest_json.as_bytes())
+    );
+    if source_manifest_sha256 != checkpoint.source_manifest_sha256.to_ascii_lowercase() {
+        bail!("exact-holder bootstrap source manifest hash mismatch");
+    }
+    let source_manifest: RelayFreshHolderTrackerManifestInput =
+        serde_json::from_str(&checkpoint.source_manifest_json)
+            .context("decode exact-holder bootstrap source manifest")?;
+    if source_manifest.schema_version != "exact_holder_tracker_activation_manifest.v1" {
+        bail!(
+            "unsupported exact-holder source manifest schema {}",
+            source_manifest.schema_version
+        );
+    }
+    if source_manifest.relay_session_id != checkpoint.source_relay_session_id {
+        bail!("exact-holder bootstrap relay session lineage mismatch");
+    }
+    if !source_manifest.dynamic_fresh_launch_tracking_enabled
+        || !source_manifest.stream_only_required
+        || source_manifest.rpc_holder_snapshot_allowed
+        || source_manifest.dex_as_holder_truth
+        || source_manifest.proxy_as_exact
+        || source_manifest.pool_vaults_counted_as_holders
+    {
+        bail!("exact-holder source manifest violates stream-only holder policy");
+    }
+    if source_manifest.max_active_mints != config.exact_holder_dynamic_max_mints
+        || source_manifest.mint_ttl_seconds != config.exact_holder_dynamic_ttl_seconds
+    {
+        bail!(
+            "exact-holder bootstrap cap/ttl mismatch source_max={} configured_max={} source_ttl={} configured_ttl={}",
+            source_manifest.max_active_mints,
+            config.exact_holder_dynamic_max_mints,
+            source_manifest.mint_ttl_seconds,
+            config.exact_holder_dynamic_ttl_seconds
+        );
+    }
+    let activation_unix_nanos = source_manifest
+        .tracker_activation_unix_nanos
+        .ok_or_else(|| anyhow!("exact-holder source manifest activation timestamp is missing"))?;
+    if activation_unix_nanos > checkpoint.captured_at_unix_nanos {
+        bail!("exact-holder source activation follows checkpoint capture");
+    }
+
+    let active_mint_set = source_manifest
+        .active_mints
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if active_mint_set.len() != source_manifest.active_mints.len() {
+        bail!("exact-holder source manifest contains duplicate active mints");
+    }
+    if active_mint_set.len() > config.exact_holder_dynamic_max_mints {
+        bail!("exact-holder source manifest exceeds configured mint cap");
+    }
+    let mut active_rows: BTreeMap<String, FreshHolderTrackerActivation> = BTreeMap::new();
+    for row in source_manifest.tracker_rows {
+        if !active_mint_set.contains(&row.mint) {
+            continue;
+        }
+        if active_rows.insert(row.mint.clone(), row).is_some() {
+            bail!("exact-holder source manifest has duplicate active tracker rows");
+        }
+    }
+    if active_rows.len() != active_mint_set.len() {
+        bail!("exact-holder source manifest active mints and tracker rows disagree");
+    }
+
+    let now_instant = Instant::now();
+    let ttl = StdDuration::from_secs(config.exact_holder_dynamic_ttl_seconds.max(1));
+    let mut active_mints = BTreeMap::new();
+    let mut seen_mints = HashSet::new();
+    let mut bootstrapped_rows = Vec::with_capacity(active_rows.len());
+    let mut expired_count = 0u64;
+    for (mint, mut row) in active_rows {
+        Pubkey::from_str(&mint)
+            .with_context(|| format!("invalid exact-holder bootstrap mint {mint}"))?;
+        let tracker_created_at_unix_nanos = row.tracker_created_at_unix_nanos.ok_or_else(|| {
+            anyhow!("exact-holder bootstrap tracker creation timestamp missing for {mint}")
+        })?;
+        if !row.tracker_created
+            || !row.active
+            || !row.eligible_for_exact_holder_acceptance
+            || row.retired_at_unix_nanos.is_some()
+            || row.retired_reason.is_some()
+            || row.ineligible_reason.is_some()
+            || row.tracker_source != "yellowstone_pump_create_dynamic_token_account_filter"
+        {
+            bail!("exact-holder bootstrap tracker row is not active/eligible for {mint}");
+        }
+        if row.launch_slot == 0
+            || row.launch_observed_at_unix_nanos < activation_unix_nanos
+            || tracker_created_at_unix_nanos < row.launch_observed_at_unix_nanos
+            || tracker_created_at_unix_nanos > now_unix_nanos.saturating_add(future_tolerance_nanos)
+        {
+            bail!("exact-holder bootstrap tracker chronology is invalid for {mint}");
+        }
+        seen_mints.insert(mint.clone());
+        row.bootstrapped_from_prior_relay = true;
+        if row.origin_relay_session_id.is_none() {
+            row.origin_relay_session_id = Some(source_manifest.relay_session_id.clone());
+        }
+        row.last_bootstrap_source_run_id = Some(checkpoint.source_run_id.clone());
+        let tracker_age_nanos = now_unix_nanos.saturating_sub(tracker_created_at_unix_nanos);
+        if tracker_age_nanos as u128 >= ttl.as_nanos() {
+            row.active = false;
+            row.retired_at_unix_nanos = Some(now_unix_nanos);
+            row.retired_reason = Some("dynamic_mint_ttl_expired_during_handoff".to_owned());
+            expired_count = expired_count.saturating_add(1);
+        } else {
+            let tracker_created_at = now_instant
+                .checked_sub(StdDuration::from_nanos(tracker_age_nanos))
+                .ok_or_else(|| anyhow!("exact-holder bootstrap tracker age overflow for {mint}"))?;
+            active_mints.insert(mint, RelayFreshHolderMint { tracker_created_at });
+        }
+        bootstrapped_rows.push(row);
+    }
+    let active_count = active_mints.len();
+    for row in &mut bootstrapped_rows {
+        row.active_mint_count = active_count;
+    }
+
+    summary.exact_holder_tracker_activation_unix_nanos = Some(activation_unix_nanos);
+    summary.exact_holder_bootstrap_applied = true;
+    summary.exact_holder_bootstrap_source_run_id = Some(checkpoint.source_run_id);
+    summary.exact_holder_bootstrap_source_relay_session_id = Some(source_manifest.relay_session_id);
+    summary.exact_holder_bootstrap_checkpoint_sha256 = Some(checkpoint_sha256);
+    summary.exact_holder_bootstrapped_tracker_count = active_count as u64;
+    summary.exact_holder_bootstrap_expired_tracker_count = expired_count;
+    summary.exact_holder_ttl_expirations = summary
+        .exact_holder_ttl_expirations
+        .saturating_add(expired_count);
+    summary.exact_holder_handoff_generation = source_manifest.handoff_generation.saturating_add(1);
+    summary.exact_holder_active_mint_count = active_count;
+    summary.exact_holder_tracker_rows = bootstrapped_rows;
+    Ok((active_mints, seen_mints))
 }
 
 fn relay_fresh_holder_subscription_request(
@@ -51547,7 +51843,9 @@ fn write_relay_fresh_holder_tracker_manifest(
     }
     let payload = json!({
         "schema_version": "exact_holder_tracker_activation_manifest.v1",
+        "written_at_unix_nanos": unix_now_nanos_u128().min(u64::MAX as u128) as u64,
         "relay_session_id": summary.relay_session_id,
+        "relay_started_at_unix_nanos": summary.exact_holder_relay_started_at_unix_nanos,
         "tracker_activation_unix_nanos": summary.exact_holder_tracker_activation_unix_nanos,
         "dynamic_fresh_launch_tracking_enabled": summary.exact_holder_fresh_launch_dynamic_enabled,
         "max_active_mints": summary.exact_holder_dynamic_max_mints,
@@ -51559,6 +51857,15 @@ fn write_relay_fresh_holder_tracker_manifest(
         "ttl_expirations": summary.exact_holder_ttl_expirations,
         "active_mint_count": active_mints.len(),
         "active_mints": active_mints.keys().collect::<Vec<_>>(),
+        "bootstrap_applied": summary.exact_holder_bootstrap_applied,
+        "bootstrap_source_run_id": summary.exact_holder_bootstrap_source_run_id,
+        "bootstrap_source_relay_session_id": summary.exact_holder_bootstrap_source_relay_session_id,
+        "bootstrap_checkpoint_sha256": summary.exact_holder_bootstrap_checkpoint_sha256,
+        "bootstrapped_tracker_count": summary.exact_holder_bootstrapped_tracker_count,
+        "bootstrap_expired_tracker_count": summary.exact_holder_bootstrap_expired_tracker_count,
+        "bootstrap_preserves_tracker_scope_only": summary.exact_holder_bootstrap_applied,
+        "bootstrap_stream_continuity_proven": false,
+        "handoff_generation": summary.exact_holder_handoff_generation,
         "tracker_rows": summary.exact_holder_tracker_rows,
         "old_migrated_mints_allowed_for_acceptance": false,
         "stream_only_required": true,
@@ -51736,6 +52043,9 @@ async fn relay_process_fresh_holder_update(
                 active: sent,
                 retired_at_unix_nanos: None,
                 retired_reason: None,
+                bootstrapped_from_prior_relay: false,
+                origin_relay_session_id: Some(summary.relay_session_id.clone()),
+                last_bootstrap_source_run_id: None,
                 eligible_for_exact_holder_acceptance: sent,
                 ineligible_reason: (!sent)
                     .then(|| "subscription_request_control_unavailable".to_owned()),
@@ -51925,6 +52235,8 @@ async fn run_live_vps_stream_relay(
     receiver_url: &str,
     duration_seconds: u64,
     health_dir: &Path,
+    exact_holder_bootstrap_checkpoint: Option<&Path>,
+    exact_holder_bootstrap_max_age_seconds: u64,
     json_output: bool,
 ) -> Result<()> {
     if !relay_health_dir_is_safe(health_dir) {
@@ -51947,6 +52259,8 @@ async fn run_live_vps_stream_relay(
         None,
     );
     summary.transport = "tcp_ndjson_over_private_ssh_tunnel".to_owned();
+    let relay_started_at_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+    summary.exact_holder_relay_started_at_unix_nanos = Some(relay_started_at_unix_nanos);
 
     let config = loaded.config.geyser.clone();
     if config.exact_holder_fresh_launch_dynamic_enabled {
@@ -51970,14 +52284,27 @@ async fn run_live_vps_stream_relay(
         {
             bail!("fresh-launch holder tracking requires the official Pump.fun transaction filter");
         }
-        summary.exact_holder_tracker_activation_unix_nanos =
-            Some(unix_now_nanos_u128().min(u64::MAX as u128) as u64);
+    } else if exact_holder_bootstrap_checkpoint.is_some() {
+        bail!("exact-holder bootstrap checkpoint requires dynamic fresh-launch tracking");
     }
 
     fs::create_dir_all(health_dir)
         .with_context(|| format!("create relay health dir {}", health_dir.display()))?;
-    let mut active_holder_mints: BTreeMap<String, RelayFreshHolderMint> = BTreeMap::new();
-    let mut seen_fresh_launch_mints: HashSet<String> = HashSet::new();
+    let (mut active_holder_mints, mut seen_fresh_launch_mints) = if let Some(checkpoint_path) =
+        exact_holder_bootstrap_checkpoint
+    {
+        relay_apply_fresh_holder_bootstrap(
+            checkpoint_path,
+            exact_holder_bootstrap_max_age_seconds,
+            &config,
+            &mut summary,
+        )?
+    } else {
+        if config.exact_holder_fresh_launch_dynamic_enabled {
+            summary.exact_holder_tracker_activation_unix_nanos = Some(relay_started_at_unix_nanos);
+        }
+        (BTreeMap::new(), HashSet::new())
+    };
     let mut holder_subscription_generation = 0u64;
     let mut next_holder_prune_at = Instant::now();
     write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
@@ -52334,6 +52661,7 @@ async fn run_live_vps_stream_relay(
         "rpc_mint_supply_canonical": false,
         "exact_holder_fresh_launch_dynamic_enabled": summary.exact_holder_fresh_launch_dynamic_enabled,
         "exact_holder_tracker_activation_unix_nanos": summary.exact_holder_tracker_activation_unix_nanos,
+        "exact_holder_relay_started_at_unix_nanos": summary.exact_holder_relay_started_at_unix_nanos,
         "exact_holder_dynamic_max_mints": summary.exact_holder_dynamic_max_mints,
         "exact_holder_dynamic_ttl_seconds": summary.exact_holder_dynamic_ttl_seconds,
         "exact_holder_fresh_launch_observations": summary.exact_holder_fresh_launch_observations,
@@ -52342,6 +52670,13 @@ async fn run_live_vps_stream_relay(
         "exact_holder_capacity_evictions": summary.exact_holder_capacity_evictions,
         "exact_holder_ttl_expirations": summary.exact_holder_ttl_expirations,
         "exact_holder_active_mint_count": summary.exact_holder_active_mint_count,
+        "exact_holder_bootstrap_applied": summary.exact_holder_bootstrap_applied,
+        "exact_holder_bootstrap_source_run_id": summary.exact_holder_bootstrap_source_run_id,
+        "exact_holder_bootstrap_source_relay_session_id": summary.exact_holder_bootstrap_source_relay_session_id,
+        "exact_holder_bootstrap_checkpoint_sha256": summary.exact_holder_bootstrap_checkpoint_sha256,
+        "exact_holder_bootstrapped_tracker_count": summary.exact_holder_bootstrapped_tracker_count,
+        "exact_holder_bootstrap_expired_tracker_count": summary.exact_holder_bootstrap_expired_tracker_count,
+        "exact_holder_handoff_generation": summary.exact_holder_handoff_generation,
         "exact_holder_tracker_rows": summary.exact_holder_tracker_rows,
     });
     write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
@@ -52362,6 +52697,8 @@ async fn vps_stream_relay_command(
     receiver_url: Option<&str>,
     duration_seconds: u64,
     health_dir: &str,
+    exact_holder_bootstrap_checkpoint: Option<&str>,
+    exact_holder_bootstrap_max_age_seconds: u64,
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
@@ -52378,9 +52715,14 @@ async fn vps_stream_relay_command(
             receiver_url,
             duration_seconds,
             health_dir,
+            exact_holder_bootstrap_checkpoint.map(Path::new),
+            exact_holder_bootstrap_max_age_seconds,
             json_output,
         )
         .await;
+    }
+    if exact_holder_bootstrap_checkpoint.is_some() {
+        bail!("exact-holder bootstrap checkpoint is not accepted in dry-run mode");
     }
     let receiver_available = receiver_url.is_some();
     let blocker = if receiver_available {
@@ -52443,6 +52785,8 @@ async fn relay_health_probe_command(
         receiver_url,
         duration_seconds,
         health_dir,
+        None,
+        600,
         true,
         json_output,
     )
@@ -63875,6 +64219,158 @@ mod tests {
         assert_eq!(filter.nonempty_txn_signature, Some(true));
         assert_eq!(filter.filters.len(), 2);
         assert_eq!(activated.transactions.len(), 1);
+    }
+
+    fn write_fresh_holder_handoff_checkpoint_for_test(
+        path: &Path,
+        config: &common::GeyserConfig,
+        holder_rpc_used: bool,
+    ) -> (u64, String, String) {
+        let now = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+        let activation = now.saturating_sub(8_000_000_000_000);
+        let active_mint = "5u83eeMKS5drqAdchhJQeUpt7x4DNaU7ZBnaMZjUpump".to_owned();
+        let expired_mint = "FQnJTPED5B8L5LVahAgNJPvf9WFDocD425C5D68Mpump".to_owned();
+        let source_relay_session_id = "vps-stream-relay-test-source";
+        let row = |mint: &str, created_at: u64, launch_slot: u64| {
+            json!({
+                "mint": mint,
+                "launch_slot": launch_slot,
+                "launch_signature": format!("signature-{launch_slot}"),
+                "launch_observed_at_unix_nanos": created_at.saturating_sub(1_000_000),
+                "tracker_created": true,
+                "tracker_created_at_unix_nanos": created_at,
+                "tracker_delay_ms": 1,
+                "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
+                "subscription_generation": launch_slot,
+                "active_mint_count": 2,
+                "active": true,
+                "retired_at_unix_nanos": null,
+                "retired_reason": null,
+                "eligible_for_exact_holder_acceptance": true,
+                "ineligible_reason": null,
+            })
+        };
+        let source_manifest = json!({
+            "schema_version": "exact_holder_tracker_activation_manifest.v1",
+            "relay_session_id": source_relay_session_id,
+            "tracker_activation_unix_nanos": activation,
+            "dynamic_fresh_launch_tracking_enabled": true,
+            "max_active_mints": config.exact_holder_dynamic_max_mints,
+            "mint_ttl_seconds": config.exact_holder_dynamic_ttl_seconds,
+            "active_mints": [active_mint.clone(), expired_mint.clone()],
+            "tracker_rows": [
+                row(&active_mint, now.saturating_sub(60_000_000_000), 10),
+                row(&expired_mint, now.saturating_sub(7_300_000_000_000), 11),
+            ],
+            "stream_only_required": true,
+            "rpc_holder_snapshot_allowed": false,
+            "dex_as_holder_truth": false,
+            "proxy_as_exact": false,
+            "pool_vaults_counted_as_holders": false,
+            "handoff_generation": 4,
+        });
+        let source_manifest_json = serde_json::to_string(&source_manifest).unwrap();
+        let source_manifest_sha256 =
+            format!("{:x}", Sha256::digest(source_manifest_json.as_bytes()));
+        let checkpoint = json!({
+            "schema_version": "exact_holder_tracker_handoff_checkpoint.v1",
+            "captured_at_unix_nanos": now.saturating_sub(1_000_000_000),
+            "source_run_finalized_at_unix_nanos": now.saturating_sub(2_000_000_000),
+            "source_run_id": "background-24h-test-source",
+            "source_relay_session_id": source_relay_session_id,
+            "source_manifest_sha256": source_manifest_sha256,
+            "source_manifest_json": source_manifest_json,
+            "immediately_preceding_mission_slice": true,
+            "source_local_collector_exit_ok": true,
+            "source_r2_unverified_chunks": 0,
+            "source_receiver_backpressure_count": 0,
+            "source_holder_rpc_used": holder_rpc_used,
+            "source_live_trading_enabled": false,
+            "source_replay_run": false,
+            "source_backtesting_run": false,
+            "source_threshold_tuning_run": false,
+            "stream_only_required": true,
+            "rpc_holder_snapshot_allowed": false,
+            "dex_as_holder_truth": false,
+            "proxy_as_exact": false,
+            "pool_vaults_counted_as_holders": false,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
+        (activation, active_mint, expired_mint)
+    }
+
+    #[test]
+    fn fresh_holder_handoff_preserves_age_and_expires_old_trackers() {
+        let loaded = load_default_config_for_test();
+        let mut config = loaded.config.geyser.clone();
+        config.exact_holder_fresh_launch_dynamic_enabled = true;
+        let test_dir = temp_test_dir("fresh_holder_handoff");
+        let checkpoint_path = test_dir.join("checkpoint.json");
+        let (activation, active_mint, expired_mint) =
+            write_fresh_holder_handoff_checkpoint_for_test(&checkpoint_path, &config, false);
+        let mut summary = build_relay_health_summary(
+            &loaded,
+            "vps-stream-relay-test-destination",
+            "test",
+            None,
+            true,
+            None,
+        );
+
+        let (active, seen) =
+            relay_apply_fresh_holder_bootstrap(&checkpoint_path, 600, &config, &mut summary)
+                .expect("valid handoff checkpoint");
+
+        assert_eq!(
+            active.keys().cloned().collect::<Vec<_>>(),
+            vec![active_mint]
+        );
+        assert!(seen.contains(&expired_mint));
+        assert_eq!(
+            summary.exact_holder_tracker_activation_unix_nanos,
+            Some(activation)
+        );
+        assert!(summary.exact_holder_bootstrap_applied);
+        assert_eq!(summary.exact_holder_bootstrapped_tracker_count, 1);
+        assert_eq!(summary.exact_holder_bootstrap_expired_tracker_count, 1);
+        assert_eq!(summary.exact_holder_ttl_expirations, 1);
+        assert_eq!(summary.exact_holder_handoff_generation, 5);
+        let expired = summary
+            .exact_holder_tracker_rows
+            .iter()
+            .find(|row| row.mint == expired_mint)
+            .expect("expired tracker row");
+        assert!(!expired.active);
+        assert_eq!(
+            expired.retired_reason.as_deref(),
+            Some("dynamic_mint_ttl_expired_during_handoff")
+        );
+        fs::remove_dir_all(test_dir).ok();
+    }
+
+    #[test]
+    fn fresh_holder_handoff_rejects_unsafe_source_checkpoint() {
+        let loaded = load_default_config_for_test();
+        let mut config = loaded.config.geyser.clone();
+        config.exact_holder_fresh_launch_dynamic_enabled = true;
+        let test_dir = temp_test_dir("fresh_holder_unsafe_handoff");
+        let checkpoint_path = test_dir.join("checkpoint.json");
+        write_fresh_holder_handoff_checkpoint_for_test(&checkpoint_path, &config, true);
+        let mut summary = build_relay_health_summary(
+            &loaded,
+            "vps-stream-relay-test-destination",
+            "test",
+            None,
+            true,
+            None,
+        );
+
+        let error =
+            relay_apply_fresh_holder_bootstrap(&checkpoint_path, 600, &config, &mut summary)
+                .expect_err("holder RPC source must fail closed");
+
+        assert!(error.to_string().contains("source safety requirements"));
+        fs::remove_dir_all(test_dir).ok();
     }
 
     fn quant_test_point(at_ms: i64, price: Decimal) -> QuantPricePoint {

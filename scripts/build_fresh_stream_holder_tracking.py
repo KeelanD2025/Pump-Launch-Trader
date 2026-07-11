@@ -299,6 +299,163 @@ def tracker_rows(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def argument_paths(value: Any) -> list[Path]:
+    values = value if isinstance(value, list) else [value]
+    return [Path(item).resolve() for item in values if str(item or "").strip()]
+
+
+def dedupe_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(row)
+    return output
+
+
+def merge_tracker_manifest_lineage(
+    manifests: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    if not manifests:
+        return {}, [], ["tracker_manifest_missing"]
+    policy_errors: list[str] = []
+    first_max = intish(manifests[0].get("max_active_mints"))
+    first_ttl = intish(manifests[0].get("mint_ttl_seconds"))
+    for index, manifest in enumerate(manifests):
+        if manifest.get("schema_version") != "exact_holder_tracker_activation_manifest.v1":
+            policy_errors.append(f"manifest_{index}_schema_invalid")
+        if not boolish(manifest.get("dynamic_fresh_launch_tracking_enabled")):
+            policy_errors.append(f"manifest_{index}_dynamic_tracking_disabled")
+        if intish(manifest.get("max_active_mints")) != first_max:
+            policy_errors.append(f"manifest_{index}_mint_cap_changed")
+        if intish(manifest.get("mint_ttl_seconds")) != first_ttl:
+            policy_errors.append(f"manifest_{index}_mint_ttl_changed")
+        if not boolish(manifest.get("stream_only_required")):
+            policy_errors.append(f"manifest_{index}_stream_only_not_required")
+        for field in (
+            "rpc_holder_snapshot_allowed",
+            "dex_as_holder_truth",
+            "proxy_as_exact",
+            "pool_vaults_counted_as_holders",
+        ):
+            if manifest.get(field) is not False:
+                policy_errors.append(f"manifest_{index}_unsafe_flag_{field}")
+
+    handoff_gaps: list[dict[str, Any]] = []
+    for previous, current in zip(manifests, manifests[1:]):
+        previous_active = {
+            str(mint)
+            for mint in previous.get("active_mints", [])
+            if str(mint or "")
+        }
+        if not previous_active:
+            continue
+        current_tracker_mints = {
+            str(row.get("mint", "")) for row in tracker_rows(current)
+        }
+        source_matches = (
+            boolish(current.get("bootstrap_applied"))
+            and first(current, "bootstrap_source_relay_session_id")
+            == first(previous, "relay_session_id")
+        )
+        missing = previous_active - current_tracker_mints if source_matches else previous_active
+        reason = (
+            "relay_handoff_tracker_row_missing"
+            if source_matches
+            else "relay_handoff_bootstrap_missing_or_lineage_mismatch"
+        )
+        current_start_nanos = intish(
+            first(
+                current,
+                "relay_started_at_unix_nanos",
+                "tracker_activation_unix_nanos",
+            )
+        )
+        previous_stop_nanos = intish(previous.get("written_at_unix_nanos"))
+        cutoff_nanos = previous_stop_nanos or current_start_nanos
+        for mint in sorted(missing):
+            handoff_gaps.append(
+                {
+                    "mint": mint,
+                    "source_relay_session_id": first(previous, "relay_session_id"),
+                    "destination_relay_session_id": first(current, "relay_session_id"),
+                    "cutoff_unix_nanos": cutoff_nanos,
+                    "cutoff_ts": fmt_time(time_from_nanos(cutoff_nanos)),
+                    "gap_type": "tracker_scope_handoff_gap",
+                    "gap_reason": reason,
+                }
+            )
+        if source_matches and not boolish(
+            current.get("bootstrap_stream_continuity_proven")
+        ):
+            for mint in sorted(previous_active - missing):
+                handoff_gaps.append(
+                    {
+                        "mint": mint,
+                        "source_relay_session_id": first(
+                            previous, "relay_session_id"
+                        ),
+                        "destination_relay_session_id": first(
+                            current, "relay_session_id"
+                        ),
+                        "cutoff_unix_nanos": cutoff_nanos,
+                        "cutoff_ts": fmt_time(time_from_nanos(cutoff_nanos)),
+                        "gap_type": "stream_continuity_handoff_gap",
+                        "gap_reason": "relay_process_boundary_without_cursor_resume",
+                    }
+                )
+
+    merged_rows: dict[str, dict[str, Any]] = {}
+    for manifest in manifests:
+        for row in tracker_rows(manifest):
+            mint = first(row, "mint")
+            if mint:
+                merged_rows[mint] = dict(row)
+    for gap in handoff_gaps:
+        if gap.get("gap_type") != "tracker_scope_handoff_gap":
+            continue
+        mint = str(gap["mint"])
+        row = merged_rows.get(mint)
+        if row is None:
+            continue
+        cutoff_nanos = intish(gap.get("cutoff_unix_nanos"))
+        current_retirement = intish(row.get("retired_at_unix_nanos"))
+        if current_retirement == 0 or (cutoff_nanos and cutoff_nanos < current_retirement):
+            row["active"] = False
+            row["retired_at_unix_nanos"] = cutoff_nanos or row.get(
+                "tracker_created_at_unix_nanos"
+            )
+            row["retired_reason"] = gap["gap_reason"]
+
+    combined = dict(manifests[-1])
+    activations = [
+        intish(manifest.get("tracker_activation_unix_nanos"))
+        for manifest in manifests
+        if intish(manifest.get("tracker_activation_unix_nanos")) > 0
+    ]
+    combined["tracker_activation_unix_nanos"] = min(activations) if activations else 0
+    combined["tracker_rows"] = [merged_rows[mint] for mint in sorted(merged_rows)]
+    combined["lineage_manifest_count"] = len(manifests)
+    combined["lineage_relay_session_ids"] = [
+        first(manifest, "relay_session_id") for manifest in manifests
+    ]
+    combined["lineage_policy_errors"] = sorted(set(policy_errors))
+    combined["handoff_gap_count"] = len(handoff_gaps)
+    combined["subscription_update_failures"] = sum(
+        intish(manifest.get("subscription_update_failures")) for manifest in manifests
+    )
+    combined["capacity_evictions"] = sum(
+        intish(manifest.get("capacity_evictions")) for manifest in manifests
+    )
+    combined["ttl_expirations"] = sum(
+        intish(manifest.get("ttl_expirations")) for manifest in manifests
+    )
+    return combined, handoff_gaps, sorted(set(policy_errors))
+
+
 def quality_for_mint(
     mint: str,
     tracker: dict[str, Any],
@@ -389,21 +546,48 @@ def state_at(
 
 def build(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).resolve()
-    run_dir = Path(args.run_dir).resolve()
+    run_dirs = argument_paths(args.run_dir)
+    manifest_paths = argument_paths(args.relay_manifest)
+    if not run_dirs or len(run_dirs) != len(manifest_paths):
+        raise ValueError("--run-dir and --relay-manifest must be supplied as ordered pairs")
     output = Path(args.output_dir).resolve() if args.output_dir else DEFAULT_OUTPUT
     amm_root = Path(args.amm_root).resolve() if args.amm_root else DEFAULT_AMM_ROOT
     strategy_root = Path(args.strategy_root).resolve() if args.strategy_root else DEFAULT_STRATEGY_ROOT
-    manifest_path = Path(args.relay_manifest).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
-    manifest = read_json(manifest_path)
+    manifests = [read_json(path) for path in manifest_paths]
+    manifest, handoff_gap_rows, lineage_policy_errors = merge_tracker_manifest_lineage(
+        manifests
+    )
     trackers = tracker_rows(manifest)
-    launch_rows = read_csv(run_dir / "decoded_launch_event_rows.csv")
-    holder_input = read_csv(run_dir / "decoded_holder_event_rows.csv")
-    migration_rows = read_csv(run_dir / "quant_pumpfun_migration_event_rows.csv")
-    pair_rows = read_csv(run_dir / "quant_pumpswap_pair_event_rows.csv")
-    gap_rows = read_csv(run_dir / "run_gap_events.csv")
-    local_summary = read_json(run_dir / "local_collector_summary.json")
+    launch_rows = dedupe_rows(
+        row
+        for run_dir in run_dirs
+        for row in read_csv(run_dir / "decoded_launch_event_rows.csv")
+    )
+    holder_input = dedupe_rows(
+        row
+        for run_dir in run_dirs
+        for row in read_csv(run_dir / "decoded_holder_event_rows.csv")
+    )
+    migration_rows = dedupe_rows(
+        row
+        for run_dir in run_dirs
+        for row in read_csv(run_dir / "quant_pumpfun_migration_event_rows.csv")
+    )
+    pair_rows = dedupe_rows(
+        row
+        for run_dir in run_dirs
+        for row in read_csv(run_dir / "quant_pumpswap_pair_event_rows.csv")
+    )
+    gap_rows = dedupe_rows(
+        row
+        for run_dir in run_dirs
+        for row in read_csv(run_dir / "run_gap_events.csv")
+    )
+    local_summaries = [
+        read_json(run_dir / "local_collector_summary.json") for run_dir in run_dirs
+    ]
 
     root_pair_rows = read_csv(amm_root / "pumpswap_live_relay_pumpswap_pair_event_rows.csv")
     pool_vault_rows = read_csv(amm_root / "pumpswap_pool_vault_rows.csv")
@@ -423,15 +607,29 @@ def build(args: argparse.Namespace) -> int:
     ]
     provider_gap_count = len(integrity_gap_rows)
     gap_times = [parse_time(first(row, "created_at", "event_observed_at_utc", "source_ts")) for row in integrity_gap_rows]
-    summary_gap_count = max(
-        intish(local_summary.get("sequence_gap_count")),
-        intish(local_summary.get("downstream_backpressure_count")),
+    summary_gap_count = sum(
+        max(
+            intish(local_summary.get("sequence_gap_count")),
+            intish(local_summary.get("downstream_backpressure_count")),
+        )
+        for local_summary in local_summaries
     )
     base_source_integrity = (
-        boolish(manifest.get("dynamic_fresh_launch_tracking_enabled"))
+        not lineage_policy_errors
+        and all(
+            boolish(item.get("dynamic_fresh_launch_tracking_enabled"))
+            for item in manifests
+        )
         and intish(manifest.get("subscription_update_failures")) == 0
         and summary_gap_count <= provider_gap_count
-        and intish(local_summary.get("unverified_chunk_count")) == 0
+        and all(
+            max(
+                intish(local_summary.get("unverified_chunk_count")),
+                intish(local_summary.get("r2_streaming_unverified_chunks")),
+            )
+            == 0
+            for local_summary in local_summaries
+        )
     )
 
     confirmed_launch_rows: list[dict[str, Any]] = []
@@ -592,6 +790,17 @@ def build(args: argparse.Namespace) -> int:
                 }
             )
 
+    for gap in handoff_gap_rows:
+        mint = str(gap.get("mint", ""))
+        tracker_gap_rows.append(
+            {
+                "mint": mint,
+                "launch_id": launch_ids.get(mint, ""),
+                "gap_type": gap.get("gap_type", "tracker_handoff_gap"),
+                "gap_reason": gap.get("gap_reason", "relay_handoff_not_continued"),
+            }
+        )
+
     launch_fields = [
         "mint",
         "launch_id",
@@ -614,6 +823,38 @@ def build(args: argparse.Namespace) -> int:
     ]
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
     write_csv(output / "exact_holder_tracker_gap_audit.csv", tracker_gap_rows, ["mint", "launch_id", "gap_type", "gap_reason"])
+    write_csv(
+        output / "exact_holder_tracker_handoff_gap_audit.csv",
+        handoff_gap_rows,
+        [
+            "mint",
+            "source_relay_session_id",
+            "destination_relay_session_id",
+            "cutoff_unix_nanos",
+            "cutoff_ts",
+            "gap_type",
+            "gap_reason",
+        ],
+    )
+    write_json(
+        output / "exact_holder_lifecycle_input_lineage.json",
+        {
+            "schema_version": "exact_holder_lifecycle_input_lineage.v1",
+            "generated_at_utc": utc_now(),
+            "run_dirs": [str(path) for path in run_dirs],
+            "relay_manifests": [str(path) for path in manifest_paths],
+            "relay_session_ids": [
+                first(item, "relay_session_id") for item in manifests
+            ],
+            "manifest_count": len(manifests),
+            "handoff_gap_count": len(handoff_gap_rows),
+            "lineage_policy_errors": lineage_policy_errors,
+            "stream_only_required": True,
+            "rpc_holder_snapshot_allowed": False,
+            "dex_as_holder_truth": False,
+            "proxy_as_exact": False,
+        },
+    )
 
     confirmed_post_activation_mints = {
         mint
@@ -680,6 +921,14 @@ def build(args: argparse.Namespace) -> int:
     continuity_cutoff_reason_by_mint: dict[str, str] = {}
     pre_gap_integrity_by_mint: dict[str, bool] = {}
     source_integrity_by_mint: dict[str, bool] = {}
+    handoff_cutoffs_by_mint: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    for gap in handoff_gap_rows:
+        cutoff = time_from_nanos(gap.get("cutoff_unix_nanos"))
+        mint = first(gap, "mint")
+        if mint and cutoff is not None:
+            handoff_cutoffs_by_mint[mint].append(
+                (cutoff, first(gap, "gap_reason") or "relay_handoff_gap")
+            )
     for mint in eligible_mints:
         tracker = tracker_by_mint[mint]
         tracker_started = time_from_nanos(tracker.get("tracker_created_at_unix_nanos"))
@@ -693,6 +942,7 @@ def build(args: argparse.Namespace) -> int:
         cutoff_candidates: list[tuple[datetime, str]] = [
             (gap_time, "provider_or_sequence_gap") for gap_time in relevant_gaps
         ]
+        cutoff_candidates.extend(handoff_cutoffs_by_mint.get(mint, []))
         retired_at = time_from_nanos(tracker.get("retired_at_unix_nanos"))
         active_value = tracker.get("active")
         retirement_declared = retired_at is not None or active_value is False or (
@@ -1384,6 +1634,19 @@ def build(args: argparse.Namespace) -> int:
         "verdict": proof_verdict,
         "overall_lifecycle_verdict": lifecycle_verdict,
         "relay_session_id": manifest_session,
+        "input_run_count": len(run_dirs),
+        "input_manifest_count": len(manifests),
+        "lineage_relay_session_ids": manifest.get("lineage_relay_session_ids", []),
+        "tracker_handoff_gap_count": len(handoff_gap_rows),
+        "tracker_scope_handoff_gap_count": sum(
+            gap.get("gap_type") == "tracker_scope_handoff_gap"
+            for gap in handoff_gap_rows
+        ),
+        "stream_continuity_handoff_gap_count": sum(
+            gap.get("gap_type") == "stream_continuity_handoff_gap"
+            for gap in handoff_gap_rows
+        ),
+        "lineage_policy_errors": lineage_policy_errors,
         "proof_window_observed_minutes": round(observed_minutes, 4),
         "proof_window_requirement_met": proof_window_met,
         "observed_launch_evidence_rows": len(launch_rows),
@@ -1469,6 +1732,7 @@ def build(args: argparse.Namespace) -> int:
         "confirmed_internal_create_instruction_required": True,
         "pending_create_backfill_allowed_for_acceptance": False,
         "tracker_retirement_ends_near_exact_validity": True,
+        "relay_process_boundary_without_cursor_resume_ends_near_exact_validity": True,
         "stream_only_required": True,
         "rpc_holder_snapshot_allowed": False,
         "dex_as_holder_truth": False,
@@ -1479,11 +1743,16 @@ def build(args: argparse.Namespace) -> int:
         "generated_at_utc": utc_now(),
         "tracker_activation_timestamp": fmt_time(activation_dt),
         "relay_session_id": manifest_session,
+        "lineage_relay_session_ids": manifest.get("lineage_relay_session_ids", []),
+        "input_run_count": len(run_dirs),
+        "tracker_handoff_gap_count": len(handoff_gap_rows),
+        "lineage_policy_errors": lineage_policy_errors,
         "quality_taxonomy": [EXACT, NEAR_EXACT, OBSERVED, PROXY],
         "full_strategy_quality_allowed": [EXACT, NEAR_EXACT],
         "quality_is_time_bounded": True,
         "provider_gap_downgrades_rows_at_or_after_gap": True,
         "tracker_retirement_ends_near_exact_validity": True,
+        "relay_process_boundary_without_cursor_resume_ends_near_exact_validity": True,
         "policy": policy,
         "proxy_holder_allowed_for_research_only": True,
         "safety_flags": SAFETY_FALSE,
@@ -1494,6 +1763,7 @@ def build(args: argparse.Namespace) -> int:
         "Only Pump.fun mints decoded after relay tracker activation and enrolled by the same create update enter the acceptance scope; "
         "the launch row must be a strict-timing, non-RPC decoded create or create_v2 instruction, and pending create backfills are rejected. "
         "Exact or near-exact source quality is still required to pass. Quality is timestamp-bounded: a provider gap downgrades states at and after the gap without relabeling earlier continuous states. "
+        "A relay-process handoff preserves tracker scope for continued observation but does not preserve near-exact stream continuity unless cursor resume is independently proven. "
         "RPC and Dex holder truth are forbidden. Trade-participant proxies remain research-only. Pool, curve, program, and burn accounts are excluded.\n"
     )
     write_json(output / "exact_holder_acceptance_policy.json", {"schema_version": "exact_holder_acceptance_policy.v1", **policy})
@@ -1580,9 +1850,11 @@ def build(args: argparse.Namespace) -> int:
     sample_gate = len(eligible_mints) >= args.min_fresh_launches
     decision_gate = bool(decision_output) and decision_coverage_pct >= args.min_decision_coverage_pct
     amm_ready = boolish(amm_gate.get("coverage_ready")) and boolish(amm_gate.get("amm_research_usable"))
+    handoff_gate = not handoff_gap_rows and not lineage_policy_errors
     full_ready = all(
         [
             launch_tracker_gate,
+            handoff_gate,
             holder_quality_ready,
             migration_gate,
             decision_gate,
@@ -1604,6 +1876,7 @@ def build(args: argparse.Namespace) -> int:
     blockers = []
     for passed, reason in [
         (launch_tracker_gate, "confirmed_launch_tracker_coverage_incomplete"),
+        (handoff_gate, "holder_tracker_handoff_continuity_incomplete"),
         (holder_quality_ready, "exact_or_near_exact_holder_rows_missing"),
         (migration_gate, "fresh_migration_carry_forward_incomplete"),
         (decision_gate, "decision_time_holder_coverage_below_threshold"),
@@ -1632,6 +1905,9 @@ def build(args: argparse.Namespace) -> int:
         ),
         "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
         "launch_tracker_coverage_complete": launch_tracker_gate,
+        "tracker_handoff_continuity_complete": handoff_gate,
+        "tracker_handoff_gap_count": len(handoff_gap_rows),
+        "lineage_policy_errors": lineage_policy_errors,
         "retired_trackers": len(retired_tracker_mints),
         "capacity_evicted_trackers": len(capacity_evicted_tracker_mints),
         "ttl_expired_trackers": len(ttl_expired_tracker_mints),
@@ -1695,8 +1971,18 @@ def build(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
-    parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--relay-manifest", required=True)
+    parser.add_argument(
+        "--run-dir",
+        action="append",
+        required=True,
+        help="Ordered lifecycle slice directory; repeat with --relay-manifest for handoffs.",
+    )
+    parser.add_argument(
+        "--relay-manifest",
+        action="append",
+        required=True,
+        help="Tracker manifest paired with the corresponding ordered --run-dir.",
+    )
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--amm-root", default="")
     parser.add_argument("--strategy-root", default="")

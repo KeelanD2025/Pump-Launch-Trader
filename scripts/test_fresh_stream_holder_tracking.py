@@ -46,7 +46,16 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 "relay_session_id": "relay-fresh",
                 "tracker_activation_unix_nanos": activation_nanos,
                 "dynamic_fresh_launch_tracking_enabled": True,
+                "max_active_mints": 64,
+                "mint_ttl_seconds": 7200,
                 "subscription_update_failures": 0,
+                "active_mint_count": 0,
+                "active_mints": [],
+                "stream_only_required": True,
+                "rpc_holder_snapshot_allowed": False,
+                "dex_as_holder_truth": False,
+                "proxy_as_exact": False,
+                "pool_vaults_counted_as_holders": False,
                 "tracker_rows": [
                     {
                         "mint": mint,
@@ -472,7 +481,16 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "relay_session_id": "relay-launch-gap",
                         "tracker_activation_unix_nanos": activation_nanos,
                         "dynamic_fresh_launch_tracking_enabled": True,
+                        "max_active_mints": 64,
+                        "mint_ttl_seconds": 7200,
                         "subscription_update_failures": 0,
+                        "active_mint_count": 2,
+                        "active_mints": [tracked_mint, tracked_anchor_mint],
+                        "stream_only_required": True,
+                        "rpc_holder_snapshot_allowed": False,
+                        "dex_as_holder_truth": False,
+                        "proxy_as_exact": False,
+                        "pool_vaults_counted_as_holders": False,
                         "tracker_rows": [
                             {
                                 "mint": tracked_mint,
@@ -673,6 +691,330 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 "launch_after_manifest_snapshot_not_assessed",
                 post_manifest_gap["gap_reason"],
             )
+
+    def test_cross_slice_tracker_scope_carries_without_overstating_stream_continuity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_one = root / "run-one"
+            run_two = root / "run-two"
+            output = root / "output"
+            amm = root / "amm"
+            strategy = root / "strategy"
+            for path in (run_one, run_two, amm, strategy):
+                path.mkdir()
+
+            mint = "FreshCrossSliceMintpump"
+            launch_signature = "cross-slice-launch"
+            activation = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            activation_nanos = int(activation.timestamp() * 1_000_000_000)
+            tracker_row = {
+                "mint": mint,
+                "launch_slot": 10,
+                "launch_signature": launch_signature,
+                "launch_observed_at_unix_nanos": activation_nanos + 1_000_000_000,
+                "tracker_created": True,
+                "tracker_created_at_unix_nanos": activation_nanos + 1_010_000_000,
+                "tracker_delay_ms": 10,
+                "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
+                "subscription_generation": 1,
+                "active_mint_count": 1,
+                "active": True,
+                "retired_at_unix_nanos": None,
+                "retired_reason": None,
+                "eligible_for_exact_holder_acceptance": True,
+                "ineligible_reason": None,
+            }
+            manifest_one = {
+                "schema_version": "exact_holder_tracker_activation_manifest.v1",
+                "relay_session_id": "relay-one",
+                "relay_started_at_unix_nanos": activation_nanos,
+                "tracker_activation_unix_nanos": activation_nanos,
+                "dynamic_fresh_launch_tracking_enabled": True,
+                "max_active_mints": 64,
+                "mint_ttl_seconds": 7200,
+                "subscription_update_failures": 0,
+                "active_mint_count": 1,
+                "active_mints": [mint],
+                "tracker_rows": [tracker_row],
+                "stream_only_required": True,
+                "rpc_holder_snapshot_allowed": False,
+                "dex_as_holder_truth": False,
+                "proxy_as_exact": False,
+                "pool_vaults_counted_as_holders": False,
+            }
+            manifest_two = {
+                **manifest_one,
+                "relay_session_id": "relay-two",
+                "relay_started_at_unix_nanos": activation_nanos + 900_000_000_000,
+                "bootstrap_applied": True,
+                "bootstrap_source_relay_session_id": "relay-one",
+                "bootstrap_source_run_id": "run-one",
+                "bootstrap_preserves_tracker_scope_only": True,
+                "bootstrap_stream_continuity_proven": False,
+                "handoff_generation": 1,
+                "tracker_rows": [
+                    {
+                        **tracker_row,
+                        "bootstrapped_from_prior_relay": True,
+                        "origin_relay_session_id": "relay-one",
+                        "last_bootstrap_source_run_id": "run-one",
+                    }
+                ],
+            }
+            manifest_one_path = root / "manifest-one.json"
+            manifest_two_path = root / "manifest-two.json"
+            manifest_one_path.write_text(json.dumps(manifest_one))
+            manifest_two_path.write_text(json.dumps(manifest_two))
+
+            write_csv(
+                run_one / "decoded_launch_event_rows.csv",
+                [
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:00:01Z",
+                        "slot": 10,
+                        "signature": launch_signature,
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "creator-wallet",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
+                    }
+                ],
+            )
+            write_csv(
+                run_one / "decoded_holder_event_rows.csv",
+                [
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:00:01Z",
+                        "slot": 10,
+                        "signature": launch_signature,
+                        "token_account": "creator-token-account",
+                        "owner_wallet": "creator-wallet",
+                        "amount_raw": "100000000",
+                        "amount_ui": "100",
+                        "decimals": "6",
+                        "holder_balance_before": "0",
+                        "holder_balance_after": "100000000",
+                        "update_source": "geyser_token_balance",
+                        "update_type": "token_account_balance_created_or_observed",
+                    },
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:00:05Z",
+                        "slot": 15,
+                        "signature": "pumpfun-transfer",
+                        "token_account": "buyer-token-account",
+                        "owner_wallet": "buyer-wallet",
+                        "amount_raw": "50000000",
+                        "amount_ui": "50",
+                        "decimals": "6",
+                        "holder_balance_before": "0",
+                        "holder_balance_after": "50000000",
+                        "update_source": "geyser_spl_token_account_update",
+                        "update_type": "token_account_balance_update",
+                    },
+                ],
+            )
+            write_csv(run_one / "run_gap_events.csv", [])
+            write_csv(run_one / "quant_pumpfun_migration_event_rows.csv", [])
+            write_csv(run_one / "quant_pumpswap_pair_event_rows.csv", [])
+
+            write_csv(run_two / "decoded_launch_event_rows.csv", [])
+            write_csv(
+                run_two / "decoded_holder_event_rows.csv",
+                [
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:15:11Z",
+                        "slot": 111,
+                        "signature": "post-migration-transfer",
+                        "token_account": "buyer-token-account",
+                        "owner_wallet": "buyer-wallet",
+                        "amount_raw": "60000000",
+                        "amount_ui": "60",
+                        "decimals": "6",
+                        "holder_balance_before": "50000000",
+                        "holder_balance_after": "60000000",
+                        "update_source": "geyser_spl_token_account_update",
+                        "update_type": "token_account_balance_update",
+                    },
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:15:11Z",
+                        "slot": 111,
+                        "signature": "post-migration-transfer",
+                        "token_account": "pool-base-vault",
+                        "owner_wallet": "pool-authority",
+                        "amount_raw": "400000000",
+                        "amount_ui": "400",
+                        "decimals": "6",
+                        "holder_balance_before": "0",
+                        "holder_balance_after": "400000000",
+                        "update_source": "geyser_spl_token_account_update",
+                        "update_type": "token_account_balance_update",
+                    },
+                ],
+            )
+            write_csv(run_two / "run_gap_events.csv", [])
+            write_csv(
+                run_two / "quant_pumpfun_migration_event_rows.csv",
+                [
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "event_observed_at_utc": "2026-01-01T00:15:10Z",
+                        "slot": 110,
+                        "signature": "migration-signature",
+                        "decoded_instruction_name": "migrate_v2",
+                        "transaction_status": "success",
+                        "migration_confirmed": True,
+                        "migration_evidence_type": "decoded_successful_pump_liquidity_migration",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
+                        "post_migration_pool": "pool-one",
+                        "pool_base_token_account": "pool-base-vault",
+                        "pool_quote_token_account": "pool-quote-vault",
+                    }
+                ],
+            )
+            write_csv(run_two / "quant_pumpswap_pair_event_rows.csv", [])
+            for run in (run_one, run_two):
+                (run / "local_collector_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "sequence_gap_count": 0,
+                            "downstream_backpressure_count": 0,
+                            "r2_streaming_unverified_chunks": 0,
+                        }
+                    )
+                )
+
+            write_csv(amm / "pumpswap_pool_vault_rows.csv", [])
+            write_csv(amm / "pumpswap_live_relay_pumpswap_pair_event_rows.csv", [])
+            (amm / "pumpswap_amm_coverage_gate.json").write_text(
+                json.dumps(
+                    {
+                        "coverage_ready": True,
+                        "amm_research_usable": True,
+                        "amm_complete_coverage": False,
+                        "decision_time_pool_state_coverage_pct": 90,
+                    }
+                )
+            )
+            write_csv(
+                strategy / "post_migration_strategy_feature_rows.csv",
+                [
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-cross-slice",
+                        "decision_ts": "2026-01-01T00:15:12Z",
+                    }
+                ],
+            )
+
+            rc = MODULE.build(
+                argparse.Namespace(
+                    repo_root=str(root),
+                    run_dir=[str(run_one), str(run_two)],
+                    relay_manifest=[str(manifest_one_path), str(manifest_two_path)],
+                    output_dir=str(output),
+                    amm_root=str(amm),
+                    strategy_root=str(strategy),
+                    min_proof_minutes=30.0,
+                    min_fresh_launches=1,
+                    min_decision_coverage_pct=75.0,
+                )
+            )
+            self.assertEqual(rc, 0)
+
+            proof = json.loads((output / "exact_holder_fresh_launch_proof_report.json").read_text())
+            self.assertEqual(proof["input_run_count"], 2)
+            self.assertEqual(proof["input_manifest_count"], 2)
+            self.assertEqual(proof["tracker_handoff_gap_count"], 1)
+            self.assertEqual(proof["tracker_scope_handoff_gap_count"], 0)
+            self.assertEqual(proof["stream_continuity_handoff_gap_count"], 1)
+            self.assertEqual(proof["fresh_migrations"], 1)
+            self.assertGreater(proof["post_migration_holder_rows"], 0)
+            self.assertEqual(proof["decision_time_exact_or_near_exact_rows"], 0)
+
+            migration_audit = json.loads(
+                (output / "exact_holder_migration_carry_forward_audit.json").read_text()
+            )
+            self.assertEqual(migration_audit["carry_forward_complete_rows"], 0)
+            readiness = json.loads((output / "full_strategy_dataset_readiness.json").read_text())
+            self.assertFalse(readiness["tracker_handoff_continuity_complete"])
+            self.assertIn(
+                "holder_tracker_handoff_continuity_incomplete",
+                readiness["blockers"],
+            )
+            with (output / "exact_holder_post_migration_state_rows.csv").open(
+                newline=""
+            ) as handle:
+                post_rows = list(csv.DictReader(handle))
+            self.assertTrue(post_rows)
+            vault = next(row for row in post_rows if row["token_account"] == "pool-base-vault")
+            self.assertEqual(vault["excluded_from_holder_count"], "True")
+            self.assertEqual(vault["source_quality"], MODULE.OBSERVED)
+
+    def test_missing_cross_slice_bootstrap_time_bounds_quality(self) -> None:
+        previous = {
+            "schema_version": "exact_holder_tracker_activation_manifest.v1",
+            "relay_session_id": "relay-one",
+            "tracker_activation_unix_nanos": 100,
+            "dynamic_fresh_launch_tracking_enabled": True,
+            "max_active_mints": 64,
+            "mint_ttl_seconds": 7200,
+            "active_mints": ["FreshMintpump"],
+            "tracker_rows": [
+                {
+                    "mint": "FreshMintpump",
+                    "tracker_created": True,
+                    "active": True,
+                    "eligible_for_exact_holder_acceptance": True,
+                    "tracker_created_at_unix_nanos": 200,
+                    "launch_observed_at_unix_nanos": 150,
+                    "launch_slot": 1,
+                }
+            ],
+            "stream_only_required": True,
+            "rpc_holder_snapshot_allowed": False,
+            "dex_as_holder_truth": False,
+            "proxy_as_exact": False,
+            "pool_vaults_counted_as_holders": False,
+        }
+        current = {
+            **previous,
+            "relay_session_id": "relay-two",
+            "relay_started_at_unix_nanos": 1_000,
+            "active_mints": [],
+            "tracker_rows": [],
+            "bootstrap_applied": False,
+        }
+
+        combined, gaps, errors = MODULE.merge_tracker_manifest_lineage(
+            [previous, current]
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(
+            gaps[0]["gap_reason"],
+            "relay_handoff_bootstrap_missing_or_lineage_mismatch",
+        )
+        row = next(row for row in combined["tracker_rows"] if row["mint"] == "FreshMintpump")
+        self.assertFalse(row["active"])
+        self.assertEqual(row["retired_at_unix_nanos"], 1_000)
 
 
 if __name__ == "__main__":

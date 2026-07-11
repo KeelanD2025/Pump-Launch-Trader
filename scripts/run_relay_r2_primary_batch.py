@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import pathlib
@@ -52,6 +53,10 @@ REQUIRED_FINAL_FILES = (
 )
 ASOF_ALPHA_HORIZONS = (5, 10, 30, 60, 120, 300, 900)
 ASOF_REQUIRED_PREFIX_HORIZONS = (5, 10, 30, 60, 120)
+EXACT_HOLDER_TRACKER_MANIFEST_NAME = "exact_holder_tracker_activation_manifest.json"
+EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME = "exact_holder_tracker_handoff_checkpoint.json"
+EXACT_HOLDER_HANDOFF_INPUT_AUDIT_NAME = "exact_holder_handoff_input_audit.json"
+EXACT_HOLDER_HANDOFF_OUTPUT_AUDIT_NAME = "exact_holder_handoff_output_audit.json"
 ASOF_TRADE_FIELDS = {
     "trade_update_count_asof",
     "transaction_active_mint_count_asof",
@@ -234,6 +239,362 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         return {}
     with path.open() as handle:
         return json.load(handle)
+
+
+def exact_holder_manifest_validation_errors(
+    manifest: dict[str, Any], expected_relay_session_id: str = ""
+) -> list[str]:
+    errors: list[str] = []
+    if manifest.get("schema_version") != "exact_holder_tracker_activation_manifest.v1":
+        errors.append("manifest_schema_invalid")
+    relay_session_id = str(manifest.get("relay_session_id", ""))
+    if not relay_session_id:
+        errors.append("manifest_relay_session_missing")
+    elif expected_relay_session_id and relay_session_id != expected_relay_session_id:
+        errors.append("manifest_relay_session_mismatch")
+    if manifest.get("dynamic_fresh_launch_tracking_enabled") is not True:
+        errors.append("dynamic_fresh_launch_tracking_not_enabled")
+    if manifest.get("stream_only_required") is not True:
+        errors.append("stream_only_not_required")
+    for key in (
+        "rpc_holder_snapshot_allowed",
+        "dex_as_holder_truth",
+        "proxy_as_exact",
+        "pool_vaults_counted_as_holders",
+    ):
+        if manifest.get(key) is not False:
+            errors.append(f"unsafe_manifest_flag:{key}")
+    try:
+        max_active_mints = int(manifest.get("max_active_mints", 0))
+        mint_ttl_seconds = int(manifest.get("mint_ttl_seconds", 0))
+        activation = int(manifest.get("tracker_activation_unix_nanos", 0))
+    except (TypeError, ValueError):
+        max_active_mints = 0
+        mint_ttl_seconds = 0
+        activation = 0
+    if max_active_mints <= 0 or max_active_mints > 256:
+        errors.append("manifest_mint_cap_invalid")
+    if mint_ttl_seconds <= 0:
+        errors.append("manifest_mint_ttl_invalid")
+    if activation <= 0:
+        errors.append("manifest_activation_timestamp_invalid")
+    active_mints = manifest.get("active_mints")
+    tracker_rows = manifest.get("tracker_rows")
+    if not isinstance(active_mints, list) or not all(
+        isinstance(mint, str) and mint for mint in active_mints
+    ):
+        errors.append("manifest_active_mints_invalid")
+        active_mints = []
+    if len(set(active_mints)) != len(active_mints):
+        errors.append("manifest_active_mints_duplicate")
+    if len(active_mints) > max_active_mints > 0:
+        errors.append("manifest_active_mints_over_cap")
+    if not isinstance(tracker_rows, list):
+        errors.append("manifest_tracker_rows_invalid")
+        tracker_rows = []
+    active_set = set(active_mints)
+    active_rows: dict[str, dict[str, Any]] = {}
+    for raw in tracker_rows:
+        if not isinstance(raw, dict):
+            errors.append("manifest_tracker_row_invalid")
+            continue
+        mint = str(raw.get("mint", ""))
+        if mint not in active_set:
+            continue
+        if mint in active_rows:
+            errors.append("manifest_active_tracker_row_duplicate")
+            continue
+        active_rows[mint] = raw
+    if set(active_rows) != active_set:
+        errors.append("manifest_active_tracker_rows_incomplete")
+    for mint, row in active_rows.items():
+        if (
+            row.get("tracker_created") is not True
+            or row.get("active") is not True
+            or row.get("eligible_for_exact_holder_acceptance") is not True
+            or row.get("retired_at_unix_nanos") is not None
+            or row.get("retired_reason") is not None
+            or row.get("ineligible_reason") is not None
+        ):
+            errors.append(f"manifest_active_tracker_not_eligible:{mint}")
+        if row.get("tracker_source") != "yellowstone_pump_create_dynamic_token_account_filter":
+            errors.append(f"manifest_tracker_source_invalid:{mint}")
+        try:
+            launch_slot = int(row.get("launch_slot", 0))
+            launch_observed = int(row.get("launch_observed_at_unix_nanos", 0))
+            tracker_created = int(row.get("tracker_created_at_unix_nanos", 0))
+        except (TypeError, ValueError):
+            launch_slot = 0
+            launch_observed = 0
+            tracker_created = 0
+        if (
+            launch_slot <= 0
+            or launch_observed < activation
+            or tracker_created < launch_observed
+        ):
+            errors.append(f"manifest_tracker_chronology_invalid:{mint}")
+    try:
+        active_mint_count = int(manifest.get("active_mint_count", -1))
+    except (TypeError, ValueError):
+        active_mint_count = -1
+    if active_mint_count != len(active_mints):
+        errors.append("manifest_active_mint_count_mismatch")
+    return sorted(set(errors))
+
+
+def exact_holder_checkpoint_from_manifest(
+    manifest: dict[str, Any],
+    source_run_dir: pathlib.Path,
+    *,
+    captured_at_unix_nanos: int | None = None,
+) -> dict[str, Any]:
+    local_exit_path = source_run_dir / "local_collector_exit_status.json"
+    local_summary_path = source_run_dir / "local_collector_summary.json"
+    local_exit = read_json(local_exit_path)
+    local_summary = read_json(local_summary_path)
+    required_exit_fields = {
+        "ok",
+        "downstream_backpressure_count",
+        "holder_rpc_used",
+        "live_trading_enabled",
+        "replay_run",
+        "backtesting_run",
+        "threshold_tuning_run",
+    }
+    required_summary_fields = {
+        "relay_session_id",
+        "r2_streaming_unverified_chunks",
+        "downstream_backpressure_count",
+    }
+    missing_exit_fields = sorted(required_exit_fields - set(local_exit))
+    missing_summary_fields = sorted(required_summary_fields - set(local_summary))
+    if missing_exit_fields or missing_summary_fields:
+        raise BatchError(
+            "exact-holder handoff source safety fields missing: "
+            f"exit={missing_exit_fields},summary={missing_summary_fields}"
+        )
+    expected_relay_session_id = str(local_summary.get("relay_session_id", ""))
+    errors = exact_holder_manifest_validation_errors(manifest, expected_relay_session_id)
+    if errors:
+        raise BatchError("invalid exact-holder tracker manifest: " + ",".join(errors))
+    if local_exit.get("ok") is not True:
+        raise BatchError("exact-holder handoff source local collector exit is not clean")
+    source_run_finalized_at_unix_nanos = max(
+        local_exit_path.stat().st_mtime_ns,
+        local_summary_path.stat().st_mtime_ns,
+    )
+    captured_at_unix_nanos = captured_at_unix_nanos or time.time_ns()
+    if source_run_finalized_at_unix_nanos > captured_at_unix_nanos + 5_000_000_000:
+        raise BatchError("exact-holder handoff source finalization timestamp is in the future")
+    source_manifest_json = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "schema_version": "exact_holder_tracker_handoff_checkpoint.v1",
+        "captured_at_unix_nanos": captured_at_unix_nanos,
+        "source_run_finalized_at_unix_nanos": source_run_finalized_at_unix_nanos,
+        "source_run_id": source_run_dir.name,
+        "source_relay_session_id": expected_relay_session_id,
+        "source_manifest_sha256": hashlib.sha256(source_manifest_json.encode()).hexdigest(),
+        "source_manifest_json": source_manifest_json,
+        "immediately_preceding_mission_slice": True,
+        "source_local_collector_exit_ok": True,
+        "source_r2_unverified_chunks": int(
+            local_summary.get("r2_streaming_unverified_chunks", 0) or 0
+        ),
+        "source_receiver_backpressure_count": max(
+            int(local_exit.get("downstream_backpressure_count", 0) or 0),
+            int(local_summary.get("downstream_backpressure_count", 0) or 0),
+        ),
+        "source_holder_rpc_used": bool(
+            local_exit.get("holder_rpc_used")
+            or local_summary.get("holder_rpc_enabled")
+        ),
+        "source_live_trading_enabled": bool(
+            local_exit.get("live_trading_enabled")
+            or local_summary.get("live_trading_enabled")
+        ),
+        "source_replay_run": bool(local_exit.get("replay_run")),
+        "source_backtesting_run": bool(local_exit.get("backtesting_run")),
+        "source_threshold_tuning_run": bool(local_exit.get("threshold_tuning_run")),
+        "stream_only_required": True,
+        "rpc_holder_snapshot_allowed": False,
+        "dex_as_holder_truth": False,
+        "proxy_as_exact": False,
+        "pool_vaults_counted_as_holders": False,
+        "source_run_output_dir": str(source_run_dir),
+    }
+
+
+def exact_holder_previous_run_dir(args: argparse.Namespace) -> pathlib.Path | None:
+    candidates = [
+        path
+        for path in args.output_root.glob(f"{args.run_prefix}-*")
+        if path.is_dir() and not path.name.endswith("-logs")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def exact_holder_remote_manifest(
+    args: argparse.Namespace, source_run_id: str
+) -> dict[str, Any]:
+    health_dir = (
+        f"{args.vps_health_root.rstrip('/')}/"
+        f"pump-launch-quant-stream-relay-{source_run_id}"
+    )
+    remote_path = f"{health_dir}/{EXACT_HOLDER_TRACKER_MANIFEST_NAME}"
+    proc = ssh(args, f"cat {shlex.quote(remote_path)}", check=False)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise BatchError(
+            f"exact-holder predecessor manifest unavailable for {source_run_id}"
+        )
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise BatchError("exact-holder predecessor manifest is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise BatchError("exact-holder predecessor manifest is not an object")
+    return payload
+
+
+def prepare_exact_holder_handoff_input(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    audit: dict[str, Any] = {
+        "schema_version": "exact_holder_handoff_input_audit.v1",
+        "generated_at_unix_nanos": time.time_ns(),
+        "bootstrap_allowed": False,
+        "bootstrap_applied_by_relay": False,
+        "continuity_reset": False,
+        "reason": "no_prior_mission_slice",
+        "max_checkpoint_age_seconds": args.exact_holder_bootstrap_max_age_seconds,
+        "stream_only_required": True,
+        "rpc_holder_snapshot_allowed": False,
+        "dex_as_holder_truth": False,
+        "proxy_as_exact": False,
+        "pool_vaults_counted_as_holders": False,
+    }
+    source_run_dir = exact_holder_previous_run_dir(args)
+    if source_run_dir is None:
+        return audit, None
+    audit["source_run_id"] = source_run_dir.name
+    audit["source_run_dir"] = str(source_run_dir)
+    try:
+        manifest_path = source_run_dir / EXACT_HOLDER_TRACKER_MANIFEST_NAME
+        manifest = (
+            read_json(manifest_path)
+            if manifest_path.exists()
+            else exact_holder_remote_manifest(args, source_run_dir.name)
+        )
+        checkpoint = exact_holder_checkpoint_from_manifest(manifest, source_run_dir)
+        active_mint_count = int(manifest.get("active_mint_count", 0) or 0)
+        audit["source_active_mint_count"] = active_mint_count
+        audit["source_relay_session_id"] = manifest.get("relay_session_id")
+        source_age_nanos = time.time_ns() - int(
+            checkpoint["source_run_finalized_at_unix_nanos"]
+        )
+        audit["source_run_finalized_age_seconds"] = max(
+            0, source_age_nanos // 1_000_000_000
+        )
+        unsafe_source = (
+            checkpoint["source_r2_unverified_chunks"] != 0
+            or checkpoint["source_receiver_backpressure_count"] != 0
+            or checkpoint["source_holder_rpc_used"]
+            or checkpoint["source_live_trading_enabled"]
+            or checkpoint["source_replay_run"]
+            or checkpoint["source_backtesting_run"]
+            or checkpoint["source_threshold_tuning_run"]
+        )
+        if unsafe_source:
+            audit["reason"] = "prior_slice_source_safety_invalid"
+            audit["continuity_reset"] = active_mint_count > 0
+            return audit, None
+        if source_age_nanos > args.exact_holder_bootstrap_max_age_seconds * 1_000_000_000:
+            audit["reason"] = "prior_slice_checkpoint_stale"
+            audit["continuity_reset"] = active_mint_count > 0
+            return audit, None
+        if active_mint_count == 0:
+            audit["reason"] = "prior_slice_has_no_active_trackers"
+            return audit, None
+        audit["bootstrap_allowed"] = True
+        audit["reason"] = "immediate_predecessor_checkpoint_valid"
+        audit["checkpoint_source_manifest_sha256"] = checkpoint[
+            "source_manifest_sha256"
+        ]
+        return audit, checkpoint
+    except (BatchError, OSError, ValueError, TypeError) as exc:
+        audit["reason"] = "prior_slice_checkpoint_invalid"
+        audit["continuity_reset"] = True
+        audit["error"] = str(exc)
+        return audit, None
+
+
+def capture_exact_holder_handoff_output(
+    args: argparse.Namespace,
+    run_dir: pathlib.Path,
+    health_dir: str,
+) -> dict[str, Any]:
+    audit: dict[str, Any] = {
+        "schema_version": "exact_holder_handoff_output_audit.v1",
+        "generated_at_unix_nanos": time.time_ns(),
+        "run_id": run_dir.name,
+        "checkpoint_written": False,
+        "manifest_written": False,
+        "reason": "remote_manifest_unavailable",
+    }
+    remote_path = f"{health_dir}/{EXACT_HOLDER_TRACKER_MANIFEST_NAME}"
+    try:
+        proc = ssh(args, f"cat {shlex.quote(remote_path)}", check=False)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise BatchError("remote exact-holder tracker manifest unavailable")
+        manifest = json.loads(proc.stdout)
+        if not isinstance(manifest, dict):
+            raise BatchError("remote exact-holder tracker manifest is not an object")
+        checkpoint = exact_holder_checkpoint_from_manifest(manifest, run_dir)
+        (run_dir / EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        (run_dir / EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME).write_text(
+            json.dumps(checkpoint, indent=2, sort_keys=True) + "\n"
+        )
+        audit.update(
+            {
+                "checkpoint_written": True,
+                "manifest_written": True,
+                "reason": "handoff_checkpoint_ready",
+                "relay_session_id": manifest.get("relay_session_id"),
+                "active_mint_count": manifest.get("active_mint_count", 0),
+                "bootstrap_applied": manifest.get("bootstrap_applied", False),
+                "bootstrap_source_run_id": manifest.get("bootstrap_source_run_id"),
+                "bootstrap_source_relay_session_id": manifest.get(
+                    "bootstrap_source_relay_session_id"
+                ),
+                "bootstrapped_tracker_count": manifest.get(
+                    "bootstrapped_tracker_count", 0
+                ),
+                "bootstrap_expired_tracker_count": manifest.get(
+                    "bootstrap_expired_tracker_count", 0
+                ),
+                "bootstrap_preserves_tracker_scope_only": manifest.get(
+                    "bootstrap_preserves_tracker_scope_only", False
+                ),
+                "bootstrap_stream_continuity_proven": manifest.get(
+                    "bootstrap_stream_continuity_proven", False
+                ),
+                "handoff_generation": manifest.get("handoff_generation", 0),
+                "source_manifest_sha256": checkpoint["source_manifest_sha256"],
+            }
+        )
+    except (BatchError, OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        audit["error"] = str(exc)
+    (run_dir / EXACT_HOLDER_HANDOFF_OUTPUT_AUDIT_NAME).write_text(
+        json.dumps(audit, indent=2, sort_keys=True) + "\n"
+    )
+    return audit
 
 
 def validate_collection_justification(args: argparse.Namespace) -> dict[str, Any]:
@@ -836,7 +1197,12 @@ def start_or_reuse_reverse_tunnel(
     raise BatchError(f"reverse tunnel did not become ready within {args.tunnel_timeout_seconds}s: {last_error}")
 
 
-def make_remote_script(args: argparse.Namespace, run_id: str, health_dir: str) -> str:
+def make_remote_script(
+    args: argparse.Namespace,
+    run_id: str,
+    health_dir: str,
+    bootstrap_checkpoint_remote: str | None = None,
+) -> str:
     remote_config = " ".join(
         [
             "--config",
@@ -845,6 +1211,14 @@ def make_remote_script(args: argparse.Namespace, run_id: str, health_dir: str) -
             shlex.quote(args.vps_config_override),
         ]
     )
+    bootstrap_args = ""
+    if bootstrap_checkpoint_remote:
+        bootstrap_args = (
+            "          --exact-holder-bootstrap-checkpoint "
+            f"{shlex.quote(bootstrap_checkpoint_remote)} \\\n"
+            "          --exact-holder-bootstrap-max-age-seconds "
+            f"{int(args.exact_holder_bootstrap_max_age_seconds)} \\\n"
+        )
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env bash
@@ -859,7 +1233,7 @@ def make_remote_script(args: argparse.Namespace, run_id: str, health_dir: str) -
           --receiver-url {shlex.quote(args.receiver_url)} \\
           --duration-seconds {int(args.duration_seconds)} \\
           --health-dir "$HEALTH" \\
-          --json >"$HEALTH/relay.log" 2>"$HEALTH/relay.err"
+{bootstrap_args}          --json >"$HEALTH/relay.log" 2>"$HEALTH/relay.err"
         RC=$?
         echo "$RC" >"$HEALTH/relay_command_rc"
         exit "$RC"
@@ -1380,14 +1754,28 @@ def run_slice(
     batch_log_dir: pathlib.Path,
     idx: int,
 ) -> tuple[dict[str, Any], list[str]]:
+    handoff_input_audit, handoff_checkpoint = prepare_exact_holder_handoff_input(args)
     run_id = f"{args.run_prefix}-{utc_stamp()}"
     out = args.output_root / run_id
     log_dir = args.output_root / f"{run_id}-logs"
     health_dir = f"{args.vps_health_root.rstrip('/')}/pump-launch-quant-stream-relay-{run_id}"
     remote_script_local = log_dir / "remote_relay.sh"
     remote_script_remote = f"{health_dir}/remote_relay.sh"
+    bootstrap_checkpoint_local = log_dir / EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME
+    bootstrap_checkpoint_remote = (
+        f"{health_dir}/{EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME}"
+        if handoff_checkpoint is not None
+        else None
+    )
     out.mkdir(parents=True, exist_ok=False)
     log_dir.mkdir(parents=True, exist_ok=False)
+    (out / EXACT_HOLDER_HANDOFF_INPUT_AUDIT_NAME).write_text(
+        json.dumps(handoff_input_audit, indent=2, sort_keys=True) + "\n"
+    )
+    if handoff_checkpoint is not None:
+        bootstrap_checkpoint_local.write_text(
+            json.dumps(handoff_checkpoint, indent=2, sort_keys=True) + "\n"
+        )
     if args.survivor_extension_mode:
         survivor_policy = {
             "schema_version": "phase107h.survivor_extension_mode.v1",
@@ -1407,7 +1795,14 @@ def run_slice(
         (out / "survivor_extension_mode.json").write_text(
             json.dumps(survivor_policy, indent=2, sort_keys=True) + "\n"
         )
-    remote_script_local.write_text(make_remote_script(args, run_id, health_dir))
+    remote_script_local.write_text(
+        make_remote_script(
+            args,
+            run_id,
+            health_dir,
+            bootstrap_checkpoint_remote,
+        )
+    )
     remote_script_local.chmod(0o700)
 
     local_cmd = [
@@ -1480,6 +1875,15 @@ def run_slice(
             f"{args.vps_ssh_target}:{remote_script_remote}",
         ]
         run_capture(scp_cmd, check=True)
+        if bootstrap_checkpoint_remote is not None:
+            run_capture(
+                scp_base(args)
+                + [
+                    str(bootstrap_checkpoint_local),
+                    f"{args.vps_ssh_target}:{bootstrap_checkpoint_remote}",
+                ],
+                check=True,
+            )
         start_remote = (
             f"set -euo pipefail; mkdir -p {shlex.quote(health_dir)}; "
             f"chmod +x {shlex.quote(remote_script_remote)}; "
@@ -1537,6 +1941,20 @@ def run_slice(
 
     vps_after_path = log_dir / "vps_after.txt"
     collect_remote_after(args, health_dir, vps_after_path)
+    handoff_output_audit = capture_exact_holder_handoff_output(
+        args,
+        out,
+        health_dir,
+    )
+    handoff_input_audit["bootstrap_applied_by_relay"] = bool(
+        handoff_output_audit.get("bootstrap_applied")
+    )
+    handoff_input_audit["destination_relay_session_id"] = handoff_output_audit.get(
+        "relay_session_id"
+    )
+    (out / EXACT_HOLDER_HANDOFF_INPUT_AUDIT_NAME).write_text(
+        json.dumps(handoff_input_audit, indent=2, sort_keys=True) + "\n"
+    )
     try:
         vps_after_text = vps_after_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1550,6 +1968,20 @@ def run_slice(
     result["classification"] = classify_slice(result) if not blockers else result.get("classification")
     result["survivor_extension_mode_enabled"] = bool(args.survivor_extension_mode)
     result["survivor_extension_mode_same_caps"] = bool(args.survivor_extension_mode)
+    result["exact_holder_handoff_bootstrap_allowed"] = bool(
+        handoff_input_audit.get("bootstrap_allowed")
+    )
+    result["exact_holder_handoff_bootstrap_applied"] = bool(
+        handoff_output_audit.get("bootstrap_applied")
+    )
+    result["exact_holder_handoff_continuity_reset"] = bool(
+        handoff_input_audit.get("continuity_reset")
+    )
+    result["exact_holder_handoff_input_reason"] = handoff_input_audit.get("reason")
+    result["exact_holder_handoff_checkpoint_written"] = bool(
+        handoff_output_audit.get("checkpoint_written")
+    )
+    result["exact_holder_handoff_output_reason"] = handoff_output_audit.get("reason")
     if local_rc != 0:
         blockers.append("local_rc")
     if local_rc == -1:
@@ -1668,6 +2100,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--duration-seconds", type=int, default=900)
+    parser.add_argument(
+        "--exact-holder-bootstrap-max-age-seconds",
+        type=int,
+        default=600,
+        help=(
+            "Maximum age of the immediately preceding finalized slice checkpoint "
+            "that may seed fresh-holder subscriptions."
+        ),
+    )
     parser.add_argument("--local-receiver-window-seconds", type=int, default=1020)
     parser.add_argument("--max-attempted-launches", type=int, default=15)
     parser.add_argument("--target-candidates", type=int, default=2)
@@ -1825,6 +2266,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--vps-ssh-target or PUMP_RELAY_VPS_SSH_TARGET is required")
     if args.local_receiver_window_seconds < args.duration_seconds:
         parser.error("--local-receiver-window-seconds must be >= --duration-seconds")
+    if args.exact_holder_bootstrap_max_age_seconds < 1:
+        parser.error("--exact-holder-bootstrap-max-age-seconds must be positive")
     args.output_root = args.output_root.resolve()
     if args.batch_log_dir is None:
         args.batch_log_dir = (DEFAULT_LOG_ROOT / utc_stamp()).resolve()

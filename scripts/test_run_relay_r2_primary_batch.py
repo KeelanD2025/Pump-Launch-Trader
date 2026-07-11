@@ -29,6 +29,7 @@ def dummy_args(**overrides: object) -> types.SimpleNamespace:
         "receiver_url": "tcp://127.0.0.1:19097",
         "listen_url": "tcp://127.0.0.1:19097",
         "duration_seconds": 900,
+        "exact_holder_bootstrap_max_age_seconds": 600,
         "expected_latest_run_id": "material-candidate-hunter-stable",
         "ssh_key": None,
         "ssh_option": [],
@@ -219,6 +220,45 @@ def write_zero_attempt_slice_fixture(
 
 
 class RelaySupervisorTests(unittest.TestCase):
+    @staticmethod
+    def exact_holder_manifest_fixture(relay_session_id: str = "relay-test") -> dict[str, object]:
+        activation = 1_780_000_000_000_000_000
+        mint = "5u83eeMKS5drqAdchhJQeUpt7x4DNaU7ZBnaMZjUpump"
+        return {
+            "schema_version": "exact_holder_tracker_activation_manifest.v1",
+            "relay_session_id": relay_session_id,
+            "tracker_activation_unix_nanos": activation,
+            "dynamic_fresh_launch_tracking_enabled": True,
+            "max_active_mints": 64,
+            "mint_ttl_seconds": 7200,
+            "active_mint_count": 1,
+            "active_mints": [mint],
+            "tracker_rows": [
+                {
+                    "mint": mint,
+                    "launch_slot": 42,
+                    "launch_signature": "launch-signature",
+                    "launch_observed_at_unix_nanos": activation + 1_000,
+                    "tracker_created": True,
+                    "tracker_created_at_unix_nanos": activation + 2_000,
+                    "tracker_delay_ms": 0,
+                    "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
+                    "subscription_generation": 1,
+                    "active_mint_count": 1,
+                    "active": True,
+                    "retired_at_unix_nanos": None,
+                    "retired_reason": None,
+                    "eligible_for_exact_holder_acceptance": True,
+                    "ineligible_reason": None,
+                }
+            ],
+            "stream_only_required": True,
+            "rpc_holder_snapshot_allowed": False,
+            "dex_as_holder_truth": False,
+            "proxy_as_exact": False,
+            "pool_vaults_counted_as_holders": False,
+        }
+
     def test_listener_readiness_is_required_before_relay_start(self) -> None:
         proc = types.SimpleNamespace(returncode=1)
         with mock.patch.object(relay_supervisor.subprocess, "run", return_value=proc):
@@ -238,6 +278,119 @@ class RelaySupervisorTests(unittest.TestCase):
         script = relay_supervisor.make_remote_script(dummy_args(), "run-1", "/run/user/1000/relay")
         self.assertIn('echo "$RC" >"$HEALTH/relay_command_rc"', script)
         self.assertIn('exit "$RC"', script)
+
+    def test_remote_script_includes_exact_holder_bootstrap_before_start(self) -> None:
+        checkpoint = "/run/user/1000/relay/exact_holder_tracker_handoff_checkpoint.json"
+        script = relay_supervisor.make_remote_script(
+            dummy_args(),
+            "run-1",
+            "/run/user/1000/relay",
+            checkpoint,
+        )
+        self.assertIn(
+            f"--exact-holder-bootstrap-checkpoint {relay_supervisor.shlex.quote(checkpoint)}",
+            script,
+        )
+        self.assertIn("--exact-holder-bootstrap-max-age-seconds 600", script)
+
+    def test_handoff_checkpoint_is_bound_to_clean_immediate_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "background-proof-20260711T000000Z"
+            source.mkdir()
+            relay_session_id = "relay-source"
+            (source / "local_collector_exit_status.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "downstream_backpressure_count": 0,
+                        "holder_rpc_used": False,
+                        "live_trading_enabled": False,
+                        "replay_run": False,
+                        "backtesting_run": False,
+                        "threshold_tuning_run": False,
+                    }
+                )
+            )
+            (source / "local_collector_summary.json").write_text(
+                json.dumps(
+                    {
+                        "relay_session_id": relay_session_id,
+                        "r2_streaming_unverified_chunks": 0,
+                        "downstream_backpressure_count": 0,
+                        "holder_rpc_enabled": False,
+                        "live_trading_enabled": False,
+                    }
+                )
+            )
+            manifest = self.exact_holder_manifest_fixture(relay_session_id)
+            (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
+                json.dumps(manifest)
+            )
+            args = dummy_args(
+                output_root=root,
+                run_prefix="background-proof",
+                exact_holder_bootstrap_max_age_seconds=600,
+            )
+
+            audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
+
+            self.assertTrue(audit["bootstrap_allowed"])
+            self.assertFalse(audit["continuity_reset"])
+            self.assertIsNotNone(checkpoint)
+            assert checkpoint is not None
+            self.assertEqual(checkpoint["source_run_id"], source.name)
+            self.assertEqual(checkpoint["source_relay_session_id"], relay_session_id)
+            source_manifest_json = checkpoint["source_manifest_json"]
+            self.assertEqual(
+                checkpoint["source_manifest_sha256"],
+                relay_supervisor.hashlib.sha256(source_manifest_json.encode()).hexdigest(),
+            )
+            self.assertEqual(checkpoint["source_r2_unverified_chunks"], 0)
+            self.assertFalse(checkpoint["source_holder_rpc_used"])
+
+    def test_handoff_rejects_active_manifest_with_unsafe_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "background-proof-20260711T000000Z"
+            source.mkdir()
+            (source / "local_collector_exit_status.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "downstream_backpressure_count": 0,
+                        "holder_rpc_used": True,
+                        "live_trading_enabled": False,
+                        "replay_run": False,
+                        "backtesting_run": False,
+                        "threshold_tuning_run": False,
+                    }
+                )
+            )
+            (source / "local_collector_summary.json").write_text(
+                json.dumps(
+                    {
+                        "relay_session_id": "relay-source",
+                        "r2_streaming_unverified_chunks": 0,
+                        "downstream_backpressure_count": 0,
+                    }
+                )
+            )
+            (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
+                json.dumps(self.exact_holder_manifest_fixture("relay-source"))
+            )
+            args = dummy_args(
+                output_root=root,
+                run_prefix="background-proof",
+                exact_holder_bootstrap_max_age_seconds=600,
+            )
+
+            audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
+
+            self.assertFalse(audit["bootstrap_allowed"])
+            self.assertTrue(audit["continuity_reset"])
+            self.assertEqual(audit["reason"], "prior_slice_source_safety_invalid")
+            self.assertIsNone(checkpoint)
 
     def test_no_secrets_are_rendered_into_remote_script(self) -> None:
         script = relay_supervisor.make_remote_script(

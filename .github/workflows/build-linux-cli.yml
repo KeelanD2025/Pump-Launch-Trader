@@ -166,6 +166,9 @@ jobs:
       - name: Run fresh stream holder tests
         run: python3 scripts/test_fresh_stream_holder_tracking.py
 
+      - name: Run relay supervisor tests
+        run: python3 scripts/test_run_relay_r2_primary_batch.py
+
       - name: Build release CLI
         run: cargo build --release -p cli
 

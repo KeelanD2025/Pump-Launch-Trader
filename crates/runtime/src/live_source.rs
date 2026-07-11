@@ -1474,6 +1474,12 @@ pub struct FreshHolderTrackerActivation {
     pub retired_at_unix_nanos: Option<u64>,
     #[serde(default)]
     pub retired_reason: Option<String>,
+    #[serde(default)]
+    pub bootstrapped_from_prior_relay: bool,
+    #[serde(default)]
+    pub origin_relay_session_id: Option<String>,
+    #[serde(default)]
+    pub last_bootstrap_source_run_id: Option<String>,
     pub eligible_for_exact_holder_acceptance: bool,
     pub ineligible_reason: Option<String>,
 }
@@ -1505,6 +1511,8 @@ pub struct RelayHealthSummary {
     #[serde(default)]
     pub exact_holder_tracker_activation_unix_nanos: Option<u64>,
     #[serde(default)]
+    pub exact_holder_relay_started_at_unix_nanos: Option<u64>,
+    #[serde(default)]
     pub exact_holder_dynamic_max_mints: usize,
     #[serde(default)]
     pub exact_holder_dynamic_ttl_seconds: u64,
@@ -1520,6 +1528,20 @@ pub struct RelayHealthSummary {
     pub exact_holder_ttl_expirations: u64,
     #[serde(default)]
     pub exact_holder_active_mint_count: usize,
+    #[serde(default)]
+    pub exact_holder_bootstrap_applied: bool,
+    #[serde(default)]
+    pub exact_holder_bootstrap_source_run_id: Option<String>,
+    #[serde(default)]
+    pub exact_holder_bootstrap_source_relay_session_id: Option<String>,
+    #[serde(default)]
+    pub exact_holder_bootstrap_checkpoint_sha256: Option<String>,
+    #[serde(default)]
+    pub exact_holder_bootstrapped_tracker_count: u64,
+    #[serde(default)]
+    pub exact_holder_bootstrap_expired_tracker_count: u64,
+    #[serde(default)]
+    pub exact_holder_handoff_generation: u64,
     #[serde(default)]
     pub exact_holder_tracker_rows: Vec<FreshHolderTrackerActivation>,
 }
