@@ -870,6 +870,14 @@ def supervisor_status(control_env: pathlib.Path) -> dict[str, Any]:
     return {"ok": False, "error": "missing_supervisor_status", "stdout_tail": proc.stdout[-1200:], "stderr_tail": proc.stderr[-1200:]}
 
 
+def git_commit_is_ancestor(ancestor_sha: str, descendant_sha: str) -> bool:
+    proc = run_capture(
+        ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+        timeout=30,
+    )
+    return proc.returncode == 0
+
+
 def verify_deployed_sha(control_env: pathlib.Path) -> dict[str, Any]:
     env = merged_env(control_env)
     ssh_target = env.get("PUMP_RELAY_VPS_SSH_TARGET", "")
@@ -892,6 +900,19 @@ def verify_deployed_sha(control_env: pathlib.Path) -> dict[str, Any]:
     remote_sha = proc.stdout.strip()
     payload = {"ok": proc.returncode == 0 and remote_sha == local_sha, "local_sha": local_sha, "deployed_sha": remote_sha}
     if payload["ok"] or proc.returncode != 0 or not remote_sha:
+        return payload
+    if git_commit_is_ancestor(local_sha, remote_sha):
+        changed_proc = run_capture(["git", "diff", "--name-only", f"{local_sha}..{remote_sha}"], timeout=60)
+        payload.update(
+            {
+                "ok": changed_proc.returncode == 0,
+                "reason": "deployed_runtime_is_verified_descendant_of_local_head",
+                "remote_deployment_ahead_of_local_head": True,
+                "deployed_changes_ahead_of_local_sha": [
+                    line.strip() for line in changed_proc.stdout.splitlines() if line.strip()
+                ],
+            }
+        )
         return payload
     changed_proc = run_capture(["git", "diff", "--name-only", f"{remote_sha}..{local_sha}"], timeout=60)
     changed_paths = [line.strip() for line in changed_proc.stdout.splitlines() if line.strip()]

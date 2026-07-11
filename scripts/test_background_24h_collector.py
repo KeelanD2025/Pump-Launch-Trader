@@ -122,6 +122,19 @@ class Background24hCollectorTests(unittest.TestCase):
         self.assertTrue(collector.remote_runtime_deploy_required(["crates/cli/src/main.rs"]))
         self.assertTrue(collector.remote_runtime_deploy_required(["config/default.toml"]))
 
+    def test_deployed_sha_gate_accepts_verified_remote_descendant(self) -> None:
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(collector, "run_capture", return_value=completed) as run_capture:
+            self.assertTrue(collector.git_commit_is_ancestor("local-sha", "deployed-sha"))
+        run_capture.assert_called_once_with(
+            ["git", "merge-base", "--is-ancestor", "local-sha", "deployed-sha"],
+            timeout=30,
+        )
+
+    def test_deployed_sha_gate_rejects_unrelated_remote_commit(self) -> None:
+        with mock.patch.object(collector, "run_capture", return_value=mock.Mock(returncode=1)):
+            self.assertFalse(collector.git_commit_is_ancestor("local-sha", "deployed-sha"))
+
     def test_worker_clears_stale_blocker_before_next_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
