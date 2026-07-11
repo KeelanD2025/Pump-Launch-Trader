@@ -63807,7 +63807,7 @@ mod tests {
         assert!(initial.accounts.is_empty());
         assert_eq!(initial.transactions.len(), 1);
 
-        let mint = bs58::encode([41u8; 32]).into_string();
+        let mint = "5u83eeMKS5drqAdchhJQeUpt7x4DNaU7ZBnaMZjUpump".to_owned();
         active_mints.insert(
             mint,
             RelayFreshHolderMint {
