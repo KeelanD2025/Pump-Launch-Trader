@@ -350,28 +350,51 @@ def exact_holder_checkpoint_from_manifest(
 ) -> dict[str, Any]:
     local_exit_path = source_run_dir / "local_collector_exit_status.json"
     local_summary_path = source_run_dir / "local_collector_summary.json"
+    run_countability_path = source_run_dir / "run_countability_decision.json"
     local_exit = read_json(local_exit_path)
     local_summary = read_json(local_summary_path)
+    run_countability = read_json(run_countability_path)
     required_exit_fields = {
         "ok",
         "downstream_backpressure_count",
+        "hash_mismatch_count",
         "holder_rpc_used",
         "live_trading_enabled",
+        "malformed_frame_count",
+        "receiver_unavailable_count",
         "replay_run",
         "backtesting_run",
+        "sequence_gap_count",
         "threshold_tuning_run",
+        "upstream_provider_blocker_count",
+        "upstream_reconnect_exhausted_count",
     }
     required_summary_fields = {
         "relay_session_id",
         "r2_streaming_unverified_chunks",
         "downstream_backpressure_count",
+        "hash_mismatch_count",
+        "malformed_frame_count",
+        "receiver_unavailable_count",
+        "sequence_gap_count",
+        "upstream_provider_blocker_count",
+        "upstream_reconnect_exhausted_count",
+    }
+    required_countability_fields = {
+        "gap_count",
+        "run_client_backpressure_detected",
+        "run_provider_data_loss_seen",
     }
     missing_exit_fields = sorted(required_exit_fields - set(local_exit))
     missing_summary_fields = sorted(required_summary_fields - set(local_summary))
-    if missing_exit_fields or missing_summary_fields:
+    missing_countability_fields = sorted(
+        required_countability_fields - set(run_countability)
+    )
+    if missing_exit_fields or missing_summary_fields or missing_countability_fields:
         raise BatchError(
             "exact-holder handoff source safety fields missing: "
-            f"exit={missing_exit_fields},summary={missing_summary_fields}"
+            f"exit={missing_exit_fields},summary={missing_summary_fields},"
+            f"countability={missing_countability_fields}"
         )
     expected_relay_session_id = str(local_summary.get("relay_session_id", ""))
     errors = exact_holder_manifest_validation_errors(manifest, expected_relay_session_id)
@@ -382,6 +405,7 @@ def exact_holder_checkpoint_from_manifest(
     source_run_finalized_at_unix_nanos = max(
         local_exit_path.stat().st_mtime_ns,
         local_summary_path.stat().st_mtime_ns,
+        run_countability_path.stat().st_mtime_ns,
     )
     captured_at_unix_nanos = captured_at_unix_nanos or time.time_ns()
     if source_run_finalized_at_unix_nanos > captured_at_unix_nanos + 5_000_000_000:
@@ -391,6 +415,7 @@ def exact_holder_checkpoint_from_manifest(
         sort_keys=True,
         separators=(",", ":"),
     )
+    source_bootstrap_applied = bool(manifest.get("bootstrap_applied"))
     return {
         "schema_version": "exact_holder_tracker_handoff_checkpoint.v1",
         "captured_at_unix_nanos": captured_at_unix_nanos,
@@ -407,6 +432,42 @@ def exact_holder_checkpoint_from_manifest(
         "source_receiver_backpressure_count": max(
             int(local_exit.get("downstream_backpressure_count", 0) or 0),
             int(local_summary.get("downstream_backpressure_count", 0) or 0),
+        ),
+        "source_gap_count": int(run_countability.get("gap_count", 0) or 0),
+        "source_provider_data_loss_seen": bool(
+            run_countability.get("run_provider_data_loss_seen")
+        ),
+        "source_client_backpressure_detected": bool(
+            run_countability.get("run_client_backpressure_detected")
+        ),
+        "source_sequence_gap_count": max(
+            int(local_exit.get("sequence_gap_count", 0) or 0),
+            int(local_summary.get("sequence_gap_count", 0) or 0),
+        ),
+        "source_receiver_unavailable_count": max(
+            int(local_exit.get("receiver_unavailable_count", 0) or 0),
+            int(local_summary.get("receiver_unavailable_count", 0) or 0),
+        ),
+        "source_hash_mismatch_count": max(
+            int(local_exit.get("hash_mismatch_count", 0) or 0),
+            int(local_summary.get("hash_mismatch_count", 0) or 0),
+        ),
+        "source_malformed_frame_count": max(
+            int(local_exit.get("malformed_frame_count", 0) or 0),
+            int(local_summary.get("malformed_frame_count", 0) or 0),
+        ),
+        "source_upstream_provider_blocker_count": max(
+            int(local_exit.get("upstream_provider_blocker_count", 0) or 0),
+            int(local_summary.get("upstream_provider_blocker_count", 0) or 0),
+        ),
+        "source_upstream_reconnect_exhausted_count": max(
+            int(local_exit.get("upstream_reconnect_exhausted_count", 0) or 0),
+            int(local_summary.get("upstream_reconnect_exhausted_count", 0) or 0),
+        ),
+        "source_bootstrap_applied": source_bootstrap_applied,
+        "source_bootstrap_stream_continuity_proven": (
+            not source_bootstrap_applied
+            or manifest.get("bootstrap_stream_continuity_proven") is True
         ),
         "source_holder_rpc_used": bool(
             local_exit.get("holder_rpc_used")
@@ -510,12 +571,36 @@ def prepare_exact_holder_handoff_input(
         unsafe_source = (
             checkpoint["source_r2_unverified_chunks"] != 0
             or checkpoint["source_receiver_backpressure_count"] != 0
+            or checkpoint["source_gap_count"] != 0
+            or checkpoint["source_provider_data_loss_seen"]
+            or checkpoint["source_client_backpressure_detected"]
+            or checkpoint["source_sequence_gap_count"] != 0
+            or checkpoint["source_receiver_unavailable_count"] != 0
+            or checkpoint["source_hash_mismatch_count"] != 0
+            or checkpoint["source_malformed_frame_count"] != 0
+            or checkpoint["source_upstream_provider_blocker_count"] != 0
+            or checkpoint["source_upstream_reconnect_exhausted_count"] != 0
+            or not checkpoint["source_bootstrap_stream_continuity_proven"]
             or checkpoint["source_holder_rpc_used"]
             or checkpoint["source_live_trading_enabled"]
             or checkpoint["source_replay_run"]
             or checkpoint["source_backtesting_run"]
             or checkpoint["source_threshold_tuning_run"]
         )
+        for key in (
+            "source_gap_count",
+            "source_provider_data_loss_seen",
+            "source_client_backpressure_detected",
+            "source_sequence_gap_count",
+            "source_receiver_unavailable_count",
+            "source_hash_mismatch_count",
+            "source_malformed_frame_count",
+            "source_upstream_provider_blocker_count",
+            "source_upstream_reconnect_exhausted_count",
+            "source_bootstrap_applied",
+            "source_bootstrap_stream_continuity_proven",
+        ):
+            audit[key] = checkpoint[key]
         if unsafe_source:
             audit["reason"] = "prior_slice_source_safety_invalid"
             audit["continuity_reset"] = active_mint_count > 0

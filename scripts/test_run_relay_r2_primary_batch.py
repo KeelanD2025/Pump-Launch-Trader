@@ -304,11 +304,17 @@ class RelaySupervisorTests(unittest.TestCase):
                     {
                         "ok": True,
                         "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
                         "holder_rpc_used": False,
                         "live_trading_enabled": False,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
                         "replay_run": False,
                         "backtesting_run": False,
+                        "sequence_gap_count": 0,
                         "threshold_tuning_run": False,
+                        "upstream_provider_blocker_count": 0,
+                        "upstream_reconnect_exhausted_count": 0,
                     }
                 )
             )
@@ -318,8 +324,23 @@ class RelaySupervisorTests(unittest.TestCase):
                         "relay_session_id": relay_session_id,
                         "r2_streaming_unverified_chunks": 0,
                         "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
                         "holder_rpc_enabled": False,
                         "live_trading_enabled": False,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "sequence_gap_count": 0,
+                        "upstream_provider_blocker_count": 0,
+                        "upstream_reconnect_exhausted_count": 0,
+                    }
+                )
+            )
+            (source / "run_countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "gap_count": 0,
+                        "run_client_backpressure_detected": False,
+                        "run_provider_data_loss_seen": False,
                     }
                 )
             )
@@ -370,11 +391,17 @@ class RelaySupervisorTests(unittest.TestCase):
                     {
                         "ok": True,
                         "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
                         "holder_rpc_used": True,
                         "live_trading_enabled": False,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
                         "replay_run": False,
                         "backtesting_run": False,
+                        "sequence_gap_count": 0,
                         "threshold_tuning_run": False,
+                        "upstream_provider_blocker_count": 0,
+                        "upstream_reconnect_exhausted_count": 0,
                     }
                 )
             )
@@ -384,6 +411,21 @@ class RelaySupervisorTests(unittest.TestCase):
                         "relay_session_id": "relay-source",
                         "r2_streaming_unverified_chunks": 0,
                         "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "sequence_gap_count": 0,
+                        "upstream_provider_blocker_count": 0,
+                        "upstream_reconnect_exhausted_count": 0,
+                    }
+                )
+            )
+            (source / "run_countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "gap_count": 0,
+                        "run_client_backpressure_detected": False,
+                        "run_provider_data_loss_seen": False,
                     }
                 )
             )
@@ -401,6 +443,139 @@ class RelaySupervisorTests(unittest.TestCase):
             self.assertFalse(audit["bootstrap_allowed"])
             self.assertTrue(audit["continuity_reset"])
             self.assertEqual(audit["reason"], "prior_slice_source_safety_invalid")
+            self.assertIsNone(checkpoint)
+
+    def test_handoff_rejects_predecessor_with_stream_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "background-proof-20260711T000000Z"
+            source.mkdir()
+            (source / "local_collector_exit_status.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
+                        "holder_rpc_used": False,
+                        "live_trading_enabled": False,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "replay_run": False,
+                        "backtesting_run": False,
+                        "sequence_gap_count": 0,
+                        "threshold_tuning_run": False,
+                        "upstream_provider_blocker_count": 1,
+                        "upstream_reconnect_exhausted_count": 0,
+                    }
+                )
+            )
+            (source / "local_collector_summary.json").write_text(
+                json.dumps(
+                    {
+                        "relay_session_id": "relay-source",
+                        "r2_streaming_unverified_chunks": 0,
+                        "downstream_backpressure_count": 0,
+                        "hash_mismatch_count": 0,
+                        "malformed_frame_count": 0,
+                        "receiver_unavailable_count": 0,
+                        "sequence_gap_count": 0,
+                        "upstream_provider_blocker_count": 1,
+                        "upstream_reconnect_exhausted_count": 0,
+                    }
+                )
+            )
+            (source / "run_countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "gap_count": 1,
+                        "run_client_backpressure_detected": False,
+                        "run_provider_data_loss_seen": True,
+                    }
+                )
+            )
+            (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
+                json.dumps(self.exact_holder_manifest_fixture("relay-source"))
+            )
+            args = dummy_args(
+                output_root=root,
+                run_prefix="background-proof",
+                exact_holder_bootstrap_max_age_seconds=600,
+            )
+
+            audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
+
+            self.assertFalse(audit["bootstrap_allowed"])
+            self.assertTrue(audit["continuity_reset"])
+            self.assertEqual(audit["reason"], "prior_slice_source_safety_invalid")
+            self.assertEqual(audit["source_gap_count"], 1)
+            self.assertTrue(audit["source_provider_data_loss_seen"])
+            self.assertIsNone(checkpoint)
+
+    def test_handoff_rejects_unproven_bootstrap_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "background-proof-20260711T000000Z"
+            source.mkdir()
+            clean_exit = {
+                "ok": True,
+                "downstream_backpressure_count": 0,
+                "hash_mismatch_count": 0,
+                "holder_rpc_used": False,
+                "live_trading_enabled": False,
+                "malformed_frame_count": 0,
+                "receiver_unavailable_count": 0,
+                "replay_run": False,
+                "backtesting_run": False,
+                "sequence_gap_count": 0,
+                "threshold_tuning_run": False,
+                "upstream_provider_blocker_count": 0,
+                "upstream_reconnect_exhausted_count": 0,
+            }
+            clean_summary = {
+                "relay_session_id": "relay-source",
+                "r2_streaming_unverified_chunks": 0,
+                "downstream_backpressure_count": 0,
+                "hash_mismatch_count": 0,
+                "malformed_frame_count": 0,
+                "receiver_unavailable_count": 0,
+                "sequence_gap_count": 0,
+                "upstream_provider_blocker_count": 0,
+                "upstream_reconnect_exhausted_count": 0,
+            }
+            (source / "local_collector_exit_status.json").write_text(
+                json.dumps(clean_exit)
+            )
+            (source / "local_collector_summary.json").write_text(
+                json.dumps(clean_summary)
+            )
+            (source / "run_countability_decision.json").write_text(
+                json.dumps(
+                    {
+                        "gap_count": 0,
+                        "run_client_backpressure_detected": False,
+                        "run_provider_data_loss_seen": False,
+                    }
+                )
+            )
+            manifest = self.exact_holder_manifest_fixture("relay-source")
+            manifest["bootstrap_applied"] = True
+            manifest["bootstrap_stream_continuity_proven"] = False
+            (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
+                json.dumps(manifest)
+            )
+            args = dummy_args(
+                output_root=root,
+                run_prefix="background-proof",
+                exact_holder_bootstrap_max_age_seconds=600,
+            )
+
+            audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
+
+            self.assertFalse(audit["bootstrap_allowed"])
+            self.assertTrue(audit["continuity_reset"])
+            self.assertEqual(audit["reason"], "prior_slice_source_safety_invalid")
+            self.assertTrue(audit["source_bootstrap_applied"])
+            self.assertFalse(audit["source_bootstrap_stream_continuity_proven"])
             self.assertIsNone(checkpoint)
 
     def test_no_secrets_are_rendered_into_remote_script(self) -> None:
