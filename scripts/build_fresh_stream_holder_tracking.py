@@ -1045,14 +1045,23 @@ def build(args: argparse.Namespace) -> int:
         proof_verdict = "blocked_fresh_source_no_launches"
     elif not normalized_rows:
         proof_verdict = "blocked_provider_no_token_account_or_balance_updates"
-    elif proven_quality_counts[EXACT] and complete_carry:
+    elif proven_quality_counts[EXACT] and proof_window_met:
         proof_verdict = "exact_holder_fresh_launch_tracking_ready"
-    elif proven_quality_counts[NEAR_EXACT] and complete_carry:
+    elif proven_quality_counts[NEAR_EXACT] and proof_window_met:
         proof_verdict = "near_exact_holder_fresh_launch_tracking_ready"
     elif migration_by_mint:
         proof_verdict = "partial_source_lacks_token_balance_state"
     else:
         proof_verdict = "partial_fresh_launches_tracked_no_migration_yet"
+    if proof_verdict in {
+        "exact_holder_fresh_launch_tracking_ready",
+        "near_exact_holder_fresh_launch_tracking_ready",
+    } and complete_carry:
+        lifecycle_verdict = proof_verdict
+    elif not carry_rows:
+        lifecycle_verdict = "partial_fresh_launches_tracked_no_migration_yet"
+    else:
+        lifecycle_verdict = "partial_source_lacks_token_balance_state"
 
     proof_rows = []
     for mint in sorted(tracker_by_mint):
@@ -1084,6 +1093,7 @@ def build(args: argparse.Namespace) -> int:
         "schema_version": "exact_holder_fresh_launch_proof_report.v1",
         "generated_at_utc": utc_now(),
         "verdict": proof_verdict,
+        "overall_lifecycle_verdict": lifecycle_verdict,
         "relay_session_id": manifest_session,
         "proof_window_observed_minutes": round(observed_minutes, 4),
         "proof_window_requirement_met": proof_window_met,
@@ -1121,6 +1131,7 @@ def build(args: argparse.Namespace) -> int:
         {
             **proof_report,
             "schema_version": "exact_holder_fresh_launch_to_migration_proof_report.v1",
+            "verdict": lifecycle_verdict,
             "fresh_migrations": len(carry_rows),
             "carry_forward_complete_rows": complete_carry,
             "migration_proof_complete": complete_carry > 0,

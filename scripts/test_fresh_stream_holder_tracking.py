@@ -278,6 +278,10 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
 
             proof = json.loads((output / "exact_holder_fresh_launch_proof_report.json").read_text())
             self.assertEqual(proof["verdict"], "near_exact_holder_fresh_launch_tracking_ready")
+            self.assertEqual(
+                proof["overall_lifecycle_verdict"],
+                "near_exact_holder_fresh_launch_tracking_ready",
+            )
             self.assertGreater(proof["token_account_update_rows"], 0)
             self.assertEqual(proof["provider_or_sequence_gap_count"], 2)
             self.assertFalse(proof["source_integrity_proven"])
@@ -323,6 +327,13 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 (output / "exact_holder_migration_carry_forward_audit.json").read_text()
             )
             self.assertEqual(migration_audit["carry_forward_complete_rows"], 1)
+            migration_proof = json.loads(
+                (output / "exact_holder_fresh_launch_to_migration_proof_report.json").read_text()
+            )
+            self.assertEqual(
+                migration_proof["verdict"],
+                "near_exact_holder_fresh_launch_tracking_ready",
+            )
 
             with (output / "exact_holder_leakage_audit.csv").open(newline="") as handle:
                 leakage = list(csv.DictReader(handle))
