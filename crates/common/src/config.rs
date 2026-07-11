@@ -2353,6 +2353,12 @@ pub struct GeyserConfig {
     pub exact_holder_startup_snapshots_enabled: bool,
     #[serde(default)]
     pub exact_holder_nonempty_txn_signature_required: bool,
+    #[serde(default)]
+    pub exact_holder_fresh_launch_dynamic_enabled: bool,
+    #[serde(default = "default_exact_holder_dynamic_max_mints")]
+    pub exact_holder_dynamic_max_mints: usize,
+    #[serde(default = "default_exact_holder_dynamic_ttl_seconds")]
+    pub exact_holder_dynamic_ttl_seconds: u64,
 }
 
 impl GeyserConfig {
@@ -2485,6 +2491,13 @@ impl GeyserConfig {
         }
         if self.auth_metadata_key.is_empty() && !self.auth_token_env.is_empty() {
             self.auth_metadata_key = "x-token".to_owned();
+        }
+        if self.exact_holder_dynamic_max_mints == 0 {
+            self.exact_holder_dynamic_max_mints = default_exact_holder_dynamic_max_mints();
+        }
+        self.exact_holder_dynamic_max_mints = self.exact_holder_dynamic_max_mints.min(256);
+        if self.exact_holder_dynamic_ttl_seconds == 0 {
+            self.exact_holder_dynamic_ttl_seconds = default_exact_holder_dynamic_ttl_seconds();
         }
     }
 }
@@ -4250,6 +4263,14 @@ const fn default_material_hunter_active_mint_coalesce_window_ms() -> u64 {
 
 const fn default_material_hunter_active_mint_delta_flush_interval_ms() -> u64 {
     5_000
+}
+
+const fn default_exact_holder_dynamic_max_mints() -> usize {
+    64
+}
+
+const fn default_exact_holder_dynamic_ttl_seconds() -> u64 {
+    7_200
 }
 
 fn default_edge_collector_segment_dir() -> String {

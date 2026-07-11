@@ -185,6 +185,9 @@ account_owner_filters = []
 account_nonempty_txn_signature_required = true
 exact_holder_startup_snapshots_enabled = true
 exact_holder_nonempty_txn_signature_required = false
+exact_holder_fresh_launch_dynamic_enabled = false
+exact_holder_dynamic_max_mints = 64
+exact_holder_dynamic_ttl_seconds = 7200
 
 [ingest.shred]
 enabled = true
@@ -257,6 +260,9 @@ account_owner_filters = []
 account_nonempty_txn_signature_required = true
 exact_holder_startup_snapshots_enabled = true
 exact_holder_nonempty_txn_signature_required = false
+exact_holder_fresh_launch_dynamic_enabled = false
+exact_holder_dynamic_max_mints = 64
+exact_holder_dynamic_ttl_seconds = 7200
 
 [shred]
 bind_addr = "127.0.0.1:19001"

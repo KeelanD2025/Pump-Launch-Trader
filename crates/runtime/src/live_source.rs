@@ -56,6 +56,10 @@ const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 pub type SubscribeUpdateStream =
     Pin<Box<dyn Stream<Item = std::result::Result<SubscribeUpdate, Status>> + Send>>;
+pub type ControlledSubscribeUpdateStream = (
+    SubscribeUpdateStream,
+    Option<mpsc::Sender<SubscribeRequest>>,
+);
 pub type SubscribeDeshredUpdateStream =
     Pin<Box<dyn Stream<Item = std::result::Result<SubscribeUpdateDeshred, Status>> + Send>>;
 
@@ -154,6 +158,14 @@ pub trait GeyserStreamConnector: Send + Sync {
         config: &common::GeyserConfig,
         request: SubscribeRequest,
     ) -> Result<SubscribeUpdateStream>;
+
+    async fn connect_and_subscribe_controlled(
+        &self,
+        config: &common::GeyserConfig,
+        request: SubscribeRequest,
+    ) -> Result<ControlledSubscribeUpdateStream> {
+        Ok((self.connect_and_subscribe(config, request).await?, None))
+    }
 }
 
 #[async_trait]
@@ -178,6 +190,17 @@ impl GeyserStreamConnector for RealGeyserConnector {
         config: &common::GeyserConfig,
         request: SubscribeRequest,
     ) -> Result<SubscribeUpdateStream> {
+        let (stream, _) = self
+            .connect_and_subscribe_controlled(config, request)
+            .await?;
+        Ok(stream)
+    }
+
+    async fn connect_and_subscribe_controlled(
+        &self,
+        config: &common::GeyserConfig,
+        request: SubscribeRequest,
+    ) -> Result<ControlledSubscribeUpdateStream> {
         let endpoint = resolved_geyser_endpoint(config)?;
         let mut resolved = config.clone();
         resolved.endpoint = endpoint.clone();
@@ -195,7 +218,7 @@ impl GeyserStreamConnector for RealGeyserConnector {
             .max_decoding_message_size(max_size);
 
         log_geyser_subscription_filter_metadata(&request);
-        let (request_tx, request_rx) = mpsc::channel::<SubscribeRequest>(4);
+        let (request_tx, request_rx) = mpsc::channel::<SubscribeRequest>(16);
         request_tx
             .send(request)
             .await
@@ -222,7 +245,7 @@ impl GeyserStreamConnector for RealGeyserConnector {
         let stream = ReceiverStream::new(request_rx);
         let response: tonic::Response<tonic::codec::Streaming<SubscribeUpdate>> =
             client.subscribe(stream).await?;
-        Ok(Box::pin(response.into_inner()))
+        Ok((Box::pin(response.into_inner()), Some(request_tx)))
     }
 }
 
@@ -1427,6 +1450,35 @@ pub fn relay_control_to_material_blocker(control: RelayControlKind) -> Option<&'
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FreshPumpLaunchObservation {
+    pub mint: String,
+    pub slot: u64,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FreshHolderTrackerActivation {
+    pub mint: String,
+    pub launch_slot: u64,
+    pub launch_signature: Option<String>,
+    pub launch_observed_at_unix_nanos: u64,
+    pub tracker_created: bool,
+    pub tracker_created_at_unix_nanos: Option<u64>,
+    pub tracker_delay_ms: Option<u64>,
+    pub tracker_source: String,
+    pub subscription_generation: u64,
+    pub active_mint_count: usize,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub retired_at_unix_nanos: Option<u64>,
+    #[serde(default)]
+    pub retired_reason: Option<String>,
+    pub eligible_for_exact_holder_acceptance: bool,
+    pub ineligible_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayHealthSummary {
     pub schema_version: String,
     pub relay_session_id: String,
@@ -1448,6 +1500,28 @@ pub struct RelayHealthSummary {
     pub relay_receiver_available: bool,
     #[serde(default)]
     pub blocker_class: Option<String>,
+    #[serde(default)]
+    pub exact_holder_fresh_launch_dynamic_enabled: bool,
+    #[serde(default)]
+    pub exact_holder_tracker_activation_unix_nanos: Option<u64>,
+    #[serde(default)]
+    pub exact_holder_dynamic_max_mints: usize,
+    #[serde(default)]
+    pub exact_holder_dynamic_ttl_seconds: u64,
+    #[serde(default)]
+    pub exact_holder_fresh_launch_observations: u64,
+    #[serde(default)]
+    pub exact_holder_trackers_created: u64,
+    #[serde(default)]
+    pub exact_holder_subscription_update_failures: u64,
+    #[serde(default)]
+    pub exact_holder_capacity_evictions: u64,
+    #[serde(default)]
+    pub exact_holder_ttl_expirations: u64,
+    #[serde(default)]
+    pub exact_holder_active_mint_count: usize,
+    #[serde(default)]
+    pub exact_holder_tracker_rows: Vec<FreshHolderTrackerActivation>,
 }
 
 #[allow(dead_code)]
@@ -3371,7 +3445,7 @@ fn should_retain_fresh_launch_event(
 }
 
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPq9sJqzQdbqT6qhHV4";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterialHunterPumpPrefilterDecision {
@@ -3598,6 +3672,65 @@ fn material_hunter_transaction_has_pump_create(update: &SubscribeUpdate) -> bool
                 Some("create") | Some("create_v2")
             )
     })
+}
+
+pub fn fresh_pump_launch_observations(update: &SubscribeUpdate) -> Vec<FreshPumpLaunchObservation> {
+    let Some(UpdateOneof::Transaction(tx)) = update.update_oneof.as_ref() else {
+        return Vec::new();
+    };
+    let Some(info) = tx.transaction.as_ref() else {
+        return Vec::new();
+    };
+    if info
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.err.as_ref())
+        .is_some()
+    {
+        return Vec::new();
+    }
+    let Some(message) = info
+        .transaction
+        .as_ref()
+        .and_then(|transaction| transaction.message.as_ref())
+    else {
+        return Vec::new();
+    };
+    let signature = material_hunter_transaction_signature_hint(update);
+    let mut seen = HashSet::new();
+    let mut observations = Vec::new();
+    for instruction in &message.instructions {
+        let is_pump_create = message
+            .account_keys
+            .get(instruction.program_id_index as usize)
+            .map(|program_id| bs58::encode(program_id).into_string() == PUMP_PROGRAM_ID)
+            .unwrap_or(false)
+            && matches!(
+                material_hunter_pump_discriminator_name(&instruction.data),
+                Some("create") | Some("create_v2")
+            );
+        if !is_pump_create {
+            continue;
+        }
+        let Some(mint_index) = instruction.accounts.first().copied() else {
+            continue;
+        };
+        let Some(mint_bytes) = message.account_keys.get(mint_index as usize) else {
+            continue;
+        };
+        if mint_bytes.len() != 32 {
+            continue;
+        }
+        let mint = bs58::encode(mint_bytes).into_string();
+        if seen.insert(mint.clone()) {
+            observations.push(FreshPumpLaunchObservation {
+                mint,
+                slot: tx.slot,
+                signature: signature.clone(),
+            });
+        }
+    }
+    observations
 }
 
 fn material_hunter_signature_seen_or_insert(
@@ -7564,7 +7697,10 @@ mod tests {
         let pump_program_bytes = bs58::decode(PUMP_PROGRAM_ID)
             .into_vec()
             .expect("pump program bytes");
-        let account_key = vec![7; 32];
+        let account_key = mint
+            .and_then(|value| bs58::decode(value).into_vec().ok())
+            .filter(|value| value.len() == 32)
+            .unwrap_or_else(|| vec![7; 32]);
         let mut data = Vec::new();
         data.extend_from_slice(&anchor_discriminator("global", instruction_name));
         data.extend_from_slice(&[0; 8]);
@@ -7599,7 +7735,7 @@ mod tests {
                                 recent_blockhash: vec![0; 32],
                                 instructions: vec![CompiledInstruction {
                                     program_id_index: 0,
-                                    accounts: vec![0, 1],
+                                    accounts: vec![1],
                                     data,
                                 }],
                                 versioned: false,
@@ -7630,6 +7766,29 @@ mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn fresh_pump_launch_observation_uses_create_instruction_mint_account() {
+        let mint = bs58::encode([31u8; 32]).into_string();
+        let update = geyser_pump_instruction_update("create", Some(&mint));
+
+        let observations = fresh_pump_launch_observations(&update);
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].mint, mint);
+        assert_eq!(observations[0].slot, 12);
+        assert!(observations[0].signature.is_some());
+    }
+
+    #[test]
+    fn fresh_pump_launch_observation_supports_create_v2_but_not_trades() {
+        let mint = bs58::encode([32u8; 32]).into_string();
+        let create_v2 = geyser_pump_instruction_update("create_v2", Some(&mint));
+        let buy = geyser_pump_instruction_update("buy", Some(&mint));
+
+        assert_eq!(fresh_pump_launch_observations(&create_v2)[0].mint, mint);
+        assert!(fresh_pump_launch_observations(&buy).is_empty());
     }
 
     fn geyser_token_balance_update(mint: &str, first_account_byte: u8) -> SubscribeUpdate {

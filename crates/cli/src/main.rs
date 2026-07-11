@@ -31,13 +31,13 @@ use reqwest as http_transport;
 use risk::RiskEngine;
 use rpc_budget::{RpcBudgetManager, RpcLedgerEntry};
 use runtime::{
-    DeshredProviderSmokeOptions, FreshLaunchCanaryLiveOptions, GeyserProviderSmokeOptions,
-    GeyserStreamConnector, LiveRunOptions, MaterialHunterStreamAction, MaterialHunterStreamOptions,
-    MaterialHunterStreamStateHint, MaterialHunterStreamSummary, RealGeyserConnector,
-    RelayControlKind, RelayFrame, RelayHealthSummary, RelaySequenceVerifier, RuntimeMode,
-    RuntimeReplayProfile, RuntimeResolvedConfig, SubscribeUpdateStream, Supervisor,
+    DeshredProviderSmokeOptions, FreshHolderTrackerActivation, FreshLaunchCanaryLiveOptions,
+    GeyserProviderSmokeOptions, GeyserStreamConnector, LiveRunOptions, MaterialHunterStreamAction,
+    MaterialHunterStreamOptions, MaterialHunterStreamStateHint, MaterialHunterStreamSummary,
+    RealGeyserConnector, RelayControlKind, RelayFrame, RelayHealthSummary, RelaySequenceVerifier,
+    RuntimeMode, RuntimeReplayProfile, RuntimeResolvedConfig, SubscribeUpdateStream, Supervisor,
     build_fixture_scenario, builtin_fixture_suite, builtin_shred_exit_fixture_suite,
-    collect_fresh_launch_canary_events, load_fixture_spec,
+    collect_fresh_launch_canary_events, fresh_pump_launch_observations, load_fixture_spec,
     material_hunter_subscription_fingerprint, relay_payload_sha256,
     run_material_hunter_stream_with_connector, run_material_hunter_stream_with_progress,
     smoke_deshred_provider, smoke_geyser_provider, write_report,
@@ -71,7 +71,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 use tonic::Status;
 use yellowstone_grpc_proto::prelude::{
-    SubscribeUpdate, subscribe_request_filter_accounts_filter::Filter as AccountFilter,
+    SubscribeRequest, SubscribeUpdate,
+    subscribe_request_filter_accounts_filter::Filter as AccountFilter,
     subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
 };
 use yellowstone_grpc_proto::prost::Message as _;
@@ -51437,7 +51438,267 @@ fn build_relay_health_summary(
         rpc_mint_supply_canonical: false,
         relay_receiver_available: receiver_available,
         blocker_class,
+        exact_holder_fresh_launch_dynamic_enabled: loaded
+            .config
+            .geyser
+            .exact_holder_fresh_launch_dynamic_enabled,
+        exact_holder_tracker_activation_unix_nanos: None,
+        exact_holder_dynamic_max_mints: loaded.config.geyser.exact_holder_dynamic_max_mints,
+        exact_holder_dynamic_ttl_seconds: loaded.config.geyser.exact_holder_dynamic_ttl_seconds,
+        exact_holder_fresh_launch_observations: 0,
+        exact_holder_trackers_created: 0,
+        exact_holder_subscription_update_failures: 0,
+        exact_holder_capacity_evictions: 0,
+        exact_holder_ttl_expirations: 0,
+        exact_holder_active_mint_count: 0,
+        exact_holder_tracker_rows: Vec::new(),
     }
+}
+
+#[derive(Debug, Clone)]
+struct RelayFreshHolderMint {
+    tracker_created_at: Instant,
+}
+
+fn relay_fresh_holder_subscription_request(
+    config: &common::GeyserConfig,
+    active_mints: &BTreeMap<String, RelayFreshHolderMint>,
+) -> SubscribeRequest {
+    if !config.exact_holder_fresh_launch_dynamic_enabled {
+        return GeyserIngestService::new(config.clone()).proto_subscription_request();
+    }
+    let mut dynamic = config.clone();
+    dynamic.subscribe_accounts = !active_mints.is_empty();
+    dynamic.account_filters.clear();
+    dynamic.account_owner_filters = vec![
+        SPL_TOKEN_PROGRAM_ID.to_owned(),
+        TOKEN_2022_PROGRAM_ID.to_owned(),
+    ];
+    dynamic.account_data_size_filters.clear();
+    dynamic.account_token_account_state_filter = true;
+    dynamic.account_token_mint_offset = 0;
+    dynamic.account_token_mint_filters = active_mints.keys().cloned().collect();
+    // The launch transaction seeds the balance map. Requiring a transaction
+    // signature avoids replaying old/current account snapshots on each update.
+    dynamic.exact_holder_startup_snapshots_enabled = false;
+    dynamic.exact_holder_nonempty_txn_signature_required = true;
+    GeyserIngestService::new(dynamic).proto_subscription_request()
+}
+
+fn write_relay_fresh_holder_tracker_manifest(
+    health_dir: &Path,
+    summary: &RelayHealthSummary,
+    active_mints: &BTreeMap<String, RelayFreshHolderMint>,
+) -> Result<()> {
+    if !relay_health_dir_is_safe(health_dir) {
+        bail!(
+            "relay health dir must not point at material-hunter artifact storage: {}",
+            health_dir.display()
+        );
+    }
+    let payload = json!({
+        "schema_version": "exact_holder_tracker_activation_manifest.v1",
+        "relay_session_id": summary.relay_session_id,
+        "tracker_activation_unix_nanos": summary.exact_holder_tracker_activation_unix_nanos,
+        "dynamic_fresh_launch_tracking_enabled": summary.exact_holder_fresh_launch_dynamic_enabled,
+        "max_active_mints": summary.exact_holder_dynamic_max_mints,
+        "mint_ttl_seconds": summary.exact_holder_dynamic_ttl_seconds,
+        "fresh_launch_observations": summary.exact_holder_fresh_launch_observations,
+        "trackers_created": summary.exact_holder_trackers_created,
+        "subscription_update_failures": summary.exact_holder_subscription_update_failures,
+        "capacity_evictions": summary.exact_holder_capacity_evictions,
+        "ttl_expirations": summary.exact_holder_ttl_expirations,
+        "active_mint_count": active_mints.len(),
+        "active_mints": active_mints.keys().collect::<Vec<_>>(),
+        "tracker_rows": summary.exact_holder_tracker_rows,
+        "old_migrated_mints_allowed_for_acceptance": false,
+        "stream_only_required": true,
+        "rpc_holder_snapshot_allowed": false,
+        "dex_as_holder_truth": false,
+        "proxy_as_exact": false,
+        "pool_vaults_counted_as_holders": false,
+    });
+    atomic_write_path(
+        &health_dir.join("exact_holder_tracker_activation_manifest.json"),
+        &serde_json::to_vec_pretty(&payload)?,
+    )
+}
+
+fn relay_retire_fresh_holder_row(
+    summary: &mut RelayHealthSummary,
+    mint: &str,
+    reason: &str,
+    retired_at_unix_nanos: u64,
+) {
+    if let Some(row) = summary
+        .exact_holder_tracker_rows
+        .iter_mut()
+        .rev()
+        .find(|row| row.mint == mint && row.active)
+    {
+        row.active = false;
+        row.retired_at_unix_nanos = Some(retired_at_unix_nanos);
+        row.retired_reason = Some(reason.to_owned());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_process_fresh_holder_update(
+    update: &SubscribeUpdate,
+    config: &common::GeyserConfig,
+    request_control: Option<&tokio::sync::mpsc::Sender<SubscribeRequest>>,
+    active_mints: &mut BTreeMap<String, RelayFreshHolderMint>,
+    seen_fresh_launch_mints: &mut HashSet<String>,
+    current_request: &mut SubscribeRequest,
+    subscription_generation: &mut u64,
+    next_prune_at: &mut Instant,
+    summary: &mut RelayHealthSummary,
+    health_dir: &Path,
+) -> Result<()> {
+    if !config.exact_holder_fresh_launch_dynamic_enabled {
+        return Ok(());
+    }
+
+    let now = Instant::now();
+    let now_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+    let mut manifest_changed = false;
+    if now >= *next_prune_at {
+        let ttl = StdDuration::from_secs(config.exact_holder_dynamic_ttl_seconds.max(1));
+        let expired = active_mints
+            .iter()
+            .filter(|(_, state)| now.duration_since(state.tracker_created_at) >= ttl)
+            .map(|(mint, _)| mint.clone())
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            let previous = active_mints.clone();
+            for mint in &expired {
+                active_mints.remove(mint);
+            }
+            let replacement = relay_fresh_holder_subscription_request(config, active_mints);
+            let sent = match request_control {
+                Some(control) => control.send(replacement.clone()).await.is_ok(),
+                None => false,
+            };
+            if sent {
+                *subscription_generation = subscription_generation.saturating_add(1);
+                *current_request = replacement;
+                summary.exact_holder_ttl_expirations = summary
+                    .exact_holder_ttl_expirations
+                    .saturating_add(expired.len() as u64);
+                for mint in &expired {
+                    relay_retire_fresh_holder_row(
+                        summary,
+                        mint,
+                        "dynamic_mint_ttl_expired",
+                        now_unix_nanos,
+                    );
+                }
+                manifest_changed = true;
+            } else {
+                *active_mints = previous;
+                summary.exact_holder_subscription_update_failures = summary
+                    .exact_holder_subscription_update_failures
+                    .saturating_add(1);
+                manifest_changed = true;
+            }
+        }
+        *next_prune_at = now + StdDuration::from_secs(5);
+    }
+
+    for observation in fresh_pump_launch_observations(update) {
+        if !seen_fresh_launch_mints.insert(observation.mint.clone()) {
+            continue;
+        }
+        summary.exact_holder_fresh_launch_observations = summary
+            .exact_holder_fresh_launch_observations
+            .saturating_add(1);
+        let launch_observed_at = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+        let previous = active_mints.clone();
+        let evicted_mint = if active_mints.len() >= config.exact_holder_dynamic_max_mints.max(1) {
+            active_mints
+                .iter()
+                .min_by_key(|(_, state)| state.tracker_created_at)
+                .map(|(mint, _)| mint.clone())
+        } else {
+            None
+        };
+        if let Some(mint) = evicted_mint.as_ref() {
+            active_mints.remove(mint);
+        }
+        active_mints.insert(
+            observation.mint.clone(),
+            RelayFreshHolderMint {
+                tracker_created_at: Instant::now(),
+            },
+        );
+        let replacement = relay_fresh_holder_subscription_request(config, active_mints);
+        let next_generation = subscription_generation.saturating_add(1);
+        let sent = match request_control {
+            Some(control) => control.send(replacement.clone()).await.is_ok(),
+            None => false,
+        };
+        let tracker_created_at = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
+        let tracker_delay_ms = tracker_created_at
+            .saturating_sub(launch_observed_at)
+            .saturating_div(1_000_000);
+        if sent {
+            *subscription_generation = next_generation;
+            *current_request = replacement;
+            summary.exact_holder_trackers_created =
+                summary.exact_holder_trackers_created.saturating_add(1);
+            if let Some(mint) = evicted_mint.as_ref() {
+                summary.exact_holder_capacity_evictions =
+                    summary.exact_holder_capacity_evictions.saturating_add(1);
+                relay_retire_fresh_holder_row(
+                    summary,
+                    mint,
+                    "dynamic_mint_capacity_evicted",
+                    tracker_created_at,
+                );
+            }
+            eprintln!(
+                "fresh_launch_holder_tracker_activated mint={} launch_slot={} tracker_delay_ms={} subscription_generation={} active_mint_count={}",
+                observation.mint,
+                observation.slot,
+                tracker_delay_ms,
+                next_generation,
+                active_mints.len(),
+            );
+        } else {
+            *active_mints = previous;
+            seen_fresh_launch_mints.remove(&observation.mint);
+            summary.exact_holder_subscription_update_failures = summary
+                .exact_holder_subscription_update_failures
+                .saturating_add(1);
+        }
+        summary
+            .exact_holder_tracker_rows
+            .push(FreshHolderTrackerActivation {
+                mint: observation.mint,
+                launch_slot: observation.slot,
+                launch_signature: observation.signature,
+                launch_observed_at_unix_nanos: launch_observed_at,
+                tracker_created: sent,
+                tracker_created_at_unix_nanos: sent.then_some(tracker_created_at),
+                tracker_delay_ms: sent.then_some(tracker_delay_ms),
+                tracker_source: "yellowstone_pump_create_dynamic_token_account_filter".to_owned(),
+                subscription_generation: next_generation,
+                active_mint_count: active_mints.len(),
+                active: sent,
+                retired_at_unix_nanos: None,
+                retired_reason: None,
+                eligible_for_exact_holder_acceptance: sent,
+                ineligible_reason: (!sent)
+                    .then(|| "subscription_request_control_unavailable".to_owned()),
+            });
+        manifest_changed = true;
+    }
+
+    summary.exact_holder_active_mint_count = active_mints.len();
+    if manifest_changed {
+        write_relay_fresh_holder_tracker_manifest(health_dir, summary, active_mints)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -51638,8 +51899,39 @@ async fn run_live_vps_stream_relay(
     );
     summary.transport = "tcp_ndjson_over_private_ssh_tunnel".to_owned();
 
+    let config = loaded.config.geyser.clone();
+    if config.exact_holder_fresh_launch_dynamic_enabled {
+        if !config.subscribe_transactions {
+            bail!("fresh-launch holder tracking requires transaction subscriptions");
+        }
+        if !config.account_filters.is_empty() || !config.account_token_mint_filters.is_empty() {
+            bail!(
+                "fresh-launch holder tracking rejects static account/mint filters to prevent stale-mint acceptance"
+            );
+        }
+        if config.subscribe_accounts {
+            bail!(
+                "fresh-launch holder tracking must start transaction-only; account subscriptions are activated per decoded launch"
+            );
+        }
+        if !config
+            .program_filters
+            .iter()
+            .any(|program| program == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        {
+            bail!("fresh-launch holder tracking requires the official Pump.fun transaction filter");
+        }
+        summary.exact_holder_tracker_activation_unix_nanos =
+            Some(unix_now_nanos_u128().min(u64::MAX as u128) as u64);
+    }
+
     fs::create_dir_all(health_dir)
         .with_context(|| format!("create relay health dir {}", health_dir.display()))?;
+    let mut active_holder_mints: BTreeMap<String, RelayFreshHolderMint> = BTreeMap::new();
+    let mut seen_fresh_launch_mints: HashSet<String> = HashSet::new();
+    let mut holder_subscription_generation = 0u64;
+    let mut next_holder_prune_at = Instant::now();
+    write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
     let mut receiver = TokioTcpStream::connect(&receiver_addr)
         .await
         .with_context(|| format!("connect relay receiver at {receiver_addr}"))?;
@@ -51669,18 +51961,17 @@ async fn run_live_vps_stream_relay(
     )
     .await?;
 
-    let config = loaded.config.geyser.clone();
-    let request = GeyserIngestService::new(config.clone()).proto_subscription_request();
+    let mut request = relay_fresh_holder_subscription_request(&config, &active_holder_mints);
     let connector = RealGeyserConnector;
     let started_at = Instant::now();
     let deadline = started_at + StdDuration::from_secs(duration_seconds);
 
     'relay: while Instant::now() < deadline {
-        let mut stream = match connector
-            .connect_and_subscribe(&config, request.clone())
+        let (mut stream, request_control) = match connector
+            .connect_and_subscribe_controlled(&config, request.clone())
             .await
         {
-            Ok(stream) => {
+            Ok((stream, request_control)) => {
                 provider_connected = true;
                 let control = if upstream_reconnect_attempt == 0 {
                     RelayControlKind::RelayUpstreamConnected
@@ -51702,7 +51993,7 @@ async fn run_live_vps_stream_relay(
                     false,
                 )
                 .await?;
-                stream
+                (stream, request_control)
             }
             Err(error) => {
                 let blocker = classify_relay_connect_error(&error);
@@ -51779,6 +52070,19 @@ async fn run_live_vps_stream_relay(
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(update))) => {
+                    relay_process_fresh_holder_update(
+                        &update,
+                        &config,
+                        request_control.as_ref(),
+                        &mut active_holder_mints,
+                        &mut seen_fresh_launch_mints,
+                        &mut request,
+                        &mut holder_subscription_generation,
+                        &mut next_holder_prune_at,
+                        &mut summary,
+                        health_dir,
+                    )
+                    .await?;
                     let payload = update.encode_to_vec();
                     bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
                     let frame = RelayFrame::data(
@@ -51979,7 +52283,19 @@ async fn run_live_vps_stream_relay(
         "live_trading_enabled": false,
         "holder_rpc_used": false,
         "rpc_mint_supply_canonical": false,
+        "exact_holder_fresh_launch_dynamic_enabled": summary.exact_holder_fresh_launch_dynamic_enabled,
+        "exact_holder_tracker_activation_unix_nanos": summary.exact_holder_tracker_activation_unix_nanos,
+        "exact_holder_dynamic_max_mints": summary.exact_holder_dynamic_max_mints,
+        "exact_holder_dynamic_ttl_seconds": summary.exact_holder_dynamic_ttl_seconds,
+        "exact_holder_fresh_launch_observations": summary.exact_holder_fresh_launch_observations,
+        "exact_holder_trackers_created": summary.exact_holder_trackers_created,
+        "exact_holder_subscription_update_failures": summary.exact_holder_subscription_update_failures,
+        "exact_holder_capacity_evictions": summary.exact_holder_capacity_evictions,
+        "exact_holder_ttl_expirations": summary.exact_holder_ttl_expirations,
+        "exact_holder_active_mint_count": summary.exact_holder_active_mint_count,
+        "exact_holder_tracker_rows": summary.exact_holder_tracker_rows,
     });
+    write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
     write_relay_health_artifacts(health_dir, &summary, &exit_status)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&exit_status)?);
@@ -63476,6 +63792,40 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp test dir");
         path
+    }
+
+    #[test]
+    fn fresh_holder_request_starts_transaction_only_then_adds_mint_filter() {
+        let mut config = load_default_config_for_test().config.geyser;
+        config.exact_holder_fresh_launch_dynamic_enabled = true;
+        config.subscribe_accounts = false;
+        config.account_filters.clear();
+        config.account_token_mint_filters.clear();
+        let mut active_mints = BTreeMap::new();
+
+        let initial = relay_fresh_holder_subscription_request(&config, &active_mints);
+        assert!(initial.accounts.is_empty());
+        assert_eq!(initial.transactions.len(), 1);
+
+        let mint = bs58::encode([41u8; 32]).into_string();
+        active_mints.insert(
+            mint,
+            RelayFreshHolderMint {
+                tracker_created_at: Instant::now(),
+            },
+        );
+        let activated = relay_fresh_holder_subscription_request(&config, &active_mints);
+        let filter = activated
+            .accounts
+            .get("token_mint_0")
+            .expect("fresh mint account filter");
+        assert_eq!(
+            filter.owner,
+            vec![SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]
+        );
+        assert_eq!(filter.nonempty_txn_signature, Some(true));
+        assert_eq!(filter.filters.len(), 2);
+        assert_eq!(activated.transactions.len(), 1);
     }
 
     fn quant_test_point(at_ms: i64, price: Decimal) -> QuantPricePoint {
