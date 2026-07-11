@@ -25,6 +25,7 @@ NEAR_EXACT = "near_exact_stream_from_launch"
 OBSERVED = "observed_subset_stream"
 PROXY = "proxy_only"
 ALLOWED_STRATEGY_QUALITY = {EXACT, NEAR_EXACT}
+CONFIRMED_LAUNCH_INSTRUCTIONS = {"create", "create_v2"}
 CONFIRMED_MIGRATION_INSTRUCTIONS = {"migrate", "migrate_v2"}
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -436,8 +437,47 @@ def build(args: argparse.Namespace) -> int:
         and intish(local_summary.get("unverified_chunk_count")) == 0
     )
 
-    launch_by_mint: dict[str, dict[str, Any]] = {}
+    confirmed_launch_rows: list[dict[str, Any]] = []
+    rejected_launch_rows: list[dict[str, Any]] = []
     for row in launch_rows:
+        instruction = first(row, "decoded_instruction_name").lower()
+        rejection_reasons: list[str] = []
+        if first(row, "event_type") != "launch_create":
+            rejection_reasons.append("event_type_not_launch_create")
+        if instruction not in CONFIRMED_LAUNCH_INSTRUCTIONS:
+            rejection_reasons.append("instruction_not_confirmed_create")
+        if not boolish(row.get("source_is_non_rpc")):
+            rejection_reasons.append("non_rpc_source_not_proven")
+        if boolish(row.get("rpc_used")):
+            rejection_reasons.append("rpc_used")
+        if not boolish(row.get("strict_timing_eligible")):
+            rejection_reasons.append("strict_timing_not_proven")
+        if first(row, "parse_status") != "non_rpc_decoded_launch_create_event":
+            rejection_reasons.append("launch_decode_status_not_confirmed")
+        if rejection_reasons:
+            rejected_launch_rows.append(
+                {
+                    "mint": first(row, "mint"),
+                    "launch_id": first(row, "launch_id"),
+                    "event_observed_at_utc": first(row, "event_observed_at_utc", "source_ts"),
+                    "slot": first(row, "slot"),
+                    "signature": first(row, "signature"),
+                    "event_type": first(row, "event_type"),
+                    "decoded_instruction_name": instruction,
+                    "source_mode": first(row, "source_mode"),
+                    "source_is_non_rpc": row.get("source_is_non_rpc", ""),
+                    "rpc_used": row.get("rpc_used", ""),
+                    "strict_timing_eligible": row.get("strict_timing_eligible", ""),
+                    "parse_status": first(row, "parse_status"),
+                    "tracker_manifest_member": False,
+                    "rejection_reason": "|".join(rejection_reasons),
+                }
+            )
+            continue
+        confirmed_launch_rows.append(row)
+
+    launch_by_mint: dict[str, dict[str, Any]] = {}
+    for row in confirmed_launch_rows:
         mint = first(row, "mint")
         launch_ts = parse_time(first(row, "event_observed_at_utc", "source_ts"))
         if not mint or launch_ts is None:
@@ -452,11 +492,37 @@ def build(args: argparse.Namespace) -> int:
         if mint and mint not in tracker_by_mint:
             tracker_by_mint[mint] = row
 
+    for row in rejected_launch_rows:
+        row["tracker_manifest_member"] = row["mint"] in tracker_by_mint
+
+    rejected_launch_fields = [
+        "mint",
+        "launch_id",
+        "event_observed_at_utc",
+        "slot",
+        "signature",
+        "event_type",
+        "decoded_instruction_name",
+        "source_mode",
+        "source_is_non_rpc",
+        "rpc_used",
+        "strict_timing_eligible",
+        "parse_status",
+        "tracker_manifest_member",
+        "rejection_reason",
+    ]
+    write_csv(
+        output / "exact_holder_rejected_launch_evidence_rows.csv",
+        rejected_launch_rows,
+        rejected_launch_fields,
+    )
+
     launch_tracker_rows: list[dict[str, Any]] = []
     tracker_gap_rows: list[dict[str, Any]] = []
     launch_ids: dict[str, str] = {}
     eligible_mints: set[str] = set()
-    for mint, tracker in tracker_by_mint.items():
+    for mint in sorted(set(tracker_by_mint) | set(launch_by_mint)):
+        tracker = tracker_by_mint.get(mint, {})
         launch = launch_by_mint.get(mint, {})
         launch_ts = parse_time(first(launch, "event_observed_at_utc"))
         tracker_created_dt = time_from_nanos(tracker.get("tracker_created_at_unix_nanos"))
@@ -470,7 +536,9 @@ def build(args: argparse.Namespace) -> int:
             ineligible.append("internal_launch_row_missing")
         if not after_activation:
             ineligible.append("launch_not_after_tracker_activation")
-        if not tracker_created:
+        if mint not in tracker_by_mint:
+            ineligible.append("tracker_manifest_row_missing")
+        elif not tracker_created:
             ineligible.append(first(tracker, "ineligible_reason") or "tracker_not_created")
         if tracker_created and decoded and after_activation:
             eligible_mints.add(mint)
@@ -479,6 +547,8 @@ def build(args: argparse.Namespace) -> int:
                 "mint": mint,
                 "launch_id": launch_id,
                 "launch_ts": fmt_time(launch_ts),
+                "confirmed_internal_launch": decoded,
+                "tracker_manifest_member": mint in tracker_by_mint,
                 "tracker_created": tracker_created,
                 "tracker_created_ts": fmt_time(tracker_created_dt),
                 "tracker_delay_ms": tracker.get("tracker_delay_ms", ""),
@@ -499,6 +569,8 @@ def build(args: argparse.Namespace) -> int:
         "mint",
         "launch_id",
         "launch_ts",
+        "confirmed_internal_launch",
+        "tracker_manifest_member",
         "tracker_created",
         "tracker_created_ts",
         "tracker_delay_ms",
@@ -511,6 +583,31 @@ def build(args: argparse.Namespace) -> int:
     ]
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
     write_csv(output / "exact_holder_tracker_gap_audit.csv", tracker_gap_rows, ["mint", "launch_id", "gap_type", "gap_reason"])
+
+    confirmed_post_activation_mints = {
+        mint
+        for mint, row in launch_by_mint.items()
+        if activation_dt
+        and (launch_ts := parse_time(first(row, "event_observed_at_utc", "source_ts")))
+        and launch_ts >= activation_dt
+    }
+    confirmed_launches_with_tracker = {
+        mint
+        for mint in confirmed_post_activation_mints
+        if boolish(tracker_by_mint.get(mint, {}).get("tracker_created"))
+    }
+    confirmed_launches_without_tracker = confirmed_post_activation_mints - confirmed_launches_with_tracker
+    manifest_trackers_without_confirmed_launch = set(tracker_by_mint) - set(launch_by_mint)
+    confirmed_launch_tracker_coverage_pct = (
+        round(len(confirmed_launches_with_tracker) / len(confirmed_post_activation_mints) * 100, 4)
+        if confirmed_post_activation_mints
+        else 0.0
+    )
+    launch_tracker_gate = (
+        bool(confirmed_post_activation_mints)
+        and not confirmed_launches_without_tracker
+        and not manifest_trackers_without_confirmed_launch
+    )
 
     all_gap_times_parseable = all(gap_time is not None for gap_time in gap_times)
     first_gap_by_mint: dict[str, datetime | None] = {}
@@ -1121,7 +1218,7 @@ def build(args: argparse.Namespace) -> int:
     latest_times = [
         parsed
         for parsed in [
-            *(parse_time(first(row, "event_observed_at_utc")) for row in launch_rows),
+            *(parse_time(first(row, "event_observed_at_utc")) for row in confirmed_launch_rows),
             *(parse_time(first(row, "source_ts", "event_observed_at_utc")) for row in holder_input),
         ]
         if parsed is not None
@@ -1134,8 +1231,10 @@ def build(args: argparse.Namespace) -> int:
         boolish(row["leakage_safe"]) and row["source_quality"] in ALLOWED_STRATEGY_QUALITY
         for row in decision_output
     )
-    if not tracker_by_mint:
+    if not confirmed_post_activation_mints:
         proof_verdict = "blocked_fresh_source_no_launches"
+    elif not launch_tracker_gate:
+        proof_verdict = "partial_fresh_launches_tracked_no_migration_yet"
     elif not normalized_rows:
         proof_verdict = "blocked_provider_no_token_account_or_balance_updates"
     elif proven_quality_counts[EXACT] and proof_window_met:
@@ -1157,14 +1256,15 @@ def build(args: argparse.Namespace) -> int:
         lifecycle_verdict = "partial_source_lacks_token_balance_state"
 
     proof_rows = []
-    for mint in sorted(tracker_by_mint):
+    for mint in sorted(set(tracker_by_mint) | set(launch_by_mint)):
+        tracker = tracker_by_mint.get(mint, {})
         carry = next((row for row in carry_rows if row["mint"] == mint), {})
         proof_rows.append(
             {
                 "mint": mint,
                 "launch_id": launch_ids.get(mint, ""),
                 "internal_launch_row": mint in launch_by_mint,
-                "tracker_created": boolish(tracker_by_mint[mint].get("tracker_created")),
+                "tracker_created": boolish(tracker.get("tracker_created")),
                 "token_account_update_rows": sum(row["mint"] == mint for row in account_rows),
                 "tx_balance_reconstruction_rows": sum(row["mint"] == mint for row in tx_rows),
                 "holder_balance_state_rows": sum(row["mint"] == mint for row in normalized_rows),
@@ -1190,6 +1290,24 @@ def build(args: argparse.Namespace) -> int:
         "relay_session_id": manifest_session,
         "proof_window_observed_minutes": round(observed_minutes, 4),
         "proof_window_requirement_met": proof_window_met,
+        "observed_launch_evidence_rows": len(launch_rows),
+        "confirmed_internal_launch_rows": len(confirmed_launch_rows),
+        "confirmed_internal_launch_mints": len(launch_by_mint),
+        "confirmed_post_activation_launch_mints": len(confirmed_post_activation_mints),
+        "rejected_launch_evidence_rows": len(rejected_launch_rows),
+        "pending_create_backfill_rows_rejected": sum(
+            row["decoded_instruction_name"] == "pending_create_backfill"
+            for row in rejected_launch_rows
+        ),
+        "confirmed_launches_with_tracker": len(confirmed_launches_with_tracker),
+        "confirmed_launches_without_tracker": len(confirmed_launches_without_tracker),
+        "confirmed_launches_without_tracker_mints": sorted(confirmed_launches_without_tracker),
+        "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
+        "launch_tracker_coverage_complete": launch_tracker_gate,
+        "manifest_trackers_without_confirmed_internal_launch": len(manifest_trackers_without_confirmed_launch),
+        "manifest_trackers_without_confirmed_internal_launch_mints": sorted(
+            manifest_trackers_without_confirmed_launch
+        ),
         "fresh_launches": len(eligible_mints),
         "trackers_created": sum(boolish(row.get("tracker_created")) for row in trackers),
         "token_account_update_rows": len(account_rows),
@@ -1240,6 +1358,8 @@ def build(args: argparse.Namespace) -> int:
         "stale_dead_mints_allowed_for_acceptance": False,
         "launch_after_tracker_activation_required": True,
         "holder_tracker_created_at_launch_required": True,
+        "confirmed_internal_create_instruction_required": True,
+        "pending_create_backfill_allowed_for_acceptance": False,
         "stream_only_required": True,
         "rpc_holder_snapshot_allowed": False,
         "dex_as_holder_truth": False,
@@ -1262,7 +1382,8 @@ def build(args: argparse.Namespace) -> int:
     (output / "exact_holder_fresh_lifecycle_contract.md").write_text(
         "# Fresh Stream Holder Contract\n\n"
         "Only Pump.fun mints decoded after relay tracker activation and enrolled by the same create update enter the acceptance scope; "
-        "exact or near-exact source quality is still required to pass. Quality is timestamp-bounded: a provider gap downgrades states at and after the gap without relabeling earlier continuous states. "
+        "the launch row must be a strict-timing, non-RPC decoded create or create_v2 instruction, and pending create backfills are rejected. "
+        "Exact or near-exact source quality is still required to pass. Quality is timestamp-bounded: a provider gap downgrades states at and after the gap without relabeling earlier continuous states. "
         "RPC and Dex holder truth are forbidden. Trade-participant proxies remain research-only. Pool, curve, program, and burn accounts are excluded.\n"
     )
     write_json(output / "exact_holder_acceptance_policy.json", {"schema_version": "exact_holder_acceptance_policy.v1", **policy})
@@ -1282,7 +1403,24 @@ def build(args: argparse.Namespace) -> int:
             "source_quality_rejected_mints": sorted(
                 mint for mint in eligible_mints if proven_quality_by_mint.get(mint) not in ALLOWED_STRATEGY_QUALITY
             ),
-            "non_manifest_launch_rows_rejected": sum(first(row, "mint") not in tracker_by_mint for row in launch_rows),
+            "observed_launch_evidence_rows": len(launch_rows),
+            "confirmed_internal_launch_rows": len(confirmed_launch_rows),
+            "rejected_launch_evidence_rows": len(rejected_launch_rows),
+            "pending_create_backfill_rows_rejected": sum(
+                row["decoded_instruction_name"] == "pending_create_backfill"
+                for row in rejected_launch_rows
+            ),
+            "non_manifest_launch_rows_rejected": sum(
+                first(row, "mint") not in tracker_by_mint for row in launch_rows
+            ),
+            "non_manifest_confirmed_launch_rows_rejected": sum(
+                first(row, "mint") not in tracker_by_mint for row in confirmed_launch_rows
+            ),
+            "confirmed_launches_without_tracker_mints": sorted(confirmed_launches_without_tracker),
+            "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
+            "manifest_trackers_without_confirmed_internal_launch_mints": sorted(
+                manifest_trackers_without_confirmed_launch
+            ),
         },
     )
     write_json(output / "exact_holder_tracker_activation_manifest.json", manifest)
@@ -1323,12 +1461,22 @@ def build(args: argparse.Namespace) -> int:
     sample_gate = len(eligible_mints) >= args.min_fresh_launches
     decision_gate = bool(decision_output) and decision_coverage_pct >= args.min_decision_coverage_pct
     amm_ready = boolish(amm_gate.get("coverage_ready")) and boolish(amm_gate.get("amm_research_usable"))
-    full_ready = all([holder_quality_ready, migration_gate, decision_gate, amm_ready, leakage_passed, sample_gate])
+    full_ready = all(
+        [
+            launch_tracker_gate,
+            holder_quality_ready,
+            migration_gate,
+            decision_gate,
+            amm_ready,
+            leakage_passed,
+            sample_gate,
+        ]
+    )
     if full_ready:
         readiness_status = "full_strategy_ready"
     elif holder_quality_ready and not sample_gate:
         readiness_status = "strategy_ready_exact_holder_pending_sample"
-    elif proven_quality_counts[EXACT]:
+    elif launch_tracker_gate and proven_quality_counts[EXACT]:
         readiness_status = "exact_holder_tracking_ready_no_strategy_yet"
     elif holder_quality_ready:
         readiness_status = "research_ready_near_exact_holder_partial"
@@ -1336,6 +1484,7 @@ def build(args: argparse.Namespace) -> int:
         readiness_status = "research_ready_proxy_holder_only"
     blockers = []
     for passed, reason in [
+        (launch_tracker_gate, "confirmed_launch_tracker_coverage_incomplete"),
         (holder_quality_ready, "exact_or_near_exact_holder_rows_missing"),
         (migration_gate, "fresh_migration_carry_forward_incomplete"),
         (decision_gate, "decision_time_holder_coverage_below_threshold"),
@@ -1351,6 +1500,14 @@ def build(args: argparse.Namespace) -> int:
         "status": readiness_status,
         "full_strategy_dataset_ready": full_ready,
         "fresh_launches": len(eligible_mints),
+        "confirmed_post_activation_launch_mints": len(confirmed_post_activation_mints),
+        "confirmed_launches_with_tracker": len(confirmed_launches_with_tracker),
+        "confirmed_launches_without_tracker": len(confirmed_launches_without_tracker),
+        "manifest_trackers_without_confirmed_internal_launch": len(
+            manifest_trackers_without_confirmed_launch
+        ),
+        "confirmed_launch_tracker_coverage_pct": confirmed_launch_tracker_coverage_pct,
+        "launch_tracker_coverage_complete": launch_tracker_gate,
         "exact_mints": proven_quality_counts[EXACT],
         "near_exact_mints": proven_quality_counts[NEAR_EXACT],
         "observed_subset_mints": quality_counts[OBSERVED],

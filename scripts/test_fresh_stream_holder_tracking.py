@@ -73,6 +73,12 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "event_observed_at_utc": "2026-01-01T00:00:01Z",
                         "slot": 10,
                         "signature": launch_signature,
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
                         "creator_wallet": "creator-wallet",
                         "bonding_curve": "curve-account",
                         "associated_bonding_curve": "curve-token-account",
@@ -83,9 +89,31 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "event_observed_at_utc": "2025-12-01T00:00:00Z",
                         "slot": 1,
                         "signature": "old-signature",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "pending_create_backfill",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
                         "creator_wallet": "old-creator",
                         "bonding_curve": "old-curve",
                         "associated_bonding_curve": "old-curve-token",
+                    },
+                    {
+                        "mint": mint,
+                        "launch_id": "launch-fresh-pending-backfill",
+                        "event_observed_at_utc": "2026-01-01T00:00:00.500000Z",
+                        "slot": 9,
+                        "signature": "pending-backfill-signature",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "pending_create_backfill",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "creator-wallet",
+                        "bonding_curve": "curve-account",
+                        "associated_bonding_curve": "curve-token-account",
                     },
                 ],
             )
@@ -326,10 +354,37 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertEqual(proof["non_fresh_migration_rows_rejected"], 0)
             self.assertEqual(proof["rejected_migration_mints"], [])
             self.assertEqual(proof["mints_with_rejected_migration_evidence"], [mint])
+            self.assertEqual(proof["observed_launch_evidence_rows"], 3)
+            self.assertEqual(proof["confirmed_internal_launch_rows"], 1)
+            self.assertEqual(proof["rejected_launch_evidence_rows"], 2)
+            self.assertEqual(proof["pending_create_backfill_rows_rejected"], 2)
+            self.assertEqual(proof["confirmed_launches_with_tracker"], 1)
+            self.assertEqual(proof["confirmed_launches_without_tracker"], 0)
+            self.assertEqual(proof["confirmed_launches_without_tracker_mints"], [])
+            self.assertEqual(proof["confirmed_launch_tracker_coverage_pct"], 100.0)
+            self.assertTrue(proof["launch_tracker_coverage_complete"])
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertEqual(guard["currently_accepted_mints"], [])
             self.assertNotIn(old_mint, guard["accepted_mints"])
+            self.assertEqual(guard["non_manifest_confirmed_launch_rows_rejected"], 0)
+            self.assertEqual(guard["confirmed_launches_without_tracker_mints"], [])
+
+            with (output / "exact_holder_rejected_launch_evidence_rows.csv").open(
+                newline=""
+            ) as handle:
+                rejected_launch_evidence = list(csv.DictReader(handle))
+            self.assertEqual(len(rejected_launch_evidence), 2)
+            self.assertEqual(
+                {row["mint"] for row in rejected_launch_evidence},
+                {old_mint, mint},
+            )
+            self.assertTrue(
+                all(
+                    "instruction_not_confirmed_create" in row["rejection_reason"]
+                    for row in rejected_launch_evidence
+                )
+            )
 
             with (output / "exact_holder_launch_tracker_rows.csv").open(newline="") as handle:
                 tracker = next(csv.DictReader(handle))
@@ -383,6 +438,170 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                 leakage = list(csv.DictReader(handle))
             self.assertEqual(leakage[0]["future_holder_state_used"], "False")
             self.assertEqual(leakage[0]["exact_fields_filled_from_proxy"], "False")
+
+    def test_confirmed_launch_without_tracker_blocks_ready_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run = root / "run"
+            output = root / "output"
+            amm = root / "amm"
+            strategy = root / "strategy"
+            run.mkdir()
+            amm.mkdir()
+            strategy.mkdir()
+
+            tracked_mint = "TrackedFreshMintpump"
+            untracked_mint = "UntrackedFreshMintpump"
+            activation = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            activation_nanos = int(activation.timestamp() * 1_000_000_000)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "exact_holder_tracker_activation_manifest.v1",
+                        "relay_session_id": "relay-launch-gap",
+                        "tracker_activation_unix_nanos": activation_nanos,
+                        "dynamic_fresh_launch_tracking_enabled": True,
+                        "subscription_update_failures": 0,
+                        "tracker_rows": [
+                            {
+                                "mint": tracked_mint,
+                                "launch_slot": 10,
+                                "launch_signature": "tracked-launch",
+                                "launch_observed_at_unix_nanos": activation_nanos
+                                + 1_000_000_000,
+                                "tracker_created": True,
+                                "tracker_created_at_unix_nanos": activation_nanos
+                                + 1_010_000_000,
+                                "tracker_delay_ms": 10,
+                                "tracker_source": "yellowstone_pump_create_dynamic_token_account_filter",
+                                "active": True,
+                            }
+                        ],
+                    }
+                )
+            )
+            write_csv(
+                run / "decoded_launch_event_rows.csv",
+                [
+                    {
+                        "mint": tracked_mint,
+                        "launch_id": "launch-tracked",
+                        "event_observed_at_utc": "2026-01-01T00:00:01Z",
+                        "slot": 10,
+                        "signature": "tracked-launch",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "tracked-creator",
+                        "bonding_curve": "tracked-curve",
+                        "associated_bonding_curve": "tracked-curve-token",
+                    },
+                    {
+                        "mint": untracked_mint,
+                        "launch_id": "launch-untracked",
+                        "event_observed_at_utc": "2026-01-01T00:00:02Z",
+                        "slot": 11,
+                        "signature": "untracked-launch",
+                        "event_type": "launch_create",
+                        "decoded_instruction_name": "create_v2",
+                        "source_is_non_rpc": True,
+                        "rpc_used": False,
+                        "strict_timing_eligible": True,
+                        "parse_status": "non_rpc_decoded_launch_create_event",
+                        "creator_wallet": "untracked-creator",
+                        "bonding_curve": "untracked-curve",
+                        "associated_bonding_curve": "untracked-curve-token",
+                    },
+                ],
+            )
+            write_csv(
+                run / "decoded_holder_event_rows.csv",
+                [
+                    {
+                        "mint": tracked_mint,
+                        "launch_id": "launch-tracked",
+                        "event_observed_at_utc": "2026-01-01T00:00:01Z",
+                        "slot": 10,
+                        "signature": "tracked-launch",
+                        "token_account": "tracked-holder-account",
+                        "owner_wallet": "tracked-holder",
+                        "amount_raw": "1000000",
+                        "amount_ui": "1",
+                        "decimals": "6",
+                        "holder_balance_before": "0",
+                        "holder_balance_after": "1000000",
+                        "update_source": "geyser_token_balance",
+                        "update_type": "token_account_balance_created_or_observed",
+                    }
+                ],
+            )
+            write_csv(run / "run_gap_events.csv", [])
+            write_csv(run / "quant_pumpfun_migration_event_rows.csv", [])
+            write_csv(run / "quant_pumpswap_pair_event_rows.csv", [])
+            (run / "local_collector_summary.json").write_text(
+                json.dumps(
+                    {
+                        "sequence_gap_count": 0,
+                        "downstream_backpressure_count": 0,
+                        "unverified_chunk_count": 0,
+                    }
+                )
+            )
+            write_csv(amm / "pumpswap_pool_vault_rows.csv", [])
+            write_csv(amm / "pumpswap_live_relay_pumpswap_pair_event_rows.csv", [])
+            (amm / "pumpswap_amm_coverage_gate.json").write_text(
+                json.dumps(
+                    {
+                        "coverage_ready": True,
+                        "amm_research_usable": True,
+                        "amm_complete_coverage": False,
+                        "decision_time_pool_state_coverage_pct": 90,
+                    }
+                )
+            )
+            write_csv(strategy / "post_migration_strategy_feature_rows.csv", [])
+
+            rc = MODULE.build(
+                argparse.Namespace(
+                    repo_root=str(root),
+                    run_dir=str(run),
+                    relay_manifest=str(manifest_path),
+                    output_dir=str(output),
+                    amm_root=str(amm),
+                    strategy_root=str(strategy),
+                    min_proof_minutes=30.0,
+                    min_fresh_launches=1,
+                    min_decision_coverage_pct=75.0,
+                )
+            )
+            self.assertEqual(rc, 0)
+
+            proof = json.loads((output / "exact_holder_fresh_launch_proof_report.json").read_text())
+            self.assertEqual(
+                proof["verdict"],
+                "partial_fresh_launches_tracked_no_migration_yet",
+            )
+            self.assertEqual(proof["confirmed_launches_with_tracker"], 1)
+            self.assertEqual(proof["confirmed_launches_without_tracker"], 1)
+            self.assertEqual(proof["confirmed_launch_tracker_coverage_pct"], 50.0)
+            self.assertFalse(proof["launch_tracker_coverage_complete"])
+
+            readiness = json.loads((output / "full_strategy_dataset_readiness.json").read_text())
+            self.assertFalse(readiness["full_strategy_dataset_ready"])
+            self.assertFalse(readiness["launch_tracker_coverage_complete"])
+            self.assertIn(
+                "confirmed_launch_tracker_coverage_incomplete",
+                readiness["blockers"],
+            )
+
+            with (output / "exact_holder_tracker_gap_audit.csv").open(newline="") as handle:
+                tracker_gaps = list(csv.DictReader(handle))
+            untracked_gap = next(row for row in tracker_gaps if row["mint"] == untracked_mint)
+            self.assertIn("tracker_manifest_row_missing", untracked_gap["gap_reason"])
 
 
 if __name__ == "__main__":
