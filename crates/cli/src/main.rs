@@ -44031,7 +44031,8 @@ const PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS: u64 = 3600;
 const PHASE107B_CURVE_TARGET_PROGRESS_PCT: f64 = 90.0;
 const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 9] = [5, 10, 30, 60, 120, 300, 900, 1800, 3600];
 const PHASE107F_HEALTH_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(1);
-const PHASE107N_INCREMENTAL_ARTIFACT_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(2);
+// Raw frames are durable independently; full derived snapshots must not starve the receiver.
+const PHASE107N_INCREMENTAL_ARTIFACT_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
     "mint",
