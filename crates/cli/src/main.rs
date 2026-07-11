@@ -52219,6 +52219,64 @@ async fn relay_emit_control_frame(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayReceiverShutdownStatus {
+    terminal_control_frame_write_succeeded: bool,
+    receiver_flush_succeeded: bool,
+    receiver_shutdown_error: Option<String>,
+}
+
+impl RelayReceiverShutdownStatus {
+    fn is_fatal(&self, relay_deadline_reached: bool) -> bool {
+        self.receiver_shutdown_error.is_some() && !relay_deadline_reached
+    }
+}
+
+async fn relay_finish_receiver(
+    receiver: &mut TokioTcpStream,
+    relay_session_id: &str,
+    stream_id: &str,
+    subscription_fingerprint: &str,
+    sequence: &mut u64,
+    control_frames_forwarded: &mut u64,
+    upstream_reconnect_attempt: u64,
+) -> RelayReceiverShutdownStatus {
+    let mut errors = Vec::new();
+    let terminal_control_frame_write_succeeded = match relay_emit_control_frame(
+        receiver,
+        relay_session_id,
+        stream_id,
+        subscription_fingerprint,
+        sequence,
+        control_frames_forwarded,
+        RelayControlKind::RelayStopped,
+        None,
+        None,
+        upstream_reconnect_attempt,
+        false,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("relay_stopped_control_write: {error:#}"));
+            false
+        }
+    };
+    let receiver_flush_succeeded = match receiver.flush().await {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("receiver_shutdown_flush: {error}"));
+            false
+        }
+    };
+    RelayReceiverShutdownStatus {
+        terminal_control_frame_write_succeeded,
+        receiver_flush_succeeded,
+        receiver_shutdown_error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
 fn write_relay_health_artifacts(
     health_dir: &Path,
     summary: &RelayHealthSummary,
@@ -52645,21 +52703,17 @@ async fn run_live_vps_stream_relay(
         }
     }
 
-    relay_emit_control_frame(
+    let relay_deadline_reached = Instant::now() >= deadline;
+    let receiver_shutdown = relay_finish_receiver(
         &mut receiver,
         &relay_session_id,
         &stream_id,
         &subscription_fingerprint,
         &mut sequence,
         &mut control_frames_forwarded,
-        RelayControlKind::RelayStopped,
-        None,
-        None,
         upstream_reconnect_attempt,
-        false,
     )
-    .await?;
-    receiver.flush().await?;
+    .await;
 
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     let exit_status = json!({
@@ -52670,6 +52724,13 @@ async fn run_live_vps_stream_relay(
         "dry_run": false,
         "provider_connected": provider_connected,
         "receiver_available": true,
+        "relay_deadline_reached": relay_deadline_reached,
+        "terminal_control_frame_write_succeeded": receiver_shutdown
+            .terminal_control_frame_write_succeeded,
+        "receiver_shutdown_flush_succeeded": receiver_shutdown.receiver_flush_succeeded,
+        "receiver_shutdown_error": receiver_shutdown.receiver_shutdown_error.clone(),
+        "receiver_shutdown_error_after_deadline_nonfatal": relay_deadline_reached
+            && receiver_shutdown.receiver_shutdown_error.is_some(),
         "structured_blocker": summary.blocker_class,
         "data_frames_forwarded": data_frames_forwarded,
         "control_frames_forwarded": control_frames_forwarded,
@@ -52711,6 +52772,18 @@ async fn run_live_vps_stream_relay(
     });
     write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
     write_relay_health_artifacts(health_dir, &summary, &exit_status)?;
+    if receiver_shutdown.is_fatal(relay_deadline_reached) {
+        bail!(
+            "relay receiver shutdown delivery failed before deadline: {}",
+            receiver_shutdown
+                .receiver_shutdown_error
+                .as_deref()
+                .unwrap_or("unknown receiver shutdown error")
+        );
+    }
+    if let Some(error) = receiver_shutdown.receiver_shutdown_error.as_deref() {
+        eprintln!("relay receiver closed at planned shutdown: {error}");
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&exit_status)?);
     } else {
@@ -68203,6 +68276,52 @@ mod tests {
         assert!(!temp.path().join("candidate_summary.csv").exists());
         assert!(!temp.path().join("rejected_summary.csv").exists());
         assert!(!temp.path().join("run_countability_decision.json").exists());
+    }
+
+    #[test]
+    fn phase107g_planned_receiver_shutdown_error_still_persists_health() {
+        let loaded = load_default_config_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let summary = build_relay_health_summary(
+            &loaded,
+            "relay-session",
+            "vps_stream_relay_live",
+            Some("tcp://127.0.0.1:19097"),
+            true,
+            None,
+        );
+        let shutdown = RelayReceiverShutdownStatus {
+            terminal_control_frame_write_succeeded: false,
+            receiver_flush_succeeded: false,
+            receiver_shutdown_error: Some("relay_stopped_control_write: broken pipe".to_owned()),
+        };
+        assert!(!shutdown.is_fatal(true));
+        assert!(shutdown.is_fatal(false));
+
+        let exit_status = json!({
+            "schema_version": "phase107g.relay_exit_status.v2",
+            "relay_deadline_reached": true,
+            "terminal_control_frame_write_succeeded": shutdown
+                .terminal_control_frame_write_succeeded,
+            "receiver_shutdown_flush_succeeded": shutdown.receiver_flush_succeeded,
+            "receiver_shutdown_error": shutdown.receiver_shutdown_error,
+            "receiver_shutdown_error_after_deadline_nonfatal": true,
+        });
+        write_relay_health_artifacts(temp.path(), &summary, &exit_status)
+            .expect("persist planned receiver shutdown health");
+        let persisted = read_json_file_or_empty(&temp.path().join("relay_exit_status.json"));
+        assert_eq!(persisted["relay_deadline_reached"], true);
+        assert_eq!(persisted["terminal_control_frame_write_succeeded"], false);
+        assert_eq!(
+            persisted["receiver_shutdown_error_after_deadline_nonfatal"],
+            true
+        );
+        assert!(
+            persisted["receiver_shutdown_error"]
+                .as_str()
+                .expect("shutdown error")
+                .contains("broken pipe")
+        );
     }
 
     #[test]
