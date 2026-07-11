@@ -482,7 +482,8 @@ def build(args: argparse.Namespace) -> int:
                 "tracker_created_ts": fmt_time(tracker_created_dt),
                 "tracker_delay_ms": tracker.get("tracker_delay_ms", ""),
                 "tracker_source": tracker.get("tracker_source", ""),
-                "eligible_for_exact_holder_acceptance": mint in eligible_mints,
+                "eligible_for_fresh_tracker_scope": mint in eligible_mints,
+                "eligible_for_exact_holder_acceptance": False,
                 "ineligible_reason": "|".join(ineligible),
             }
         )
@@ -499,6 +500,7 @@ def build(args: argparse.Namespace) -> int:
         "tracker_created_ts",
         "tracker_delay_ms",
         "tracker_source",
+        "eligible_for_fresh_tracker_scope",
         "eligible_for_exact_holder_acceptance",
         "ineligible_reason",
     ]
@@ -591,6 +593,15 @@ def build(args: argparse.Namespace) -> int:
         )
         quality_by_mint[mint] = quality
         quality_reasons[mint] = reasons
+
+    for row in launch_tracker_rows:
+        mint = str(row["mint"])
+        quality = quality_by_mint.get(mint, PROXY)
+        accepted = mint in eligible_mints and quality in ALLOWED_STRATEGY_QUALITY
+        row["eligible_for_exact_holder_acceptance"] = accepted
+        if mint in eligible_mints and not accepted:
+            row["ineligible_reason"] = f"source_quality_{quality}_not_exact_or_near_exact"
+    write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
 
     normalized_rows: list[dict[str, Any]] = []
     for mint in sorted(eligible_mints):

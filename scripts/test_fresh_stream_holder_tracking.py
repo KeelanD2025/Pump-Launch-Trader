@@ -264,6 +264,11 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
             self.assertEqual(guard["accepted_mints"], [mint])
             self.assertNotIn(old_mint, guard["accepted_mints"])
 
+            with (output / "exact_holder_launch_tracker_rows.csv").open(newline="") as handle:
+                tracker = next(csv.DictReader(handle))
+            self.assertEqual(tracker["eligible_for_fresh_tracker_scope"], "True")
+            self.assertEqual(tracker["eligible_for_exact_holder_acceptance"], "True")
+
             with (output / "exact_holder_balance_state_rows.csv").open(newline="") as handle:
                 balances = list(csv.DictReader(handle))
             vault = next(row for row in balances if row["token_account"] == "pool-base-vault")
