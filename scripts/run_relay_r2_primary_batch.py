@@ -485,12 +485,19 @@ def prepare_exact_holder_handoff_input(
     audit["source_run_dir"] = str(source_run_dir)
     try:
         manifest_path = source_run_dir / EXACT_HOLDER_TRACKER_MANIFEST_NAME
+        manifest_recovered_from_remote = not manifest_path.exists()
         manifest = (
             read_json(manifest_path)
             if manifest_path.exists()
             else exact_holder_remote_manifest(args, source_run_dir.name)
         )
         checkpoint = exact_holder_checkpoint_from_manifest(manifest, source_run_dir)
+        if manifest_recovered_from_remote:
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+        audit["source_manifest_recovered_from_remote"] = manifest_recovered_from_remote
+        audit["source_manifest_persisted"] = manifest_path.exists()
         active_mint_count = int(manifest.get("active_mint_count", 0) or 0)
         audit["source_active_mint_count"] = active_mint_count
         audit["source_relay_session_id"] = manifest.get("relay_session_id")
@@ -525,6 +532,10 @@ def prepare_exact_holder_handoff_input(
         audit["checkpoint_source_manifest_sha256"] = checkpoint[
             "source_manifest_sha256"
         ]
+        (source_run_dir / EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME).write_text(
+            json.dumps(checkpoint, indent=2, sort_keys=True) + "\n"
+        )
+        audit["source_checkpoint_persisted"] = True
         return audit, checkpoint
     except (BatchError, OSError, ValueError, TypeError) as exc:
         audit["reason"] = "prior_slice_checkpoint_invalid"

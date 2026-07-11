@@ -324,16 +324,18 @@ class RelaySupervisorTests(unittest.TestCase):
                 )
             )
             manifest = self.exact_holder_manifest_fixture(relay_session_id)
-            (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).write_text(
-                json.dumps(manifest)
-            )
             args = dummy_args(
                 output_root=root,
                 run_prefix="background-proof",
                 exact_holder_bootstrap_max_age_seconds=600,
             )
 
-            audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
+            with mock.patch.object(
+                relay_supervisor,
+                "exact_holder_remote_manifest",
+                return_value=manifest,
+            ):
+                audit, checkpoint = relay_supervisor.prepare_exact_holder_handoff_input(args)
 
             self.assertTrue(audit["bootstrap_allowed"])
             self.assertFalse(audit["continuity_reset"])
@@ -348,6 +350,15 @@ class RelaySupervisorTests(unittest.TestCase):
             )
             self.assertEqual(checkpoint["source_r2_unverified_chunks"], 0)
             self.assertFalse(checkpoint["source_holder_rpc_used"])
+            self.assertTrue(audit["source_manifest_recovered_from_remote"])
+            self.assertTrue(audit["source_manifest_persisted"])
+            self.assertTrue(audit["source_checkpoint_persisted"])
+            self.assertTrue(
+                (source / relay_supervisor.EXACT_HOLDER_TRACKER_MANIFEST_NAME).exists()
+            )
+            self.assertTrue(
+                (source / relay_supervisor.EXACT_HOLDER_HANDOFF_CHECKPOINT_NAME).exists()
+            )
 
     def test_handoff_rejects_active_manifest_with_unsafe_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
