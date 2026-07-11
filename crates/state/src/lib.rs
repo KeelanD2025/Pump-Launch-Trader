@@ -436,23 +436,52 @@ impl HolderState {
             .map(|state| state.raw_balance)
             .or_else(|| self.token_account_balances.get(&token_account_key).copied())
             .unwrap_or(Decimal::ZERO);
+        let old_account_nonzero = old_balance > Decimal::ZERO;
+        let new_account_nonzero = new_balance > Decimal::ZERO;
+        let previous_holder_count = self.nonzero_holder_count;
+        let old_owner_for_repair = old_owner.clone();
 
         match old_owner {
             Some(owner) if owner != new_owner => {
                 self.counters.holder_owner_changes += 1;
-                self.apply_owner_delta(&owner, -old_balance, token_decimals, observed_at);
-                self.apply_owner_delta(&new_owner, new_balance, token_decimals, observed_at);
+                self.apply_owner_delta(
+                    &owner,
+                    -old_balance,
+                    if old_account_nonzero { -1 } else { 0 },
+                    token_decimals,
+                    observed_at,
+                );
+                self.apply_owner_delta(
+                    &new_owner,
+                    new_balance,
+                    if new_account_nonzero { 1 } else { 0 },
+                    token_decimals,
+                    observed_at,
+                );
             }
             Some(owner) => {
                 self.apply_owner_delta(
                     &owner,
                     new_balance - old_balance,
+                    if new_account_nonzero == old_account_nonzero {
+                        0
+                    } else if new_account_nonzero {
+                        1
+                    } else {
+                        -1
+                    },
                     token_decimals,
                     observed_at,
                 );
             }
             None => {
-                self.apply_owner_delta(&new_owner, new_balance, token_decimals, observed_at);
+                self.apply_owner_delta(
+                    &new_owner,
+                    new_balance,
+                    if new_account_nonzero { 1 } else { 0 },
+                    token_decimals,
+                    observed_at,
+                );
             }
         }
 
@@ -483,17 +512,22 @@ impl HolderState {
         }
         self.counters.holder_updates_applied += 1;
         self.last_updated_at = Some(observed_at);
-        self.rebuild_owner_balances_from_token_accounts(observed_at, token_decimals);
+        if let Some(owner) = old_owner_for_repair.as_ref() {
+            self.repair_zero_account_count(owner);
+        }
+        self.repair_zero_account_count(&update.owner_wallet);
+        self.recompute_distribution_with_previous(observed_at, previous_holder_count);
     }
 
     fn apply_owner_delta(
         &mut self,
         owner: &PubkeyValue,
         delta_raw: Decimal,
+        account_count_delta: i64,
         decimals: u8,
         observed_at: OffsetDateTime,
     ) {
-        if delta_raw == Decimal::ZERO && self.owner_balances.contains_key(&owner.0) {
+        if !self.owner_balances.contains_key(&owner.0) && delta_raw <= Decimal::ZERO {
             return;
         }
         let entry = self.owner_balances.entry(owner.0.clone()).or_default();
@@ -504,16 +538,36 @@ impl HolderState {
         entry.ui_balance_sum = raw_tokens_to_ui(entry.balance.max(Decimal::ZERO), decimals);
         entry.last_updated_at = Some(observed_at);
         entry.last_trade_at = Some(observed_at);
-        entry.account_count = self
+        if account_count_delta < 0 {
+            entry.account_count = entry
+                .account_count
+                .saturating_sub(account_count_delta.unsigned_abs() as usize);
+        } else {
+            entry.account_count = entry
+                .account_count
+                .saturating_add(account_count_delta as usize);
+        }
+        Self::refresh_holder_behaviour(entry);
+        if entry.balance <= Decimal::ZERO {
+            self.owner_balances.remove(&owner.0);
+        }
+    }
+
+    fn repair_zero_account_count(&mut self, owner: &PubkeyValue) {
+        let needs_repair = self
+            .owner_balances
+            .get(&owner.0)
+            .is_some_and(|holder| holder.balance > Decimal::ZERO && holder.account_count == 0);
+        if !needs_repair {
+            return;
+        }
+        let account_count = self
             .token_accounts
             .values()
             .filter(|account| account.owner == *owner && account.raw_balance > Decimal::ZERO)
             .count();
-        if delta_raw > Decimal::ZERO {
-            entry.account_count += 1;
-        }
-        if entry.balance <= Decimal::ZERO {
-            self.owner_balances.remove(&owner.0);
+        if let Some(holder) = self.owner_balances.get_mut(&owner.0) {
+            holder.account_count = account_count;
         }
     }
 
@@ -616,27 +670,18 @@ impl HolderState {
         observed_at: OffsetDateTime,
         previous_holder_count: usize,
     ) {
-        self.nonzero_holder_count = self
-            .owner_balances
-            .values()
-            .filter(|holder| holder.balance > Decimal::ZERO)
-            .count();
-        let total: Decimal = self
-            .owner_balances
-            .values()
-            .map(|holder| holder.balance)
-            .sum();
-        let mut balances: Vec<(PubkeyValue, Decimal)> = self
-            .owner_balances
-            .iter()
-            .filter_map(|(owner, holder)| {
-                (holder.balance > Decimal::ZERO)
-                    .then(|| (PubkeyValue(owner.clone()), holder.balance))
-            })
-            .collect();
+        let mut total = Decimal::ZERO;
+        let mut balances = Vec::with_capacity(self.owner_balances.len());
+        for (owner, holder) in &self.owner_balances {
+            if holder.balance > Decimal::ZERO {
+                total += holder.balance;
+                balances.push((PubkeyValue(owner.clone()), holder.balance));
+            }
+        }
         balances.sort_by(|(_, left), (_, right)| {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
+        self.nonzero_holder_count = balances.len();
 
         self.top_holders = balances
             .iter()
@@ -651,8 +696,27 @@ impl HolderState {
                 },
             })
             .collect();
-        self.gini = compute_gini(balances.iter().map(|(_, balance)| *balance).collect());
-        self.hhi = compute_hhi(balances.iter().map(|(_, balance)| *balance).collect());
+        if total > Decimal::ZERO && !balances.is_empty() {
+            let n = Decimal::from(balances.len() as u64);
+            let weighted_sum =
+                balances
+                    .iter()
+                    .enumerate()
+                    .fold(Decimal::ZERO, |acc, (index, (_, balance))| {
+                        acc + Decimal::from((balances.len() - index) as u64) * *balance
+                    });
+            self.gini = (Decimal::from(2u64) * weighted_sum) / (n * total) - (n + Decimal::ONE) / n;
+            self.hhi = balances
+                .iter()
+                .map(|(_, balance)| {
+                    let share = *balance / total;
+                    share * share
+                })
+                .sum();
+        } else {
+            self.gini = Decimal::ZERO;
+            self.hhi = Decimal::ZERO;
+        }
         self.paperhand_90pct_wallet_count = self
             .owner_balances
             .values()
@@ -1987,10 +2051,12 @@ impl StateEngine {
         event: &NormalizedEvent,
     ) -> Result<(), StateError> {
         {
-            let token = self
-                .tokens
-                .entry(payload.mint.0.clone())
-                .or_insert_with(|| TokenState::new(payload.mint.clone(), event.meta.source));
+            let Some(token) = self.tokens.get_mut(&payload.mint.0) else {
+                return Ok(());
+            };
+            if token.launch_time.is_none() {
+                return Ok(());
+            }
             token.holder_state.apply_balance_update(
                 payload,
                 event,
@@ -3314,6 +3380,51 @@ mod tests {
     }
 
     #[test]
+    fn holder_update_does_not_create_tracker_without_decoded_launch() {
+        let mut engine = StateEngine::new(ttl());
+        let mut update = holder_update_account("holder-a", "ata-a-1", 100);
+        let EventPayload::HolderBalanceUpdate(payload) = &mut update.payload else {
+            unreachable!("holder update fixture")
+        };
+        payload.mint = pubkey("unknown-mint");
+
+        let _ = engine.apply_event(&update).expect("ignore unknown holder");
+
+        assert!(engine.token(&pubkey("unknown-mint")).is_none());
+    }
+
+    #[test]
+    fn holder_update_waits_for_launch_even_when_trade_created_token_state() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine
+            .apply_event(&buy("pre-launch-buy", "holder-a", 100, 100))
+            .expect("pre-launch trade");
+        let _ = engine
+            .apply_event(&holder_update_account("holder-a", "ata-a-1", 100))
+            .expect("ignore pre-launch holder");
+        let before_launch = engine.token(&pubkey("mint")).expect("trade-created token");
+        assert!(before_launch.launch_time.is_none());
+        assert!(before_launch.holder_state.token_accounts.is_empty());
+        assert_eq!(before_launch.holder_state.counters.holder_updates_seen, 0);
+
+        let _ = engine
+            .apply_event(&token_created())
+            .expect("decoded launch");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a",
+                "ata-a-1",
+                100,
+                5,
+                "post-launch-holder",
+            ))
+            .expect("post-launch holder");
+        let after_launch = engine.token(&pubkey("mint")).expect("launched token");
+        assert_eq!(after_launch.holder_state.counters.holder_updates_applied, 1);
+        assert_eq!(after_launch.holder_state.nonzero_holder_count, 1);
+    }
+
+    #[test]
     fn holder_balance_sums_multiple_token_accounts_per_owner() {
         let mut engine = StateEngine::new(ttl());
         let _ = engine.apply_event(&token_created()).expect("create");
@@ -3335,6 +3446,14 @@ mod tests {
                 .get("holder-a")
                 .map(|holder| holder.balance),
             Some(Decimal::from(150u64))
+        );
+        assert_eq!(
+            token
+                .holder_state
+                .owner_balances
+                .get("holder-a")
+                .map(|holder| holder.account_count),
+            Some(2)
         );
         assert_eq!(token.holder_state.top_holders[0].owner.0, "holder-a");
         assert_eq!(token.holder_state.missing_owner_mapping_count(), 0);
@@ -3413,6 +3532,15 @@ mod tests {
         let _ = engine
             .apply_event(&holder_update_account_slot(
                 "holder-a",
+                "holder-a-second-account",
+                50,
+                3,
+                "sig-before-owner-change",
+            ))
+            .expect("holder-a second account");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a",
                 "shared-token-account",
                 100,
                 4,
@@ -3429,20 +3557,82 @@ mod tests {
             ))
             .expect("owner change update");
         let token = engine.token(&pubkey("mint")).expect("token");
-        assert!(!token.holder_state.owner_balances.contains_key("holder-a"));
+        assert_eq!(
+            token
+                .holder_state
+                .owner_balances
+                .get("holder-a")
+                .map(|holder| (holder.balance, holder.account_count)),
+            Some((Decimal::from(50u64), 1))
+        );
         assert_eq!(
             token
                 .holder_state
                 .owner_balances
                 .get("holder-b")
-                .map(|holder| holder.balance),
-            Some(Decimal::from(80u64))
+                .map(|holder| (holder.balance, holder.account_count)),
+            Some((Decimal::from(80u64), 1))
         );
         assert_eq!(
             token.holder_state.observed_holder_supply(),
-            Decimal::from(80u64)
+            Decimal::from(130u64)
         );
         assert_eq!(token.holder_state.counters.holder_owner_changes, 1);
+    }
+
+    #[test]
+    fn incremental_holder_update_preserves_cost_basis_and_matches_full_rebuild() {
+        let mut engine = StateEngine::new(ttl());
+        let _ = engine.apply_event(&token_created()).expect("create");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 100, 4, "sig-a",
+            ))
+            .expect("holder update");
+        let _ = engine
+            .apply_event(&buy("buy-a", "holder-a", 100, 100))
+            .expect("cost basis");
+        let _ = engine
+            .apply_event(&holder_update_account_slot(
+                "holder-a", "ata-a-1", 125, 5, "sig-b",
+            ))
+            .expect("incremental replacement");
+        let token = engine.token(&pubkey("mint")).expect("token");
+        let incremental = token.holder_state.clone();
+        let mut rebuilt = incremental.clone();
+        rebuilt.rebuild_owner_balances_from_token_accounts(
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(5),
+            DEFAULT_PUMP_TOKEN_DECIMALS,
+        );
+
+        let incremental_holder = incremental
+            .owner_balances
+            .get("holder-a")
+            .expect("incremental holder");
+        let rebuilt_holder = rebuilt
+            .owner_balances
+            .get("holder-a")
+            .expect("rebuilt holder");
+        assert_eq!(incremental_holder.balance, rebuilt_holder.balance);
+        assert_eq!(
+            incremental_holder.ui_balance_sum,
+            rebuilt_holder.ui_balance_sum
+        );
+        assert_eq!(
+            incremental_holder.account_count,
+            rebuilt_holder.account_count
+        );
+        assert_eq!(
+            incremental_holder.cost_basis.original_position_size,
+            rebuilt_holder.cost_basis.original_position_size
+        );
+        assert_eq!(
+            incremental.nonzero_holder_count,
+            rebuilt.nonzero_holder_count
+        );
+        assert_eq!(incremental.gini, rebuilt.gini);
+        assert_eq!(incremental.hhi, rebuilt.hhi);
+        assert_eq!(incremental.top_holder_pct(1), rebuilt.top_holder_pct(1));
     }
 
     #[test]
