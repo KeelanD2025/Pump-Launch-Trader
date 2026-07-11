@@ -41565,6 +41565,9 @@ async fn material_candidate_hunter_command_with_connector(
     let last_r2_checkpoint_for_events = last_r2_checkpoint_at.clone();
     let last_r2_checkpoint_for_progress = last_r2_checkpoint_at.clone();
     let run_started_at = Instant::now();
+    let mut last_incremental_artifact_write_at = Instant::now();
+    let mut last_progress_health_write_at = Instant::now();
+    let mut last_progress_provider_status = String::new();
     let (stream_summary, _provider_blocked_run, interrupted_run, interruption_reason) = 'segment_streams: loop {
         let remaining_duration = duration_seconds
             .saturating_sub(run_started_at.elapsed().as_secs())
@@ -41577,7 +41580,7 @@ async fn material_candidate_hunter_command_with_connector(
             ..runtime::MaterialHunterStreamOptions::default()
         },
         stream_connector.clone(),
-        |event, summary| {
+        |event, _summary| {
             if interrupted_for_stream.load(Ordering::SeqCst) {
                 return Ok(MaterialHunterStreamAction::Stop);
             }
@@ -41589,19 +41592,6 @@ async fn material_candidate_hunter_command_with_connector(
                     candidate_rows.len(),
                 );
             }
-            phase107f_write_health(
-                &health_dir,
-                &run_id,
-                "streaming",
-                summary,
-                attempt_rows.len(),
-                active_mints.len(),
-                rejected_rows.len(),
-                candidate_rows.len(),
-                true,
-                "",
-            )?;
-
             let mut stream_state_hint = MaterialHunterStreamStateHint::default();
             if is_successful_launch_create(&event) {
                 let outside_launch_intake = launch_intake_duration_seconds
@@ -42249,42 +42239,48 @@ async fn material_candidate_hunter_command_with_connector(
                 active_mints.remove(&mint);
                 finalized_mints.insert(mint);
             }
-            phase107b_write_incremental_checkpoint(
-                &output_dir,
-                &run_id,
-                &attempt_rows,
-                &rejected_rows,
-                &candidate_rows,
-                &unavailable_rows,
-            )?;
-            phase107i_write_all_launch_tracking_artifacts(
-                &output_dir,
-                &run_id,
-                &all_launch_rows,
-                &rich_slot_rows,
-                max_attempted_launches,
-                max_concurrent_tracked_mints,
-            )?;
-            phase107k_write_followup_and_promotion_artifacts(
-                &output_dir,
-                &run_id,
-                &all_launch_rows,
-                &cheap_followup_rows,
-                &promotion_queue_rows,
-                tracking_budgets,
-            )?;
-            phase107n_write_lifecycle_stream_artifacts(
-                &output_dir,
-                &run_id,
-                &all_launch_rows,
-                &cheap_followup_events,
-            )?;
-            if upload_r2 {
-                let due = last_r2_checkpoint_for_events
+            let r2_checkpoint_due = upload_r2
+                && last_r2_checkpoint_for_events
                     .lock()
                     .map(|last| last.elapsed() >= std::time::Duration::from_secs(300))
                     .unwrap_or(true);
-                if due {
+            if r2_checkpoint_due
+                || last_incremental_artifact_write_at.elapsed()
+                    >= PHASE107N_INCREMENTAL_ARTIFACT_WRITE_INTERVAL
+            {
+                phase107b_write_incremental_checkpoint(
+                    &output_dir,
+                    &run_id,
+                    &attempt_rows,
+                    &rejected_rows,
+                    &candidate_rows,
+                    &unavailable_rows,
+                )?;
+                phase107i_write_all_launch_tracking_artifacts(
+                    &output_dir,
+                    &run_id,
+                    &all_launch_rows,
+                    &rich_slot_rows,
+                    max_attempted_launches,
+                    max_concurrent_tracked_mints,
+                )?;
+                phase107k_write_followup_and_promotion_artifacts(
+                    &output_dir,
+                    &run_id,
+                    &all_launch_rows,
+                    &cheap_followup_rows,
+                    &promotion_queue_rows,
+                    tracking_budgets,
+                )?;
+                phase107n_write_lifecycle_stream_artifacts(
+                    &output_dir,
+                    &run_id,
+                    &all_launch_rows,
+                    &cheap_followup_events,
+                )?;
+                last_incremental_artifact_write_at = Instant::now();
+            }
+            if r2_checkpoint_due {
                     let verified = phase107f_upload_r2_checkpoint_blocking(
                         loaded,
                         &output_dir,
@@ -42299,7 +42295,6 @@ async fn material_candidate_hunter_command_with_connector(
                         interrupted_for_stream.store(true, Ordering::SeqCst);
                         return Ok(MaterialHunterStreamAction::Stop);
                     }
-                }
             }
 
             if attempt_rows.len() >= tracking_budgets.max_rich_promotions_per_slice
@@ -42320,18 +42315,26 @@ async fn material_candidate_hunter_command_with_connector(
                 .map(|counts| *counts)
                 .unwrap_or_default();
             let interrupted_now = interrupted_for_progress.load(Ordering::SeqCst);
-            phase107f_write_health(
-                &health_dir_for_progress,
-                &run_id_for_progress,
-                if interrupted_now { "interrupt_requested" } else { "provider_progress" },
-                summary,
-                attempted,
-                active,
-                rejected,
-                candidates,
-                !interrupted_now,
-                if interrupted_now { "signal_interrupted" } else { "" },
-            )?;
+            let provider_status_changed = summary.provider_status != last_progress_provider_status;
+            if interrupted_now
+                || provider_status_changed
+                || last_progress_health_write_at.elapsed() >= PHASE107F_HEALTH_WRITE_INTERVAL
+            {
+                phase107f_write_health(
+                    &health_dir_for_progress,
+                    &run_id_for_progress,
+                    if interrupted_now { "interrupt_requested" } else { "provider_progress" },
+                    summary,
+                    attempted,
+                    active,
+                    rejected,
+                    candidates,
+                    !interrupted_now,
+                    if interrupted_now { "signal_interrupted" } else { "" },
+                )?;
+                last_progress_health_write_at = Instant::now();
+                last_progress_provider_status.clone_from(&summary.provider_status);
+            }
             if upload_r2 {
                 let due = last_r2_checkpoint_for_progress
                     .lock()
@@ -44027,6 +44030,8 @@ const PHASE107L_EARLY_BURST_REVIEW_FIELDS: &[&str] = &[
 const PHASE107B_TOKEN_LIFECYCLE_TARGET_SECONDS: u64 = 3600;
 const PHASE107B_CURVE_TARGET_PROGRESS_PCT: f64 = 90.0;
 const PHASE107H_ASOF_ALPHA_HORIZONS: [u64; 9] = [5, 10, 30, 60, 120, 300, 900, 1800, 3600];
+const PHASE107F_HEALTH_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const PHASE107N_INCREMENTAL_ARTIFACT_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(2);
 
 const PHASE107H_ASOF_ALPHA_FIELDS: &[&str] = &[
     "mint",
@@ -51035,6 +51040,19 @@ fn relay_tcp_addr_from_url(url: &str) -> Result<String> {
     Ok(authority.to_owned())
 }
 
+const RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
+const RELAY_PAYLOAD_ZSTD_LEVEL: i32 = 1;
+
+fn relay_compress_payload_if_beneficial(payload: Vec<u8>) -> (Vec<u8>, bool) {
+    if payload.len() < RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES {
+        return (payload, false);
+    }
+    match zstd::encode_all(payload.as_slice(), RELAY_PAYLOAD_ZSTD_LEVEL) {
+        Ok(compressed) if compressed.len() < payload.len() => (compressed, true),
+        _ => (payload, false),
+    }
+}
+
 async fn relay_write_frame(writer: &mut TokioTcpStream, frame: &RelayFrame) -> Result<()> {
     let wire = RelayWireFrame::from(frame);
     let encoded = serde_json::to_vec(&wire)?;
@@ -52391,6 +52409,8 @@ async fn run_live_vps_stream_relay(
     let mut upstream_provider_blocker_count = 0u64;
     let mut upstream_reconnect_count = 0u64;
     let mut upstream_reconnect_attempt_total = 0u64;
+    let mut uncompressed_payload_bytes = 0u64;
+    let mut compressed_data_frames_forwarded = 0u64;
     // This counter is consecutive by design. A valid update proves recovery,
     // so isolated provider lags cannot exhaust the entire relay window.
     let mut upstream_reconnect_attempt = 0u64;
@@ -52537,9 +52557,15 @@ async fn run_live_vps_stream_relay(
                         health_dir,
                     )
                     .await?;
-                    let payload = update.encode_to_vec();
+                    let raw_payload = update.encode_to_vec();
+                    uncompressed_payload_bytes =
+                        uncompressed_payload_bytes.saturating_add(raw_payload.len() as u64);
+                    let (payload, payload_compressed) =
+                        relay_compress_payload_if_beneficial(raw_payload);
                     bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
-                    let frame = RelayFrame::data(
+                    compressed_data_frames_forwarded = compressed_data_frames_forwarded
+                        .saturating_add(u64::from(payload_compressed));
+                    let mut frame = RelayFrame::data(
                         relay_session_id.clone(),
                         stream_id.clone(),
                         "geyser",
@@ -52550,6 +52576,7 @@ async fn run_live_vps_stream_relay(
                         "yellowstone_subscribe_update_protobuf",
                         payload,
                     );
+                    frame.payload_compressed = payload_compressed;
                     relay_write_frame(&mut receiver, &frame).await?;
                     sequence = sequence.saturating_add(1);
                     data_frames_forwarded = data_frames_forwarded.saturating_add(1);
@@ -52735,6 +52762,9 @@ async fn run_live_vps_stream_relay(
         "data_frames_forwarded": data_frames_forwarded,
         "control_frames_forwarded": control_frames_forwarded,
         "bytes_forwarded": bytes_forwarded,
+        "uncompressed_payload_bytes": uncompressed_payload_bytes,
+        "compressed_data_frames_forwarded": compressed_data_frames_forwarded,
+        "payload_compression_enabled": true,
         "upstream_errors": upstream_errors,
         "upstream_provider_blocker_count": upstream_provider_blocker_count,
         "upstream_reconnect_count": upstream_reconnect_count,
@@ -67524,6 +67554,43 @@ mod tests {
             }
             other => panic!("unexpected update {other:?}"),
         }
+    }
+
+    #[test]
+    fn phase107g_relay_compressed_payload_verifies_and_decodes() {
+        let original = vec![42_u8; RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES * 4];
+        let (payload, compressed) = relay_compress_payload_if_beneficial(original.clone());
+        assert!(compressed);
+        assert!(payload.len() < original.len());
+
+        let mut frame = RelayFrame::data(
+            "relay-session",
+            "geyser-material-hunter",
+            "geyser",
+            "fingerprint",
+            1,
+            123,
+            None,
+            "yellowstone_subscribe_update_protobuf",
+            payload,
+        );
+        frame.payload_compressed = compressed;
+        let decoded_frame = RelayWireFrame::from(&frame)
+            .into_relay_frame()
+            .expect("relay frame");
+        assert!(decoded_frame.verify_payload_hash());
+        assert_eq!(
+            zstd::decode_all(decoded_frame.payload_bytes.as_slice()).expect("zstd payload"),
+            original
+        );
+    }
+
+    #[test]
+    fn phase107g_relay_leaves_small_payload_uncompressed() {
+        let original = vec![7_u8; RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES - 1];
+        let (payload, compressed) = relay_compress_payload_if_beneficial(original.clone());
+        assert!(!compressed);
+        assert_eq!(payload, original);
     }
 
     #[test]
