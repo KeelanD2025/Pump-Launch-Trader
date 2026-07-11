@@ -155,6 +155,22 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                     "update_type": "token_account_balance_update",
                 },
                 {
+                    "mint": mint,
+                    "launch_id": "launch-fresh",
+                    "event_observed_at_utc": "2026-01-01T00:00:21Z",
+                    "slot": 31,
+                    "signature": "post-gap-transfer",
+                    "token_account": "buyer-token-account",
+                    "owner_wallet": "buyer-wallet",
+                    "amount_raw": "60000000",
+                    "amount_ui": "60",
+                    "decimals": "6",
+                    "holder_balance_before": "50000000",
+                    "holder_balance_after": "60000000",
+                    "update_source": "geyser_spl_token_account_update",
+                    "update_type": "token_account_balance_update",
+                },
+                {
                     "mint": old_mint,
                     "launch_id": "launch-old",
                     "event_observed_at_utc": "2026-01-01T00:00:03Z",
@@ -180,7 +196,13 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
                         "client_backpressure_detected": False,
                         "blocker_class": "provider_lagged_data_loss",
                         "created_at": "[2025,365,23,59,59,0,0,0,0]",
-                    }
+                    },
+                    {
+                        "provider_data_loss_seen": True,
+                        "client_backpressure_detected": False,
+                        "blocker_class": "provider_lagged_data_loss",
+                        "created_at": "[2026,1,0,0,20,0,0,0,0]",
+                    },
                 ],
             )
             write_csv(
@@ -256,25 +278,51 @@ class FreshStreamHolderTrackingTest(unittest.TestCase):
 
             proof = json.loads((output / "exact_holder_fresh_launch_proof_report.json").read_text())
             self.assertEqual(proof["verdict"], "near_exact_holder_fresh_launch_tracking_ready")
-            self.assertEqual(proof["source_quality_counts"][MODULE.NEAR_EXACT], 1)
             self.assertGreater(proof["token_account_update_rows"], 0)
-            self.assertEqual(proof["provider_or_sequence_gap_count"], 1)
-            self.assertTrue(proof["source_integrity_proven"])
+            self.assertEqual(proof["provider_or_sequence_gap_count"], 2)
+            self.assertFalse(proof["source_integrity_proven"])
+            self.assertEqual(proof["pre_gap_source_integrity_mint_count"], 1)
+            self.assertEqual(proof["source_quality_counts"][MODULE.OBSERVED], 1)
+            self.assertEqual(proof["best_proven_source_quality_counts"][MODULE.NEAR_EXACT], 1)
             self.assertEqual(proof["observed_migration_rows"], 1)
             self.assertEqual(proof["non_fresh_migration_rows_rejected"], 0)
             guard = json.loads((output / "exact_holder_no_stale_mint_guard.json").read_text())
             self.assertEqual(guard["accepted_mints"], [mint])
+            self.assertEqual(guard["currently_accepted_mints"], [])
             self.assertNotIn(old_mint, guard["accepted_mints"])
 
             with (output / "exact_holder_launch_tracker_rows.csv").open(newline="") as handle:
                 tracker = next(csv.DictReader(handle))
             self.assertEqual(tracker["eligible_for_fresh_tracker_scope"], "True")
             self.assertEqual(tracker["eligible_for_exact_holder_acceptance"], "True")
+            self.assertEqual(tracker["currently_eligible_for_exact_holder_acceptance"], "False")
+            self.assertEqual(tracker["acceptance_valid_until"], "2026-01-01T00:00:20Z")
 
             with (output / "exact_holder_balance_state_rows.csv").open(newline="") as handle:
                 balances = list(csv.DictReader(handle))
             vault = next(row for row in balances if row["token_account"] == "pool-base-vault")
             self.assertEqual(vault["excluded_from_holder_count"], "True")
+            pre_gap = next(row for row in balances if row["signature"] == "transfer-one")
+            post_gap = next(row for row in balances if row["signature"] == "post-gap-transfer")
+            self.assertEqual(pre_gap["source_quality"], MODULE.NEAR_EXACT)
+            self.assertEqual(post_gap["source_quality"], MODULE.OBSERVED)
+
+            with (output / "exact_holder_concentration_rows.csv").open(newline="") as handle:
+                concentrations = list(csv.DictReader(handle))
+            self.assertEqual(
+                {row["source_quality"] for row in concentrations},
+                {MODULE.NEAR_EXACT},
+            )
+
+            with (output / "exact_holder_decision_state_rows.csv").open(newline="") as handle:
+                decision = next(csv.DictReader(handle))
+            self.assertEqual(decision["source_quality"], MODULE.NEAR_EXACT)
+            self.assertNotEqual(decision["holder_count_near_exact"], "")
+
+            migration_audit = json.loads(
+                (output / "exact_holder_migration_carry_forward_audit.json").read_text()
+            )
+            self.assertEqual(migration_audit["carry_forward_complete_rows"], 1)
 
             with (output / "exact_holder_leakage_audit.csv").open(newline="") as handle:
                 leakage = list(csv.DictReader(handle))

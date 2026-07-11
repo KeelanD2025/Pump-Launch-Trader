@@ -484,6 +484,8 @@ def build(args: argparse.Namespace) -> int:
                 "tracker_source": tracker.get("tracker_source", ""),
                 "eligible_for_fresh_tracker_scope": mint in eligible_mints,
                 "eligible_for_exact_holder_acceptance": False,
+                "currently_eligible_for_exact_holder_acceptance": False,
+                "acceptance_valid_until": "",
                 "ineligible_reason": "|".join(ineligible),
             }
         )
@@ -502,21 +504,33 @@ def build(args: argparse.Namespace) -> int:
         "tracker_source",
         "eligible_for_fresh_tracker_scope",
         "eligible_for_exact_holder_acceptance",
+        "currently_eligible_for_exact_holder_acceptance",
+        "acceptance_valid_until",
         "ineligible_reason",
     ]
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
     write_csv(output / "exact_holder_tracker_gap_audit.csv", tracker_gap_rows, ["mint", "launch_id", "gap_type", "gap_reason"])
 
+    all_gap_times_parseable = all(gap_time is not None for gap_time in gap_times)
+    first_gap_by_mint: dict[str, datetime | None] = {}
+    pre_gap_integrity_by_mint: dict[str, bool] = {}
     source_integrity_by_mint: dict[str, bool] = {}
     for mint in eligible_mints:
         tracker_started = time_from_nanos(tracker_by_mint[mint].get("tracker_created_at_unix_nanos"))
         launch_started = parse_time(first(launch_by_mint.get(mint, {}), "event_observed_at_utc", "source_ts"))
         tracking_started = tracker_started or launch_started
-        gap_after_tracking_started = any(
-            gap_time is None or tracking_started is None or gap_time >= tracking_started
+        relevant_gaps = sorted(
+            gap_time
             for gap_time in gap_times
+            if gap_time is not None and tracking_started is not None and gap_time >= tracking_started
         )
-        source_integrity_by_mint[mint] = base_source_integrity and not gap_after_tracking_started
+        first_gap_by_mint[mint] = relevant_gaps[0] if relevant_gaps else None
+        pre_gap_integrity_by_mint[mint] = (
+            base_source_integrity and all_gap_times_parseable and tracking_started is not None
+        )
+        source_integrity_by_mint[mint] = (
+            pre_gap_integrity_by_mint[mint] and first_gap_by_mint[mint] is None
+        )
     source_integrity = bool(eligible_mints) and all(source_integrity_by_mint.values())
 
     migration_by_mint: dict[str, dict[str, Any]] = {}
@@ -583,33 +597,63 @@ def build(args: argparse.Namespace) -> int:
         if mint in eligible_mints:
             holder_by_mint_raw[mint].append(row)
 
+    proven_quality_by_mint: dict[str, str] = {}
+    proven_quality_reasons: dict[str, list[str]] = {}
     quality_by_mint: dict[str, str] = {}
     quality_reasons: dict[str, list[str]] = {}
     for mint in eligible_mints:
         launch_signature = first(launch_by_mint.get(mint, {}), "signature")
-        quality, reasons = quality_for_mint(
+        first_gap = first_gap_by_mint.get(mint)
+        pre_gap_rows = [
+            row
+            for row in holder_by_mint_raw.get(mint, [])
+            if (row_ts := parse_time(first(row, "source_ts", "event_observed_at_utc"))) is not None
+            and (first_gap is None or row_ts < first_gap)
+        ]
+        proven_quality, reasons = quality_for_mint(
             mint,
             tracker_by_mint[mint],
-            holder_by_mint_raw.get(mint, []),
+            pre_gap_rows,
             launch_signature,
-            source_integrity_by_mint.get(mint, False),
+            pre_gap_integrity_by_mint.get(mint, False),
         )
-        quality_by_mint[mint] = quality
-        quality_reasons[mint] = reasons
+        proven_quality_by_mint[mint] = proven_quality
+        proven_quality_reasons[mint] = reasons
+        if first_gap is None:
+            quality_by_mint[mint] = proven_quality
+            quality_reasons[mint] = list(reasons)
+        else:
+            quality_by_mint[mint] = OBSERVED if holder_by_mint_raw.get(mint) else PROXY
+            quality_reasons[mint] = [*reasons, f"stream_continuity_lost_at_{fmt_time(first_gap)}"]
+
+    def quality_at_time(mint: str, source_ts: datetime | None) -> str:
+        proven_quality = proven_quality_by_mint.get(mint, PROXY)
+        first_gap = first_gap_by_mint.get(mint)
+        if (
+            source_ts is not None
+            and proven_quality in ALLOWED_STRATEGY_QUALITY
+            and (first_gap is None or source_ts < first_gap)
+        ):
+            return proven_quality
+        return quality_by_mint.get(mint, PROXY)
 
     for row in launch_tracker_rows:
         mint = str(row["mint"])
-        quality = quality_by_mint.get(mint, PROXY)
-        accepted = mint in eligible_mints and quality in ALLOWED_STRATEGY_QUALITY
+        proven_quality = proven_quality_by_mint.get(mint, PROXY)
+        accepted = mint in eligible_mints and proven_quality in ALLOWED_STRATEGY_QUALITY
+        current_accepted = mint in eligible_mints and quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY
         row["eligible_for_exact_holder_acceptance"] = accepted
+        row["currently_eligible_for_exact_holder_acceptance"] = current_accepted
+        row["acceptance_valid_until"] = fmt_time(first_gap_by_mint.get(mint))
         if mint in eligible_mints and not accepted:
-            row["ineligible_reason"] = f"source_quality_{quality}_not_exact_or_near_exact"
+            row["ineligible_reason"] = f"source_quality_{proven_quality}_not_exact_or_near_exact"
     write_csv(output / "exact_holder_launch_tracker_rows.csv", launch_tracker_rows, launch_fields)
 
     normalized_rows: list[dict[str, Any]] = []
     for mint in sorted(eligible_mints):
-        quality = quality_by_mint[mint]
         for row in holder_by_mint_raw.get(mint, []):
+            source_ts = first(row, "source_ts", "event_observed_at_utc")
+            row_quality = quality_at_time(mint, parse_time(source_ts))
             token_account = first(row, "token_account", "token_account_pubkey")
             owner_wallet = first(row, "owner_wallet", "holder_wallet")
             amount_raw = first(row, "amount_raw", "holder_balance_after", "balance_after") or "0"
@@ -637,11 +681,11 @@ def build(args: argparse.Namespace) -> int:
                     "amount_raw": amount_raw,
                     "amount_ui": amount_ui,
                     "decimals": decimals,
-                    "source_ts": first(row, "source_ts", "event_observed_at_utc"),
+                    "source_ts": source_ts,
                     "slot": first(row, "slot"),
                     "signature": first(row, "signature"),
                     "source_type": source_type_for(row),
-                    "source_quality": quality,
+                    "source_quality": row_quality,
                     "is_nonzero": decimalish(amount_raw) > 0,
                     "excluded_from_holder_count": excluded,
                     "exclusion_reason": exclusion_reason,
@@ -671,9 +715,22 @@ def build(args: argparse.Namespace) -> int:
                 "mint": mint,
                 "launch_id": launch_ids[mint],
                 "source_quality": quality_by_mint[mint],
+                "best_proven_source_quality": proven_quality_by_mint[mint],
+                "near_exact_valid_until": fmt_time(first_gap_by_mint.get(mint)),
                 "transaction_balance_rows": sum(row["source_type"].startswith("transaction") for row in mint_rows),
                 "account_subscription_rows": sum(row["source_type"] == "geyser_spl_token_account_update" for row in mint_rows),
+                "pre_gap_transaction_balance_rows": sum(
+                    row["source_type"].startswith("transaction")
+                    and row["source_quality"] in ALLOWED_STRATEGY_QUALITY
+                    for row in mint_rows
+                ),
+                "pre_gap_account_subscription_rows": sum(
+                    row["source_type"] == "geyser_spl_token_account_update"
+                    and row["source_quality"] in ALLOWED_STRATEGY_QUALITY
+                    for row in mint_rows
+                ),
                 "source_integrity_proven": source_integrity_by_mint.get(mint, False),
+                "pre_gap_source_integrity_proven": pre_gap_integrity_by_mint.get(mint, False),
                 "quality_reasons": "|".join(quality_reasons[mint]),
             }
         )
@@ -686,7 +743,20 @@ def build(args: argparse.Namespace) -> int:
                     "gap_reason": "|".join(quality_reasons[mint]) or "source_quality_below_near_exact",
                 }
             )
-    source_fields = ["mint", "launch_id", "source_quality", "transaction_balance_rows", "account_subscription_rows", "source_integrity_proven", "quality_reasons"]
+    source_fields = [
+        "mint",
+        "launch_id",
+        "source_quality",
+        "best_proven_source_quality",
+        "near_exact_valid_until",
+        "transaction_balance_rows",
+        "account_subscription_rows",
+        "pre_gap_transaction_balance_rows",
+        "pre_gap_account_subscription_rows",
+        "source_integrity_proven",
+        "pre_gap_source_integrity_proven",
+        "quality_reasons",
+    ]
     write_csv(output / "exact_holder_state_source_audit.csv", source_audit_rows, source_fields)
     write_csv(output / "exact_holder_tx_balance_reconstruction_gap_audit.csv", tx_gap_rows, ["mint", "launch_id", "gap_type", "gap_reason"])
     write_json(
@@ -720,7 +790,8 @@ def build(args: argparse.Namespace) -> int:
         initial_top1: float | None = None
         for row in pump_rows:
             state[row["token_account"]] = row
-            metrics = aggregate_state(state, creator, quality_by_mint[mint])
+            row_quality = str(row["source_quality"])
+            metrics = aggregate_state(state, creator, row_quality)
             if initial_count is None:
                 initial_count = int(metrics["holder_count_observed_subset"])
                 initial_top1 = float(metrics["top_1_holder_pct"])
@@ -732,27 +803,41 @@ def build(args: argparse.Namespace) -> int:
                 "phase": "pumpfun",
                 "source_ts": row["source_ts"],
                 "slot": row["slot"],
-                "source_quality": quality_by_mint[mint],
+                "source_quality": row_quality,
                 **metrics,
-                "holder_growth_exact": current_count - initial_count if quality_by_mint[mint] == EXACT else "",
-                "holder_growth_near_exact": current_count - initial_count if quality_by_mint[mint] == NEAR_EXACT else "",
+                "holder_growth_exact": current_count - initial_count if row_quality == EXACT else "",
+                "holder_growth_near_exact": current_count - initial_count if row_quality == NEAR_EXACT else "",
                 "holder_concentration_delta": round(float(metrics["top_1_holder_pct"]) - float(initial_top1 or 0), 8),
             }
             pumpfun_snapshots.append(snapshot)
-        if pumpfun_snapshots:
-            final = next((row for row in reversed(pumpfun_snapshots) if row["mint"] == mint), None)
-            if final:
-                concentration_rows.append(dict(final))
+        mint_snapshots = [snapshot for snapshot in pumpfun_snapshots if snapshot["mint"] == mint]
+        if mint_snapshots:
+            final = mint_snapshots[-1]
+            last_strategy_quality = next(
+                (
+                    snapshot
+                    for snapshot in reversed(mint_snapshots)
+                    if snapshot["source_quality"] in ALLOWED_STRATEGY_QUALITY
+                ),
+                None,
+            )
+            selected_snapshots = []
+            if last_strategy_quality is not None:
+                selected_snapshots.append(last_strategy_quality)
+            if last_strategy_quality is None or final["source_ts"] != last_strategy_quality["source_ts"]:
+                selected_snapshots.append(final)
+            for selected in selected_snapshots:
+                concentration_rows.append(dict(selected))
                 creator_rows.append(
                     {
                         "mint": mint,
                         "launch_id": launch_ids[mint],
-                        "source_ts": final["source_ts"],
+                        "source_ts": selected["source_ts"],
                         "creator_wallet": creator,
                         "dev_wallet": creator,
-                        "creator_holding_pct": final["creator_holding_pct"],
-                        "dev_wallet_holding_pct": final["dev_wallet_holding_pct"],
-                        "source_quality": quality_by_mint[mint],
+                        "creator_holding_pct": selected["creator_holding_pct"],
+                        "dev_wallet_holding_pct": selected["dev_wallet_holding_pct"],
+                        "source_quality": selected["source_quality"],
                     }
                 )
     write_csv(output / "exact_holder_pumpfun_phase_state_rows.csv", pumpfun_snapshots, SNAPSHOT_FIELDS)
@@ -783,9 +868,24 @@ def build(args: argparse.Namespace) -> int:
         pool = first(migration, "post_migration_pool") or first(pair_by_mint.get(mint, {}), "pool")
         creator = first(launch_by_mint.get(mint, {}), "creator_wallet")
         rows = normalized_by_mint.get(mint, [])
-        before_state, before_metrics, before_latest = state_at(rows, migration_ts, creator, quality_by_mint[mint])
+        migration_quality = quality_at_time(mint, migration_ts)
+        before_state, before_metrics, before_latest = state_at(rows, migration_ts, creator, migration_quality)
         post_source_rows = [row for row in rows if migration_ts and parse_time(row["source_ts"]) and parse_time(row["source_ts"]) > migration_ts]
-        after_state, after_metrics, after_latest = state_at(rows, None, creator, quality_by_mint[mint])
+        first_gap = first_gap_by_mint.get(mint)
+        valid_post_rows = [
+            row
+            for row in post_source_rows
+            if first_gap is None
+            or migration_ts is None
+            or first_gap <= migration_ts
+            or (parse_time(row["source_ts"]) is not None and parse_time(row["source_ts"]) < first_gap)
+        ]
+        after_cutoff = max(
+            (parse_time(row["source_ts"]) for row in valid_post_rows if parse_time(row["source_ts"]) is not None),
+            default=migration_ts,
+        )
+        after_quality = quality_at_time(mint, after_cutoff)
+        after_state, after_metrics, after_latest = state_at(rows, after_cutoff, creator, after_quality)
         vault_accounts = {
             row["excluded_account"]
             for row in pool_exclusions
@@ -799,10 +899,14 @@ def build(args: argparse.Namespace) -> int:
             gaps.append("pumpswap_pool_link_missing")
         if not vault_accounts:
             gaps.append("pool_vault_accounts_missing")
-        if not post_source_rows:
+        if not valid_post_rows:
             gaps.append("post_migration_holder_updates_missing")
-        if quality_by_mint[mint] not in ALLOWED_STRATEGY_QUALITY:
+        if migration_quality not in ALLOWED_STRATEGY_QUALITY:
             gaps.append("source_quality_below_near_exact")
+        if valid_post_rows and not any(
+            row["source_quality"] in ALLOWED_STRATEGY_QUALITY for row in valid_post_rows
+        ):
+            gaps.append("post_migration_source_quality_below_near_exact")
         complete = not gaps
         before_count = int(before_metrics["holder_count_observed_subset"])
         after_count = int(after_metrics["holder_count_observed_subset"])
@@ -833,7 +937,7 @@ def build(args: argparse.Namespace) -> int:
             "top_10_holder_pct": after_metrics["top_10_holder_pct"],
             "creator_holding_pct": after_metrics["creator_holding_pct"],
             "dev_wallet_holding_pct": after_metrics["dev_wallet_holding_pct"],
-            "source_quality": quality_by_mint[mint],
+            "source_quality": migration_quality,
             "pool_vaults_identified": bool(vault_accounts),
             "pool_vaults_excluded": bool(vault_accounts),
             "carry_forward_complete": complete,
@@ -872,10 +976,10 @@ def build(args: argparse.Namespace) -> int:
             continue
         decision_ts = parse_time(first(decision, "decision_ts", "entry_decision_timestamp", "entry_timestamp"))
         creator = first(launch_by_mint.get(mint, {}), "creator_wallet")
-        _, metrics, latest = state_at(normalized_by_mint.get(mint, []), decision_ts, creator, quality_by_mint[mint])
+        quality = quality_at_time(mint, decision_ts)
+        _, metrics, latest = state_at(normalized_by_mint.get(mint, []), decision_ts, creator, quality)
         leakage_safe = bool(decision_ts and latest and latest <= decision_ts)
         age = (decision_ts - latest).total_seconds() if leakage_safe and decision_ts and latest else ""
-        quality = quality_by_mint[mint]
         missing = []
         if latest is None:
             missing.append("holder_state_at_or_before_decision_missing")
@@ -920,6 +1024,7 @@ def build(args: argparse.Namespace) -> int:
     write_csv(output / "exact_holder_leakage_audit.csv", leakage_rows, leakage_fields)
 
     quality_counts = Counter(quality_by_mint.values())
+    proven_quality_counts = Counter(proven_quality_by_mint.values())
     latest_times = [
         parsed
         for parsed in [
@@ -940,9 +1045,9 @@ def build(args: argparse.Namespace) -> int:
         proof_verdict = "blocked_fresh_source_no_launches"
     elif not normalized_rows:
         proof_verdict = "blocked_provider_no_token_account_or_balance_updates"
-    elif quality_counts[EXACT] and complete_carry:
+    elif proven_quality_counts[EXACT] and complete_carry:
         proof_verdict = "exact_holder_fresh_launch_tracking_ready"
-    elif quality_counts[NEAR_EXACT] and complete_carry:
+    elif proven_quality_counts[NEAR_EXACT] and complete_carry:
         proof_verdict = "near_exact_holder_fresh_launch_tracking_ready"
     elif migration_by_mint:
         proof_verdict = "partial_source_lacks_token_balance_state"
@@ -962,14 +1067,17 @@ def build(args: argparse.Namespace) -> int:
                 "tx_balance_reconstruction_rows": sum(row["mint"] == mint for row in tx_rows),
                 "holder_balance_state_rows": sum(row["mint"] == mint for row in normalized_rows),
                 "source_quality": quality_by_mint.get(mint, PROXY),
+                "best_proven_source_quality": proven_quality_by_mint.get(mint, PROXY),
+                "near_exact_valid_until": fmt_time(first_gap_by_mint.get(mint)),
                 "migration_seen": mint in migration_by_mint,
                 "carry_forward_complete": carry.get("carry_forward_complete", False),
                 "decision_time_rows": sum(row["mint"] == mint for row in decision_output),
-                "eligible_for_exact_holder_acceptance": mint in eligible_mints and quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY,
+                "eligible_for_exact_holder_acceptance": mint in eligible_mints and proven_quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY,
+                "currently_eligible_for_exact_holder_acceptance": mint in eligible_mints and quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY,
                 "gap_reason": "|".join(quality_reasons.get(mint, [])),
             }
         )
-    proof_fields = ["mint", "launch_id", "internal_launch_row", "tracker_created", "token_account_update_rows", "tx_balance_reconstruction_rows", "holder_balance_state_rows", "source_quality", "migration_seen", "carry_forward_complete", "decision_time_rows", "eligible_for_exact_holder_acceptance", "gap_reason"]
+    proof_fields = ["mint", "launch_id", "internal_launch_row", "tracker_created", "token_account_update_rows", "tx_balance_reconstruction_rows", "holder_balance_state_rows", "source_quality", "best_proven_source_quality", "near_exact_valid_until", "migration_seen", "carry_forward_complete", "decision_time_rows", "eligible_for_exact_holder_acceptance", "currently_eligible_for_exact_holder_acceptance", "gap_reason"]
     write_csv(output / "exact_holder_proof_window_rows.csv", proof_rows, proof_fields)
 
     proof_report = {
@@ -994,9 +1102,12 @@ def build(args: argparse.Namespace) -> int:
         "post_migration_holder_rows": len(post_rows),
         "decision_time_exact_or_near_exact_rows": decision_ready_rows,
         "source_quality_counts": dict(quality_counts),
+        "best_proven_source_quality_counts": dict(proven_quality_counts),
+        "pre_gap_exact_or_near_exact_mints": proven_quality_counts[EXACT] + proven_quality_counts[NEAR_EXACT],
         "provider_or_sequence_gap_count": provider_gap_count,
         "source_integrity_proven": source_integrity,
         "source_integrity_mint_count": sum(source_integrity_by_mint.values()),
+        "pre_gap_source_integrity_mint_count": sum(pre_gap_integrity_by_mint.values()),
         "source_gap_affected_mint_count": sum(not value for value in source_integrity_by_mint.values()),
         "rpc_used": False,
         "dex_as_holder_truth": False,
@@ -1034,6 +1145,8 @@ def build(args: argparse.Namespace) -> int:
         "relay_session_id": manifest_session,
         "quality_taxonomy": [EXACT, NEAR_EXACT, OBSERVED, PROXY],
         "full_strategy_quality_allowed": [EXACT, NEAR_EXACT],
+        "quality_is_time_bounded": True,
+        "provider_gap_downgrades_rows_at_or_after_gap": True,
         "policy": policy,
         "proxy_holder_allowed_for_research_only": True,
         "safety_flags": SAFETY_FALSE,
@@ -1042,7 +1155,7 @@ def build(args: argparse.Namespace) -> int:
     (output / "exact_holder_fresh_lifecycle_contract.md").write_text(
         "# Fresh Stream Holder Contract\n\n"
         "Only Pump.fun mints decoded after relay tracker activation and enrolled by the same create update enter the acceptance scope; "
-        "exact or near-exact source quality is still required to pass. "
+        "exact or near-exact source quality is still required to pass. Quality is timestamp-bounded: a provider gap downgrades states at and after the gap without relabeling earlier continuous states. "
         "RPC and Dex holder truth are forbidden. Trade-participant proxies remain research-only. Pool, curve, program, and burn accounts are excluded.\n"
     )
     write_json(output / "exact_holder_acceptance_policy.json", {"schema_version": "exact_holder_acceptance_policy.v1", **policy})
@@ -1054,10 +1167,13 @@ def build(args: argparse.Namespace) -> int:
             "tracker_manifest_mints": sorted(tracker_by_mint),
             "fresh_tracker_scope_mints": sorted(eligible_mints),
             "accepted_mints": sorted(
+                mint for mint in eligible_mints if proven_quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY
+            ),
+            "currently_accepted_mints": sorted(
                 mint for mint in eligible_mints if quality_by_mint.get(mint) in ALLOWED_STRATEGY_QUALITY
             ),
             "source_quality_rejected_mints": sorted(
-                mint for mint in eligible_mints if quality_by_mint.get(mint) not in ALLOWED_STRATEGY_QUALITY
+                mint for mint in eligible_mints if proven_quality_by_mint.get(mint) not in ALLOWED_STRATEGY_QUALITY
             ),
             "non_manifest_launch_rows_rejected": sum(first(row, "mint") not in tracker_by_mint for row in launch_rows),
         },
@@ -1095,16 +1211,18 @@ def build(args: argparse.Namespace) -> int:
 
     decision_coverage_pct = round(decision_ready_rows / len(decision_output) * 100, 4) if decision_output else 0.0
     leakage_passed = bool(leakage_rows) and all(boolish(row["leakage_safe"]) for row in leakage_rows)
-    holder_quality_ready = quality_counts[EXACT] + quality_counts[NEAR_EXACT] > 0
-    migration_gate = not carry_rows or complete_carry == len(carry_rows)
+    holder_quality_ready = proven_quality_counts[EXACT] + proven_quality_counts[NEAR_EXACT] > 0
+    migration_gate = bool(carry_rows) and complete_carry == len(carry_rows)
     sample_gate = len(eligible_mints) >= args.min_fresh_launches
     decision_gate = bool(decision_output) and decision_coverage_pct >= args.min_decision_coverage_pct
     amm_ready = boolish(amm_gate.get("coverage_ready")) and boolish(amm_gate.get("amm_research_usable"))
     full_ready = all([holder_quality_ready, migration_gate, decision_gate, amm_ready, leakage_passed, sample_gate])
     if full_ready:
         readiness_status = "full_strategy_ready"
-    elif holder_quality_ready and sample_gate:
-        readiness_status = "strategy_ready_exact_holder_pending_sample" if not decision_gate else "exact_holder_tracking_ready_no_strategy_yet"
+    elif holder_quality_ready and not sample_gate:
+        readiness_status = "strategy_ready_exact_holder_pending_sample"
+    elif proven_quality_counts[EXACT]:
+        readiness_status = "exact_holder_tracking_ready_no_strategy_yet"
     elif holder_quality_ready:
         readiness_status = "research_ready_near_exact_holder_partial"
     else:
@@ -1126,12 +1244,15 @@ def build(args: argparse.Namespace) -> int:
         "status": readiness_status,
         "full_strategy_dataset_ready": full_ready,
         "fresh_launches": len(eligible_mints),
-        "exact_mints": quality_counts[EXACT],
-        "near_exact_mints": quality_counts[NEAR_EXACT],
+        "exact_mints": proven_quality_counts[EXACT],
+        "near_exact_mints": proven_quality_counts[NEAR_EXACT],
         "observed_subset_mints": quality_counts[OBSERVED],
         "proxy_only_mints": quality_counts[PROXY],
+        "current_exact_mints": quality_counts[EXACT],
+        "current_near_exact_mints": quality_counts[NEAR_EXACT],
+        "time_bounded_quality": True,
         "decision_time_holder_coverage_pct": decision_coverage_pct,
-        "holder_state_carries_through_migration": migration_gate and bool(carry_rows),
+        "holder_state_carries_through_migration": migration_gate,
         "proxy_holder_allowed_for_research_only": True,
         "proxy_holder_allowed_for_strategy_ready": False,
         "blockers": blockers,
