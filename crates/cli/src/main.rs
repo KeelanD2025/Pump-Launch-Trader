@@ -52167,6 +52167,19 @@ fn relay_can_reconnect(
     )
 }
 
+fn relay_note_valid_upstream_data(consecutive_reconnect_attempt: &mut u64) {
+    *consecutive_reconnect_attempt = 0;
+}
+
+fn relay_note_reconnect_scheduled(
+    consecutive_reconnect_attempt: &mut u64,
+    reconnect_attempt_total: &mut u64,
+    next_attempt: u64,
+) {
+    *consecutive_reconnect_attempt = next_attempt;
+    *reconnect_attempt_total = reconnect_attempt_total.saturating_add(1);
+}
+
 async fn relay_emit_control_frame(
     receiver: &mut TokioTcpStream,
     relay_session_id: &str,
@@ -52319,6 +52332,9 @@ async fn run_live_vps_stream_relay(
     let mut upstream_errors: Vec<String> = Vec::new();
     let mut upstream_provider_blocker_count = 0u64;
     let mut upstream_reconnect_count = 0u64;
+    let mut upstream_reconnect_attempt_total = 0u64;
+    // This counter is consecutive by design. A valid update proves recovery,
+    // so isolated provider lags cannot exhaust the entire relay window.
     let mut upstream_reconnect_attempt = 0u64;
     let mut provider_connected = false;
 
@@ -52398,7 +52414,11 @@ async fn run_live_vps_stream_relay(
                 )
                 .await?;
                 if will_reconnect {
-                    upstream_reconnect_attempt = next_attempt;
+                    relay_note_reconnect_scheduled(
+                        &mut upstream_reconnect_attempt,
+                        &mut upstream_reconnect_attempt_total,
+                        next_attempt,
+                    );
                     relay_emit_control_frame(
                         &mut receiver,
                         &relay_session_id,
@@ -52475,6 +52495,7 @@ async fn run_live_vps_stream_relay(
                     relay_write_frame(&mut receiver, &frame).await?;
                     sequence = sequence.saturating_add(1);
                     data_frames_forwarded = data_frames_forwarded.saturating_add(1);
+                    relay_note_valid_upstream_data(&mut upstream_reconnect_attempt);
                 }
                 Ok(Some(Err(status))) => {
                     let blocker = classify_relay_upstream_status(&status);
@@ -52504,7 +52525,11 @@ async fn run_live_vps_stream_relay(
                     )
                     .await?;
                     if will_reconnect {
-                        upstream_reconnect_attempt = next_attempt;
+                        relay_note_reconnect_scheduled(
+                            &mut upstream_reconnect_attempt,
+                            &mut upstream_reconnect_attempt_total,
+                            next_attempt,
+                        );
                         relay_emit_control_frame(
                             &mut receiver,
                             &relay_session_id,
@@ -52574,7 +52599,11 @@ async fn run_live_vps_stream_relay(
                     )
                     .await?;
                     if will_reconnect {
-                        upstream_reconnect_attempt = next_attempt;
+                        relay_note_reconnect_scheduled(
+                            &mut upstream_reconnect_attempt,
+                            &mut upstream_reconnect_attempt_total,
+                            next_attempt,
+                        );
                         relay_emit_control_frame(
                             &mut receiver,
                             &relay_session_id,
@@ -52649,6 +52678,7 @@ async fn run_live_vps_stream_relay(
         "upstream_provider_blocker_count": upstream_provider_blocker_count,
         "upstream_reconnect_count": upstream_reconnect_count,
         "upstream_reconnect_attempt": upstream_reconnect_attempt,
+        "upstream_reconnect_attempt_total": upstream_reconnect_attempt_total,
         "material_hunter_started": false,
         "material_hunter_artifacts_written": false,
         "latest_run_id_mutated": false,
@@ -64371,6 +64401,25 @@ mod tests {
 
         assert!(error.to_string().contains("source safety requirements"));
         fs::remove_dir_all(test_dir).ok();
+    }
+
+    #[test]
+    fn relay_reconnect_budget_resets_after_valid_upstream_data() {
+        let mut consecutive_attempt = 0;
+        let mut total_attempts = 0;
+
+        relay_note_reconnect_scheduled(&mut consecutive_attempt, &mut total_attempts, 1);
+        assert_eq!(consecutive_attempt, 1);
+        assert_eq!(total_attempts, 1);
+
+        relay_note_valid_upstream_data(&mut consecutive_attempt);
+        assert_eq!(consecutive_attempt, 0);
+
+        let next_attempt = consecutive_attempt.saturating_add(1);
+        relay_note_reconnect_scheduled(&mut consecutive_attempt, &mut total_attempts, next_attempt);
+
+        assert_eq!(consecutive_attempt, 1);
+        assert_eq!(total_attempts, 2);
     }
 
     fn quant_test_point(at_ms: i64, price: Decimal) -> QuantPricePoint {
