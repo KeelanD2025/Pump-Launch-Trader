@@ -51041,7 +51041,9 @@ fn relay_tcp_addr_from_url(url: &str) -> Result<String> {
     Ok(authority.to_owned())
 }
 
+#[cfg(test)]
 const RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
+#[cfg(test)]
 const RELAY_PAYLOAD_ZSTD_LEVEL: i32 = 1;
 const RELAY_TRANSPORT_ZSTD_LEVEL: i32 = 9;
 const RELAY_TRANSPORT_BATCH_SCHEMA_VERSION: &str = "phase107g.relay_transport_batch.v1";
@@ -51051,6 +51053,7 @@ const RELAY_TRANSPORT_PACKET_PREFIX: &[u8] = b"PLQTB2:";
 const RELAY_TRANSPORT_PACKET_ESCAPE: u8 = 0x1b;
 const RELAY_TRANSPORT_PACKET_ESCAPE_NEWLINE: u8 = b'n';
 const RELAY_TRANSPORT_PACKET_ESCAPE_ESCAPE: u8 = b'e';
+const RELAY_TRANSPORT_COMPRESSED_PAYLOAD_MARKER: &[u8] = b"\"payload_compressed\":true";
 const RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES: usize = 16_384;
 const RELAY_TRANSPORT_BATCH_MAX_FRAMES: usize = 64;
 const RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
@@ -51282,6 +51285,12 @@ fn relay_rehydrate_compressed_transport_line(line: &[u8]) -> Result<Option<Vec<u
     let Some(line) = line.strip_suffix(b"\n") else {
         bail!("relay_transport_source_frame_missing_terminal_newline");
     };
+    if !line
+        .windows(RELAY_TRANSPORT_COMPRESSED_PAYLOAD_MARKER.len())
+        .any(|window| window == RELAY_TRANSPORT_COMPRESSED_PAYLOAD_MARKER)
+    {
+        return Ok(None);
+    }
     let mut wire: RelayWireFrame =
         serde_json::from_slice(line).context("decode relay transport source frame")?;
     if !wire.payload_compressed {
@@ -51634,6 +51643,7 @@ fn relay_spawn_transport_writer(
     )
 }
 
+#[cfg(test)]
 fn relay_compress_payload_if_beneficial(payload: Vec<u8>) -> (Vec<u8>, bool) {
     if payload.len() < RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES {
         return (payload, false);
@@ -52934,7 +52944,7 @@ async fn run_live_vps_stream_relay(
         None,
     );
     summary.transport =
-        "tcp_zstd9_rehydrated_binary_safe_ndjson_batches_over_private_ssh_tunnel".to_owned();
+        "tcp_zstd9_raw_payload_binary_safe_ndjson_batches_over_private_ssh_tunnel".to_owned();
     let relay_started_at_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
     summary.exact_holder_relay_started_at_unix_nanos = Some(relay_started_at_unix_nanos);
 
@@ -52998,7 +53008,7 @@ async fn run_live_vps_stream_relay(
     let mut upstream_reconnect_count = 0u64;
     let mut upstream_reconnect_attempt_total = 0u64;
     let mut uncompressed_payload_bytes = 0u64;
-    let mut compressed_data_frames_forwarded = 0u64;
+    let compressed_data_frames_forwarded = 0u64;
     // This counter is consecutive by design. A valid update proves recovery,
     // so isolated provider lags cannot exhaust the entire relay window.
     let mut upstream_reconnect_attempt = 0u64;
@@ -53149,12 +53159,8 @@ async fn run_live_vps_stream_relay(
                     let raw_payload = update.encode_to_vec();
                     uncompressed_payload_bytes =
                         uncompressed_payload_bytes.saturating_add(raw_payload.len() as u64);
-                    let (payload, payload_compressed) =
-                        relay_compress_payload_if_beneficial(raw_payload);
-                    bytes_forwarded = bytes_forwarded.saturating_add(payload.len() as u64);
-                    compressed_data_frames_forwarded = compressed_data_frames_forwarded
-                        .saturating_add(u64::from(payload_compressed));
-                    let mut frame = RelayFrame::data(
+                    bytes_forwarded = bytes_forwarded.saturating_add(raw_payload.len() as u64);
+                    let frame = RelayFrame::data(
                         relay_session_id.clone(),
                         stream_id.clone(),
                         "geyser",
@@ -53163,9 +53169,8 @@ async fn run_live_vps_stream_relay(
                         unix_now_nanos_u128(),
                         None,
                         "yellowstone_subscribe_update_protobuf",
-                        payload,
+                        raw_payload,
                     );
-                    frame.payload_compressed = payload_compressed;
                     let queue_waited_for_capacity = transport.enqueue_frame(&frame).await?;
                     sequence = sequence.saturating_add(1);
                     data_frames_forwarded = data_frames_forwarded.saturating_add(1);
@@ -53373,9 +53378,10 @@ async fn run_live_vps_stream_relay(
         "bytes_forwarded": bytes_forwarded,
         "uncompressed_payload_bytes": uncompressed_payload_bytes,
         "compressed_data_frames_forwarded": compressed_data_frames_forwarded,
-        "payload_compression_enabled": true,
+        "payload_compression_enabled": false,
         "relay_transport_batching_enabled": true,
-        "relay_transport_queue_payload_compression_enabled": true,
+        "relay_transport_queue_payload_compression_enabled": false,
+        "relay_transport_raw_payload_queue_enabled": true,
         "relay_transport_payload_rehydration_enabled": true,
         "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
         "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
@@ -54113,6 +54119,7 @@ async fn run_live_local_stream_collector(
         "relay_transport_batch_schema_version": RELAY_TRANSPORT_PACKET_SCHEMA_VERSION,
         "relay_transport_legacy_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
         "relay_transport_base64_outer_envelope_enabled": false,
+        "relay_transport_raw_payload_queue_enabled": true,
         "relay_transport_payload_rehydration_enabled": true,
         "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
         "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
@@ -68689,6 +68696,8 @@ mod tests {
         assert!(stats.queue_depth_max <= RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES);
         assert!(stats.write_batches >= 2);
         assert!(stats.compressed_batches > 0);
+        assert_eq!(stats.rehydrated_payload_frames, 0);
+        assert_eq!(stats.source_inner_bytes_written, stats.inner_bytes_written);
         assert!(stats.wire_bytes_written < stats.inner_bytes_written);
     }
 
