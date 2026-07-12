@@ -49,9 +49,9 @@ use sha2::{Digest, Sha256};
 use sim::{FeeModel, Simulator};
 use solana_pubkey::Pubkey;
 use state::{StateEngine, StateSnapshot};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::str::FromStr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 use storage::{
@@ -51043,6 +51043,363 @@ fn relay_tcp_addr_from_url(url: &str) -> Result<String> {
 
 const RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
 const RELAY_PAYLOAD_ZSTD_LEVEL: i32 = 1;
+const RELAY_TRANSPORT_BATCH_SCHEMA_VERSION: &str = "phase107g.relay_transport_batch.v1";
+const RELAY_TRANSPORT_BATCH_CODEC: &str = "zstd_ndjson";
+const RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES: usize = 16_384;
+const RELAY_TRANSPORT_BATCH_MAX_FRAMES: usize = 64;
+const RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
+const RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+const RELAY_TRANSPORT_BATCH_FLUSH_MILLIS: u64 = 20;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelayTransportBatchWire {
+    schema_version: String,
+    payload_codec: String,
+    frame_count: usize,
+    payload_hash: String,
+    payload_len: usize,
+    uncompressed_len: usize,
+    payload_base64: String,
+}
+
+#[derive(Debug)]
+struct RelayDecodedTransportBatch {
+    lines: Vec<String>,
+    compressed_bytes: usize,
+    uncompressed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct RelayTransportStatsSnapshot {
+    queue_capacity_frames: usize,
+    queue_depth_current: usize,
+    queue_depth_max: usize,
+    queue_bytes_current: u64,
+    queue_bytes_max: u64,
+    queue_full_wait_count: u64,
+    frames_enqueued: u64,
+    frames_written: u64,
+    write_batches: u64,
+    compressed_batches: u64,
+    inner_bytes_written: u64,
+    wire_bytes_written: u64,
+}
+
+#[derive(Debug, Default)]
+struct RelayTransportStats {
+    queue_depth_current: AtomicUsize,
+    queue_depth_max: AtomicUsize,
+    queue_bytes_current: AtomicU64,
+    queue_bytes_max: AtomicU64,
+    queue_full_wait_count: AtomicU64,
+    frames_enqueued: AtomicU64,
+    frames_written: AtomicU64,
+    write_batches: AtomicU64,
+    compressed_batches: AtomicU64,
+    inner_bytes_written: AtomicU64,
+    wire_bytes_written: AtomicU64,
+}
+
+fn relay_atomic_update_max_usize(target: &AtomicUsize, candidate: usize) {
+    let mut current = target.load(Ordering::Relaxed);
+    while candidate > current {
+        match target.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn relay_atomic_update_max_u64(target: &AtomicU64, candidate: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while candidate > current {
+        match target.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+impl RelayTransportStats {
+    fn note_enqueued(&self, bytes: usize) {
+        let depth = self
+            .queue_depth_current
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let queued_bytes = self
+            .queue_bytes_current
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        relay_atomic_update_max_usize(&self.queue_depth_max, depth);
+        relay_atomic_update_max_u64(&self.queue_bytes_max, queued_bytes);
+        self.frames_enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_dequeued(&self, bytes: usize) {
+        self.queue_depth_current.fetch_sub(1, Ordering::Relaxed);
+        self.queue_bytes_current
+            .fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RelayTransportStatsSnapshot {
+        RelayTransportStatsSnapshot {
+            queue_capacity_frames: RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES,
+            queue_depth_current: self.queue_depth_current.load(Ordering::Relaxed),
+            queue_depth_max: self.queue_depth_max.load(Ordering::Relaxed),
+            queue_bytes_current: self.queue_bytes_current.load(Ordering::Relaxed),
+            queue_bytes_max: self.queue_bytes_max.load(Ordering::Relaxed),
+            queue_full_wait_count: self.queue_full_wait_count.load(Ordering::Relaxed),
+            frames_enqueued: self.frames_enqueued.load(Ordering::Relaxed),
+            frames_written: self.frames_written.load(Ordering::Relaxed),
+            write_batches: self.write_batches.load(Ordering::Relaxed),
+            compressed_batches: self.compressed_batches.load(Ordering::Relaxed),
+            inner_bytes_written: self.inner_bytes_written.load(Ordering::Relaxed),
+            wire_bytes_written: self.wire_bytes_written.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RelayTransportSender {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    stats: Arc<RelayTransportStats>,
+}
+
+impl RelayTransportSender {
+    async fn enqueue_frame(&self, frame: &RelayFrame) -> Result<bool> {
+        let encoded = relay_encode_frame_line(frame)?;
+        let encoded_len = encoded.len();
+        self.stats.note_enqueued(encoded_len);
+        match self.sender.try_send(encoded) {
+            Ok(()) => Ok(false),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(encoded)) => {
+                self.stats
+                    .queue_full_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if self.sender.send(encoded).await.is_err() {
+                    self.stats.note_dequeued(encoded_len);
+                    bail!("relay transport writer closed while waiting for queue capacity");
+                }
+                Ok(true)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.stats.note_dequeued(encoded_len);
+                bail!("relay transport writer closed")
+            }
+        }
+    }
+}
+
+struct RelayTransportWriter {
+    task: tokio::task::JoinHandle<Result<()>>,
+    stats: Arc<RelayTransportStats>,
+}
+
+impl RelayTransportWriter {
+    async fn finish(self) -> (RelayTransportStatsSnapshot, Result<()>) {
+        let result = match self.task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("relay transport writer task failed: {error}")),
+        };
+        (self.stats.snapshot(), result)
+    }
+}
+
+fn relay_encode_frame_line(frame: &RelayFrame) -> Result<Vec<u8>> {
+    let wire = RelayWireFrame::from(frame);
+    let mut encoded = serde_json::to_vec(&wire)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn relay_encode_transport_batch(lines: &[Vec<u8>]) -> Result<(Vec<u8>, bool)> {
+    let inner_bytes = lines.iter().map(Vec::len).sum::<usize>();
+    let mut inner = Vec::with_capacity(inner_bytes);
+    for line in lines {
+        inner.extend_from_slice(line);
+    }
+    if lines.len() < 2 {
+        return Ok((inner, false));
+    }
+
+    let compressed = zstd::encode_all(inner.as_slice(), RELAY_PAYLOAD_ZSTD_LEVEL)?;
+    let envelope = RelayTransportBatchWire {
+        schema_version: RELAY_TRANSPORT_BATCH_SCHEMA_VERSION.to_owned(),
+        payload_codec: RELAY_TRANSPORT_BATCH_CODEC.to_owned(),
+        frame_count: lines.len(),
+        payload_hash: relay_payload_sha256(&inner),
+        payload_len: compressed.len(),
+        uncompressed_len: inner.len(),
+        payload_base64: BASE64_STANDARD.encode(compressed),
+    };
+    let mut encoded = serde_json::to_vec(&envelope)?;
+    encoded.push(b'\n');
+    if encoded.len() < inner.len() {
+        Ok((encoded, true))
+    } else {
+        Ok((inner, false))
+    }
+}
+
+fn relay_decode_transport_batch_line(line: &str) -> Result<Option<RelayDecodedTransportBatch>> {
+    let is_transport_batch = line
+        .strip_prefix("{\"schema_version\":\"")
+        .is_some_and(|suffix| suffix.starts_with(RELAY_TRANSPORT_BATCH_SCHEMA_VERSION));
+    if !is_transport_batch {
+        return Ok(None);
+    }
+    let wire: RelayTransportBatchWire = serde_json::from_str(line)?;
+    if wire.schema_version != RELAY_TRANSPORT_BATCH_SCHEMA_VERSION {
+        bail!("relay_transport_batch_schema_mismatch");
+    }
+    if wire.payload_codec != RELAY_TRANSPORT_BATCH_CODEC {
+        bail!("relay_transport_batch_codec_unsupported");
+    }
+    if wire.frame_count == 0 || wire.frame_count > RELAY_TRANSPORT_BATCH_MAX_FRAMES {
+        bail!("relay_transport_batch_frame_count_invalid");
+    }
+    if wire.uncompressed_len > RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES {
+        bail!("relay_transport_batch_uncompressed_length_exceeds_limit");
+    }
+    let compressed = BASE64_STANDARD
+        .decode(wire.payload_base64.as_bytes())
+        .context("decode relay transport batch payload")?;
+    if compressed.len() != wire.payload_len {
+        bail!("relay_transport_batch_payload_length_mismatch");
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+    let mut decoded = Vec::with_capacity(wire.uncompressed_len);
+    decoder
+        .by_ref()
+        .take((RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES + 1) as u64)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() > RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES {
+        bail!("relay_transport_batch_decoded_size_exceeds_limit");
+    }
+    if decoded.len() != wire.uncompressed_len {
+        bail!("relay_transport_batch_uncompressed_length_mismatch");
+    }
+    if relay_payload_sha256(&decoded) != wire.payload_hash {
+        bail!("relay_transport_batch_hash_mismatch");
+    }
+    let decoded = String::from_utf8(decoded).context("relay transport batch is not UTF-8")?;
+    if !decoded.ends_with('\n') {
+        bail!("relay_transport_batch_missing_terminal_newline");
+    }
+    let lines = decoded.lines().map(str::to_owned).collect::<Vec<_>>();
+    if lines.len() != wire.frame_count {
+        bail!("relay_transport_batch_expanded_frame_count_mismatch");
+    }
+    Ok(Some(RelayDecodedTransportBatch {
+        lines,
+        compressed_bytes: compressed.len(),
+        uncompressed_bytes: wire.uncompressed_len,
+    }))
+}
+
+async fn relay_transport_writer_loop(
+    mut receiver: TokioTcpStream,
+    mut queue: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    stats: Arc<RelayTransportStats>,
+) -> Result<()> {
+    let mut pending = None;
+    loop {
+        let first = match pending.take() {
+            Some(line) => line,
+            None => match queue.recv().await {
+                Some(line) => line,
+                None => break,
+            },
+        };
+        let mut batch = vec![first];
+        let mut batch_bytes = batch[0].len();
+        let flush_deadline =
+            Instant::now() + StdDuration::from_millis(RELAY_TRANSPORT_BATCH_FLUSH_MILLIS);
+        'fill_batch: while batch.len() < RELAY_TRANSPORT_BATCH_MAX_FRAMES
+            && batch_bytes < RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES
+        {
+            while batch.len() < RELAY_TRANSPORT_BATCH_MAX_FRAMES
+                && batch_bytes < RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES
+            {
+                match queue.try_recv() {
+                    Ok(line) => {
+                        let next_batch_bytes = batch_bytes.saturating_add(line.len());
+                        if next_batch_bytes > RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES {
+                            pending = Some(line);
+                            break 'fill_batch;
+                        }
+                        batch_bytes = next_batch_bytes;
+                        batch.push(line);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            if batch.len() >= RELAY_TRANSPORT_BATCH_MAX_FRAMES
+                || batch_bytes >= RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES
+            {
+                break;
+            }
+            let remaining = flush_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, queue.recv()).await {
+                Ok(Some(line)) => {
+                    let next_batch_bytes = batch_bytes.saturating_add(line.len());
+                    if next_batch_bytes > RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES {
+                        pending = Some(line);
+                        break;
+                    }
+                    batch_bytes = next_batch_bytes;
+                    batch.push(line);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let (encoded, compressed) = relay_encode_transport_batch(&batch)?;
+        receiver.write_all(&encoded).await?;
+        for line in &batch {
+            stats.note_dequeued(line.len());
+        }
+        stats
+            .frames_written
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        stats.write_batches.fetch_add(1, Ordering::Relaxed);
+        stats
+            .compressed_batches
+            .fetch_add(u64::from(compressed), Ordering::Relaxed);
+        stats
+            .inner_bytes_written
+            .fetch_add(batch_bytes as u64, Ordering::Relaxed);
+        stats
+            .wire_bytes_written
+            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+    }
+    receiver.flush().await?;
+    Ok(())
+}
+
+fn relay_spawn_transport_writer(
+    receiver: TokioTcpStream,
+) -> (RelayTransportSender, RelayTransportWriter) {
+    let (sender, queue) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES);
+    let stats = Arc::new(RelayTransportStats::default());
+    let task_stats = stats.clone();
+    let task =
+        tokio::spawn(async move { relay_transport_writer_loop(receiver, queue, task_stats).await });
+    (
+        RelayTransportSender {
+            sender,
+            stats: stats.clone(),
+        },
+        RelayTransportWriter { task, stats },
+    )
+}
 
 fn relay_compress_payload_if_beneficial(payload: Vec<u8>) -> (Vec<u8>, bool) {
     if payload.len() < RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES {
@@ -51052,14 +51409,6 @@ fn relay_compress_payload_if_beneficial(payload: Vec<u8>) -> (Vec<u8>, bool) {
         Ok(compressed) if compressed.len() < payload.len() => (compressed, true),
         _ => (payload, false),
     }
-}
-
-async fn relay_write_frame(writer: &mut TokioTcpStream, frame: &RelayFrame) -> Result<()> {
-    let wire = RelayWireFrame::from(frame);
-    let encoded = serde_json::to_vec(&wire)?;
-    writer.write_all(&encoded).await?;
-    writer.write_all(b"\n").await?;
-    Ok(())
 }
 
 fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
@@ -52200,7 +52549,7 @@ fn relay_note_reconnect_scheduled(
 }
 
 async fn relay_emit_control_frame(
-    receiver: &mut TokioTcpStream,
+    transport: &RelayTransportSender,
     relay_session_id: &str,
     stream_id: &str,
     subscription_fingerprint: &str,
@@ -52232,7 +52581,7 @@ async fn relay_emit_control_frame(
             will_reconnect,
         );
     }
-    relay_write_frame(receiver, &frame).await?;
+    let _ = transport.enqueue_frame(&frame).await?;
     *sequence = sequence.saturating_add(1);
     *control_frames_forwarded = control_frames_forwarded.saturating_add(1);
     Ok(())
@@ -52252,17 +52601,18 @@ impl RelayReceiverShutdownStatus {
 }
 
 async fn relay_finish_receiver(
-    receiver: &mut TokioTcpStream,
+    transport: RelayTransportSender,
+    writer: RelayTransportWriter,
     relay_session_id: &str,
     stream_id: &str,
     subscription_fingerprint: &str,
     sequence: &mut u64,
     control_frames_forwarded: &mut u64,
     upstream_reconnect_attempt: u64,
-) -> RelayReceiverShutdownStatus {
+) -> (RelayReceiverShutdownStatus, RelayTransportStatsSnapshot) {
     let mut errors = Vec::new();
     let terminal_control_frame_write_succeeded = match relay_emit_control_frame(
-        receiver,
+        &transport,
         relay_session_id,
         stream_id,
         subscription_fingerprint,
@@ -52282,18 +52632,20 @@ async fn relay_finish_receiver(
             false
         }
     };
-    let receiver_flush_succeeded = match receiver.flush().await {
-        Ok(()) => true,
-        Err(error) => {
-            errors.push(format!("receiver_shutdown_flush: {error}"));
-            false
-        }
-    };
-    RelayReceiverShutdownStatus {
-        terminal_control_frame_write_succeeded,
-        receiver_flush_succeeded,
-        receiver_shutdown_error: (!errors.is_empty()).then(|| errors.join("; ")),
+    drop(transport);
+    let (transport_stats, finish_result) = writer.finish().await;
+    let receiver_flush_succeeded = finish_result.is_ok();
+    if let Err(error) = finish_result {
+        errors.push(format!("receiver_transport_finish: {error:#}"));
     }
+    (
+        RelayReceiverShutdownStatus {
+            terminal_control_frame_write_succeeded,
+            receiver_flush_succeeded,
+            receiver_shutdown_error: (!errors.is_empty()).then(|| errors.join("; ")),
+        },
+        transport_stats,
+    )
 }
 
 fn write_relay_health_artifacts(
@@ -52348,7 +52700,7 @@ async fn run_live_vps_stream_relay(
         true,
         None,
     );
-    summary.transport = "tcp_ndjson_over_private_ssh_tunnel".to_owned();
+    summary.transport = "tcp_zstd_ndjson_batches_over_private_ssh_tunnel".to_owned();
     let relay_started_at_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
     summary.exact_holder_relay_started_at_unix_nanos = Some(relay_started_at_unix_nanos);
 
@@ -52398,9 +52750,10 @@ async fn run_live_vps_stream_relay(
     let mut holder_subscription_generation = 0u64;
     let mut next_holder_prune_at = Instant::now();
     write_relay_fresh_holder_tracker_manifest(health_dir, &summary, &active_holder_mints)?;
-    let mut receiver = TokioTcpStream::connect(&receiver_addr)
+    let receiver = TokioTcpStream::connect(&receiver_addr)
         .await
         .with_context(|| format!("connect relay receiver at {receiver_addr}"))?;
+    let (transport, transport_writer) = relay_spawn_transport_writer(receiver);
 
     let mut sequence = 1u64;
     let mut data_frames_forwarded = 0u64;
@@ -52416,9 +52769,10 @@ async fn run_live_vps_stream_relay(
     // so isolated provider lags cannot exhaust the entire relay window.
     let mut upstream_reconnect_attempt = 0u64;
     let mut provider_connected = false;
+    let mut transport_backpressure_control_emitted = false;
 
     relay_emit_control_frame(
-        &mut receiver,
+        &transport,
         &relay_session_id,
         &stream_id,
         &subscription_fingerprint,
@@ -52451,7 +52805,7 @@ async fn run_live_vps_stream_relay(
                     RelayControlKind::RelayUpstreamReconnected
                 };
                 relay_emit_control_frame(
-                    &mut receiver,
+                    &transport,
                     &relay_session_id,
                     &stream_id,
                     &subscription_fingerprint,
@@ -52479,7 +52833,7 @@ async fn run_live_vps_stream_relay(
                 let (will_reconnect, backoff) =
                     relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
                 relay_emit_control_frame(
-                    &mut receiver,
+                    &transport,
                     &relay_session_id,
                     &stream_id,
                     &subscription_fingerprint,
@@ -52499,7 +52853,7 @@ async fn run_live_vps_stream_relay(
                         next_attempt,
                     );
                     relay_emit_control_frame(
-                        &mut receiver,
+                        &transport,
                         &relay_session_id,
                         &stream_id,
                         &subscription_fingerprint,
@@ -52517,7 +52871,7 @@ async fn run_live_vps_stream_relay(
                 }
                 if blocker.recoverable {
                     relay_emit_control_frame(
-                        &mut receiver,
+                        &transport,
                         &relay_session_id,
                         &stream_id,
                         &subscription_fingerprint,
@@ -52578,9 +52932,28 @@ async fn run_live_vps_stream_relay(
                         payload,
                     );
                     frame.payload_compressed = payload_compressed;
-                    relay_write_frame(&mut receiver, &frame).await?;
+                    let queue_waited_for_capacity = transport.enqueue_frame(&frame).await?;
                     sequence = sequence.saturating_add(1);
                     data_frames_forwarded = data_frames_forwarded.saturating_add(1);
+                    if queue_waited_for_capacity && !transport_backpressure_control_emitted {
+                        transport_backpressure_control_emitted = true;
+                        summary.blocker_class =
+                            Some("relay_transport_queue_backpressure".to_owned());
+                        relay_emit_control_frame(
+                            &transport,
+                            &relay_session_id,
+                            &stream_id,
+                            &subscription_fingerprint,
+                            &mut sequence,
+                            &mut control_frames_forwarded,
+                            RelayControlKind::RelayReceiverBackpressure,
+                            Some("relay_transport_queue_capacity_wait".to_owned()),
+                            None,
+                            upstream_reconnect_attempt,
+                            false,
+                        )
+                        .await?;
+                    }
                     relay_note_valid_upstream_data(&mut upstream_reconnect_attempt);
                 }
                 Ok(Some(Err(status))) => {
@@ -52597,7 +52970,7 @@ async fn run_live_vps_stream_relay(
                     let (will_reconnect, backoff) =
                         relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
                     relay_emit_control_frame(
-                        &mut receiver,
+                        &transport,
                         &relay_session_id,
                         &stream_id,
                         &subscription_fingerprint,
@@ -52617,7 +52990,7 @@ async fn run_live_vps_stream_relay(
                             next_attempt,
                         );
                         relay_emit_control_frame(
-                            &mut receiver,
+                            &transport,
                             &relay_session_id,
                             &stream_id,
                             &subscription_fingerprint,
@@ -52635,7 +53008,7 @@ async fn run_live_vps_stream_relay(
                     }
                     if blocker.recoverable {
                         relay_emit_control_frame(
-                            &mut receiver,
+                            &transport,
                             &relay_session_id,
                             &stream_id,
                             &subscription_fingerprint,
@@ -52671,7 +53044,7 @@ async fn run_live_vps_stream_relay(
                     let (will_reconnect, backoff) =
                         relay_can_reconnect(deadline, &config, next_attempt, blocker.recoverable);
                     relay_emit_control_frame(
-                        &mut receiver,
+                        &transport,
                         &relay_session_id,
                         &stream_id,
                         &subscription_fingerprint,
@@ -52691,7 +53064,7 @@ async fn run_live_vps_stream_relay(
                             next_attempt,
                         );
                         relay_emit_control_frame(
-                            &mut receiver,
+                            &transport,
                             &relay_session_id,
                             &stream_id,
                             &subscription_fingerprint,
@@ -52708,7 +53081,7 @@ async fn run_live_vps_stream_relay(
                         continue 'relay;
                     }
                     relay_emit_control_frame(
-                        &mut receiver,
+                        &transport,
                         &relay_session_id,
                         &stream_id,
                         &subscription_fingerprint,
@@ -52732,8 +53105,9 @@ async fn run_live_vps_stream_relay(
     }
 
     let relay_deadline_reached = Instant::now() >= deadline;
-    let receiver_shutdown = relay_finish_receiver(
-        &mut receiver,
+    let (receiver_shutdown, transport_stats) = relay_finish_receiver(
+        transport,
+        transport_writer,
         &relay_session_id,
         &stream_id,
         &subscription_fingerprint,
@@ -52766,6 +53140,20 @@ async fn run_live_vps_stream_relay(
         "uncompressed_payload_bytes": uncompressed_payload_bytes,
         "compressed_data_frames_forwarded": compressed_data_frames_forwarded,
         "payload_compression_enabled": true,
+        "relay_transport_batching_enabled": true,
+        "relay_transport_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
+        "relay_transport_queue_capacity_frames": transport_stats.queue_capacity_frames,
+        "relay_transport_queue_depth_current": transport_stats.queue_depth_current,
+        "relay_transport_queue_depth_max": transport_stats.queue_depth_max,
+        "relay_transport_queue_bytes_current": transport_stats.queue_bytes_current,
+        "relay_transport_queue_bytes_max": transport_stats.queue_bytes_max,
+        "relay_transport_queue_full_wait_count": transport_stats.queue_full_wait_count,
+        "relay_transport_frames_enqueued": transport_stats.frames_enqueued,
+        "relay_transport_frames_written": transport_stats.frames_written,
+        "relay_transport_write_batches": transport_stats.write_batches,
+        "relay_transport_compressed_batches": transport_stats.compressed_batches,
+        "relay_transport_inner_bytes_written": transport_stats.inner_bytes_written,
+        "relay_transport_wire_bytes_written": transport_stats.wire_bytes_written,
         "upstream_errors": upstream_errors,
         "upstream_provider_blocker_count": upstream_provider_blocker_count,
         "upstream_reconnect_count": upstream_reconnect_count,
@@ -52992,58 +53380,110 @@ async fn run_live_local_stream_collector(
     let mut relay_session_id: Option<String> = None;
     let mut subscription_fingerprint: Option<String> = None;
     let mut last_sequence_by_stream: BTreeMap<String, u64> = BTreeMap::new();
+    let mut transport_batch_envelopes_received = 0u64;
+    let mut transport_batch_frames_expanded = 0u64;
+    let mut transport_batch_compressed_bytes_received = 0u64;
+    let mut transport_batch_uncompressed_bytes_received = 0u64;
+    let mut transport_legacy_frames_received = 0u64;
+    let mut transport_wire_bytes_received = 0u64;
     let mut clean_relay_stop_seen = false;
     let mut terminal_provider_close_recorded = false;
     let planned_stop_grace_deadline =
         local_relay_planned_stop_grace_deadline(material_forward_deadline, deadline);
 
     let mut line = String::new();
-    while Instant::now() < deadline {
+    let mut pending_relay_lines = VecDeque::<String>::new();
+    while Instant::now() < deadline || !pending_relay_lines.is_empty() {
         line.clear();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let read = tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
-        let bytes_read = match read {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => return Err(error).context("read relay frame"),
-            Err(_) => break,
-        };
-        if bytes_read == 0 {
-            if let Some(material_tx) = material_update_tx.as_ref() {
-                if local_relay_should_signal_terminal_close(
-                    Instant::now(),
-                    material_forward_deadline,
-                    clean_relay_stop_seen,
-                ) {
-                    local_relay_record_terminal_provider_close(
-                        &mut terminal_provider_close_recorded,
-                        &mut upstream_provider_blocker_count,
-                        &mut upstream_reconnect_exhausted_count,
-                        &mut relay_errors,
-                        "stream_closed_before_material_deadline",
-                    );
-                    let status = local_relay_terminal_close_status(
-                        "local relay stream closed before material deadline",
-                    );
-                    if matches!(
-                        send_relay_material_update(material_tx, Err(status)).await,
-                        RelayMaterialSendOutcome::TimedOut
+        let from_transport_batch = if let Some(pending) = pending_relay_lines.pop_front() {
+            line = pending;
+            true
+        } else {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let read = tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
+            let bytes_read = match read {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => return Err(error).context("read relay frame"),
+                Err(_) => break,
+            };
+            if bytes_read == 0 {
+                if let Some(material_tx) = material_update_tx.as_ref() {
+                    if local_relay_should_signal_terminal_close(
+                        Instant::now(),
+                        material_forward_deadline,
+                        clean_relay_stop_seen,
                     ) {
-                        downstream_backpressure_count =
-                            downstream_backpressure_count.saturating_add(1);
-                        relay_errors
-                            .push("local_material_hunter_terminal_close_send_timeout".to_owned());
+                        local_relay_record_terminal_provider_close(
+                            &mut terminal_provider_close_recorded,
+                            &mut upstream_provider_blocker_count,
+                            &mut upstream_reconnect_exhausted_count,
+                            &mut relay_errors,
+                            "stream_closed_before_material_deadline",
+                        );
+                        let status = local_relay_terminal_close_status(
+                            "local relay stream closed before material deadline",
+                        );
+                        if matches!(
+                            send_relay_material_update(material_tx, Err(status)).await,
+                            RelayMaterialSendOutcome::TimedOut
+                        ) {
+                            downstream_backpressure_count =
+                                downstream_backpressure_count.saturating_add(1);
+                            relay_errors.push(
+                                "local_material_hunter_terminal_close_send_timeout".to_owned(),
+                            );
+                        }
                     }
                 }
-            }
-            if clean_relay_stop_seen {
-                if let Some(grace_deadline) = planned_stop_grace_deadline {
-                    let remaining = grace_deadline.saturating_duration_since(Instant::now());
-                    if !remaining.is_zero() {
-                        tokio::time::sleep(remaining).await;
+                if clean_relay_stop_seen {
+                    if let Some(grace_deadline) = planned_stop_grace_deadline {
+                        let remaining = grace_deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            tokio::time::sleep(remaining).await;
+                        }
                     }
                 }
+                break;
             }
-            break;
+            transport_wire_bytes_received =
+                transport_wire_bytes_received.saturating_add(bytes_read as u64);
+            false
+        };
+
+        if !from_transport_batch {
+            match relay_decode_transport_batch_line(line.trim_end()) {
+                Ok(Some(batch)) => {
+                    transport_batch_envelopes_received =
+                        transport_batch_envelopes_received.saturating_add(1);
+                    transport_batch_frames_expanded =
+                        transport_batch_frames_expanded.saturating_add(batch.lines.len() as u64);
+                    transport_batch_compressed_bytes_received =
+                        transport_batch_compressed_bytes_received
+                            .saturating_add(batch.compressed_bytes as u64);
+                    transport_batch_uncompressed_bytes_received =
+                        transport_batch_uncompressed_bytes_received
+                            .saturating_add(batch.uncompressed_bytes as u64);
+                    pending_relay_lines.extend(batch.lines);
+                    continue;
+                }
+                Ok(None) => {
+                    transport_legacy_frames_received =
+                        transport_legacy_frames_received.saturating_add(1);
+                }
+                Err(error) => {
+                    let rendered = format!("relay_transport_batch_decode_failed:{error:#}");
+                    if rendered.contains("relay_transport_batch_hash_mismatch") {
+                        hash_mismatch_count = hash_mismatch_count.saturating_add(1);
+                    } else {
+                        malformed_frame_count = malformed_frame_count.saturating_add(1);
+                    }
+                    relay_errors.push(rendered);
+                    continue;
+                }
+            }
         }
         let trimmed = line.trim_end();
         let wire: RelayWireFrame = match serde_json::from_str(trimmed) {
@@ -53382,6 +53822,13 @@ async fn run_live_local_stream_collector(
         "sequence_gap_count": sequence_gap_count,
         "hash_mismatch_count": hash_mismatch_count,
         "malformed_frame_count": malformed_frame_count,
+        "relay_transport_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
+        "relay_transport_batch_envelopes_received": transport_batch_envelopes_received,
+        "relay_transport_batch_frames_expanded": transport_batch_frames_expanded,
+        "relay_transport_batch_compressed_bytes_received": transport_batch_compressed_bytes_received,
+        "relay_transport_batch_uncompressed_bytes_received": transport_batch_uncompressed_bytes_received,
+        "relay_transport_legacy_frames_received": transport_legacy_frames_received,
+        "relay_transport_wire_bytes_received": transport_wire_bytes_received,
         "downstream_backpressure_count": downstream_backpressure_count,
         "receiver_unavailable_count": receiver_unavailable_count,
         "upstream_provider_blocker_count": upstream_provider_blocker_count,
@@ -53441,6 +53888,9 @@ async fn run_live_local_stream_collector(
         "sequence_gap_count": sequence_gap_count,
         "hash_mismatch_count": hash_mismatch_count,
         "malformed_frame_count": malformed_frame_count,
+        "relay_transport_batch_envelopes_received": transport_batch_envelopes_received,
+        "relay_transport_batch_frames_expanded": transport_batch_frames_expanded,
+        "relay_transport_wire_bytes_received": transport_wire_bytes_received,
         "downstream_backpressure_count": downstream_backpressure_count,
         "receiver_unavailable_count": receiver_unavailable_count,
         "upstream_provider_blocker_count": upstream_provider_blocker_count,
@@ -53476,6 +53926,9 @@ async fn run_live_local_stream_collector(
             "frames_received": frames_received,
             "data_frames_received": data_frames_received,
             "control_frames_received": control_frames_received,
+            "relay_transport_batch_envelopes_received": transport_batch_envelopes_received,
+            "relay_transport_batch_frames_expanded": transport_batch_frames_expanded,
+            "relay_transport_wire_bytes_received": transport_wire_bytes_received,
         }))?,
     )?;
     if json_output {
@@ -67592,6 +68045,159 @@ mod tests {
         let (payload, compressed) = relay_compress_payload_if_beneficial(original.clone());
         assert!(!compressed);
         assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn phase107g_relay_transport_batch_roundtrip_preserves_inner_frames() {
+        let lines = (1..=8)
+            .map(|sequence| {
+                relay_encode_frame_line(&RelayFrame::data(
+                    "relay-session",
+                    "geyser-material-hunter",
+                    "geyser",
+                    "fingerprint",
+                    sequence,
+                    sequence as u128,
+                    None,
+                    "yellowstone_subscribe_update_protobuf",
+                    vec![42_u8; 8 * 1024],
+                ))
+                .expect("encode inner relay frame")
+            })
+            .collect::<Vec<_>>();
+
+        let (encoded, compressed) =
+            relay_encode_transport_batch(&lines).expect("encode transport batch");
+        assert!(compressed);
+        assert!(encoded.len() < lines.iter().map(Vec::len).sum::<usize>());
+
+        let decoded = relay_decode_transport_batch_line(
+            std::str::from_utf8(&encoded)
+                .expect("UTF-8 transport batch")
+                .trim_end(),
+        )
+        .expect("decode transport batch")
+        .expect("batch envelope");
+        assert_eq!(decoded.lines.len(), lines.len());
+        assert!(decoded.compressed_bytes < decoded.uncompressed_bytes);
+
+        for (index, line) in decoded.lines.iter().enumerate() {
+            assert_eq!(line.as_bytes(), lines[index].strip_suffix(b"\n").unwrap());
+            let wire: RelayWireFrame = serde_json::from_str(line).expect("inner wire frame");
+            let frame = wire.into_relay_frame().expect("verified inner relay frame");
+            assert_eq!(frame.sequence, (index + 1) as u64);
+            assert!(frame.verify_payload_hash());
+        }
+    }
+
+    #[test]
+    fn phase107g_relay_transport_batch_rejects_tampered_payload_hash() {
+        let lines = (1..=2)
+            .map(|sequence| {
+                relay_encode_frame_line(&RelayFrame::data(
+                    "relay-session",
+                    "geyser-material-hunter",
+                    "geyser",
+                    "fingerprint",
+                    sequence,
+                    sequence as u128,
+                    None,
+                    "yellowstone_subscribe_update_protobuf",
+                    vec![9_u8; 8 * 1024],
+                ))
+                .expect("encode inner relay frame")
+            })
+            .collect::<Vec<_>>();
+        let (encoded, compressed) =
+            relay_encode_transport_batch(&lines).expect("encode transport batch");
+        assert!(compressed);
+        let mut wire: RelayTransportBatchWire =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("batch envelope");
+        wire.payload_hash = "0".repeat(64);
+        let tampered = serde_json::to_string(&wire).expect("tampered batch");
+
+        let error = relay_decode_transport_batch_line(&tampered)
+            .expect_err("tampered transport batch must fail closed");
+        assert!(format!("{error:#}").contains("relay_transport_batch_hash_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn phase107g_relay_transport_writer_batches_without_reordering() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind transport receiver");
+        let receiver_addr = listener.local_addr().expect("receiver address");
+        let receiver_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept transport writer");
+            let mut reader = TokioBufReader::new(socket);
+            let mut line = String::new();
+            let mut sequences = Vec::new();
+            let mut envelopes = 0usize;
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).await.expect("read wire line");
+                if bytes == 0 {
+                    break;
+                }
+                let inner_lines = match relay_decode_transport_batch_line(line.trim_end())
+                    .expect("decode transport wire line")
+                {
+                    Some(batch) => {
+                        envelopes += 1;
+                        batch.lines
+                    }
+                    None => vec![line.trim_end().to_owned()],
+                };
+                for inner in inner_lines {
+                    let wire: RelayWireFrame =
+                        serde_json::from_str(&inner).expect("inner wire frame");
+                    let frame = wire.into_relay_frame().expect("verified inner relay frame");
+                    assert!(frame.verify_payload_hash());
+                    sequences.push(frame.sequence);
+                }
+            }
+            (sequences, envelopes)
+        });
+
+        let socket = TokioTcpStream::connect(receiver_addr)
+            .await
+            .expect("connect transport writer");
+        let (transport, writer) = relay_spawn_transport_writer(socket);
+        for sequence in 1..=100 {
+            let frame = RelayFrame::data(
+                "relay-session",
+                "geyser-material-hunter",
+                "geyser",
+                "fingerprint",
+                sequence,
+                sequence as u128,
+                None,
+                "yellowstone_subscribe_update_protobuf",
+                vec![sequence as u8; 4 * 1024],
+            );
+            assert!(
+                !transport
+                    .enqueue_frame(&frame)
+                    .await
+                    .expect("enqueue transport frame")
+            );
+        }
+        drop(transport);
+        let (stats, finish_result) = writer.finish().await;
+        finish_result.expect("finish transport writer");
+        let (sequences, envelopes) = receiver_task.await.expect("transport receiver task");
+
+        assert_eq!(sequences, (1..=100).collect::<Vec<_>>());
+        assert!(envelopes > 0);
+        assert_eq!(stats.frames_enqueued, 100);
+        assert_eq!(stats.frames_written, 100);
+        assert_eq!(stats.queue_depth_current, 0);
+        assert_eq!(stats.queue_bytes_current, 0);
+        assert_eq!(stats.queue_full_wait_count, 0);
+        assert!(stats.queue_depth_max <= RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES);
+        assert!(stats.write_batches >= 2);
+        assert!(stats.compressed_batches > 0);
+        assert!(stats.wire_bytes_written < stats.inner_bytes_written);
     }
 
     #[test]
