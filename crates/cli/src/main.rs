@@ -51663,6 +51663,7 @@ fn relay_frame_shard_path(output_dir: &Path, part: u64) -> PathBuf {
 }
 
 const LOCAL_RELAY_R2_STREAMING_RELAY_SHARD_BYTES: u64 = 32 * 1024 * 1024;
+const LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalRelayStreamingShardEntry {
@@ -51796,6 +51797,169 @@ async fn local_relay_upload_r2_streaming_shard(
         error: result.error.or(last_error),
         retry_count,
     })
+}
+
+#[derive(Debug)]
+struct LocalRelayStreamingUploadJob {
+    output_dir: PathBuf,
+    local_path: PathBuf,
+    part_index: u64,
+    sequence_start: Option<u64>,
+    sequence_end: Option<u64>,
+    frame_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalRelayStreamingUploadStatsSnapshot {
+    queue_depth_current: usize,
+    queue_depth_max: usize,
+    queue_full_wait_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct LocalRelayStreamingUploadStats {
+    queue_depth_current: AtomicUsize,
+    queue_depth_max: AtomicUsize,
+    queue_full_wait_count: AtomicU64,
+}
+
+impl LocalRelayStreamingUploadStats {
+    fn note_enqueued(&self) {
+        let depth = self
+            .queue_depth_current
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        relay_atomic_update_max_usize(&self.queue_depth_max, depth);
+    }
+
+    fn note_dequeued(&self) {
+        self.queue_depth_current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LocalRelayStreamingUploadStatsSnapshot {
+        LocalRelayStreamingUploadStatsSnapshot {
+            queue_depth_current: self.queue_depth_current.load(Ordering::Relaxed),
+            queue_depth_max: self.queue_depth_max.load(Ordering::Relaxed),
+            queue_full_wait_count: self.queue_full_wait_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalRelayStreamingUploadSender {
+    sender: tokio::sync::mpsc::Sender<LocalRelayStreamingUploadJob>,
+    stats: Arc<LocalRelayStreamingUploadStats>,
+}
+
+impl LocalRelayStreamingUploadSender {
+    async fn enqueue(&self, job: LocalRelayStreamingUploadJob) -> Result<bool> {
+        self.stats.note_enqueued();
+        match self.sender.try_send(job) {
+            Ok(()) => Ok(false),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                self.stats
+                    .queue_full_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if self.sender.send(job).await.is_err() {
+                    self.stats.note_dequeued();
+                    bail!("R2 streaming upload worker closed while waiting for queue capacity");
+                }
+                Ok(true)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.stats.note_dequeued();
+                bail!("R2 streaming upload worker closed")
+            }
+        }
+    }
+}
+
+struct LocalRelayStreamingUploadWorker {
+    task: Option<tokio::task::JoinHandle<Result<Vec<LocalRelayStreamingShardEntry>>>>,
+    stats: Arc<LocalRelayStreamingUploadStats>,
+}
+
+impl LocalRelayStreamingUploadWorker {
+    async fn finish(
+        mut self,
+    ) -> (
+        LocalRelayStreamingUploadStatsSnapshot,
+        Result<Vec<LocalRelayStreamingShardEntry>>,
+    ) {
+        let task = self
+            .task
+            .take()
+            .expect("R2 streaming upload worker task must exist before finish");
+        let result = match task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("R2 streaming upload worker task failed: {error}")),
+        };
+        (self.stats.snapshot(), result)
+    }
+}
+
+impl Drop for LocalRelayStreamingUploadWorker {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn local_relay_spawn_r2_streaming_upload_worker(
+    loaded: LoadedConfig,
+) -> (
+    LocalRelayStreamingUploadSender,
+    LocalRelayStreamingUploadWorker,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<LocalRelayStreamingUploadJob>(
+        LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY,
+    );
+    let stats = Arc::new(LocalRelayStreamingUploadStats::default());
+    let task_stats = stats.clone();
+    let task = tokio::spawn(async move {
+        let mut entries = Vec::new();
+        while let Some(job) = receiver.recv().await {
+            task_stats.note_dequeued();
+            let entry = local_relay_upload_r2_streaming_shard(
+                &loaded,
+                &job.output_dir,
+                &job.local_path,
+                job.part_index,
+                job.sequence_start,
+                job.sequence_end,
+                job.frame_count,
+            )
+            .await?;
+            let failure = (!(entry.uploaded && entry.verified && entry.local_deleted)).then(|| {
+                entry
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "R2_STREAMING_BLOCK_UNVERIFIED_RELAY_SHARD".to_owned())
+            });
+            entries.push(entry);
+            if let Some(failure) = failure {
+                bail!("R2 streaming upload failed closed: {failure}");
+            }
+        }
+        Ok(entries)
+    });
+    (
+        LocalRelayStreamingUploadSender {
+            sender,
+            stats: stats.clone(),
+        },
+        LocalRelayStreamingUploadWorker {
+            task: Some(task),
+            stats,
+        },
+    )
+}
+
+fn local_relay_r2_streaming_spool_limit(chunk_bytes: u64) -> u64 {
+    // Each shard can cross the target by one final frame, so reserve one extra
+    // chunk of accounting headroom beyond upload + queued + active files.
+    chunk_bytes.saturating_mul(LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY as u64 + 3)
 }
 
 type RelayMaterialUpdate = std::result::Result<SubscribeUpdate, Status>;
@@ -53614,6 +53778,15 @@ async fn run_live_local_stream_collector(
         .clamp(16, 64)
         .saturating_mul(1024 * 1024);
     let mut r2_streaming_shards = Vec::<LocalRelayStreamingShardEntry>::new();
+    let (mut r2_streaming_upload_sender, r2_streaming_upload_worker) = if r2_streaming_enabled {
+        let (sender, worker) = local_relay_spawn_r2_streaming_upload_worker(loaded.clone());
+        (Some(sender), Some(worker))
+    } else {
+        (None, None)
+    };
+    let mut r2_streaming_upload_stats = LocalRelayStreamingUploadStatsSnapshot::default();
+    let mut r2_streaming_backpressure_detected = false;
+    let mut local_spool_bytes_peak = path_size_bytes(&output_dir.join("relay_frames"));
     let mut frames_received = 0u64;
     let mut data_frames_received = 0u64;
     let mut control_frames_received = 0u64;
@@ -54060,17 +54233,21 @@ async fn run_live_local_stream_collector(
             shard.flush()?;
             if r2_streaming_enabled {
                 let current_path = relay_frame_shard_path(output_dir, part);
-                let entry = local_relay_upload_r2_streaming_shard(
-                    loaded,
-                    output_dir,
-                    &current_path,
-                    part,
-                    part_sequence_start,
-                    part_sequence_end,
-                    part_rows,
-                )
-                .await?;
-                r2_streaming_shards.push(entry);
+                local_spool_bytes_peak =
+                    local_spool_bytes_peak.max(path_size_bytes(&output_dir.join("relay_frames")));
+                let sender = r2_streaming_upload_sender
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("R2 streaming upload sender unavailable"))?;
+                r2_streaming_backpressure_detected |= sender
+                    .enqueue(LocalRelayStreamingUploadJob {
+                        output_dir: output_dir.to_path_buf(),
+                        local_path: current_path,
+                        part_index: part,
+                        sequence_start: part_sequence_start,
+                        sequence_end: part_sequence_end,
+                        frame_count: part_rows,
+                    })
+                    .await?;
             }
             part = part.saturating_add(1);
             part_rows = 0;
@@ -54086,20 +54263,30 @@ async fn run_live_local_stream_collector(
     if r2_streaming_enabled {
         let current_path = relay_frame_shard_path(output_dir, part);
         if part_rows > 0 {
-            let entry = local_relay_upload_r2_streaming_shard(
-                loaded,
-                output_dir,
-                &current_path,
-                part,
-                part_sequence_start,
-                part_sequence_end,
-                part_rows,
-            )
-            .await?;
-            r2_streaming_shards.push(entry);
+            local_spool_bytes_peak =
+                local_spool_bytes_peak.max(path_size_bytes(&output_dir.join("relay_frames")));
+            let sender = r2_streaming_upload_sender
+                .as_ref()
+                .ok_or_else(|| anyhow!("R2 streaming upload sender unavailable"))?;
+            r2_streaming_backpressure_detected |= sender
+                .enqueue(LocalRelayStreamingUploadJob {
+                    output_dir: output_dir.to_path_buf(),
+                    local_path: current_path,
+                    part_index: part,
+                    sequence_start: part_sequence_start,
+                    sequence_end: part_sequence_end,
+                    frame_count: part_rows,
+                })
+                .await?;
         } else if current_path.exists() {
             let _ = fs::remove_file(&current_path);
         }
+        drop(r2_streaming_upload_sender.take());
+        let worker = r2_streaming_upload_worker
+            .ok_or_else(|| anyhow!("R2 streaming upload worker unavailable"))?;
+        let (stats, result) = worker.finish().await;
+        r2_streaming_upload_stats = stats;
+        r2_streaming_shards = result?;
     }
 
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
@@ -54158,14 +54345,16 @@ async fn run_live_local_stream_collector(
         "r2_streaming_verified_chunks": r2_streaming_shards.iter().filter(|entry| entry.verified).count(),
         "r2_streaming_deleted_local_chunks": r2_streaming_shards.iter().filter(|entry| entry.local_deleted).count(),
         "r2_streaming_unverified_chunks": r2_streaming_shards.iter().filter(|entry| !entry.verified).count(),
-        "r2_streaming_upload_queue_depth": 0,
-        "r2_streaming_upload_queue_max": 1,
+        "r2_streaming_upload_queue_depth": r2_streaming_upload_stats.queue_depth_current,
+        "r2_streaming_upload_queue_max": LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY,
+        "r2_streaming_upload_queue_depth_max": r2_streaming_upload_stats.queue_depth_max,
+        "r2_streaming_upload_queue_full_wait_count": r2_streaming_upload_stats.queue_full_wait_count,
         "r2_streaming_upload_timeout_count": 0,
         "r2_streaming_retry_count": r2_streaming_shards.iter().map(|entry| entry.retry_count).sum::<u64>(),
-        "r2_streaming_backpressure_detected": false,
+        "r2_streaming_backpressure_detected": r2_streaming_backpressure_detected,
         "local_spool_bytes_current": path_size_bytes(&output_dir.join("relay_frames")),
-        "local_spool_bytes_peak": if r2_streaming_enabled { r2_streaming_chunk_bytes } else { path_size_bytes(&output_dir.join("relay_frames")) },
-        "local_spool_bytes_limit": if r2_streaming_enabled { r2_streaming_chunk_bytes.saturating_mul(2) } else { 0 },
+        "local_spool_bytes_peak": if r2_streaming_enabled { local_spool_bytes_peak } else { path_size_bytes(&output_dir.join("relay_frames")) },
+        "local_spool_bytes_limit": if r2_streaming_enabled { local_relay_r2_streaming_spool_limit(r2_streaming_chunk_bytes) } else { 0 },
         "local_disk_free_mb": local_free_mb(output_dir),
         "local_hash_probe": local_hash_probe,
         "material_hunter_artifacts_local_only": material_hunter_processing_ran,
@@ -54841,6 +55030,13 @@ fn local_relay_write_r2_streaming_summary(output_dir: &Path) -> Result<serde_jso
     let backpressure_detected = collector_summary["r2_streaming_backpressure_detected"]
         .as_bool()
         .unwrap_or(false);
+    let upload_queue_depth_max = collector_summary["r2_streaming_upload_queue_depth_max"]
+        .as_u64()
+        .unwrap_or(0);
+    let upload_queue_full_wait_count =
+        collector_summary["r2_streaming_upload_queue_full_wait_count"]
+            .as_u64()
+            .unwrap_or(0);
     let local_spool_bytes_peak = collector_summary["local_spool_bytes_peak"]
         .as_u64()
         .unwrap_or_else(|| path_size_bytes(&output_dir.join("relay_frames")));
@@ -54894,7 +55090,7 @@ fn local_relay_write_r2_streaming_summary(output_dir: &Path) -> Result<serde_jso
         "local_retained_bytes": retention["local_retained_bytes"].as_u64().unwrap_or_else(|| path_size_bytes(output_dir)),
         "verified_chunks_deleted_local": deleted_local_chunks,
         "unverified_chunks_retained_local": unverified_chunks,
-        "spool_bounded": true,
+        "spool_bounded": local_spool_bytes_peak <= local_spool_bytes_limit,
         "replay_allowed": false,
     });
     let artifact_stream_manifest = json!({
@@ -54947,6 +55143,8 @@ fn local_relay_write_r2_streaming_summary(output_dir: &Path) -> Result<serde_jso
         "local_spool_bytes_limit": local_spool_bytes_limit,
         "r2_streaming_upload_queue_depth": collector_summary["r2_streaming_upload_queue_depth"].as_u64().unwrap_or(0),
         "r2_streaming_upload_queue_max": collector_summary["r2_streaming_upload_queue_max"].as_u64().unwrap_or(1),
+        "r2_streaming_upload_queue_depth_max": upload_queue_depth_max,
+        "r2_streaming_upload_queue_full_wait_count": upload_queue_full_wait_count,
         "r2_streaming_retry_count": collector_summary["r2_streaming_retry_count"].as_u64().unwrap_or(0),
         "r2_streaming_upload_timeout_count": collector_summary["r2_streaming_upload_timeout_count"].as_u64().unwrap_or(0),
         "r2_streaming_backpressure_detected": backpressure_detected,
@@ -55012,6 +55210,24 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
     let receiver_unavailable_count = relay_summary["receiver_unavailable_count"]
         .as_u64()
         .unwrap_or(0);
+    let r2_streaming_backpressure_detected =
+        r2_streaming_upload["r2_streaming_backpressure_detected"]
+            .as_bool()
+            .or_else(|| relay_summary["r2_streaming_backpressure_detected"].as_bool())
+            .unwrap_or(false);
+    let r2_streaming_upload_queue_full_wait_count =
+        r2_streaming_upload["r2_streaming_upload_queue_full_wait_count"]
+            .as_u64()
+            .or_else(|| relay_summary["r2_streaming_upload_queue_full_wait_count"].as_u64())
+            .unwrap_or(0);
+    let local_spool_bytes_peak = r2_streaming_upload["local_spool_bytes_peak"]
+        .as_u64()
+        .or_else(|| relay_summary["local_spool_bytes_peak"].as_u64())
+        .unwrap_or(0);
+    let local_spool_bytes_limit = r2_streaming_upload["local_spool_bytes_limit"]
+        .as_u64()
+        .or_else(|| relay_summary["local_spool_bytes_limit"].as_u64())
+        .unwrap_or(0);
     let provider_data_loss_seen = countability["provider_data_loss_seen"]
         .as_bool()
         .unwrap_or(false)
@@ -55049,6 +55265,10 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "RELAY_LOCAL_DATASET_BLOCK_DECODE"
     } else if receiver_backpressure_count > 0 || receiver_unavailable_count > 0 {
         "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
+    } else if r2_streaming_backpressure_detected || r2_streaming_upload_queue_full_wait_count > 0 {
+        "RELAY_LOCAL_DATASET_BLOCK_R2_STREAMING_BACKPRESSURE"
+    } else if local_spool_bytes_limit > 0 && local_spool_bytes_peak > local_spool_bytes_limit {
+        "RELAY_LOCAL_DATASET_BLOCK_SPOOL"
     } else if provider_gap_continuation_counted && !r2_verified {
         "RELAY_LOCAL_DATASET_BLOCK_R2"
     } else if provider_gap_continuation_counted && safety_ok {
@@ -55120,22 +55340,20 @@ fn local_relay_dataset_proof_summary(output_dir: &Path) -> Result<serde_json::Va
         "r2_streaming_upload_timeout_count": r2_streaming_upload["r2_streaming_upload_timeout_count"].as_u64()
             .or_else(|| relay_summary["r2_streaming_upload_timeout_count"].as_u64())
             .unwrap_or(0),
-        "r2_streaming_backpressure_detected": r2_streaming_upload["r2_streaming_backpressure_detected"].as_bool()
-            .or_else(|| relay_summary["r2_streaming_backpressure_detected"].as_bool())
-            .unwrap_or(false),
+        "r2_streaming_backpressure_detected": r2_streaming_backpressure_detected,
         "r2_streaming_upload_queue_depth": r2_streaming_upload["r2_streaming_upload_queue_depth"].as_u64()
             .or_else(|| relay_summary["r2_streaming_upload_queue_depth"].as_u64())
             .unwrap_or(0),
         "r2_streaming_upload_queue_max": r2_streaming_upload["r2_streaming_upload_queue_max"].as_u64()
             .or_else(|| relay_summary["r2_streaming_upload_queue_max"].as_u64())
             .unwrap_or(1),
+        "r2_streaming_upload_queue_depth_max": r2_streaming_upload["r2_streaming_upload_queue_depth_max"].as_u64()
+            .or_else(|| relay_summary["r2_streaming_upload_queue_depth_max"].as_u64())
+            .unwrap_or(0),
+        "r2_streaming_upload_queue_full_wait_count": r2_streaming_upload_queue_full_wait_count,
         "local_spool_bytes_current": r2_streaming_upload["local_spool_bytes_current"].as_u64().unwrap_or(0),
-        "local_spool_bytes_peak": r2_streaming_upload["local_spool_bytes_peak"].as_u64()
-            .or_else(|| relay_summary["local_spool_bytes_peak"].as_u64())
-            .unwrap_or(0),
-        "local_spool_bytes_limit": r2_streaming_upload["local_spool_bytes_limit"].as_u64()
-            .or_else(|| relay_summary["local_spool_bytes_limit"].as_u64())
-            .unwrap_or(0),
+        "local_spool_bytes_peak": local_spool_bytes_peak,
+        "local_spool_bytes_limit": local_spool_bytes_limit,
         "local_disk_free_mb": relay_summary["local_disk_free_mb"].as_u64(),
         "local_retained_bytes_final": retention_summary["local_retained_bytes"].as_u64().unwrap_or(0),
         "r2_upload_result": r2_upload,
@@ -68354,6 +68572,56 @@ mod tests {
     }
 
     #[test]
+    fn phase107g_r2_streaming_upload_spool_limit_covers_active_and_bounded_queue() {
+        assert_eq!(LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY, 1);
+        assert_eq!(
+            local_relay_r2_streaming_spool_limit(LOCAL_RELAY_R2_STREAMING_RELAY_SHARD_BYTES),
+            128 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn phase107g_r2_streaming_upload_queue_reports_capacity_wait() {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel(LOCAL_RELAY_R2_STREAMING_UPLOAD_QUEUE_CAPACITY);
+        let stats = Arc::new(LocalRelayStreamingUploadStats::default());
+        let upload_sender = LocalRelayStreamingUploadSender {
+            sender,
+            stats: stats.clone(),
+        };
+        let job = |part_index| LocalRelayStreamingUploadJob {
+            output_dir: PathBuf::from("output"),
+            local_path: PathBuf::from(format!("part-{part_index}.ndjson")),
+            part_index,
+            sequence_start: Some(part_index),
+            sequence_end: Some(part_index),
+            frame_count: 1,
+        };
+
+        assert!(!upload_sender.enqueue(job(1)).await.expect("enqueue first"));
+        let waiting_sender = upload_sender.clone();
+        let waiting = tokio::spawn(async move { waiting_sender.enqueue(job(2)).await });
+        tokio::task::yield_now().await;
+        assert_eq!(stats.snapshot().queue_full_wait_count, 1);
+
+        receiver.recv().await.expect("receive first queued job");
+        stats.note_dequeued();
+        assert!(
+            waiting
+                .await
+                .expect("join waiting sender")
+                .expect("enqueue second")
+        );
+        receiver.recv().await.expect("receive second queued job");
+        stats.note_dequeued();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.queue_depth_current, 0);
+        assert_eq!(snapshot.queue_depth_max, 2);
+        assert_eq!(snapshot.queue_full_wait_count, 1);
+    }
+
+    #[test]
     fn phase107g_relay_transport_batch_roundtrip_preserves_inner_frames() {
         let lines = (1..=8)
             .map(|sequence| {
@@ -69294,6 +69562,25 @@ mod tests {
         let summary = local_relay_dataset_proof_summary(temp.path()).expect("proof summary");
         assert_eq!(summary["classification"], "RELAY_LOCAL_DATASET_PASS");
         assert_eq!(summary["unique_attempted_mints"], 1);
+
+        fs::write(
+            temp.path().join("r2_streaming_upload_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "storage_mode": "r2_streaming",
+                "r2_streaming_backpressure_detected": true,
+                "r2_streaming_upload_queue_full_wait_count": 1
+            }))
+            .expect("json"),
+        )
+        .expect("streaming manifest");
+        let backpressured =
+            local_relay_dataset_proof_summary(temp.path()).expect("backpressured summary");
+        assert_eq!(
+            backpressured["classification"],
+            "RELAY_LOCAL_DATASET_BLOCK_R2_STREAMING_BACKPRESSURE"
+        );
+        fs::remove_file(temp.path().join("r2_streaming_upload_manifest.json"))
+            .expect("remove streaming manifest");
 
         fs::write(
             temp.path().join("local_collector_summary.json"),

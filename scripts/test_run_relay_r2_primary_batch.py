@@ -1149,6 +1149,30 @@ class RelaySupervisorTests(unittest.TestCase):
                 "RELAY_LOCAL_DATASET_PASS_NO_SIGNAL",
             )
 
+    def test_r2_streaming_queue_wait_blocks_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "slice"
+            write_zero_attempt_slice_fixture(root, all_launches_seen=96)
+            proof_path = root / "local_relay_dataset_proof_summary.json"
+            proof = json.loads(proof_path.read_text())
+            proof["r2_streaming_backpressure_detected"] = True
+            proof["r2_streaming_upload_queue_full_wait_count"] = 1
+            proof_path.write_text(json.dumps(proof))
+            validator = types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "blockers": []}),
+                stderr="",
+            )
+            with mock.patch.object(relay_supervisor, "run_capture", return_value=validator):
+                result, blockers = relay_supervisor.validate_slice(root)
+            self.assertIn("r2_streaming_backpressure", blockers)
+            self.assertFalse(result.get("zero_attempt_no_signal", False))
+            self.assertEqual(result["r2_streaming_upload_queue_full_wait_count"], 1)
+            self.assertEqual(
+                relay_supervisor.classify_blockers(blockers, result),
+                "RELAY_LOCAL_DATASET_BLOCK_R2_STREAMING_BACKPRESSURE",
+            )
+
     def test_no_signal_slice_satisfies_one_slice_batch_without_counted_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

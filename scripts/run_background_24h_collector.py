@@ -136,6 +136,10 @@ SLICE_FIELDS = [
     "r2_streaming_retry_count",
     "r2_streaming_upload_timeout_count",
     "r2_streaming_backpressure_detected",
+    "r2_streaming_upload_queue_depth",
+    "r2_streaming_upload_queue_max",
+    "r2_streaming_upload_queue_depth_max",
+    "r2_streaming_upload_queue_full_wait_count",
     "vps_safety_ok",
     "blocker_if_any",
 ]
@@ -1063,6 +1067,18 @@ def aggregate_status(base: dict[str, Any] | None = None) -> dict[str, Any]:
         "r2_streaming_backpressure_detected": any(
             str(r.get("r2_streaming_backpressure_detected", "")).lower() == "true" for r in rows
         ),
+        "r2_streaming_upload_queue_depth": max(
+            [safe_int(r.get("r2_streaming_upload_queue_depth")) for r in rows] or [0]
+        ),
+        "r2_streaming_upload_queue_max": max(
+            [safe_int(r.get("r2_streaming_upload_queue_max"), 1) for r in rows] or [1]
+        ),
+        "r2_streaming_upload_queue_depth_max": max(
+            [safe_int(r.get("r2_streaming_upload_queue_depth_max")) for r in rows] or [0]
+        ),
+        "r2_streaming_upload_queue_full_wait_count": sum(
+            safe_int(r.get("r2_streaming_upload_queue_full_wait_count")) for r in rows
+        ),
         "generic_collection_allowed": False,
         "replay_allowed": False,
         "formal_backtesting_allowed": False,
@@ -1185,6 +1201,14 @@ def mirror_slice(batch_index: int, batch_log_dir: pathlib.Path, report_summary: 
         "r2_streaming_retry_count": row.get("r2_streaming_retry_count", ""),
         "r2_streaming_upload_timeout_count": row.get("r2_streaming_upload_timeout_count", ""),
         "r2_streaming_backpressure_detected": row.get("r2_streaming_backpressure_detected", ""),
+        "r2_streaming_upload_queue_depth": row.get("r2_streaming_upload_queue_depth", ""),
+        "r2_streaming_upload_queue_max": row.get("r2_streaming_upload_queue_max", ""),
+        "r2_streaming_upload_queue_depth_max": row.get(
+            "r2_streaming_upload_queue_depth_max", ""
+        ),
+        "r2_streaming_upload_queue_full_wait_count": row.get(
+            "r2_streaming_upload_queue_full_wait_count", ""
+        ),
         "vps_safety_ok": str(not blocker.startswith("vps") and blocker != "old_vps_material_hunter_active").lower(),
         "blocker_if_any": blocker,
     }
@@ -1412,7 +1436,7 @@ def write_recovered_r2_streaming_manifests(run_dir: pathlib.Path) -> dict[str, A
         "local_retained_bytes": local_retained_bytes,
         "verified_chunks_deleted_local": counts["deleted_local_chunks"],
         "unverified_chunks_retained_local": counts["unverified_chunks"],
-        "spool_bounded": True,
+        "spool_bounded": local_spool_bytes_peak <= local_spool_bytes_limit,
         "replay_allowed": False,
         "finalization_recovered_after_hang": True,
         "generated_at_utc": utc_stamp(),
@@ -1449,6 +1473,12 @@ def write_recovered_r2_streaming_manifests(run_dir: pathlib.Path) -> dict[str, A
         "local_spool_bytes_limit": local_spool_bytes_limit,
         "r2_streaming_upload_queue_depth": safe_int(collector.get("r2_streaming_upload_queue_depth")),
         "r2_streaming_upload_queue_max": safe_int(collector.get("r2_streaming_upload_queue_max"), 1),
+        "r2_streaming_upload_queue_depth_max": safe_int(
+            collector.get("r2_streaming_upload_queue_depth_max")
+        ),
+        "r2_streaming_upload_queue_full_wait_count": safe_int(
+            collector.get("r2_streaming_upload_queue_full_wait_count")
+        ),
         "r2_streaming_retry_count": safe_int(collector.get("r2_streaming_retry_count")),
         "r2_streaming_upload_timeout_count": safe_int(collector.get("r2_streaming_upload_timeout_count")),
         "r2_streaming_backpressure_detected": collector.get("r2_streaming_backpressure_detected") is True,
@@ -1607,6 +1637,14 @@ def write_recovered_local_proof_summary(run_dir: pathlib.Path) -> dict[str, Any]
         "r2_streaming_backpressure_detected": streaming.get("r2_streaming_backpressure_detected") is True,
         "r2_streaming_upload_queue_depth": safe_int(streaming.get("r2_streaming_upload_queue_depth")),
         "r2_streaming_upload_queue_max": safe_int(streaming.get("r2_streaming_upload_queue_max"), 1),
+        "r2_streaming_upload_queue_depth_max": safe_int(
+            streaming.get("r2_streaming_upload_queue_depth_max"),
+            safe_int(collector.get("r2_streaming_upload_queue_depth_max")),
+        ),
+        "r2_streaming_upload_queue_full_wait_count": safe_int(
+            streaming.get("r2_streaming_upload_queue_full_wait_count"),
+            safe_int(collector.get("r2_streaming_upload_queue_full_wait_count")),
+        ),
         "local_spool_bytes_current": safe_int(streaming.get("local_spool_bytes_current")),
         "local_spool_bytes_peak": safe_int(streaming.get("local_spool_bytes_peak"), safe_int(collector.get("local_spool_bytes_peak"))),
         "local_spool_bytes_limit": safe_int(streaming.get("local_spool_bytes_limit"), safe_int(collector.get("local_spool_bytes_limit"))),

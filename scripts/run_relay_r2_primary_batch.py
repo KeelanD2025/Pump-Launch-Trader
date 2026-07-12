@@ -871,6 +871,8 @@ def classify_blockers(blockers: list[str], result: dict[str, Any] | None = None)
         return "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_BACKPRESSURE"
     if "receiver_unavailable_count" in blocker_set:
         return "RELAY_LOCAL_DATASET_BLOCK_RECEIVER_UNAVAILABLE"
+    if "r2_streaming_backpressure" in blocker_set:
+        return "RELAY_LOCAL_DATASET_BLOCK_R2_STREAMING_BACKPRESSURE"
     if "r2_failed" in blocker_set or "retention_not_ok" in blocker_set or "r2_timeout" in blocker_set:
         return "RELAY_LOCAL_DATASET_BLOCK_R2"
     if "r2_local_spool_full" in blocker_set:
@@ -1534,6 +1536,22 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         "r2_streaming_backpressure_detected": summary.get("r2_streaming_backpressure_detected")
         if "r2_streaming_backpressure_detected" in summary
         else collector.get("r2_streaming_backpressure_detected", False),
+        "r2_streaming_upload_queue_depth": summary.get("r2_streaming_upload_queue_depth")
+        or collector.get("r2_streaming_upload_queue_depth")
+        or 0,
+        "r2_streaming_upload_queue_max": summary.get("r2_streaming_upload_queue_max")
+        or collector.get("r2_streaming_upload_queue_max")
+        or 1,
+        "r2_streaming_upload_queue_depth_max": summary.get(
+            "r2_streaming_upload_queue_depth_max"
+        )
+        or collector.get("r2_streaming_upload_queue_depth_max")
+        or 0,
+        "r2_streaming_upload_queue_full_wait_count": summary.get(
+            "r2_streaming_upload_queue_full_wait_count"
+        )
+        or collector.get("r2_streaming_upload_queue_full_wait_count")
+        or 0,
     }
     blockers: list[str] = []
     for key in (
@@ -1547,6 +1565,14 @@ def validate_slice(out: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
             blockers.append(key)
     if failed_count != 0:
         blockers.append("r2_failed")
+    if result["r2_streaming_backpressure_detected"] is True or int(
+        result["r2_streaming_upload_queue_full_wait_count"]
+    ) != 0:
+        blockers.append("r2_streaming_backpressure")
+    if result["local_spool_bytes_limit"] and (
+        int(result["local_spool_bytes_peak"]) > int(result["local_spool_bytes_limit"])
+    ):
+        blockers.append("r2_local_spool_full")
     if not retention.get("ok", False):
         blockers.append("retention_not_ok")
     if validator_proc.returncode != 0 or validator_json.get("blockers"):
