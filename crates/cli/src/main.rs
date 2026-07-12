@@ -51055,8 +51055,10 @@ const RELAY_TRANSPORT_PACKET_ESCAPE_NEWLINE: u8 = b'n';
 const RELAY_TRANSPORT_PACKET_ESCAPE_ESCAPE: u8 = b'e';
 const RELAY_TRANSPORT_COMPRESSED_PAYLOAD_MARKER: &[u8] = b"\"payload_compressed\":true";
 const RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES: usize = 16_384;
-const RELAY_TRANSPORT_BATCH_MAX_FRAMES: usize = 64;
-const RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
+// Larger outer batches exploit redundancy across adjacent protobuf frames without
+// increasing the bounded queue or the decoder's existing absolute memory limit.
+const RELAY_TRANSPORT_BATCH_MAX_FRAMES: usize = 512;
+const RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const RELAY_TRANSPORT_BATCH_FLUSH_MILLIS: u64 = 100;
 
@@ -53385,6 +53387,8 @@ async fn run_live_vps_stream_relay(
         "relay_transport_payload_rehydration_enabled": true,
         "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
         "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
+        "relay_transport_batch_max_frames": RELAY_TRANSPORT_BATCH_MAX_FRAMES,
+        "relay_transport_batch_max_uncompressed_bytes": RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES,
         "relay_transport_batch_schema_version": RELAY_TRANSPORT_PACKET_SCHEMA_VERSION,
         "relay_transport_legacy_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
         "relay_transport_base64_outer_envelope_enabled": false,
@@ -54123,6 +54127,8 @@ async fn run_live_local_stream_collector(
         "relay_transport_payload_rehydration_enabled": true,
         "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
         "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
+        "relay_transport_batch_max_frames": RELAY_TRANSPORT_BATCH_MAX_FRAMES,
+        "relay_transport_batch_max_uncompressed_bytes": RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES,
         "relay_transport_batch_envelopes_received": transport_batch_envelopes_received,
         "relay_transport_batch_frames_expanded": transport_batch_frames_expanded,
         "relay_transport_batch_compressed_bytes_received": transport_batch_compressed_bytes_received,
@@ -68662,7 +68668,7 @@ mod tests {
             .await
             .expect("connect transport writer");
         let (transport, writer) = relay_spawn_transport_writer(socket);
-        for sequence in 1..=100 {
+        for sequence in 1..=600 {
             let frame = RelayFrame::data(
                 "relay-session",
                 "geyser-material-hunter",
@@ -68686,10 +68692,10 @@ mod tests {
         finish_result.expect("finish transport writer");
         let (sequences, envelopes) = receiver_task.await.expect("transport receiver task");
 
-        assert_eq!(sequences, (1..=100).collect::<Vec<_>>());
+        assert_eq!(sequences, (1..=600).collect::<Vec<_>>());
         assert!(envelopes > 0);
-        assert_eq!(stats.frames_enqueued, 100);
-        assert_eq!(stats.frames_written, 100);
+        assert_eq!(stats.frames_enqueued, 600);
+        assert_eq!(stats.frames_written, 600);
         assert_eq!(stats.queue_depth_current, 0);
         assert_eq!(stats.queue_bytes_current, 0);
         assert_eq!(stats.queue_full_wait_count, 0);
