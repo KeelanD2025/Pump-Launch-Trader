@@ -51043,6 +51043,7 @@ fn relay_tcp_addr_from_url(url: &str) -> Result<String> {
 
 const RELAY_PAYLOAD_COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
 const RELAY_PAYLOAD_ZSTD_LEVEL: i32 = 1;
+const RELAY_TRANSPORT_ZSTD_LEVEL: i32 = 9;
 const RELAY_TRANSPORT_BATCH_SCHEMA_VERSION: &str = "phase107g.relay_transport_batch.v1";
 const RELAY_TRANSPORT_BATCH_CODEC: &str = "zstd_ndjson";
 const RELAY_TRANSPORT_PACKET_SCHEMA_VERSION: &str = "phase107g.relay_transport_packet.v2";
@@ -51054,7 +51055,7 @@ const RELAY_TRANSPORT_QUEUE_CAPACITY_FRAMES: usize = 16_384;
 const RELAY_TRANSPORT_BATCH_MAX_FRAMES: usize = 64;
 const RELAY_TRANSPORT_BATCH_MAX_UNCOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
-const RELAY_TRANSPORT_BATCH_FLUSH_MILLIS: u64 = 20;
+const RELAY_TRANSPORT_BATCH_FLUSH_MILLIS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayTransportBatchWire {
@@ -51074,6 +51075,15 @@ struct RelayDecodedTransportBatch {
     uncompressed_bytes: usize,
 }
 
+#[derive(Debug)]
+struct RelayEncodedTransportBatch {
+    wire_bytes: Vec<u8>,
+    compressed: bool,
+    source_inner_bytes: usize,
+    transport_inner_bytes: usize,
+    rehydrated_payload_frames: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 struct RelayTransportStatsSnapshot {
     queue_capacity_frames: usize,
@@ -51086,6 +51096,8 @@ struct RelayTransportStatsSnapshot {
     frames_written: u64,
     write_batches: u64,
     compressed_batches: u64,
+    rehydrated_payload_frames: u64,
+    source_inner_bytes_written: u64,
     inner_bytes_written: u64,
     wire_bytes_written: u64,
 }
@@ -51101,6 +51113,8 @@ struct RelayTransportStats {
     frames_written: AtomicU64,
     write_batches: AtomicU64,
     compressed_batches: AtomicU64,
+    rehydrated_payload_frames: AtomicU64,
+    source_inner_bytes_written: AtomicU64,
     inner_bytes_written: AtomicU64,
     wire_bytes_written: AtomicU64,
 }
@@ -51160,6 +51174,8 @@ impl RelayTransportStats {
             frames_written: self.frames_written.load(Ordering::Relaxed),
             write_batches: self.write_batches.load(Ordering::Relaxed),
             compressed_batches: self.compressed_batches.load(Ordering::Relaxed),
+            rehydrated_payload_frames: self.rehydrated_payload_frames.load(Ordering::Relaxed),
+            source_inner_bytes_written: self.source_inner_bytes_written.load(Ordering::Relaxed),
             inner_bytes_written: self.inner_bytes_written.load(Ordering::Relaxed),
             wire_bytes_written: self.wire_bytes_written.load(Ordering::Relaxed),
         }
@@ -51262,24 +51278,90 @@ fn relay_unescape_transport_payload(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn relay_encode_transport_batch(lines: &[Vec<u8>]) -> Result<(Vec<u8>, bool)> {
-    let inner_bytes = lines.iter().map(Vec::len).sum::<usize>();
-    let mut inner = Vec::with_capacity(inner_bytes);
+fn relay_rehydrate_compressed_transport_line(line: &[u8]) -> Result<Option<Vec<u8>>> {
+    let Some(line) = line.strip_suffix(b"\n") else {
+        bail!("relay_transport_source_frame_missing_terminal_newline");
+    };
+    let mut wire: RelayWireFrame =
+        serde_json::from_slice(line).context("decode relay transport source frame")?;
+    if !wire.payload_compressed {
+        return Ok(None);
+    }
+    let compressed = BASE64_STANDARD
+        .decode(wire.payload_base64.as_bytes())
+        .context("decode compressed relay transport source payload")?;
+    if compressed.len() != wire.payload_len {
+        bail!("relay_transport_source_payload_length_mismatch");
+    }
+    if relay_payload_sha256(&compressed) != wire.payload_hash {
+        bail!("relay_transport_source_payload_hash_mismatch");
+    }
+    if compressed.len() > RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES {
+        return Ok(None);
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+    let mut payload = Vec::new();
+    decoder
+        .by_ref()
+        .take((RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES + 1) as u64)
+        .read_to_end(&mut payload)?;
+    if payload.len() > RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES {
+        return Ok(None);
+    }
+    wire.payload_compressed = false;
+    wire.payload_hash = relay_payload_sha256(&payload);
+    wire.payload_len = payload.len();
+    wire.payload_base64 = BASE64_STANDARD.encode(payload);
+    let mut encoded = serde_json::to_vec(&wire)?;
+    encoded.push(b'\n');
+    Ok(Some(encoded))
+}
+
+fn relay_encode_transport_batch(lines: &[Vec<u8>]) -> Result<RelayEncodedTransportBatch> {
+    let source_inner_bytes = lines.iter().map(Vec::len).sum::<usize>();
+    let mut source_inner = Vec::with_capacity(source_inner_bytes);
     for line in lines {
-        inner.extend_from_slice(line);
+        source_inner.extend_from_slice(line);
     }
     if lines.len() < 2 {
-        return Ok((inner, false));
+        return Ok(RelayEncodedTransportBatch {
+            wire_bytes: source_inner,
+            compressed: false,
+            source_inner_bytes,
+            transport_inner_bytes: source_inner_bytes,
+            rehydrated_payload_frames: 0,
+        });
     }
 
-    let compressed = zstd::encode_all(inner.as_slice(), RELAY_PAYLOAD_ZSTD_LEVEL)?;
+    let mut transport_inner = Vec::with_capacity(source_inner_bytes);
+    let mut rehydrated_payload_frames = 0usize;
+    let mut rehydration_within_limit = true;
+    for line in lines {
+        let rehydrated = relay_rehydrate_compressed_transport_line(line)?;
+        let transport_line = rehydrated.as_deref().unwrap_or(line.as_slice());
+        if transport_inner.len().saturating_add(transport_line.len())
+            > RELAY_TRANSPORT_BATCH_ABSOLUTE_MAX_UNCOMPRESSED_BYTES
+        {
+            rehydration_within_limit = false;
+            break;
+        }
+        rehydrated_payload_frames =
+            rehydrated_payload_frames.saturating_add(usize::from(rehydrated.is_some()));
+        transport_inner.extend_from_slice(transport_line);
+    }
+    if !rehydration_within_limit {
+        transport_inner = source_inner.clone();
+        rehydrated_payload_frames = 0;
+    }
+
+    let compressed = zstd::encode_all(transport_inner.as_slice(), RELAY_TRANSPORT_ZSTD_LEVEL)?;
     let escaped = relay_escape_transport_payload(&compressed);
     let header = format!(
         "{}:{}:{}:{}:",
         lines.len(),
         compressed.len(),
-        inner.len(),
-        relay_payload_sha256(&inner)
+        transport_inner.len(),
+        relay_payload_sha256(&transport_inner)
     );
     let mut encoded = Vec::with_capacity(
         RELAY_TRANSPORT_PACKET_PREFIX
@@ -51292,10 +51374,22 @@ fn relay_encode_transport_batch(lines: &[Vec<u8>]) -> Result<(Vec<u8>, bool)> {
     encoded.extend_from_slice(header.as_bytes());
     encoded.extend_from_slice(&escaped);
     encoded.push(b'\n');
-    if encoded.len() < inner.len() {
-        Ok((encoded, true))
+    if encoded.len() < source_inner.len() {
+        Ok(RelayEncodedTransportBatch {
+            wire_bytes: encoded,
+            compressed: true,
+            source_inner_bytes,
+            transport_inner_bytes: transport_inner.len(),
+            rehydrated_payload_frames,
+        })
     } else {
-        Ok((inner, false))
+        Ok(RelayEncodedTransportBatch {
+            wire_bytes: source_inner,
+            compressed: false,
+            source_inner_bytes,
+            transport_inner_bytes: source_inner_bytes,
+            rehydrated_payload_frames: 0,
+        })
     }
 }
 
@@ -51493,8 +51587,8 @@ async fn relay_transport_writer_loop(
             }
         }
 
-        let (encoded, compressed) = relay_encode_transport_batch(&batch)?;
-        receiver.write_all(&encoded).await?;
+        let encoded = relay_encode_transport_batch(&batch)?;
+        receiver.write_all(&encoded.wire_bytes).await?;
         for line in &batch {
             stats.note_dequeued(line.len());
         }
@@ -51504,13 +51598,19 @@ async fn relay_transport_writer_loop(
         stats.write_batches.fetch_add(1, Ordering::Relaxed);
         stats
             .compressed_batches
-            .fetch_add(u64::from(compressed), Ordering::Relaxed);
+            .fetch_add(u64::from(encoded.compressed), Ordering::Relaxed);
+        stats
+            .rehydrated_payload_frames
+            .fetch_add(encoded.rehydrated_payload_frames as u64, Ordering::Relaxed);
+        stats
+            .source_inner_bytes_written
+            .fetch_add(encoded.source_inner_bytes as u64, Ordering::Relaxed);
         stats
             .inner_bytes_written
-            .fetch_add(batch_bytes as u64, Ordering::Relaxed);
+            .fetch_add(encoded.transport_inner_bytes as u64, Ordering::Relaxed);
         stats
             .wire_bytes_written
-            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+            .fetch_add(encoded.wire_bytes.len() as u64, Ordering::Relaxed);
     }
     receiver.flush().await?;
     Ok(())
@@ -52834,7 +52934,7 @@ async fn run_live_vps_stream_relay(
         None,
     );
     summary.transport =
-        "tcp_zstd_escaped_binary_safe_ndjson_batches_over_private_ssh_tunnel".to_owned();
+        "tcp_zstd9_rehydrated_binary_safe_ndjson_batches_over_private_ssh_tunnel".to_owned();
     let relay_started_at_unix_nanos = unix_now_nanos_u128().min(u64::MAX as u128) as u64;
     summary.exact_holder_relay_started_at_unix_nanos = Some(relay_started_at_unix_nanos);
 
@@ -53275,6 +53375,10 @@ async fn run_live_vps_stream_relay(
         "compressed_data_frames_forwarded": compressed_data_frames_forwarded,
         "payload_compression_enabled": true,
         "relay_transport_batching_enabled": true,
+        "relay_transport_queue_payload_compression_enabled": true,
+        "relay_transport_payload_rehydration_enabled": true,
+        "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
+        "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
         "relay_transport_batch_schema_version": RELAY_TRANSPORT_PACKET_SCHEMA_VERSION,
         "relay_transport_legacy_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
         "relay_transport_base64_outer_envelope_enabled": false,
@@ -53288,6 +53392,8 @@ async fn run_live_vps_stream_relay(
         "relay_transport_frames_written": transport_stats.frames_written,
         "relay_transport_write_batches": transport_stats.write_batches,
         "relay_transport_compressed_batches": transport_stats.compressed_batches,
+        "relay_transport_rehydrated_payload_frames": transport_stats.rehydrated_payload_frames,
+        "relay_transport_source_inner_bytes_written": transport_stats.source_inner_bytes_written,
         "relay_transport_inner_bytes_written": transport_stats.inner_bytes_written,
         "relay_transport_wire_bytes_written": transport_stats.wire_bytes_written,
         "upstream_errors": upstream_errors,
@@ -54007,6 +54113,9 @@ async fn run_live_local_stream_collector(
         "relay_transport_batch_schema_version": RELAY_TRANSPORT_PACKET_SCHEMA_VERSION,
         "relay_transport_legacy_batch_schema_version": RELAY_TRANSPORT_BATCH_SCHEMA_VERSION,
         "relay_transport_base64_outer_envelope_enabled": false,
+        "relay_transport_payload_rehydration_enabled": true,
+        "relay_transport_zstd_level": RELAY_TRANSPORT_ZSTD_LEVEL,
+        "relay_transport_batch_flush_millis": RELAY_TRANSPORT_BATCH_FLUSH_MILLIS,
         "relay_transport_batch_envelopes_received": transport_batch_envelopes_received,
         "relay_transport_batch_frames_expanded": transport_batch_frames_expanded,
         "relay_transport_batch_compressed_bytes_received": transport_batch_compressed_bytes_received,
@@ -68250,12 +68359,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let (encoded, compressed) =
-            relay_encode_transport_batch(&lines).expect("encode transport batch");
-        assert!(compressed);
-        assert!(encoded.starts_with(RELAY_TRANSPORT_PACKET_PREFIX));
-        assert!(!encoded[..encoded.len() - 1].contains(&b'\n'));
-        assert!(encoded.len() < lines.iter().map(Vec::len).sum::<usize>());
+        let encoded = relay_encode_transport_batch(&lines).expect("encode transport batch");
+        assert!(encoded.compressed);
+        assert!(
+            encoded
+                .wire_bytes
+                .starts_with(RELAY_TRANSPORT_PACKET_PREFIX)
+        );
+        assert!(!encoded.wire_bytes[..encoded.wire_bytes.len() - 1].contains(&b'\n'));
+        assert!(encoded.wire_bytes.len() < lines.iter().map(Vec::len).sum::<usize>());
+        assert_eq!(encoded.rehydrated_payload_frames, 0);
+        assert_eq!(encoded.source_inner_bytes, encoded.transport_inner_bytes);
         let mut inner = Vec::new();
         for line in &lines {
             inner.extend_from_slice(line);
@@ -68272,9 +68386,9 @@ mod tests {
             payload_base64: BASE64_STANDARD.encode(legacy_compressed),
         };
         let legacy_encoded = serde_json::to_vec(&legacy_wire).expect("legacy comparison envelope");
-        assert!(encoded.len() < legacy_encoded.len());
+        assert!(encoded.wire_bytes.len() < legacy_encoded.len());
 
-        let decoded = relay_decode_transport_batch_line(&encoded)
+        let decoded = relay_decode_transport_batch_line(&encoded.wire_bytes)
             .expect("decode transport batch")
             .expect("batch envelope");
         assert_eq!(decoded.lines.len(), lines.len());
@@ -68287,6 +68401,87 @@ mod tests {
             assert_eq!(frame.sequence, (index + 1) as u64);
             assert!(frame.verify_payload_hash());
         }
+    }
+
+    #[test]
+    fn phase107g_relay_transport_rehydrates_verified_payloads_before_batch_compression() {
+        let originals = (1..=4)
+            .map(|sequence| vec![sequence as u8; 16 * 1024])
+            .collect::<Vec<_>>();
+        let lines = originals
+            .iter()
+            .enumerate()
+            .map(|(index, original)| {
+                let payload = zstd::encode_all(original.as_slice(), RELAY_PAYLOAD_ZSTD_LEVEL)
+                    .expect("compress queue payload");
+                let mut frame = RelayFrame::data(
+                    "relay-session",
+                    "geyser-material-hunter",
+                    "geyser",
+                    "fingerprint",
+                    (index + 1) as u64,
+                    (index + 1) as u128,
+                    None,
+                    "yellowstone_subscribe_update_protobuf",
+                    payload,
+                );
+                frame.payload_compressed = true;
+                relay_encode_frame_line(&frame).expect("encode compressed queue frame")
+            })
+            .collect::<Vec<_>>();
+
+        let encoded = relay_encode_transport_batch(&lines).expect("encode transport batch");
+        assert!(encoded.compressed);
+        assert_eq!(encoded.rehydrated_payload_frames, originals.len());
+        assert!(encoded.transport_inner_bytes > encoded.source_inner_bytes);
+        let decoded = relay_decode_transport_batch_line(&encoded.wire_bytes)
+            .expect("decode transport batch")
+            .expect("batch envelope");
+
+        for (index, line) in decoded.lines.iter().enumerate() {
+            let wire: RelayWireFrame = serde_json::from_str(line).expect("inner wire frame");
+            let frame = wire.into_relay_frame().expect("verified inner relay frame");
+            assert!(!frame.payload_compressed);
+            assert!(frame.verify_payload_hash());
+            assert_eq!(frame.payload_bytes, originals[index]);
+        }
+    }
+
+    #[test]
+    fn phase107g_relay_transport_rejects_corrupt_queue_payload_before_rehydration() {
+        let payload = zstd::encode_all(&vec![8_u8; 16 * 1024][..], RELAY_PAYLOAD_ZSTD_LEVEL)
+            .expect("compress queue payload");
+        let mut frame = RelayFrame::data(
+            "relay-session",
+            "geyser-material-hunter",
+            "geyser",
+            "fingerprint",
+            1,
+            1,
+            None,
+            "yellowstone_subscribe_update_protobuf",
+            payload,
+        );
+        frame.payload_compressed = true;
+        let mut wire = RelayWireFrame::from(&frame);
+        wire.payload_hash = "0".repeat(64);
+        let mut corrupt = serde_json::to_vec(&wire).expect("encode corrupt queue frame");
+        corrupt.push(b'\n');
+        let valid = relay_encode_frame_line(&RelayFrame::control(
+            "relay-session",
+            "geyser-material-hunter",
+            "geyser",
+            "fingerprint",
+            2,
+            2,
+            RelayControlKind::RelayHeartbeat,
+            None,
+        ))
+        .expect("encode control frame");
+
+        let error = relay_encode_transport_batch(&[corrupt, valid])
+            .expect_err("corrupt queue payload must fail closed");
+        assert!(format!("{error:#}").contains("relay_transport_source_payload_hash_mismatch"));
     }
 
     #[test]
@@ -68312,20 +68507,20 @@ mod tests {
             inner.extend_from_slice(line);
         }
         let expected_hash = relay_payload_sha256(&inner);
-        let (mut encoded, compressed) =
-            relay_encode_transport_batch(&lines).expect("encode transport batch");
-        assert!(compressed);
+        let mut encoded = relay_encode_transport_batch(&lines).expect("encode transport batch");
+        assert!(encoded.compressed);
         let hash_start = encoded
+            .wire_bytes
             .windows(expected_hash.len())
             .position(|window| window == expected_hash.as_bytes())
             .expect("payload hash in packet header");
-        encoded[hash_start] = if encoded[hash_start] == b'0' {
+        encoded.wire_bytes[hash_start] = if encoded.wire_bytes[hash_start] == b'0' {
             b'1'
         } else {
             b'0'
         };
 
-        let error = relay_decode_transport_batch_line(&encoded)
+        let error = relay_decode_transport_batch_line(&encoded.wire_bytes)
             .expect_err("tampered transport batch must fail closed");
         assert!(format!("{error:#}").contains("relay_transport_batch_hash_mismatch"));
     }
@@ -68359,12 +68554,12 @@ mod tests {
                 .expect("encode inner relay frame")
             })
             .collect::<Vec<_>>();
-        let (encoded, compressed) =
-            relay_encode_transport_batch(&lines).expect("encode transport packet");
-        assert!(compressed);
+        let encoded = relay_encode_transport_batch(&lines).expect("encode transport packet");
+        assert!(encoded.compressed);
 
-        let error = relay_decode_transport_batch_line(&encoded[..encoded.len() - 1])
-            .expect_err("unterminated packet must fail closed");
+        let error =
+            relay_decode_transport_batch_line(&encoded.wire_bytes[..encoded.wire_bytes.len() - 1])
+                .expect_err("unterminated packet must fail closed");
         assert!(format!("{error:#}").contains("relay_transport_packet_missing_terminal_newline"));
     }
 
